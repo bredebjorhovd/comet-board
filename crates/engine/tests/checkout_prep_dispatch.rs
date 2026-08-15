@@ -127,6 +127,10 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     ));
+    let repository_id = core.repos.repository_identity(&repo).await.unwrap();
+    core.checkout_prep
+        .approve(&repo, &repository_id)
+        .expect("host trusts the committed failing recipe");
 
     let spec = DispatchSpec {
         identifier: "gh#422".into(),
@@ -141,11 +145,42 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         model: None,
         account: None,
         push_repo: None,
+        push_contract: None,
         git_author: None,
         turn_limits: Default::default(),
         agent_instructions: false,
+        mcp_servers: Vec::new(),
         prompt: "do the thing".into(),
     };
+
+    // A durable park is a precondition, not a warning. Simulate a state-path
+    // collision before dispatch: the freshly created chat, worktree and branch
+    // must all be rolled back, and setup must never start without recovery.
+    let expected_worktree = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("worktrees")
+        .join("widget")
+        .join("board-gh-422-widget");
+    core.checkout_prep
+        .park(&expected_worktree, "occupied recovery state")
+        .unwrap();
+    let rt = runtime.clone();
+    let rejected = spec.clone();
+    let error = tokio::task::spawn_blocking(move || rt.dispatch(&rejected))
+        .await
+        .unwrap()
+        .expect_err("an unrecoverable dispatch must fail");
+    assert!(error.to_string().contains("parking the dispatch"), "{error:#}");
+    assert!(
+        !expected_worktree.exists(),
+        "the failed dispatch rolled its checkout back"
+    );
+    assert!(
+        core.workspace.watch_chats().borrow().is_empty(),
+        "the failed dispatch rolled its chat back"
+    );
+    core.checkout_prep.revoke_parked(&expected_worktree);
+
     let rt = runtime.clone();
     let handle = tokio::task::spawn_blocking(move || rt.dispatch(&spec))
         .await
@@ -204,10 +239,17 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
     )
     .unwrap();
     let client = comet_rpc::memory_client(core.rpc_service());
+    client
+        .call(
+            methods::APPROVE_CHECKOUT_PREPARATION,
+            serde_json::json!({ "worktreePath": handle.cwd.clone() }),
+        )
+        .await
+        .expect("host approves the edited digest");
     let prepared = client
         .call(
             methods::PREPARE_CHECKOUT,
-            serde_json::json!({ "worktreePath": handle.cwd }),
+            serde_json::json!({ "worktreePath": handle.cwd.clone() }),
         )
         .await
         .expect("PrepareCheckout");

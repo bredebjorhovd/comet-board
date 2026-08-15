@@ -195,6 +195,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--decompose`, `--onto`, `--base` | Release a task into a coding-agent chat |
 | `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--decompose`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
+| `approve-preparation` | `--task` | Approve the exact repository recipe blocking a task, then retry it in the same worktree. Must run on the worktree host |
 | `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
 | `claim` | `--task`, `--claim`, `--json` | Say what your attempt did, in claims a reviewer can check |
 | `review` | `--task`, `--attempt`, `--json` | What an attempt was asked to do, what it says it did, and what it did not account for |

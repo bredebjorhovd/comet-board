@@ -384,7 +384,8 @@ impl ChatDocHandle {
         is_error: bool,
         created_at: i64,
     ) -> Result<(), DocError> {
-        if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
+        let doc = self.doc();
+        if doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
         }
         let part = if is_error {
@@ -398,7 +399,7 @@ impl ChatDocHandle {
                 text: text.to_string(),
             }
         };
-        self.doc.push_message(&SessionMessageEntry {
+        doc.push_message(&SessionMessageEntry {
             id: message_id.to_string(),
             role: MessageRole::System,
             parts: vec![part],
@@ -826,16 +827,32 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
-        let handle = self.open(chat_id)?;
         let id = new_id();
+        self.queue_command_with_id(chat_id, &id, payload)?;
+        Ok(id)
+    }
+
+    /// Queue a command under a caller-owned id. Used by checkout preparation:
+    /// the id is parked durably before the chat exists, so retrying a release
+    /// after a crash cannot append a second billable run.
+    pub fn queue_command_with_id(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+    ) -> Result<(), EngineError> {
+        let handle = self.open(chat_id)?;
         let now = now_ms();
         handle.with_current(|doc| {
+            if doc.read_commands()?.iter().any(|command| command.id == id) {
+                return Ok(());
+            }
             let based_on = doc.read_entries()?.last().map(|m| CommandBasedOn {
                 turn_id: Some(m.id.clone()),
                 frontier: None,
             });
             doc.queue_command(&SessionCommandEntry {
-                id: id.clone(),
+                id: id.to_string(),
                 payload,
                 issued_by: self.inner.config.device_id.clone(),
                 issued_at: now,
@@ -850,7 +867,7 @@ impl DocHost {
         // the command is durable in the doc either way (a host that opens the chat
         // for any other reason still executes it).
         self.nudge_remote_host(chat_id);
-        Ok(id)
+        Ok(())
     }
 
     /// The device hosting `chat_id`, when anything says: the session doc's own
@@ -1839,6 +1856,37 @@ mod tests {
             handle.doc().read_commands().unwrap()[0].id,
             "boundary-command",
             "the owner swap must reconcile the final old-doc command delta"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_owned_command_id_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        host.queue_command_with_id(
+            "chat-fixed-command",
+            "prep-release-1",
+            SessionCommandPayload::Interrupt {},
+        )
+        .unwrap();
+        host.queue_command_with_id(
+            "chat-fixed-command",
+            "prep-release-1",
+            SessionCommandPayload::Interrupt {},
+        )
+        .unwrap();
+        let commands = host
+            .open("chat-fixed-command")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.id == "prep-release-1")
+                .count(),
+            1
         );
     }
 

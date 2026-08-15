@@ -108,6 +108,12 @@ pub mod methods {
     /// succeeds, releases whatever brief the failure was holding. That is the
     /// retry that does not mint a second attempt.
     pub const PREPARE_CHECKOUT: &str = "PrepareCheckout";
+    /// Stop an active setup command and its process group. Relay-forwardable;
+    /// cancellation must execute where the checkout lives.
+    pub const CANCEL_CHECKOUT_PREPARATION: &str = "CancelCheckoutPreparation";
+    /// Host-local trust mutation for an ordinary checkout. Approves the exact
+    /// repository + recipe digest; editing the recipe invalidates it.
+    pub const APPROVE_CHECKOUT_PREPARATION: &str = "ApproveCheckoutPreparation";
     /// Read-only: the last thing known about a checkout's preparation, plus the
     /// recipe's `run` command so a viewport can offer it.
     pub const CHECKOUT_PREP: &str = "CheckoutPrep";
@@ -183,6 +189,10 @@ pub mod methods {
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";
+    /// Approve the exact recipe digest blocking a live task, then retry its
+    /// preparation in place. Host-local only: repository code must not be able
+    /// to authorize itself through the relay. Params: `{taskId}`.
+    pub const APPROVE_TASK_PREPARATION: &str = "ApproveTaskPreparation";
     /// The issue text behind one row, for the detail surface (gh#132). Params:
     /// `{taskId}` → `{id, body}`.
     ///

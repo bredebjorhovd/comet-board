@@ -16,7 +16,7 @@ use tempfile::TempDir;
 struct Box_ {
     _tmp: TempDir,
     data: PathBuf,
-    repo: PathBuf,
+    repository_id: String,
     worktree: PathBuf,
 }
 
@@ -33,10 +33,11 @@ fn a_box(recipe: Option<&str>) -> Box_ {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
     }
+    let repository_id = format!("test-device:{}", repo.display());
     Box_ {
         _tmp: tmp,
         data,
-        repo,
+        repository_id,
         worktree,
     }
 }
@@ -47,9 +48,10 @@ impl Box_ {
     }
 
     fn request(&self) -> PrepareRequest<'_> {
+        let _ = self.prep().approve(&self.worktree, &self.repository_id);
         PrepareRequest {
             worktree: &self.worktree,
-            repo_path: &self.repo,
+            repository_id: &self.repository_id,
             force: false,
             cancel: None,
         }
@@ -57,7 +59,7 @@ impl Box_ {
 
     /// Put a machine-local file where a `[[link]]`'s `from` can reach it.
     fn local(&self, name: &str, contents: &str, mode: u32) -> PathBuf {
-        let root = self.prep().locals_root(&self.repo);
+        let root = self.prep().locals_root(&self.repository_id);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(name);
         std::fs::write(&path, contents).unwrap();
@@ -194,6 +196,132 @@ async fn a_cancelled_setup_stops_and_says_so() {
 }
 
 #[tokio::test]
+async fn checkout_owned_cancellation_stops_the_active_command_tree() {
+    let b = a_box(Some(
+        "version = 1\n[setup]\nrun = \"sleep 60\"\ntimeout = \"1h\"\n",
+    ));
+    let prep = b.prep();
+    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    let runner = prep.clone();
+    let worktree = b.worktree.clone();
+    let repository_id = b.repository_id.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .prepare(PrepareRequest {
+                worktree: &worktree,
+                repository_id: &repository_id,
+                force: true,
+                cancel: None,
+            })
+            .await
+    });
+    for _ in 0..100 {
+        if prep
+            .status(&b.worktree)
+            .is_some_and(|record| record.state == PrepState::Preparing)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(prep.cancel(&b.worktree));
+    let record = task.await.unwrap();
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(record.detail.as_deref().unwrap().contains("cancelled"));
+}
+
+#[tokio::test]
+async fn a_dropped_preparation_is_killed_and_reconciled_from_preparing_to_failed() {
+    let b = a_box(Some(
+        "version = 1\n[setup]\nrun = \"echo $$ > setup.pid; sleep 60\"\ntimeout = \"1h\"\n",
+    ));
+    let prep = b.prep();
+    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    let runner = prep.clone();
+    let worktree = b.worktree.clone();
+    let repository_id = b.repository_id.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .prepare(PrepareRequest {
+                worktree: &worktree,
+                repository_id: &repository_id,
+                force: true,
+                cancel: None,
+            })
+            .await
+    });
+    for _ in 0..100 {
+        if b.worktree.join("setup.pid").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let pid: i32 = std::fs::read_to_string(b.worktree.join("setup.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+
+    task.abort();
+    assert!(task.await.is_err());
+    let record = prep.status(&b.worktree).expect("orphaned record reconciled");
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(record.detail.as_deref().unwrap().contains("interrupted"));
+
+    #[cfg(unix)]
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    #[cfg(unix)]
+    panic!("pid {pid} outlived its dropped preparation future");
+}
+
+#[tokio::test]
+async fn cancellation_revokes_parked_work_before_a_late_setup_can_release_it() {
+    let b = a_box(Some(
+        "version = 1\n[setup]\nrun = \"sleep 60\"\ntimeout = \"1h\"\n",
+    ));
+    let prep = b.prep();
+    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    prep.park(&b.worktree, "run this agent").unwrap();
+
+    let runner = prep.clone();
+    let worktree = b.worktree.clone();
+    let repository_id = b.repository_id.clone();
+    let task = tokio::spawn(async move {
+        runner
+            .prepare(PrepareRequest {
+                worktree: &worktree,
+                repository_id: &repository_id,
+                force: true,
+                cancel: None,
+            })
+            .await
+    });
+    for _ in 0..100 {
+        if prep
+            .status(&b.worktree)
+            .is_some_and(|record| record.state == PrepState::Preparing)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // This is the ordering the dispatch cancellation path promises: first
+    // make release impossible, then stop preparation.
+    prep.revoke_parked(&b.worktree);
+    assert!(prep.cancel(&b.worktree));
+    let record = task.await.unwrap();
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(prep.parked(&b.worktree).is_none());
+    assert!(prep.claim_parked(&b.worktree).is_none());
+}
+
+#[tokio::test]
 async fn a_ready_checkout_is_not_prepared_twice_until_the_recipe_changes() {
     // What makes a retry cheap, and what makes an edited recipe take effect
     // without anybody remembering to force it.
@@ -293,18 +421,128 @@ async fn a_symlink_in_the_locals_directory_is_refused_rather_than_followed() {
     ));
     let secret = b._tmp.path().join("id_ed25519");
     std::fs::write(&secret, "PRIVATE KEY\n").unwrap();
-    let root = b.prep().locals_root(&b.repo);
+    let root = b.prep().locals_root(&b.repository_id);
     std::fs::create_dir_all(&root).unwrap();
     std::os::unix::fs::symlink(&secret, root.join("dev.env")).unwrap();
 
     let record = b.prep().prepare(b.request()).await;
     assert_eq!(record.state, PrepState::Failed);
     assert!(
-        record.detail.as_deref().unwrap().contains("not a regular file"),
+        record.detail.as_deref().unwrap().contains("symlink"),
         "{:?}",
         record.detail
     );
     assert!(!b.worktree.join(".env.local").exists());
+}
+
+#[tokio::test]
+async fn repository_code_cannot_execute_before_the_host_approves_its_exact_digest() {
+    let b = a_box(None);
+    let outside = b._tmp.path().join("host-secret");
+    std::fs::write(&outside, "do-not-read\n").unwrap();
+    set_recipe(
+        &b,
+        &format!(
+            "version = 1\n[setup]\nrun = \"cp '{}' stolen\"\n",
+            outside.display()
+        ),
+    );
+    let record = b
+        .prep()
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(record.requires_approval);
+    assert!(!b.worktree.join("stolen").exists());
+
+    b.prep()
+        .approve(&b.worktree, &b.repository_id)
+        .expect("host approval");
+    let record = b.prep().prepare(b.request()).await;
+    assert_eq!(record.state, PrepState::Ready, "{:?}", record.detail);
+    assert_eq!(
+        std::fs::read_to_string(b.worktree.join("stolen")).unwrap(),
+        "do-not-read\n"
+    );
+
+    // A repository edit is a new trust decision, not an inherited approval.
+    set_recipe(&b, "version = 1\n[setup]\nrun = \"touch changed\"\n");
+    let changed = b
+        .prep()
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert!(changed.requires_approval);
+    assert!(!b.worktree.join("changed").exists());
+}
+
+#[tokio::test]
+async fn repository_edits_cannot_broaden_machine_local_file_reach_without_approval() {
+    let b = a_box(Some(
+        "version = 1\n[[link]]\nfrom = \"signing.env\"\nto = \".env.local\"\n",
+    ));
+    b.local("signing.env", "TOKEN=host-secret\n", 0o600);
+
+    let record = b
+        .prep()
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(record.requires_approval);
+    assert!(record.links.is_empty());
+    assert!(!b.worktree.join(".env.local").exists());
+
+    b.prep().approve(&b.worktree, &b.repository_id).unwrap();
+    let approved = b.prep().prepare(b.request()).await;
+    assert_eq!(approved.state, PrepState::Ready);
+    assert_eq!(approved.links[0].result, "copied");
+    assert_eq!(
+        std::fs::read_to_string(b.worktree.join(".env.local")).unwrap(),
+        "TOKEN=host-secret\n"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn projection_refuses_symlinked_source_and_destination_ancestors() {
+    let source = a_box(Some(
+        "version = 1\n[[link]]\nfrom = \"nested/dev.env\"\nto = \".env.local\"\n",
+    ));
+    let outside = source._tmp.path().join("outside-source");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("dev.env"), "SECRET\n").unwrap();
+    let locals = source.prep().locals_root(&source.repository_id);
+    std::fs::create_dir_all(&locals).unwrap();
+    std::os::unix::fs::symlink(&outside, locals.join("nested")).unwrap();
+    let record = source.prep().prepare(source.request()).await;
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(record.detail.as_deref().unwrap().contains("symlink"));
+
+    let destination = a_box(Some(
+        "version = 1\n[[link]]\nfrom = \"dev.env\"\nto = \"config/.env.local\"\n",
+    ));
+    destination.local("dev.env", "SECRET\n", 0o600);
+    let outside = destination._tmp.path().join("outside-destination");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, destination.worktree.join("config")).unwrap();
+    let record = destination.prep().prepare(destination.request()).await;
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(record.detail.as_deref().unwrap().contains("symlink"));
+    assert!(!outside.join(".env.local").exists());
 }
 
 #[tokio::test]
@@ -325,17 +563,45 @@ async fn setup_runs_from_the_worktree_root_with_the_recipes_environment() {
 }
 
 #[tokio::test]
+async fn setup_does_not_inherit_engine_credentials_or_ambient_values() {
+    const SECRET: &str = "CHECKOUT_PREP_AMBIENT_SECRET_TEST";
+    // SAFETY: this unique variable is read only by this test; no other test
+    // gives it meaning.
+    unsafe { std::env::set_var(SECRET, "must-not-reach-repository-code") };
+    let b = a_box(Some(&format!(
+        "version = 1\n[setup]\nrun = \"test -z \\\"${{{SECRET}+set}}\\\"\"\n"
+    )));
+    let record = b.prep().prepare(b.request()).await;
+    unsafe { std::env::remove_var(SECRET) };
+    assert_eq!(record.state, PrepState::Ready, "{:?}", record.detail);
+}
+
+#[tokio::test]
 async fn a_parked_brief_is_released_exactly_once() {
     // The recovery contract: a retry that succeeds releases the work the
     // failure held back, and two racing retries cannot both release it.
     let b = a_box(None);
     let prep = b.prep();
     prep.park(&b.worktree, "{\"brief\":\"go\"}").unwrap();
-    assert_eq!(
-        prep.take_parked(&b.worktree).as_deref(),
-        Some("{\"brief\":\"go\"}")
+    let claim = prep.claim_parked(&b.worktree).expect("claimed");
+    assert_eq!(claim.payload(), "{\"brief\":\"go\"}");
+    assert!(
+        prep.claim_parked(&b.worktree).is_none(),
+        "a racing claimant cannot own the same release"
     );
-    assert!(prep.take_parked(&b.worktree).is_none());
+    drop(claim);
+    let claim = prep.claim_parked(&b.worktree).expect("rolled back");
+    claim.complete();
+    assert!(prep.claim_parked(&b.worktree).is_none());
+}
+
+#[test]
+fn parking_is_create_only_and_never_replaces_recovery_state() {
+    let b = a_box(None);
+    let prep = b.prep();
+    prep.park(&b.worktree, "first").unwrap();
+    assert!(prep.park(&b.worktree, "second").is_err());
+    assert_eq!(prep.parked(&b.worktree).as_deref(), Some("first"));
 }
 
 #[tokio::test]
@@ -344,13 +610,63 @@ async fn archive_runs_the_repositorys_own_cleanup() {
         "version = 1\n[archive]\nrun = \"rm -rf build-output\"\n",
     ));
     std::fs::create_dir_all(b.worktree.join("build-output")).unwrap();
-    let said = b.prep().archive(&b.worktree, None).await.expect("ran");
+    b.prep()
+        .approve(&b.worktree, &b.repository_id)
+        .expect("approved");
+    let said = b
+        .prep()
+        .archive(&b.worktree, &b.repository_id, None)
+        .await
+        .expect("ran");
     assert!(said.contains("succeeded"), "{said}");
     assert!(!b.worktree.join("build-output").exists());
 
     // A repo with no `[archive]` says nothing, and the caller sweeps as before.
     let plain = a_box(Some("version = 1\n"));
-    assert!(plain.prep().archive(&plain.worktree, None).await.is_none());
+    assert!(
+        plain
+            .prep()
+            .archive(&plain.worktree, &plain.repository_id, None)
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn an_archive_only_recipe_is_approved_before_the_agent_can_edit_it() {
+    let b = a_box(Some(
+        "version = 1\n[archive]\nrun = \"rm -rf build-output\"\n",
+    ));
+    let unapproved = b
+        .prep()
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert_eq!(unapproved.state, PrepState::Failed);
+    assert!(unapproved.requires_approval);
+
+    b.prep().approve(&b.worktree, &b.repository_id).unwrap();
+    let approved = b.prep().prepare(b.request()).await;
+    assert_eq!(approved.state, PrepState::Ready);
+    assert!(approved.command.is_none());
+}
+
+#[tokio::test]
+async fn an_unapproved_archive_command_is_never_executed() {
+    let b = a_box(Some(
+        "version = 1\n[archive]\nrun = \"touch archive-ran\"\n",
+    ));
+    let said = b
+        .prep()
+        .archive(&b.worktree, &b.repository_id, None)
+        .await
+        .expect("archive refusal is visible");
+    assert!(said.contains("not approved"), "{said}");
+    assert!(!b.worktree.join("archive-ran").exists());
 }
 
 #[tokio::test]

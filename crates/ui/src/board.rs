@@ -587,6 +587,20 @@ fn repo_cell(row: &TaskRow) -> String {
 /// A ready row has nothing running and so nothing to say here, and says
 /// nothing — the column stays a column either way.
 fn time_cell(row: &TaskRow, now: chrono::DateTime<Utc>) -> String {
+    if let Some(preparation) = &row.preparation {
+        use comet_proto::view::board::CheckoutPreparationState;
+        match preparation.state {
+            CheckoutPreparationState::Preparing => return "preparing".to_string(),
+            CheckoutPreparationState::Failed => {
+                return if preparation.requires_approval {
+                    "approval needed".to_string()
+                } else {
+                    "setup failed".to_string()
+                };
+            }
+            CheckoutPreparationState::Ready => {}
+        }
+    }
     match row.state() {
         BoardState::Working | BoardState::Blocked => row
             .started_at

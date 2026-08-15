@@ -245,6 +245,12 @@ enum Command {
         #[arg(long)]
         task: String,
     },
+    /// Approve the exact repository recipe blocking a task, then retry it in
+    /// the same worktree. Must run on the worktree host.
+    ApprovePreparation {
+        #[arg(long)]
+        task: String,
+    },
     /// Block until watched work settles. The counterpart to `dispatch`.
     Wait {
         /// Task to watch; repeat for several. Omit to watch everything in
@@ -963,6 +969,19 @@ fn main() -> Result<()> {
                 if let Some(p) = parent {
                     println!("dispatched by chat {p} — not notified");
                 }
+                Ok(())
+            })
+        }
+        Command::ApprovePreparation { task } => {
+            if device.is_some() {
+                bail!(
+                    "approve-preparation is host-local — run it on the device that owns the worktree"
+                );
+            }
+            runtime.block_on(async {
+                let board = ops::attach(port, None).await?;
+                ops::approve_preparation(&board, &task).await?;
+                println!("approved and retried preparation for {task} in its existing checkout");
                 Ok(())
             })
         }

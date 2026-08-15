@@ -120,41 +120,52 @@ impl CometRuntime {
     /// billing, which is precisely the state that a `PrepareCheckout` retry
     /// resolves without minting a second attempt: the parked brief is still
     /// there, and the retry releases it.
-    fn release_when_ready(
+    fn park_for_preparation(
         &self,
         chat_id: &str,
-        repo_path: &Path,
         cwd: &str,
         brief: SessionCommandPayload,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<String>> {
         let worktree = std::path::PathBuf::from(cwd);
         // The inline path: no recipe, or one that gates nothing — a repo that
-        // wrote only `[run]`/`[archive]` has said "here is how to drive me",
-        // not "wait for me", and its dispatches must not grow a parked brief
-        // and a "preparing…" notice for a no-op. A recipe that does not
+        // wrote only `[run]` has said "here is how to drive me", not "let the
+        // host engine do something", and its dispatches must not grow a parked
+        // brief and a "preparing…" notice for a no-op. `[archive]` does gate:
+        // approval before the agent runs prevents a later repository edit from
+        // turning reclamation into unreviewed engine-user code. A recipe that does not
         // *parse* is neither: it must reach `prepare`, which writes it down as
         // a failure instead of starting an agent in a checkout whose
         // repository asked for something we could not read.
         let gates = match self.prep.recipe(&worktree) {
             Ok(None) => false,
-            Ok(Some(recipe)) => recipe.setup.is_some() || !recipe.links.is_empty(),
+            Ok(Some(recipe)) => recipe.requires_host_approval(),
             Err(_) => true,
         };
         if !gates {
-            self.doc_host.queue_command(chat_id, brief)?;
-            return Ok(());
+            return Ok(None);
         }
 
+        let repository_id = self
+            .handle
+            .block_on(self.repos.repository_identity(&worktree))
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         let parked = serde_json::to_string(&ParkedBrief {
             chat_id: chat_id.to_string(),
+            command_id: crate::new_id(),
+            repository_id: repository_id.clone(),
             command: brief.clone(),
         })?;
-        if let Err(e) = self.prep.park(&worktree, &parked) {
-            // Parking is what makes recovery possible, not what makes the
-            // dispatch work. Losing it costs a retry the ability to release
-            // this brief; it must not cost the dispatch the checkout.
-            tracing::warn!(chat = chat_id, error = %e, "parking the brief for gh#422 recovery");
-        }
+        // This is the point of no return: the durable parked command must
+        // exist before a chat can be presented as an attempt. A failure here
+        // is a dispatch failure, not a warning that silently deletes recovery.
+        self.prep
+            .park(&worktree, &parked)
+            .map_err(|e| anyhow::anyhow!("parking the dispatch before preparation: {e}"))?;
+        Ok(Some(repository_id))
+    }
+
+    fn start_preparation(&self, chat_id: &str, cwd: &str, repository_id: String) {
+        let worktree = std::path::PathBuf::from(cwd);
         notice(
             &self.doc_host,
             chat_id,
@@ -169,19 +180,17 @@ impl CometRuntime {
 
         let prep = self.prep.clone();
         let doc_host = self.doc_host.clone();
-        let repo = repo_path.to_path_buf();
         self.handle.spawn(async move {
             let record = prep
                 .prepare(crate::checkout_prep::PrepareRequest {
                     worktree: &worktree,
-                    repo_path: &repo,
+                    repository_id: &repository_id,
                     force: false,
                     cancel: None,
                 })
                 .await;
             settle_preparation(&prep, &doc_host, &worktree, &record);
         });
-        Ok(())
     }
 }
 
@@ -194,6 +203,8 @@ impl CometRuntime {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ParkedBrief {
     chat_id: String,
+    command_id: String,
+    repository_id: String,
     command: SessionCommandPayload,
 }
 
@@ -210,16 +221,44 @@ pub(crate) fn settle_preparation(
     record: &crate::checkout_prep::PrepRecord,
 ) {
     for link in &record.links {
-        // Said before the agent starts, every time, including on the
-        // short-circuit: what a checkout can read is the operator's business
-        // and belongs in the log they already tail, not in a file they would
-        // have to know to open.
         tracing::info!(
             from = %link.from,
             to = %link.to,
             result = %link.result,
             mode = link.mode.as_deref().unwrap_or("-"),
             "checkout link"
+        );
+    }
+    // Persist the reach in the chat before queueing the run. The board record
+    // carries the same structured list, but a transcript is the evidence an
+    // operator can read without winning a race against a fast agent start.
+    if !record.links.is_empty()
+        && let Some(parked) = peek_parked(prep, worktree)
+    {
+        let projections = record
+            .links
+            .iter()
+            .map(|link| {
+                format!(
+                    "- `{}` → `{}`: {}{}",
+                    link.from,
+                    link.to,
+                    link.result,
+                    link.mode
+                        .as_deref()
+                        .map(|mode| format!(" (mode {mode})"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        notice(
+            doc_host,
+            &parked.chat_id,
+            &format!(
+                "Machine-local files made reachable in this checkout before the run:\n{projections}"
+            ),
+            false,
         );
     }
     if !record.is_ready() {
@@ -253,18 +292,26 @@ pub(crate) fn settle_preparation(
         return;
     }
     tracing::info!(summary = %record.summary(), "checkout ready");
-    let Some(parked) = take_parked(prep, worktree) else {
+    let Some(claim) = prep.claim_parked(worktree) else {
         return;
     };
-    if let Err(e) = doc_host.queue_command(&parked.chat_id, parked.command.clone()) {
-        // The brief is out of the park and did not land. Put it back rather
-        // than lose it: an attempt with no brief is an agent that never starts
-        // and never says why.
-        tracing::error!(chat = %parked.chat_id, error = %e, "releasing the prepared brief");
-        if let Ok(text) = serde_json::to_string(&parked) {
-            let _ = prep.park(worktree, &text);
+    let parked: ParkedBrief = match serde_json::from_str(claim.payload()) {
+        Ok(parked) => parked,
+        Err(e) => {
+            tracing::error!(error = %e, "reading the claimed prepared brief");
+            return;
         }
+    };
+    if let Err(e) = doc_host.queue_command_with_id(
+        &parked.chat_id,
+        &parked.command_id,
+        parked.command.clone(),
+    ) {
+        // Dropping the claim rolls the durable payload back for retry.
+        tracing::error!(chat = %parked.chat_id, error = %e, "releasing the prepared brief");
+        return;
     }
+    claim.complete();
 }
 
 fn peek_parked(
@@ -272,14 +319,6 @@ fn peek_parked(
     worktree: &Path,
 ) -> Option<ParkedBrief> {
     let text = prep.parked(worktree)?;
-    serde_json::from_str(&text).ok()
-}
-
-fn take_parked(
-    prep: &crate::checkout_prep::CheckoutPrep,
-    worktree: &Path,
-) -> Option<ParkedBrief> {
-    let text = prep.take_parked(worktree)?;
     serde_json::from_str(&text).ok()
 }
 
@@ -446,8 +485,87 @@ impl Runtime for CometRuntime {
         // back for a minute while the checkout prepares, and the transcript
         // saying so is no use to a teammate who cannot open it.
         self.doc_host.share_chat(&chat_id);
-        self.release_when_ready(&chat_id, Path::new(&spec.repo_path), &cwd, brief)?;
-        Ok(DispatchHandle { chat_id, cwd })
+        let preparation = match self.park_for_preparation(&chat_id, &cwd, brief.clone()) {
+            Ok(preparation) => preparation,
+            Err(error) => {
+                // Parking is the recovery guarantee. If it cannot be made
+                // durable, undo the chat and checkout that were just cut
+                // rather than leave an attempt which can neither start nor
+                // recover.
+                let _ = self.workspace.delete_chat(&chat_id);
+                self.doc_host.purge_chat(&chat_id);
+                if spec.worktree
+                    && let Err(rollback) = self.handle.block_on(self.repos.delete_worktree(
+                        Path::new(&spec.repo_path),
+                        Path::new(&cwd),
+                        Some(&spec.branch),
+                    ))
+                {
+                    return Err(anyhow::anyhow!(
+                        "{error}; rolling back {} also failed: {rollback}",
+                        cwd
+                    ));
+                }
+                return Err(error);
+            }
+        };
+        let preparation_view = preparation.as_ref().map(|_| {
+            comet_proto::view::board::CheckoutPreparation {
+                state: comet_proto::view::board::CheckoutPreparationState::Preparing,
+                recipe_digest: None,
+                detail: Some("preparing checkout before the agent starts".to_string()),
+                log: None,
+                requires_approval: false,
+                projections: Vec::new(),
+            }
+        });
+        if let Some(repository_id) = preparation {
+            self.start_preparation(&chat_id, &cwd, repository_id);
+        } else {
+            self.doc_host.queue_command(&chat_id, brief)?;
+        }
+        Ok(DispatchHandle {
+            chat_id,
+            cwd,
+            preparation: preparation_view,
+        })
+    }
+
+    fn checkout_preparation(
+        &self,
+        worktree: &str,
+    ) -> anyhow::Result<Option<comet_proto::view::board::CheckoutPreparation>> {
+        Ok(self
+            .prep
+            .status(Path::new(worktree))
+            .map(|record| record.board_view()))
+    }
+
+    fn retry_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+        let parked = peek_parked(&self.prep, Path::new(worktree))
+            .ok_or_else(|| anyhow::anyhow!("{} has no parked dispatch to release", worktree))?;
+        self.start_preparation(&parked.chat_id, worktree, parked.repository_id);
+        Ok(())
+    }
+
+    fn approve_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+        let parked = peek_parked(&self.prep, Path::new(worktree))
+            .ok_or_else(|| anyhow::anyhow!("{} has no parked dispatch to approve", worktree))?;
+        let digest = self
+            .prep
+            .approve(Path::new(worktree), &parked.repository_id)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        notice(
+            &self.doc_host,
+            &parked.chat_id,
+            &format!(
+                "Approved repository preparation recipe {} on this host; retrying in the existing checkout.",
+                &digest[..digest.len().min(12)]
+            ),
+            false,
+        );
+        self.start_preparation(&parked.chat_id, worktree, parked.repository_id);
+        Ok(())
     }
 
     fn prompt(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
@@ -504,6 +622,15 @@ impl Runtime for CometRuntime {
     }
 
     fn cancel(&self, chat_id: &str) -> anyhow::Result<()> {
+        if let Some(chat) = self.workspace.doc().chat(chat_id)?
+            && let Some(cwd) = chat.cwd
+        {
+            let worktree = Path::new(&cwd);
+            // Revoke before signalling the process. A setup that happens to
+            // finish at the same instant then finds no command to release.
+            self.prep.revoke_parked(worktree);
+            self.prep.cancel(worktree);
+        }
         // Interrupt is durable and idempotent; an idle chat resolves it as a
         // no-op. Archive regardless — cancel ends the attempt either way.
         self.doc_host
@@ -701,8 +828,16 @@ impl Runtime for CometRuntime {
         //
         // Best-effort, because the caller is reclaiming a disk that is already
         // the problem: a `clean` that fails or hangs must not keep the 36 GB.
-        if let Some(said) = self.handle.block_on(self.prep.archive(path, None)) {
-            tracing::info!(worktree, outcome = %said, "checkout archive step");
+        match self.handle.block_on(self.repos.repository_identity(path)) {
+            Ok(repository_id) => {
+                if let Some(said) = self
+                    .handle
+                    .block_on(self.prep.archive(path, &repository_id, None))
+                {
+                    tracing::info!(worktree, outcome = %said, "checkout archive step");
+                }
+            }
+            Err(error) => tracing::warn!(worktree, %error, "checkout archive identity"),
         }
         Ok(comet_board::gc::sweep_build_output(path))
     }

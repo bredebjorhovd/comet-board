@@ -73,7 +73,7 @@ use tokio::sync::watch;
 
 use comet_doc::SessionCommandPayload;
 use comet_proto::view::stats::{
-    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsHostStatus, StatsProbe,
+    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe,
     StatsProbeResult, aggregate_board_stats,
 };
 use comet_proto::{ChatConfig, HarnessId};
@@ -1660,6 +1660,7 @@ fn forwardable(method: &str) -> bool {
             // verb in this group, and the one that lets a laptop retry a
             // failed preparation on the box.
             | methods::PREPARE_CHECKOUT
+            | methods::CANCEL_CHECKOUT_PREPARATION
             | methods::CHECKOUT_PREP
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
@@ -2140,6 +2141,25 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::APPROVE_TASK_PREPARATION => {
+                if caller != &Caller::LOCAL {
+                    return Err(RpcError::Failed(
+                        "repository preparation approval is host-local; run the command on the worktree host"
+                            .to_string(),
+                    ));
+                }
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                }
+                let p: P = parse_params(params)?;
+                self.board()?
+                    .approve_preparation(&p.task_id)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             // Throughput over a window (gh#143) — read when the page opens,
             // never streamed: a full aggregate on every board tick would cost
             // every connected viewport a recompute nobody is looking at.
@@ -2453,11 +2473,16 @@ impl RpcService for EngineRpc {
                     .map(std::path::PathBuf::from)
                     .or_else(|| repo_of_checkout(&worktree))
                     .unwrap_or_else(|| worktree.clone());
+                let repository_id = self
+                    .repos
+                    .repository_identity(&repo)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
                 let record = self
                     .prep
                     .prepare(crate::checkout_prep::PrepareRequest {
                         worktree: &worktree,
-                        repo_path: &repo,
+                        repository_id: &repository_id,
                         // A retry is always a real retry: the caller pressed
                         // this because the last answer was wrong, and handing
                         // back the cached `ready` would be the one reply that
@@ -2476,6 +2501,33 @@ impl RpcService for EngineRpc {
                     &record,
                 );
                 RpcReply::value(&record)
+            }
+            methods::CANCEL_CHECKOUT_PREPARATION => {
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let cancelled = self
+                    .prep
+                    .cancel(std::path::Path::new(&p.worktree_path));
+                RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
+            }
+            methods::APPROVE_CHECKOUT_PREPARATION => {
+                if caller != &Caller::LOCAL {
+                    return Err(RpcError::Failed(
+                        "repository preparation approval is host-local"
+                            .to_string(),
+                    ));
+                }
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let worktree = std::path::PathBuf::from(&p.worktree_path);
+                let repository_id = self
+                    .repos
+                    .repository_identity(&worktree)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let digest = self
+                    .prep
+                    .approve(&worktree, &repository_id)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "recipeDigest": digest }))
             }
             methods::CHECKOUT_PREP => {
                 let p: PrepareCheckoutParams = parse_params(params)?;
@@ -2745,6 +2797,9 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::APPROVE_CHECKOUT_PREPARATION));
+        assert!(!forwardable(methods::APPROVE_TASK_PREPARATION));
+        assert!(forwardable(methods::CANCEL_CHECKOUT_PREPARATION));
         assert!(forwardable(methods::QUEUE_COMMAND));
         // Skills are files on the chat's host, and which files depends on the
         // agent account that chat names (gh#134).
@@ -2786,7 +2841,10 @@ mod tests {
             }],
         );
         assert!(!aggregate.complete);
-        assert_eq!(aggregate.hosts[0].status, StatsHostStatus::Unreadable);
+        assert_eq!(
+            aggregate.hosts[0].status,
+            comet_proto::view::stats::StatsHostStatus::Unreadable
+        );
     }
 
     /// gh#97: onboarding is three device-local effects behind one verb — a

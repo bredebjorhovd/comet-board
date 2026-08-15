@@ -85,6 +85,42 @@ enum BoardState: String, CaseIterable, Hashable {
 
 // MARK: - The wire row
 
+enum CheckoutPreparationState: String, Decodable, Hashable {
+    case preparing, ready, failed
+}
+
+struct CheckoutProjection: Decodable, Hashable {
+    var from: String
+    var to: String
+    var result: String
+    var mode: String?
+}
+
+struct CheckoutPreparation: Decodable, Hashable {
+    var state: CheckoutPreparationState
+    var recipeDigest: String?
+    var detail: String?
+    var log: String?
+    var requiresApproval: Bool
+    var projections: [CheckoutProjection]
+
+    enum CodingKeys: String, CodingKey {
+        case state, detail, log, projections
+        case recipeDigest = "recipeDigest"
+        case requiresApproval = "requiresApproval"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        state = try c.decode(CheckoutPreparationState.self, forKey: .state)
+        recipeDigest = try c.decodeIfPresent(String.self, forKey: .recipeDigest)
+        detail = try c.decodeIfPresent(String.self, forKey: .detail)
+        log = try c.decodeIfPresent(String.self, forKey: .log)
+        requiresApproval = try c.decodeIfPresent(Bool.self, forKey: .requiresApproval) ?? false
+        projections = try c.decodeIfPresent([CheckoutProjection].self, forKey: .projections) ?? []
+    }
+}
+
 /// One task, in the shape `WatchBoard` streams: herdr-board's `list --json`
 /// contract with the pane→chat rename applied (docs/agent-conventions.md).
 ///
@@ -109,6 +145,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
     var runtime: String?
     /// The live attempt's chat (herdr-board's `pane_id`).
     var chatId: String?
+    var preparation: CheckoutPreparation?
     /// The chat that authored the latest review, retained after it settles.
     var reviewChatId: String?
     var prUrl: String?
@@ -144,7 +181,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case id, identifier, title, state, source, url, labels, dispatchable, gone
-        case route, workspace, runtime, branch, attempts, reopened, account
+        case route, workspace, runtime, branch, attempts, reopened, account, preparation
         case chatId = "chat_id"
         case reviewChatId = "review_chat_id"
         case prUrl = "pr_url"
@@ -175,6 +212,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         workspace = try c.decodeIfPresent(String.self, forKey: .workspace)
         runtime = try c.decodeIfPresent(String.self, forKey: .runtime)
         chatId = try c.decodeIfPresent(String.self, forKey: .chatId)
+        preparation = try c.decodeIfPresent(CheckoutPreparation.self, forKey: .preparation)
         reviewChatId = try c.decodeIfPresent(String.self, forKey: .reviewChatId)
         prUrl = try c.decodeIfPresent(String.self, forKey: .prUrl)
         prNumber = try c.decodeIfPresent(Int.self, forKey: .prNumber)
@@ -198,6 +236,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
          source: String = "github", url: String = "", labels: [String] = [],
          dispatchable: Bool = true, gone: Bool = false, route: String? = nil,
          workspace: String? = nil, runtime: String? = nil, chatId: String? = nil,
+         preparation: CheckoutPreparation? = nil,
          reviewChatId: String? = nil,
          prUrl: String? = nil, prNumber: Int? = nil, branch: String? = nil,
          dispatchedBy: String? = nil, dispatchedByChat: String? = nil,
@@ -219,6 +258,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         self.workspace = workspace
         self.runtime = runtime
         self.chatId = chatId
+        self.preparation = preparation
         self.reviewChatId = reviewChatId
         self.prUrl = prUrl
         self.prNumber = prNumber
@@ -683,12 +723,18 @@ func boardRowDetail(_ row: TaskRow, now: Date = Date()) -> BoardRowDetail {
     var overCap = false
     switch row.boardState {
     case .working, .blocked:
-        text = [row.runtime, row.workspace.map { "ws:\($0)" }]
-            .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
-        elapsed = agentElapsedLabel(startedAt: row.startedAtDate,
-                                    capSecs: row.maxDurationSecs, now: now)
-        overCap = agentOverCap(startedAt: row.startedAtDate,
-                               capSecs: row.maxDurationSecs, now: now)
+        if let preparation = row.preparation, preparation.state != .ready {
+            text = preparation.state == .preparing
+                ? "preparing checkout · agent not started"
+                : (preparation.detail ?? "checkout preparation failed")
+        } else {
+            text = [row.runtime, row.workspace.map { "ws:\($0)" }]
+                .compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · ")
+            elapsed = agentElapsedLabel(startedAt: row.startedAtDate,
+                                        capSecs: row.maxDurationSecs, now: now)
+            overCap = agentOverCap(startedAt: row.startedAtDate,
+                                   capSecs: row.maxDurationSecs, now: now)
+        }
     case .failed:
         text = "pane exited without completing"
     case .review:

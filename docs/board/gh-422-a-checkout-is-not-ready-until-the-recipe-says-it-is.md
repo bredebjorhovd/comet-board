@@ -13,7 +13,7 @@ This gives a repository a reviewed, repeatable way to say what a fresh
 checkout needs, and gives the engine a rule: **the agent does not start, and
 is not billed, until the recipe says the checkout is ready.**
 
-## The recipe
+### The recipe
 
 `.comet/repo.toml`, in the repository, owned and reviewed like any other file:
 
@@ -34,16 +34,15 @@ run = "cargo clean"          # bounded cleanup before reclamation
 RUST_BACKTRACE = "1"         # values safe to commit — they are in the open
 
 [[link]]
-from = "dev.env"             # a leaf under {data_dir}/locals/{repoName}/
+from = "dev.env"             # a leaf under {data_dir}/locals/{repository identity}/
 to = ".env.local"            # a path inside the checkout
 ```
 
 A directory (`.comet/`) rather than a bare file at the root because gh#273's
-per-repository MCP configuration wants a home beside this one; the recipe
-already parses (and ignores) an `[mcp]` table so a repository that fills it in
-early is not a parse error on today's engine. That table is the explicit seam:
-what an MCP server is allowed to be on a shared box is gh#273's question, and
-nothing here answers it.
+per-repository MCP configuration wants a home beside this one. That issue now
+injects route-owned `mcp_servers` into the chat config. The recipe parses but
+does not act on an `[mcp]` table: it is the repository-owned seam, while the
+route remains the authority until MCP trust and merge rules are designed.
 
 Everything is strict. Unknown keys are refused (`timout = "20m"` silently
 meaning ten minutes is precisely the class of failure this issue is about),
@@ -51,7 +50,7 @@ another `version` is refused by name, a timeout past the 1-hour ceiling is
 refused rather than clamped. The engine executes what it understood or
 declines to execute at all.
 
-## The lifecycle
+### The lifecycle
 
 `preparing → ready | failed`, persisted per checkout under
 `{data_dir}/checkout-prep/{hash of the canonical path}/`:
@@ -64,6 +63,12 @@ declines to execute at all.
   setup, and the 200MB of `npm install` progress that pushed it out is a file
   nobody can read anyway.
 - `brief.json` — see recovery.
+
+The live attempt stores the same lifecycle in `board.db`, and `TaskRow` carries
+it to the CLI, desktop, and phone: state, diagnostic/log path, approval need,
+and every projected file. The first dispatch frame already says `preparing`;
+it does not wait for the session poll, because there is deliberately no session
+until preparation succeeds.
 
 The record is keyed by the checkout and by the sha256 of the recipe: a
 checkout that is `ready` for this digest is not prepared again (a retry lands
@@ -79,7 +84,7 @@ one that also lies about having stopped), SIGKILLed on timeout or
 cancellation, output capped, and the recipe may shorten the budget but never
 lift it past the ceiling.
 
-## Where it sits in a dispatch
+### Where it sits in a dispatch
 
 `CometRuntime::dispatch` used to queue the brief as soon as the chat existed.
 Now:
@@ -87,7 +92,9 @@ Now:
 1. worktree, account, conventions, chat — exactly as before;
 2. **no recipe → the brief is queued inline, unchanged, at the same cost.**
    This is every repository that has not written one;
-3. with a recipe: the brief is **parked** in the checkout's state directory,
+3. with a gating recipe: the brief is **parked durably** in the checkout's
+   state directory before preparation can start. A parking failure rolls the
+   new chat and worktree back instead of producing an unrecoverable attempt;
    the transcript says "preparing, nothing is billed yet", and preparation is
    spawned. `dispatch` returns; the board loop is not held behind a five-minute
    `npm install` (it is one thread — awaiting there would stall every other
@@ -98,12 +105,14 @@ Now:
    failure and the log head are written into the chat, and the row shows a
    live attempt whose agent never started and never cost anything.
 
-Recovery reuses everything: `PrepareCheckout` (below) re-runs the recipe
-against the same worktree, and on success releases the same parked brief
+Recovery reuses everything: the board's ordinary Retry and `PrepareCheckout`
+(below) re-run the recipe against the same worktree, and on success release
+the same parked brief
 through the same `settle_preparation` — the same attempt continues, no second
-attempt is minted, no new checkout is cut. The park is a file, so it survives
-an engine restart; the take is a remove, so two racing retries cannot both
-release one brief.
+attempt is minted, no new checkout is cut. Delivery is an atomic filesystem
+claim plus a command id minted before parking. A crash rolls the claim back; a
+crash after queueing sees the same id in the command ledger and does not append
+a second billable run. Two racing retries therefore cannot both release it.
 
 The `[archive]` step rides reclamation: `reclaim_build_output` runs the
 repository's own cleanup first (best-effort, its own shorter budget), then
@@ -113,12 +122,13 @@ never wrote a recipe. Deleting a worktree forgets its preparation record;
 paths get reused, and a stale `ready` on a re-cut path would short-circuit a
 checkout that was never prepared.
 
-## Ordinary sessions — the board composes, it does not own
+### Ordinary sessions — the board composes, it does not own
 
 The primitive is `comet_engine::checkout_prep::CheckoutPrep`, on the engine
-core, held (not wrapped) by the board runtime. Two RPCs expose it to every
-frontend, relay-forwardable like the rest of the checkout verbs because a
-recipe executes where the working tree is, never where the button was pressed:
+core, held (not wrapped) by the board runtime. RPCs expose it to every
+frontend. Preparation and cancellation route to the device that owns the
+checkout; approval deliberately does not, because trust is granted only by an
+operator already on that host:
 
 - `CheckoutPrep { worktreePath }` — read-only: the record, the parsed recipe,
   and a parse error said out loud (a viewport offering nothing because the
@@ -128,6 +138,15 @@ recipe executes where the working tree is, never where the button was pressed:
   `force` defaults to **true** here (a person pressed this because the last
   answer was wrong; handing back the cached `ready` helps nobody) and false on
   the automatic path.
+- `CancelCheckoutPreparation { worktreePath }` — cancel the checkout-owned
+  token and kill the command's process group.
+- `ApproveCheckoutPreparation { worktreePath }` — host-local only: approve the
+  exact stable repository identity plus current recipe digest. Repository code
+  cannot relay this call or approve itself.
+
+For board work, `comet-board approve-preparation --task <id>` performs that
+host-local approval and retries the same attempt. Plain `comet-board retry`
+does the in-place retry when no approval is needed.
 
 Deliberately a verb, not something `CreateWorktree` does on its own:
 preparation runs the repository's code, and a checkout appearing in a sidebar
@@ -135,24 +154,40 @@ is not the moment to start doing that behind somebody. A dispatch prepares
 automatically because it is about to hand the same checkout to an agent that
 would run that code anyway.
 
-## Secrets and the shared box
+### Secrets and the shared box
 
 The reference implementation this was researched against discovers `.env`
 files by walking the machine. That is the one behavior deliberately not
 ported. Comet runs shared boxes and dispatches work for teammates, and
-`.comet/repo.toml` is writable by anyone who can open a pull request — so the
-recipe's reach is constrained by *construction*, not by filtering:
+`.comet/repo.toml` is writable by anyone who can open a pull request. There are
+two independent boundaries: paths are constrained by construction, and every
+repository-authored effect requires an engine-owned trust decision:
 
+- **A recipe cannot approve itself.** `[[link]]` projection and `[setup]` or
+  `[archive]` execution occur only after the host approves the exact repository
+  identity + recipe sha256. An edit invalidates approval. Before that, the
+  lifecycle is `failed` with `requires_approval = true`: no file is projected
+  and no command is spawned.
+- **The child does not inherit the engine's environment.** It receives a small
+  shell/toolchain baseline (`PATH`, `HOME`, locale and common tool homes), the
+  committed `[env]`, and `COMET_WORKTREE`/`COMET_PREPARE`. Board credentials,
+  GitHub tokens, askpass state, and unrelated ambient values do not ride along.
 - **A `[[link]]` names a leaf; comet names the root.** `from` resolves under
-  `{data_dir}/locals/{repoName}/`, a directory the operator fills by hand.
+  `{data_dir}/locals/{hash of stable repository identity}/`, a directory the
+  operator fills by hand. The identity hashes the device and Git common dir,
+  so unrelated repositories with the same basename never share a namespace.
   Absolute paths and `..` are refused at parse, on the spelling, before
   anything exists to check. `~/.ssh/id_ed25519` is not reachable because it is
   not *spellable*.
-- **A symlink inside the locals directory is refused, not followed** — one
-  `ln -s` would otherwise reintroduce exactly the reach the root removed.
+- **Symlinks at the leaf or in any existing source/destination ancestor are
+  refused, not followed** — one `ln -s` would otherwise reintroduce exactly
+  the reach the roots removed.
 - **Projection copies, never symlinks, preserving mode** — a symlink out of
   the checkout is unreadable to a sandboxed run and editable-through by an
   unsandboxed one; a 0600 credential that lands 0644 is a finding.
+- **Ownership stays explicit** — Unix sources must belong to the engine uid;
+  the copied destination belongs to that same uid. A shared host never silently
+  changes ownership on another user's credential.
 - **Never clobbers** — an existing destination is kept and said so; a missing
   source is recorded (`missing`) rather than failing the dispatch, because an
   operator convenience must not become a hard dependency of every attempt.
@@ -165,26 +200,28 @@ recipe's reach is constrained by *construction*, not by filtering:
   into every process the setup starts (`LD_PRELOAD`), or silently re-point
   every binary name in the script a reviewer just read (`PATH`).
 
-## Exit criteria, answered
+### Exit criteria, answered
 
 - *Visible `preparing → ready | failed` lifecycle* — `PrepState` persisted per
-  checkout, served by `CheckoutPrep`, summarized into the chat transcript.
+  checkout and on the attempt, served by `CheckoutPrep`, streamed on `TaskRow`,
+  summarized into the chat transcript, and rendered by both board viewports.
 - *Agent not started or billed until preparation succeeds* — the brief is
   parked before preparation begins and released only by `settle_preparation`
   on a `ready` record; a failure queues nothing.
 - *Idempotent, bounded, cancellable, diagnosable* — digest short-circuit +
   re-run-on-failure; process-group kill on a ceilinged timeout and on a
   `CancellationToken`; head-kept capped log that outlives the attempt.
-- *Retry reuses the worktree* — `PrepareCheckout` runs against the existing
-  checkout and releases the existing parked brief; the attempt row, chat and
-  branch all continue.
+- *Retry reuses the worktree* — Board Retry and `PrepareCheckout` run against
+  the existing checkout and release the existing parked brief; the attempt
+  row, chat and branch all continue.
 - *Works for ordinary sessions; the board composes engine primitives* — one
   `CheckoutPrep` on the engine core, shared by the board runtime and the RPC
   surface; the board has no private setup path.
-- *Relationship to #273 explicit* — the `[mcp]` table parses today, acts
-  never; `.comet/` is the shared home.
+- *Relationship to #273 explicit* — route `mcp_servers` remains the current
+  chat authority; the recipe's `[mcp]` table parses as the repository seam and
+  acts never; `.comet/` is the shared home.
 
-## License boundary
+### License boundary
 
 Zuse (AGPL-3.0-only) was product research for this design: which verbs a
 recipe needs, what the lifecycle owes the operator, what file-linking gets
@@ -194,14 +231,10 @@ its discovery), the parked-brief recovery and the digest short-circuit are
 comet's own, written against comet's architecture. If closer reuse is ever
 wanted, the license question comes first.
 
-## Not in this issue
+### Not in this issue
 
-- **gh#273** — per-repository MCP configuration. The seam exists; the policy
-  does not.
-- **Blocking the run row on readiness surfaces.** The transcript and the prep
-  record say the truth; a dedicated frontend affordance (a "preparing" pill on
-  the board row, a retry button on the chat) is frontend work that reads the
-  same record.
+- **Repository-owned MCP authority.** gh#273's route-owned injection exists;
+  merging it with the recipe's `[mcp]` seam is a separate trust decision.
 - **Zuse-style worktree defaults** (per-repo worktree root/naming) — routing
   already owns that on the board path.
 - **A recipe for the operator's own space folder.** Preparation is about

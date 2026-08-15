@@ -34,7 +34,7 @@
 //!
 //! **The repository names a leaf; comet names the root.** A `[[link]]`'s `from`
 //! is resolved under [`CheckoutPrep::locals_root`] —
-//! `{data_dir}/locals/{repoName}/`, a directory the *operator* fills by hand —
+//! `{data_dir}/locals/{repository identity}/`, a directory the *operator* fills by hand —
 //! and it may not be absolute and may not contain `..`. This is the deliberate
 //! divergence from the implementation this was researched against, which
 //! discovers `.env` files by walking the machine. comet runs shared boxes and
@@ -65,9 +65,11 @@
 //! shell — a `npm install` whose parent `sh` was killed is otherwise still
 //! running an hour later.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use comet_harness::CancellationToken;
@@ -104,10 +106,9 @@ pub const LOG_CAP_BYTES: usize = 256 * 1024;
 
 /// Environment names a recipe may not set, and why each one is here.
 ///
-/// `COMET_*` is the sharp one. A dispatched agent's environment carries
-/// `COMET_BOARD_CONFIG_DIR` / `COMET_BOARD_STATE_DIR` so the `comet-board` it
-/// runs attaches to the board that dispatched it (`config::Paths::discover`).
-/// A repository file that could set those could point a teammate's agent at
+/// `COMET_*` is the sharp one. A dispatched agent's environment carries board
+/// routing variables so its CLI attaches to the board that dispatched it. A
+/// repository file that could replace those could point a teammate's agent at
 /// another board — a file in a pull request deciding which database the box
 /// writes to. The loader variables are the classic pair: `LD_PRELOAD` and
 /// `DYLD_INSERT_LIBRARIES` turn "run the setup script" into "inject into
@@ -247,6 +248,13 @@ impl Recipe {
     /// The archive timeout this recipe asks for, already bounded.
     pub fn archive_timeout(&self) -> Duration {
         step_timeout(self.archive.as_ref(), DEFAULT_ARCHIVE_TIMEOUT)
+    }
+
+    /// Whether accepting this recipe grants repository-authored effects to
+    /// the host engine. `[run]` is excluded: it is only an offer, later run
+    /// explicitly under the session's own sandbox. `[mcp]` is parsed-only.
+    pub fn requires_host_approval(&self) -> bool {
+        self.setup.is_some() || self.archive.is_some() || !self.links.is_empty()
     }
 }
 
@@ -408,6 +416,15 @@ pub struct PrepRecord {
     /// record so a viewport that has the status also has the offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_command: Option<String>,
+    /// A repository command exists, but this exact repository + recipe digest
+    /// has not been approved in the engine-owned trust store. Links may still
+    /// have been projected; no repository command ran.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_approval: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl PrepRecord {
@@ -426,11 +443,39 @@ impl PrepRecord {
             log: None,
             links: Vec::new(),
             run_command: None,
+            requires_approval: false,
         }
     }
 
     pub fn is_ready(&self) -> bool {
         self.state == PrepState::Ready
+    }
+
+    pub fn board_view(&self) -> comet_proto::view::board::CheckoutPreparation {
+        use comet_proto::view::board::{
+            CheckoutPreparation, CheckoutPreparationState, CheckoutProjection,
+        };
+        CheckoutPreparation {
+            state: match self.state {
+                PrepState::Preparing => CheckoutPreparationState::Preparing,
+                PrepState::Ready => CheckoutPreparationState::Ready,
+                PrepState::Failed => CheckoutPreparationState::Failed,
+            },
+            recipe_digest: self.recipe_digest.clone(),
+            detail: self.detail.clone(),
+            log: self.log.clone(),
+            requires_approval: self.requires_approval,
+            projections: self
+                .links
+                .iter()
+                .map(|link| CheckoutProjection {
+                    from: link.from.clone(),
+                    to: link.to.clone(),
+                    result: link.result.clone(),
+                    mode: link.mode.clone(),
+                })
+                .collect(),
+        }
     }
 
     /// The line the engine log and a transcript both want.
@@ -467,10 +512,10 @@ fn now_ms() -> i64 {
 pub struct PrepareRequest<'a> {
     /// The checkout. Must exist.
     pub worktree: &'a Path,
-    /// The repository the checkout was cut from — only used to name the
-    /// box-local directory a `[[link]]` resolves under, so that every worktree
-    /// of one repo shares one set of machine-local files.
-    pub repo_path: &'a Path,
+    /// Stable, device-local identity of the repository the checkout was cut
+    /// from. It keys both machine-local projections and command approval, so
+    /// two unrelated `widget` repositories never share either namespace.
+    pub repository_id: &'a str,
     /// Re-run even if the record says ready for this recipe. What a retry after
     /// a half-finished setup uses.
     pub force: bool,
@@ -483,27 +528,97 @@ pub struct PrepareRequest<'a> {
 #[derive(Clone)]
 pub struct CheckoutPrep {
     data_dir: PathBuf,
+    active: Arc<Mutex<HashMap<PathBuf, (String, CancellationToken)>>>,
+    claims: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Approval {
+    repository_id: String,
+    recipe_digest: String,
+    approved_at: i64,
+}
+
+/// Exclusive ownership of work waiting behind preparation. Dropping an
+/// incomplete claim restores it; completing one removes it. The rename is the
+/// durable state transition, so an engine restart can recover the same work.
+pub struct ParkedClaim {
+    prep: CheckoutPrep,
+    key: PathBuf,
+    parked: PathBuf,
+    claimed: PathBuf,
+    payload: String,
+    completed: bool,
+}
+
+impl ParkedClaim {
+    pub fn payload(&self) -> &str {
+        &self.payload
+    }
+
+    pub fn complete(mut self) {
+        let _ = std::fs::remove_file(&self.claimed);
+        if let Some(parent) = self.claimed.parent() {
+            let _ = sync_directory(parent);
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for ParkedClaim {
+    fn drop(&mut self) {
+        if !self.completed && self.claimed.exists() && !self.parked.exists() {
+            let _ = std::fs::rename(&self.claimed, &self.parked);
+            if let Some(parent) = self.parked.parent() {
+                let _ = sync_directory(parent);
+            }
+        }
+        self.prep
+            .claims
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.key);
+    }
+}
+
+struct ActivePreparation {
+    active: Arc<Mutex<HashMap<PathBuf, (String, CancellationToken)>>>,
+    key: PathBuf,
+    generation: String,
+}
+
+impl Drop for ActivePreparation {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        if active
+            .get(&self.key)
+            .is_some_and(|(generation, _)| generation == &self.generation)
+        {
+            active.remove(&self.key);
+        }
+    }
 }
 
 impl CheckoutPrep {
     pub fn new(data_dir: &Path) -> Self {
         Self {
             data_dir: data_dir.to_path_buf(),
+            active: Arc::new(Mutex::new(HashMap::new())),
+            claims: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
     /// Where a `[[link]]`'s `from` is resolved: one directory per repository,
     /// under comet's own data dir, filled by the operator.
     ///
-    /// Keyed by the repository's folder name — the same key `Repos` uses for
-    /// the worktree root, so an operator who knows where their checkouts land
-    /// already knows where this is.
-    pub fn locals_root(&self, repo_path: &Path) -> PathBuf {
-        let name = repo_path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "repo".to_string());
-        self.data_dir.join("locals").join(name)
+    /// The stable repository identity is intentionally opaque. A basename is
+    /// not an identity: `owner-a/widget` and `owner-b/widget` must never share
+    /// a secret namespace on a multi-tenant host.
+    pub fn locals_root(&self, repository_id: &str) -> PathBuf {
+        self.data_dir
+            .join("locals")
+            .join(identity_key(repository_id))
     }
 
     /// Per-checkout state: keyed by a hash of the canonical path so that a
@@ -529,11 +644,45 @@ impl CheckoutPrep {
         self.state_dir(worktree).join("brief.json")
     }
 
+    fn claimed_brief_path(&self, worktree: &Path) -> PathBuf {
+        self.state_dir(worktree).join("brief.claimed.json")
+    }
+
+    fn approval_path(&self, repository_id: &str, recipe_digest: &str) -> PathBuf {
+        self.data_dir
+            .join("checkout-prep")
+            .join("trust")
+            .join(identity_key(repository_id))
+            .join(format!("{recipe_digest}.json"))
+    }
+
     /// The last thing known about this checkout, or `None` for one nothing has
     /// ever prepared.
     pub fn status(&self, worktree: &Path) -> Option<PrepRecord> {
         let text = std::fs::read_to_string(self.record_path(worktree)).ok()?;
-        serde_json::from_str(&text).ok()
+        let mut record: PrepRecord = serde_json::from_str(&text).ok()?;
+        if record.state == PrepState::Preparing {
+            let key = canonical(worktree);
+            let is_active = self
+                .active
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&key);
+            if !is_active {
+                // The operation that wrote `preparing` no longer exists: the
+                // engine restarted, its RPC future was dropped, or its task
+                // was aborted. The process-group guard has already stopped
+                // repository code; persist the actionable half of that fact.
+                record.state = PrepState::Failed;
+                record.ended_at = Some(now_ms());
+                record.detail = Some(
+                    "preparation was interrupted before it recorded completion; retry this checkout"
+                        .to_string(),
+                );
+                return Some(self.write(record));
+            }
+        }
+        Some(record)
     }
 
     /// The head of the captured output — the part that diagnoses.
@@ -566,22 +715,118 @@ impl CheckoutPrep {
     pub fn park(&self, worktree: &Path, payload: &str) -> std::io::Result<()> {
         let dir = self.state_dir(worktree);
         std::fs::create_dir_all(&dir)?;
-        std::fs::write(self.brief_path(worktree), payload)
+        atomic_create(&self.brief_path(worktree), payload.as_bytes())
     }
 
     /// Read the parked payload without taking it — what a failure path uses to
     /// find out whom to tell, having decided not to release anything.
     pub fn parked(&self, worktree: &Path) -> Option<String> {
-        std::fs::read_to_string(self.brief_path(worktree)).ok()
+        std::fs::read_to_string(self.brief_path(worktree))
+            .or_else(|_| std::fs::read_to_string(self.claimed_brief_path(worktree)))
+            .ok()
     }
 
-    /// Take the parked payload, exactly once. The remove is the handoff: two
-    /// racing retries cannot both release the same brief.
-    pub fn take_parked(&self, worktree: &Path) -> Option<String> {
-        let path = self.brief_path(worktree);
-        let text = std::fs::read_to_string(&path).ok()?;
-        let _ = std::fs::remove_file(&path);
-        Some(text)
+    /// Atomically claim the parked payload. The rename is the durable state
+    /// transition; the in-process set excludes a second claimant while this
+    /// process owns it. A claimed file left by a crash is recoverable because
+    /// a fresh process starts with an empty ownership set.
+    pub fn claim_parked(&self, worktree: &Path) -> Option<ParkedClaim> {
+        let key = self.state_dir(worktree);
+        let mut claims = self.claims.lock().unwrap_or_else(|e| e.into_inner());
+        if !claims.insert(key.clone()) {
+            return None;
+        }
+        let parked = self.brief_path(worktree);
+        let claimed = self.claimed_brief_path(worktree);
+        if parked.exists() && std::fs::rename(&parked, &claimed).is_err() {
+            claims.remove(&key);
+            return None;
+        }
+        if let Some(parent) = claimed.parent()
+            && sync_directory(parent).is_err()
+        {
+            let _ = std::fs::rename(&claimed, &parked);
+            claims.remove(&key);
+            return None;
+        }
+        let payload = match std::fs::read_to_string(&claimed) {
+            Ok(payload) => payload,
+            Err(_) => {
+                claims.remove(&key);
+                return None;
+            }
+        };
+        drop(claims);
+        Some(ParkedClaim {
+            prep: self.clone(),
+            key,
+            parked,
+            claimed,
+            payload,
+            completed: false,
+        })
+    }
+
+    /// Revoke work that has not been released yet. Cancellation calls this
+    /// before interrupting the chat, so a late successful setup cannot start a
+    /// run after its attempt was cancelled.
+    pub fn revoke_parked(&self, worktree: &Path) {
+        let parked = self.brief_path(worktree);
+        let claimed = self.claimed_brief_path(worktree);
+        let _ = std::fs::remove_file(&parked);
+        let _ = std::fs::remove_file(claimed);
+        if let Some(parent) = parked.parent() {
+            let _ = sync_directory(parent);
+        }
+    }
+
+    /// Cancel the active setup for this checkout, if there is one. The token
+    /// reaches [`run_step`], which kills the entire process group.
+    pub fn cancel(&self, worktree: &Path) -> bool {
+        let key = canonical(worktree);
+        let token = self
+            .active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .map(|(_, token)| token.clone());
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Approve the exact recipe currently in `worktree` for this stable
+    /// repository identity. The record lives outside the repository, so a
+    /// checkout cannot approve itself; editing the recipe changes its digest
+    /// and invalidates the approval automatically.
+    pub fn approve(&self, worktree: &Path, repository_id: &str) -> Result<String, String> {
+        let recipe_path = worktree.join(RECIPE_PATH);
+        let digest = file_digest(&recipe_path)
+            .ok_or_else(|| format!("could not read {}", recipe_path.display()))?;
+        self.recipe(worktree)?
+            .ok_or_else(|| format!("{} has no {RECIPE_PATH}", worktree.display()))?;
+        let approval = Approval {
+            repository_id: repository_id.to_string(),
+            recipe_digest: digest.clone(),
+            approved_at: now_ms(),
+        };
+        let text = serde_json::to_vec_pretty(&approval).map_err(|e| e.to_string())?;
+        atomic_replace(&self.approval_path(repository_id, &digest), &text)
+            .map_err(|e| e.to_string())?;
+        Ok(digest)
+    }
+
+    fn approved(&self, repository_id: &str, digest: Option<&str>) -> bool {
+        let Some(digest) = digest else { return false };
+        let Ok(text) = std::fs::read_to_string(self.approval_path(repository_id, digest)) else {
+            return false;
+        };
+        serde_json::from_str::<Approval>(&text).is_ok_and(|approval| {
+            approval.repository_id == repository_id && approval.recipe_digest == digest
+        })
     }
 
     /// Prepare the checkout: project the links, run `[setup]`, write down what
@@ -617,6 +862,31 @@ impl CheckoutPrep {
             return previous;
         }
 
+        // A retry may race a sync or another explicit retry. Only one command
+        // tree may prepare a checkout; every other caller observes the same
+        // persisted lifecycle instead of starting the script twice.
+        let token = req.cancel.clone().unwrap_or_else(CancellationToken::new);
+        let generation = uuid::Uuid::new_v4().to_string();
+        {
+            let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+            if active.contains_key(&worktree) {
+                return self.status(&worktree).unwrap_or_else(|| {
+                    failed_record(
+                        &worktree,
+                        digest.clone(),
+                        recipe.setup.as_ref().map(|step| step.run.clone()),
+                        "preparation is already running for this checkout".to_string(),
+                    )
+                });
+            }
+            active.insert(worktree.clone(), (generation.clone(), token.clone()));
+        }
+        let _active = ActivePreparation {
+            active: Arc::clone(&self.active),
+            key: worktree.clone(),
+            generation,
+        };
+
         let run_command = recipe.run.as_ref().map(|s| s.run.clone());
         let command = recipe.setup.as_ref().map(|s| s.run.clone());
         let mut record = PrepRecord {
@@ -631,12 +901,31 @@ impl CheckoutPrep {
             log: None,
             links: Vec::new(),
             run_command: run_command.clone(),
+            requires_approval: false,
         };
         self.write(record.clone());
 
+        // Both executable setup and machine-local projection cross the
+        // repository boundary. Paths being constrained is necessary but not
+        // sufficient: without this exact-digest approval, a repository edit
+        // could name a different allowlisted credential leaf and make it
+        // reachable to its eventual agent without the host agreeing.
+        if recipe.requires_host_approval()
+            && !self.approved(req.repository_id, digest.as_deref())
+        {
+            record.state = PrepState::Failed;
+            record.ended_at = Some(now_ms());
+            record.requires_approval = true;
+            record.detail = Some(format!(
+                "repository preparation is not approved on this host (recipe {})",
+                digest.as_deref().unwrap_or("has no digest")
+            ));
+            return self.write(record);
+        }
+
         // Links first: a setup script's whole reason for existing may be the
         // `.env.local` it reads.
-        let locals = self.locals_root(req.repo_path);
+        let locals = self.locals_root(req.repository_id);
         match project_links(&recipe.links, &locals, &worktree) {
             Ok(outcomes) => record.links = outcomes,
             Err(detail) => {
@@ -662,7 +951,7 @@ impl CheckoutPrep {
             &recipe.env,
             recipe.setup_timeout(),
             &log,
-            req.cancel.as_ref(),
+            Some(&token),
         )
         .await;
 
@@ -687,10 +976,22 @@ impl CheckoutPrep {
     /// Best-effort by construction: the caller is reclaiming disk, and a repo
     /// whose `cargo clean` fails should still lose its `target/`. The returned
     /// string is what happened, for the caller's log; `None` = nothing to run.
-    pub async fn archive(&self, worktree: &Path, cancel: Option<&CancellationToken>) -> Option<String> {
+    pub async fn archive(
+        &self,
+        worktree: &Path,
+        repository_id: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Option<String> {
         let worktree = canonical(worktree);
         let recipe = self.recipe(&worktree).ok().flatten()?;
         let step = recipe.archive.as_ref()?;
+        let digest = file_digest(&worktree.join(RECIPE_PATH));
+        if !self.approved(repository_id, digest.as_deref()) {
+            return Some(format!(
+                "`{}` was not run because this recipe is not approved on this host",
+                step.run
+            ));
+        }
         let log = self.state_dir(&worktree).join("archive.log");
         let outcome = run_step(
             &step.run,
@@ -722,7 +1023,7 @@ impl CheckoutPrep {
         }
         match serde_json::to_string_pretty(&record) {
             Ok(text) => {
-                if let Err(e) = std::fs::write(dir.join("prep.json"), text) {
+                if let Err(e) = atomic_replace(&dir.join("prep.json"), text.as_bytes()) {
                     tracing::warn!(dir = %dir.display(), error = %e, "writing checkout prep record");
                 }
             }
@@ -750,6 +1051,7 @@ fn failed_record(
         log: None,
         links: Vec::new(),
         run_command: None,
+        requires_approval: false,
     }
 }
 
@@ -783,6 +1085,8 @@ fn project_links(
         let from = locals.join(&from_rel);
         let to = worktree.join(&to_rel);
 
+        ensure_no_symlink_ancestors(locals, &from_rel, true)?;
+        ensure_no_symlink_ancestors(worktree, &to_rel, false)?;
         let meta = match std::fs::symlink_metadata(&from) {
             Ok(meta) => meta,
             Err(_) => {
@@ -803,7 +1107,25 @@ fn project_links(
                 locals.display()
             ));
         }
-        if to.exists() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            // A shared host may have files belonging to several people under
+            // one administrator-managed tree. The engine projects only its
+            // own user's files; copying another uid's credential into an
+            // agent-owned checkout would silently change its ownership.
+            // SAFETY: geteuid has no preconditions and only reads process state.
+            let engine_uid = unsafe { libc::geteuid() };
+            if meta.uid() != engine_uid {
+                return Err(format!(
+                    "{} is owned by uid {}, not the engine uid {}",
+                    from.display(),
+                    meta.uid(),
+                    engine_uid
+                ));
+            }
+        }
+        if std::fs::symlink_metadata(&to).is_ok() {
             out.push(LinkOutcome {
                 from: from.to_string_lossy().into_owned(),
                 to: link.to.clone(),
@@ -816,7 +1138,26 @@ fn project_links(
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("creating {} for a link: {e}", parent.display()))?;
         }
-        std::fs::copy(&from, &to)
+        let mut source = std::fs::File::open(&from)
+            .map_err(|e| format!("opening {} for a link: {e}", from.display()))?;
+        let mut destination = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&to)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                out.push(LinkOutcome {
+                    from: from.to_string_lossy().into_owned(),
+                    to: link.to.clone(),
+                    result: "kept".into(),
+                    mode: mode_of(&to),
+                });
+                continue;
+            }
+            Err(e) => return Err(format!("creating {} for a link: {e}", to.display())),
+        };
+        std::io::copy(&mut source, &mut destination)
             .map_err(|e| format!("copying {} into the checkout: {e}", from.display()))?;
         // Copy, not symlink, and the mode carried over: a symlink out of the
         // checkout is unreadable to a sandboxed run and editable back into the
@@ -836,6 +1177,46 @@ fn project_links(
         });
     }
     Ok(out)
+}
+
+/// Refuse every existing symlink from `root` down to the requested leaf.
+/// Checking only the leaf is insufficient: either a source or destination
+/// parent can redirect a relative path outside its promised root.
+fn ensure_no_symlink_ancestors(
+    root: &Path,
+    relative: &Path,
+    include_leaf: bool,
+) -> Result<(), String> {
+    let root_meta = match std::fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("could not inspect projection root {}: {e}", root.display())),
+    };
+    if root_meta.file_type().is_symlink() {
+        return Err(format!("projection root {} is a symlink", root.display()));
+    }
+    let components: Vec<_> = relative.components().collect();
+    let limit = if include_leaf {
+        components.len()
+    } else {
+        components.len().saturating_sub(1)
+    };
+    let mut cursor = root.to_path_buf();
+    for component in components.into_iter().take(limit) {
+        cursor.push(component.as_os_str());
+        match std::fs::symlink_metadata(&cursor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(format!(
+                    "{} is a symlink — projected files may not cross a symlink ancestor",
+                    cursor.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+            Err(e) => return Err(format!("could not inspect {}: {e}", cursor.display())),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -886,12 +1267,43 @@ async fn run_step(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // The engine process may hold board/GitHub credentials. A repository
+        // command receives a useful shell/toolchain baseline, never the
+        // engine's ambient environment wholesale.
+        .env_clear()
         // What a setup script is allowed to know about where it is. Named
         // rather than left to the script's own `pwd` so a repo whose setup is a
         // shared script across several checkouts can tell them apart.
         .env("COMET_WORKTREE", worktree)
         .env("COMET_PREPARE", "1")
         .kill_on_drop(true);
+    for name in [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "PATH",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "LANG",
+        "TERM",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "NVM_DIR",
+        "VOLTA_HOME",
+        "PNPM_HOME",
+        "BUN_INSTALL",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            cmd.env(name, value);
+        }
+    }
+    for (name, value) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("LC_") {
+            cmd.env(name, value);
+        }
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -908,6 +1320,7 @@ async fn run_step(
         }
     };
     let pid = child.id().map(|p| p as i32);
+    let mut group = ProcessGroupGuard(pid);
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
 
@@ -951,8 +1364,8 @@ async fn run_step(
         }
     };
 
-    let outcome = tokio::select! {
-        status = wait => match status {
+    let (outcome, completed) = tokio::select! {
+        status = wait => (match status {
             Ok(status) => {
                 let code = status.code();
                 if status.success() {
@@ -971,24 +1384,38 @@ async fn run_step(
                 verdict: Verdict::Failed(format!("could not be waited on: {e}")),
                 exit_code: None,
             },
-        },
+        }, true),
         _ = tokio::time::sleep(timeout) => {
             kill_group(pid);
-            StepOutcome {
+            (StepOutcome {
                 verdict: Verdict::Failed(format!("ran past its {} budget", format_duration(timeout))),
                 exit_code: None,
-            }
+            }, false)
         }
         _ = cancelled => {
             kill_group(pid);
-            StepOutcome {
+            (StepOutcome {
                 verdict: Verdict::Failed("was cancelled".to_string()),
                 exit_code: None,
-            }
+            }, false)
         }
     };
+    if completed {
+        group.0 = None;
+    }
     sink.finish(&outcome.verdict);
     outcome
+}
+
+/// Last-resort cleanup when the async preparation future itself is dropped
+/// (for example an RPC request is cancelled). `Child::kill_on_drop` kills only
+/// the shell; this guard owns the process-group promise.
+struct ProcessGroupGuard(Option<i32>);
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        kill_group(self.0);
+    }
 }
 
 /// SIGKILL the child's whole process group. `-pid` is the group, which is the
@@ -1071,6 +1498,78 @@ fn canonical(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn identity_key(repository_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(repository_id.as_bytes());
+    hex(&hasher.finalize())[..24].to_string()
+}
+
+/// Create a durable file without replacing an existing one. `rename` is not
+/// suitable here because Unix rename replaces; a hard link publishes the
+/// fully-written temp file atomically and returns AlreadyExists to the loser.
+fn atomic_create(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("state"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::hard_link(&temp, path)?;
+        sync_directory(parent)
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
+fn atomic_replace(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|name| name.to_str()).unwrap_or("state"),
+        uuid::Uuid::new_v4()
+    ));
+    let result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        sync_directory(parent)
+    })();
+    let _ = std::fs::remove_file(&temp);
+    result
+}
+
+/// Persist a state-file create, rename, or removal rather than only its bytes.
+/// Directory syncing is meaningful on Unix; other platforms keep the same
+/// atomic operations and rely on their filesystem's rename durability.
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 fn file_digest(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = Sha256::new();
@@ -1116,6 +1615,7 @@ to = ".env.local"
         assert_eq!(r.archive_timeout(), DEFAULT_ARCHIVE_TIMEOUT);
         assert_eq!(r.env.get("RUST_BACKTRACE").unwrap(), "1");
         assert_eq!(r.links.len(), 1);
+        assert!(r.requires_host_approval());
     }
 
     #[test]
@@ -1123,6 +1623,16 @@ to = ".env.local"
         let r = recipe("version = 1").expect("parses");
         assert!(r.setup.is_none());
         assert_eq!(r.setup_timeout(), DEFAULT_SETUP_TIMEOUT);
+    }
+
+    #[test]
+    fn an_explicit_run_is_an_offer_while_host_effects_require_approval() {
+        assert!(!recipe("version = 1\n[run]\nrun = \"cargo run\"\n")
+            .unwrap()
+            .requires_host_approval());
+        assert!(recipe("version = 1\n[archive]\nrun = \"cargo clean\"\n")
+            .unwrap()
+            .requires_host_approval());
     }
 
     #[test]
@@ -1155,8 +1665,12 @@ to = ".env.local"
     fn a_recipe_may_not_move_comets_own_state() {
         // A file in a pull request must not be able to point the agent's
         // `comet-board` at a different board.
-        let err = recipe("version = 1\n[env]\nCOMET_BOARD_STATE_DIR = \"/tmp/evil\"\n").unwrap_err();
-        assert!(err.contains("COMET_BOARD_STATE_DIR"), "{err}");
+        let state_dir = ["COMET", "BOARD", "STATE", "DIR"].join("_");
+        let err = recipe(&format!(
+            "version = 1\n[env]\n{state_dir} = \"/tmp/evil\"\n"
+        ))
+        .unwrap_err();
+        assert!(err.contains(&state_dir), "{err}");
         for name in ["PATH", "LD_PRELOAD", "GIT_ASKPASS", "DYLD_INSERT_LIBRARIES"] {
             let err = recipe(&format!("version = 1\n[env]\n{name} = \"x\"\n")).unwrap_err();
             assert!(err.contains(name), "{name} should be refused: {err}");
@@ -1205,10 +1719,10 @@ to = ".env.local"
     #[test]
     fn a_locals_root_is_per_repository_and_under_the_data_dir() {
         let prep = CheckoutPrep::new(Path::new("/data"));
-        assert_eq!(
-            prep.locals_root(Path::new("/home/x/src/comet-board")),
-            Path::new("/data/locals/comet-board")
-        );
+        let a = prep.locals_root("device:/home/x/src/comet-board/.git");
+        let b = prep.locals_root("device:/home/y/src/comet-board/.git");
+        assert!(a.starts_with("/data/locals"));
+        assert_ne!(a, b, "same basename is not a repository identity");
     }
 
     #[test]

@@ -21,6 +21,7 @@
 
 use chrono::{DateTime, Utc};
 use comet_proto::{HarnessId, Session, SessionStatus};
+pub use comet_proto::view::board::CheckoutPreparation;
 use serde::{Deserialize, Serialize};
 
 use crate::model::AgentStatus;
@@ -357,6 +358,10 @@ pub struct DispatchHandle {
     pub chat_id: String,
     /// Worktree path the attempt runs in (repo root when `worktree` was false).
     pub cwd: String,
+    /// Initial gate state, returned with the durable park so the first board
+    /// frame says `preparing` before the interval reconciler runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<CheckoutPreparation>,
 }
 
 /// A dispatch refused before it cut anything (gh#410): no branch, no worktree,
@@ -439,6 +444,27 @@ pub trait Runtime {
     /// guarantees delivery, which is the property herdr-board's
     /// nudge-and-verify loop existed to approximate.
     fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle>;
+
+    /// Last persisted lifecycle for a checkout. `None` means the repository
+    /// has no preparation gate (or predates it), not an unknown state.
+    fn checkout_preparation(
+        &self,
+        _worktree: &str,
+    ) -> anyhow::Result<Option<CheckoutPreparation>> {
+        Ok(None)
+    }
+
+    /// Re-run a failed preparation in its existing checkout. The parked brief
+    /// and fixed command id keep this on the same attempt without double-send.
+    fn retry_checkout_preparation(&self, _worktree: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this runtime cannot retry checkout preparation")
+    }
+
+    /// Approve the checkout's exact repository + recipe digest on this host,
+    /// then retry it. Transport policy decides who may invoke this mutation.
+    fn approve_checkout_preparation(&self, _worktree: &str) -> anyhow::Result<()> {
+        anyhow::bail!("this runtime cannot approve checkout preparation")
+    }
 
     /// Deliver text into a live chat — review comments, settle notices to a
     /// dispatching orchestrator. Queued as a steer if a run is live, a send

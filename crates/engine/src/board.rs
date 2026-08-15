@@ -46,6 +46,7 @@ use comet_board::stats::Stats as BoardStats;
 use comet_board::sync::{SessionStatuses, SyncEngine};
 use comet_board::verdict::{VerdictKind, VerdictReceipt};
 use comet_proto::view::board::OrchestratorPin;
+use comet_proto::view::board::CheckoutPreparationState;
 use comet_proto::view::stats::StatsMergeBasis;
 use comet_proto::{Session, Space};
 use tokio::sync::{oneshot, watch};
@@ -75,6 +76,10 @@ enum Msg {
         reply: oneshot::Sender<anyhow::Result<Dispatched>>,
     },
     Cancel {
+        task_id: String,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    ApprovePreparation {
         task_id: String,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
@@ -319,6 +324,19 @@ impl BoardService {
         overrides: DispatchOverrides,
     ) -> anyhow::Result<Dispatched> {
         self.dispatch_with(task_id, origin, overrides, true).await
+    }
+
+    /// Host-local approval for the exact recipe digest blocking this task.
+    pub async fn approve_preparation(&self, task_id: &str) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::ApprovePreparation {
+                task_id: task_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop stopped before approving preparation"))?
     }
 
     async fn dispatch_with(
@@ -617,6 +635,16 @@ fn run_loop(
                 publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
+            Ok(Msg::ApprovePreparation { task_id, reply }) => {
+                let result = handle_approve_preparation(&engine, runtime.as_ref(), &task_id);
+                if let Err(error) = &result {
+                    log.error(format!(
+                        "preparation approval for {task_id} failed: {error:#}"
+                    ));
+                }
+                publish_rows(&engine, &feeds.rows, &log);
+                let _ = reply.send(result);
+            }
             // A read, so it publishes nothing and logs nothing: opening a row
             // is not an event on the board.
             // A read like `Detail`: publishes nothing, logs nothing. Opening
@@ -773,6 +801,41 @@ fn handle_dispatch(
         .db
         .get_task(task_id)?
         .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+    if replace
+        && let Some(attempt) = task.live_attempt()
+        && let Some(preparation) = attempt.preparation.as_ref()
+        && preparation.state == CheckoutPreparationState::Failed
+    {
+        if preparation.requires_approval {
+            anyhow::bail!(
+                "{} preparation requires host approval — run `comet-board approve-preparation --task {}` on the worktree host",
+                task.identifier,
+                task.identifier
+            );
+        }
+        let worktree = attempt
+            .worktree
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("attempt {} has no checkout to prepare", attempt.id))?;
+        let chat_id = attempt
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("attempt {} has no chat", attempt.id))?;
+        runtime.retry_checkout_preparation(worktree)?;
+        let mut preparing = preparation.clone();
+        preparing.state = CheckoutPreparationState::Preparing;
+        preparing.detail = Some("retrying preparation in this checkout".to_string());
+        engine.db.set_attempt_preparation(attempt.id, &preparing)?;
+        engine
+            .db
+            .set_attempt_status(attempt.id, AgentStatus::Working)?;
+        engine.rederive_all()?;
+        return Ok(Dispatched {
+            chat_id: chat_id.to_string(),
+            cwd: worktree.to_string(),
+            attempt: task.attempt_count(),
+        });
+    }
     if !replace && let Some(live) = task.live_attempt() {
         anyhow::bail!(
             "{} already has a live attempt (chat {})",
@@ -1043,6 +1106,14 @@ fn handle_dispatch(
         Ok(handle) => {
             engine.db.set_attempt_pane(attempt_id, &handle.chat_id)?;
             engine.db.set_attempt_worktree(attempt_id, &handle.cwd)?;
+            if let Some(preparation) = &handle.preparation {
+                engine
+                    .db
+                    .set_attempt_preparation(attempt_id, preparation)?;
+                engine
+                    .db
+                    .set_attempt_status(attempt_id, AgentStatus::Working)?;
+            }
             // The checkout's own HEAD is the attempt's true starting point: for
             // a fresh branch it equals the repo HEAD, and for a reused one it
             // is the tip the agent builds on (herdr-board#10).
@@ -1107,6 +1178,44 @@ fn handle_dispatch(
             Err(e)
         }
     }
+}
+
+fn handle_approve_preparation(
+    engine: &SyncEngine,
+    runtime: &(dyn Runtime + Send + Sync),
+    task_id: &str,
+) -> anyhow::Result<()> {
+    let task = engine
+        .db
+        .get_task(task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+    let attempt = task
+        .live_attempt()
+        .ok_or_else(|| anyhow::anyhow!("{} has no live attempt", task.identifier))?;
+    let preparation = attempt.preparation.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("{} has no recorded checkout preparation", task.identifier)
+    })?;
+    if !preparation.requires_approval {
+        anyhow::bail!(
+            "{} preparation is not waiting for host approval",
+            task.identifier
+        );
+    }
+    let worktree = attempt
+        .worktree
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("attempt {} has no checkout", attempt.id))?;
+    runtime.approve_checkout_preparation(worktree)?;
+    let mut preparing = preparation.clone();
+    preparing.state = CheckoutPreparationState::Preparing;
+    preparing.requires_approval = false;
+    preparing.detail = Some("approved; retrying preparation in this checkout".to_string());
+    engine.db.set_attempt_preparation(attempt.id, &preparing)?;
+    engine
+        .db
+        .set_attempt_status(attempt.id, AgentStatus::Working)?;
+    engine.rederive_all()?;
+    Ok(())
 }
 
 /// One cancel, on the loop thread. The chat may already be gone; that is not a
@@ -1299,6 +1408,8 @@ mod tests {
         /// The actual askpass/gh handoff cannot be established. Unlike a
         /// dispatch failure, this must refuse before the attempt row exists.
         fail_push_handoff: std::sync::atomic::AtomicBool,
+        preparation_retries: std::sync::Mutex<Vec<String>>,
+        preparation_approvals: std::sync::Mutex<Vec<String>>,
     }
 
     impl Default for FakeRuntime {
@@ -1314,6 +1425,8 @@ mod tests {
                 refuse_dispatch: std::sync::atomic::AtomicBool::new(false),
                 fail_dispatch: std::sync::atomic::AtomicBool::new(false),
                 fail_push_handoff: std::sync::atomic::AtomicBool::new(false),
+                preparation_retries: Default::default(),
+                preparation_approvals: Default::default(),
             }
         }
     }
@@ -1357,7 +1470,22 @@ mod tests {
             Ok(DispatchHandle {
                 chat_id: format!("chat-for-{}", spec.identifier),
                 cwd: format!("/worktrees/{}", spec.branch),
+                preparation: None,
             })
+        }
+        fn retry_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+            self.preparation_retries
+                .lock()
+                .unwrap()
+                .push(worktree.to_string());
+            Ok(())
+        }
+        fn approve_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+            self.preparation_approvals
+                .lock()
+                .unwrap()
+                .push(worktree.to_string());
+            Ok(())
         }
         fn prompt(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
             self.prompted
@@ -2980,6 +3108,75 @@ max_concurrent_per_workspace = 1
             "the replaced attempt is archived as cancelled"
         );
 
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_of_failed_preparation_reuses_the_live_attempt_and_checkout() {
+        use comet_proto::view::board::{CheckoutPreparation, CheckoutPreparationState};
+
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#422", "gh#422");
+        seed_attempt_in(&paths, "gh:owner/widget#422", "chat-422", "widget");
+        let db = Db::open(&paths.db()).unwrap();
+        let attempt = db
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap()
+            .live_attempt()
+            .unwrap()
+            .id;
+        db.set_attempt_worktree(attempt, "/worktrees/widget-422")
+            .unwrap();
+        db.set_attempt_preparation(
+            attempt,
+            &CheckoutPreparation {
+                state: CheckoutPreparationState::Failed,
+                recipe_digest: Some("abc".into()),
+                detail: Some("setup exited 7".into()),
+                log: Some("/logs/prep.log".into()),
+                requires_approval: false,
+                projections: Vec::new(),
+            },
+        )
+        .unwrap();
+        db.set_attempt_status(attempt, AgentStatus::Blocked).unwrap();
+        drop(db);
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![]);
+        let dispatched = service
+            .retry_task(
+                "gh:owner/widget#422",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dispatched.attempt, 1);
+        assert_eq!(dispatched.chat_id, "chat-422");
+        assert_eq!(dispatched.cwd, "/worktrees/widget-422");
+        assert!(runtime.cancelled.lock().unwrap().is_empty());
+        assert_eq!(
+            runtime.preparation_retries.lock().unwrap().as_slice(),
+            ["/worktrees/widget-422"]
+        );
+
+        let task = Db::open(&paths.db())
+            .unwrap()
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.attempt_count(), 1);
+        assert_eq!(
+            task.live_attempt()
+                .unwrap()
+                .preparation
+                .as_ref()
+                .unwrap()
+                .state,
+            CheckoutPreparationState::Preparing
+        );
         service.shutdown();
     }
 

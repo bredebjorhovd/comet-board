@@ -1,11 +1,10 @@
 # The repository recipe (gh#422, docs/board/gh-422-*.md): what a fresh
 # worktree of THIS repo needs before an agent starts in it.
 #
-# Deliberately no [setup] yet: the builds here want cargo, and cargo's PATH is
-# a property of the box user's shell, not of the engine process that runs this
-# step — a `cargo fetch` that fails on a box where cargo lives outside the
-# default PATH would block every dispatch on this repo to save a network
-# round-trip. Add one when there is a step that pays for that risk.
+# Deliberately no [setup] yet: this repository has no required generated files
+# or install step. Cargo resolves the committed lockfile when the explicit run
+# or test command starts; prefetching it would move the same work earlier
+# without making the checkout more ready.
 
 version = 1
 
@@ -17,7 +16,8 @@ run = "cargo run -p comet"
 # Bounded cleanup of reproducible output before the board reclaims a finished
 # checkout. Everything this repo generates is under target/, which the board's
 # own sweep (gh#186) already knows by name — cargo clean just gets there
-# politely first, and a box without cargo on PATH loses nothing but that.
+# politely first. Like every repository command, the exact recipe digest must
+# be approved by the worktree host before this executes.
 [archive]
 run = "cargo clean"
 timeout = "5m"
