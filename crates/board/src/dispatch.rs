@@ -243,7 +243,7 @@ pub fn credential_preflight_brief(capabilities: PushCapabilities) -> String {
                 "Have the operator grant the App `Contents: Read and write` and approve the updated permission on this installation."
             }
             CapabilityEvidence::ClassicOauthScopes => {
-                "Have the operator refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope."
+                "Have the operator ensure the token holder has push access to this repository and refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope."
             }
             CapabilityEvidence::OpaqueToken => {
                 "Have the operator use a GitHub App whose installation reports `Contents: Read and write`, or a classic token whose `repo` scope GitHub can report."
@@ -313,7 +313,7 @@ pub fn credential_preflight_refusal(capabilities: PushCapabilities) -> Option<St
             "grant the GitHub App `Contents: Read and write` and approve the updated installation permission"
         }
         CapabilityEvidence::ClassicOauthScopes => {
-            "refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope"
+            "ensure the token holder has push access to this repository and refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope"
         }
         CapabilityEvidence::OpaqueToken => {
             "GitHub exposed no OAuth-scope evidence for this fine-grained/unknown token; use an App installation reporting Contents write or a classic token reporting `repo`"

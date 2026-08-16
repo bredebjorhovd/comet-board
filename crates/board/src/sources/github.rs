@@ -165,7 +165,11 @@ impl PushCapabilities {
         }
     }
 
-    fn from_oauth_scopes(scopes: Option<&[String]>, private: bool) -> PushCapabilities {
+    fn from_oauth_scopes(
+        scopes: Option<&[String]>,
+        private: bool,
+        repo_push: Option<bool>,
+    ) -> PushCapabilities {
         let Some(scopes) = scopes.filter(|scopes| !scopes.is_empty()) else {
             return PushCapabilities {
                 contents: WriteCapability::Unknown,
@@ -174,17 +178,18 @@ impl PushCapabilities {
             };
         };
         let has = |want: &str| scopes.iter().any(|scope| scope == want);
-        let contents = if has("repo") || (!private && has("public_repo")) {
-            WriteCapability::Write
-        } else {
-            WriteCapability::Missing
+        let scope_allows_repo = has("repo") || (!private && has("public_repo"));
+        let contents = match (scope_allows_repo, repo_push) {
+            (false, _) | (true, Some(false)) => WriteCapability::Missing,
+            (true, Some(true)) => WriteCapability::Write,
+            (true, None) => WriteCapability::Unknown,
         };
         PushCapabilities {
             contents,
-            workflows: if contents == WriteCapability::Write && has("workflow") {
-                WriteCapability::Write
-            } else {
-                WriteCapability::Missing
+            workflows: match (contents, has("workflow")) {
+                (_, false) | (WriteCapability::Missing, true) => WriteCapability::Missing,
+                (WriteCapability::Write, true) => WriteCapability::Write,
+                (WriteCapability::Unknown, true) => WriteCapability::Unknown,
             },
             evidence: CapabilityEvidence::ClassicOauthScopes,
         }
@@ -372,9 +377,14 @@ impl HttpRest {
                     // Missing is the conservative half: `public_repo` must not
                     // be accepted for a repo GitHub did not identify as public.
                     .unwrap_or(true);
+                let repo_push = body
+                    .get("permissions")
+                    .and_then(|permissions| permissions.get("push"))
+                    .and_then(Value::as_bool);
                 Ok(PushCapabilities::from_oauth_scopes(
                     scopes.as_deref(),
                     private,
+                    repo_push,
                 ))
             }
         }
@@ -1847,13 +1857,20 @@ mod auth_tests {
         HttpRest::over(Box::new(t), auth)
     }
 
-    fn scoped(scopes: &[&str], private: bool) -> HttpRest {
+    fn scoped_with_push(scopes: &[&str], private: bool, push: Option<bool>) -> HttpRest {
         let t = Rc::new(ScriptedTransport::with_scopes(
             &[200],
-            serde_json::json!({ "private": private }),
+            serde_json::json!({
+                "private": private,
+                "permissions": push.map(|push| serde_json::json!({ "push": push }))
+            }),
             scopes,
         ));
         HttpRest::over(Box::new(t), TokenProvider::Static("secret".into()))
+    }
+
+    fn scoped(scopes: &[&str], private: bool) -> HttpRest {
+        scoped_with_push(scopes, private, Some(true))
     }
 
     #[test]
@@ -1913,6 +1930,21 @@ mod auth_tests {
                 .contents,
             WriteCapability::Missing
         );
+    }
+
+    #[test]
+    fn classic_scope_does_not_override_the_tokens_repo_push_permission() {
+        let read_only = scoped_with_push(&["repo", "workflow"], true, Some(false))
+            .push_capabilities("o/r")
+            .unwrap();
+        assert_eq!(read_only.contents, WriteCapability::Missing);
+        assert_eq!(read_only.workflows, WriteCapability::Missing);
+
+        let absent = scoped_with_push(&["repo", "workflow"], true, None)
+            .push_capabilities("o/r")
+            .unwrap();
+        assert_eq!(absent.contents, WriteCapability::Unknown);
+        assert_eq!(absent.workflows, WriteCapability::Unknown);
     }
 
     #[test]

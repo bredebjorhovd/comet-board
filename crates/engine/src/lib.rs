@@ -665,12 +665,14 @@ impl Engine {
             // has none of this. Resolving the paths is the only fallible part,
             // and it fails the same way the board itself does.
             match comet_board::config::Paths::under(&config.data_dir) {
-                Ok(paths) => core.sessions.set_push_credentials(Arc::new(
-                    push_credentials::PushCredentials::detect(paths),
-                )),
+                Ok(paths) => {
+                    let push = Arc::new(push_credentials::PushCredentials::detect(paths));
+                    core.sessions.set_push_credentials(push.clone());
+                    runtime.set_push_credentials(push);
+                }
                 Err(err) => tracing::warn!(
                     error = %err,
-                    "board directories unreadable — dispatched agents will push with this device's git credentials"
+                    "board directories unreadable — board-dispatched GitHub runs will be refused"
                 ),
             }
             match board::BoardService::spawn(

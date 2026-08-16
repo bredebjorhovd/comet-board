@@ -79,8 +79,8 @@ impl AgentAccount {
 /// which repo it is for, terminal prompting off) and `bin_dir` holds a `gh`
 /// wrapper. Both mint at the moment the tool asks, so a run that lasts longer
 /// than the hour an installation token lives still pushes and still opens its
-/// pull request. Absent means the agent uses the box's own git credentials,
-/// which is every chat the board did not dispatch.
+/// pull request. Absent means the agent uses the box's own git credentials and
+/// is valid only for chats the board did not dispatch to a GitHub repository.
 #[derive(Debug, Clone, Default)]
 pub struct PushCredentials {
     /// `name=value` pairs stamped on the child.

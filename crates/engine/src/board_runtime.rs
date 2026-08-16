@@ -15,7 +15,7 @@
 //! engine they run on the `comet-board-sync` thread only.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use comet_board::evidence::RanCommand;
 use comet_board::runtime::{
@@ -48,6 +48,9 @@ pub struct CometRuntime {
     /// The device's saved agent logins — a dispatch naming one materializes it
     /// into its own config dir here, before the chat exists (gh#59).
     accounts: AgentAccounts,
+    /// The exact resolver also wired into `Sessions`, so dispatch preflights
+    /// the handoff later runs will receive rather than only GitHub metadata.
+    push: OnceLock<Arc<crate::push_credentials::PushCredentials>>,
     handle: Handle,
 }
 
@@ -69,8 +72,13 @@ impl CometRuntime {
             sessions,
             journal,
             accounts,
+            push: OnceLock::new(),
             handle,
         }
+    }
+
+    pub fn set_push_credentials(&self, push: Arc<crate::push_credentials::PushCredentials>) {
+        let _ = self.push.set(push);
     }
 
     fn chat_config(&self, chat_id: &str) -> Option<ChatConfig> {
@@ -79,6 +87,13 @@ impl CometRuntime {
 }
 
 impl Runtime for CometRuntime {
+    fn verify_push_credentials(&self, repo: &str) -> anyhow::Result<()> {
+        self.push
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("the engine has no board credential handoff resolver"))?
+            .verify_for_repo(repo)
+    }
+
     fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
         // The checkout first: a failure here leaves nothing behind to clean up.
         // That includes an unreachable origin — `create_worktree_on` fetches

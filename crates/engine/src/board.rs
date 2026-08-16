@@ -887,7 +887,12 @@ fn handle_dispatch(
     // dispatch here; a known workflow-only gap takes the patch path in brief.
     if let Some(repo) = spec.push_repo.as_deref() {
         let capabilities = engine.push_capabilities.unwrap_or_else(|| {
-            HttpRest::from_credentials(&engine.credentials)
+            // Read the credential again at the point of release. The sync
+            // engine reloads on its interval, while the handoff below reads
+            // `.env` per run; using its cached credential here could approve
+            // one credential and hand the run a different, newly configured
+            // one before the next poll.
+            HttpRest::from_paths(&engine.paths)
                 .and_then(|rest| rest.push_capabilities(repo))
                 .unwrap_or_else(|error| {
                     engine.log.warn(format!(
@@ -904,6 +909,9 @@ fn handle_dispatch(
             .push_str(&comet_board::dispatch::credential_preflight_brief(
                 capabilities,
             ));
+        runtime.verify_push_credentials(repo).map_err(|error| {
+            anyhow::anyhow!("credential handoff preflight for {repo}: {error:#}")
+        })?;
     }
     // What the attempt actually runs under — the override, else the route's.
     let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
@@ -1262,6 +1270,9 @@ mod tests {
         /// When set, `dispatch` fails plainly — a failure after the pre-flight,
         /// which still burns the attempt.
         fail_dispatch: std::sync::atomic::AtomicBool,
+        /// The actual askpass/gh handoff cannot be established. Unlike a
+        /// dispatch failure, this must refuse before the attempt row exists.
+        fail_push_handoff: std::sync::atomic::AtomicBool,
     }
 
     impl Default for FakeRuntime {
@@ -1276,11 +1287,22 @@ mod tests {
                 unavailable: Default::default(),
                 refuse_dispatch: std::sync::atomic::AtomicBool::new(false),
                 fail_dispatch: std::sync::atomic::AtomicBool::new(false),
+                fail_push_handoff: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
 
     impl Runtime for FakeRuntime {
+        fn verify_push_credentials(&self, _repo: &str) -> anyhow::Result<()> {
+            if self
+                .fail_push_handoff
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("askpass helper is unavailable");
+            }
+            Ok(())
+        }
+
         fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
             if self
                 .refuse_dispatch
@@ -1734,6 +1756,57 @@ runtime = "mock"
             specs[0].prompt
         );
         drop(specs);
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broken_credential_handoff_refuses_before_attempt_or_runtime() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#72", "gh#72");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .fail_push_handoff
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, spaces_rx) = watch::channel(vec![space("widget")]);
+        let service = BoardService::spawn_at_with_capabilities(
+            paths.clone(),
+            rx,
+            runtime.clone(),
+            spaces_rx,
+            tokio::runtime::Handle::current(),
+            Some(PushCapabilities {
+                contents: comet_board::sources::github::WriteCapability::Write,
+                workflows: comet_board::sources::github::WriteCapability::Write,
+                evidence: comet_board::sources::github::CapabilityEvidence::AppInstallation,
+            }),
+        )
+        .unwrap();
+
+        let error = service
+            .dispatch_task(
+                "gh:owner/widget#72",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("credential handoff preflight"), "{error}");
+        assert!(error.contains("askpass helper is unavailable"), "{error}");
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let task = Db::open(&paths.db())
+            .unwrap()
+            .get_task("gh:owner/widget#72")
+            .unwrap()
+            .unwrap();
+        assert!(
+            task.attempts.is_empty(),
+            "handoff failure burned an attempt"
+        );
 
         service.shutdown();
     }

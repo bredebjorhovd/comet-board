@@ -2357,7 +2357,7 @@ fn push_capability_check(repo: &str, capabilities: Result<PushCapabilities, Stri
         CapabilityEvidence::ClassicOauthScopes
             if capabilities.contents != WriteCapability::Write =>
         {
-            " — refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope"
+            " — ensure the token holder has push access to this repository, then refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope"
         }
         CapabilityEvidence::ClassicOauthScopes if !capabilities.can_write_workflows() => {
             " — refresh or replace GITHUB_TOKEN with the classic `workflow` scope in addition to its repository scope"
@@ -5158,6 +5158,21 @@ mod tests {
         assert!(!check.ok, "{}", check.detail);
         assert!(check.detail.contains("classic `workflow` scope"));
         assert!(check.detail.contains("repository scope"));
+    }
+
+    #[test]
+    fn classic_pat_reporting_names_missing_repository_push_access() {
+        let check = push_capability_check(
+            "o/r",
+            Ok(PushCapabilities {
+                contents: WriteCapability::Missing,
+                workflows: WriteCapability::Missing,
+                evidence: CapabilityEvidence::ClassicOauthScopes,
+            }),
+        );
+        assert!(!check.ok, "{}", check.detail);
+        assert!(check.detail.contains("token holder has push access"));
+        assert!(check.detail.contains("`repo`"));
     }
 
     #[test]

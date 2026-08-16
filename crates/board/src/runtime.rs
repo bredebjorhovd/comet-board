@@ -416,6 +416,14 @@ pub struct ReviewCandidate {
 /// exists so `sync`/`dispatch`/`settled` stay testable without an engine, not
 /// to abstract over multiple backends.
 pub trait Runtime {
+    /// Prove that a board-dispatched GitHub chat will receive the board's
+    /// credential handoff. Called before an attempt row or worktree exists.
+    /// The no-op default keeps source-level test runtimes lightweight; the
+    /// production engine runtime overrides it with the real handoff probe.
+    fn verify_push_credentials(&self, _repo: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Cut the worktree (when asked), create the chat on the host device, and
     /// queue the brief as the first send. Returns once the command entry is
     /// durably in the session doc — NOT once the agent starts: the ledger

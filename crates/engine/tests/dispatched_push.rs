@@ -321,14 +321,13 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         "the token reached the run's environment: {env:?}"
     );
 
-    // `gh` gets a wrapper on PATH rather than a token in the environment —
-    // when there is a `gh` on this box to wrap. Both are correct; what must
-    // never happen is a GH_TOKEN sitting in the agent's own environment.
-    if let Some(bin_dir) = &push.bin_dir {
-        let script = std::fs::read_to_string(bin_dir.join("gh")).unwrap();
-        assert!(script.contains("gh-token"), "{script}");
-        assert!(!script.contains("ghp_secret"), "{script}");
-    }
+    // `gh` gets a required wrapper on PATH rather than a token in the
+    // environment. A dispatched GitHub run is refused if this wrapper cannot
+    // be installed, so it may never fall through to the box's ambient login.
+    let bin_dir = push.bin_dir.as_ref().expect("the required gh wrapper");
+    let script = std::fs::read_to_string(bin_dir.join("gh")).unwrap();
+    assert!(script.contains("gh-token"), "{script}");
+    assert!(!script.contains("ghp_secret"), "{script}");
     assert!(
         !env.contains_key("GH_TOKEN"),
         "a token was exported into the agent's environment: {env:?}"
@@ -378,6 +377,38 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
             "{chat} could not have run comet-board"
         );
     }
+
+    // The grant preflight may have passed earlier, but the handoff is resolved
+    // again for the actual run. If the board credential disappears in between,
+    // a board-dispatched GitHub chat refuses instead of reaching the harness
+    // with ambient box credentials.
+    std::fs::remove_file(paths.config_dir.join(".env")).unwrap();
+    core.workspace
+        .create_chat(
+            "chat-broken-handoff",
+            "space-1",
+            Some(chat_config(Some("owner/widget"), None)),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let error = core
+        .sessions
+        .dispatch(
+            "chat-broken-handoff",
+            HarnessId::Mock,
+            run_request("/tmp"),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("credential handoff"), "{error}");
+    assert!(
+        !recorded()
+            .iter()
+            .any(|run| run.chat_id.as_deref() == Some("chat-broken-handoff")),
+        "broken handoff reached the harness"
+    );
 
     core.sessions.shutdown().await;
 }

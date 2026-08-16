@@ -767,9 +767,9 @@ fn main() -> Result<()> {
                     println!("{token}");
                     Ok(())
                 }
-                // The shim discards this too (`2>/dev/null`, so a box with its
-                // own `gh auth login` keeps working), which makes the ledger
-                // the only place a failed mint is written down.
+                // The shim suppresses this stderr and refuses the invocation;
+                // the ledger is therefore the durable, token-free record of
+                // why the board credential could not be handed to `gh`.
                 Err(e) => {
                     comet_board::credential_ledger::failed(
                         &paths,

@@ -17,16 +17,13 @@
 //!   credential exactly when it goes to open its pull request. The wrapper
 //!   mints per invocation instead.
 //!
-//! Everything is conditional, and the fallback is always "what happened
-//! before". No board credential configured, no `comet-board` on the box, no
-//! `gh` installed, no repo on the chat: the child is spawned untouched and the
-//! agent pushes as the box user, exactly as it did before this change.
-
-use std::path::{Path, PathBuf};
-use std::sync::{Mutex, PoisonError};
+//! A chat the board did not dispatch is untouched. A board-dispatched GitHub
+//! chat is different: missing credentials, helpers, or `gh` refuse the run so
+//! it can never silently deliver through the box user's ambient login.
 
 use comet_board::config::{Credentials, GithubAuth, Paths};
 use comet_board::git_credentials;
+use std::path::{Path, PathBuf};
 
 /// Where the `gh` shim is installed, under the board's state dir. One per
 /// device rather than one per run: its contents depend on nothing but the two
@@ -39,20 +36,15 @@ pub struct PushCredentials {
     /// helper process started with none of the engine's arguments reads the
     /// same `.env` the engine's board loop does.
     paths: Paths,
-    /// The `comet-board` binary the helpers run as. `None` disables the whole
-    /// thing: pointing `GIT_ASKPASS` at a binary that is not there would break
-    /// pushes that work today, since the same environment switches off the
-    /// box's credential helper and terminal prompting.
+    /// The `comet-board` binary the helpers run as. `None` makes a
+    /// board-dispatched GitHub run undeliverable: the handoff may never fall
+    /// back to the box's credential helper or terminal prompting.
     board_exe: Option<PathBuf>,
-    /// Whether the operator has already been told this device cannot do it.
-    /// The alternative is one warning per run, forever.
-    warned: Mutex<bool>,
 }
 
 impl PushCredentials {
-    /// Resolve what this device can offer. Cheap and infallible — every part
-    /// that can be missing is optional, and what is missing is reported the
-    /// first time a run actually wants it.
+    /// Resolve what this device can offer. Cheap and infallible; missing pieces
+    /// become a fatal handoff error when a board-dispatched GitHub run asks.
     pub fn detect(paths: Paths) -> Self {
         Self::with_board_exe(paths, git_credentials::resolve_board_exe())
     }
@@ -61,16 +53,14 @@ impl PushCredentials {
     /// the seam for a caller (a test, a packaged build) that can say where
     /// `comet-board` is instead of going looking for it.
     pub fn with_board_exe(paths: Paths, board_exe: Option<PathBuf>) -> Self {
-        Self {
-            paths,
-            board_exe,
-            warned: Mutex::new(false),
-        }
+        Self { paths, board_exe }
     }
 
-    /// The credentials for a run pushing to `repo`, or `None` when this device
-    /// cannot authenticate for it and the agent should keep using the box's
-    /// own git credentials.
+    /// The credentials for a board-dispatched run pushing to `repo`.
+    ///
+    /// Failure is fatal: a chat carrying `push_repo` is not an ordinary chat
+    /// that may fall back to the box user's ambient git/gh credentials. This
+    /// verifies the same askpass and gh-wrapper handoff the child receives.
     ///
     /// `chat` is the run this is for, recorded in the ledger so the settle can
     /// ask afterwards whether the credential it handed over was the one that
@@ -79,43 +69,69 @@ impl PushCredentials {
         &self,
         repo: &str,
         chat: Option<&str>,
-    ) -> Option<comet_harness::PushCredentials> {
+    ) -> anyhow::Result<comet_harness::PushCredentials> {
         // Re-read per run rather than at boot: an operator who drops a PEM on
         // the box and restarts the board loop should not also have to restart
         // the engine.
-        self.for_repo_with(repo, Credentials::load(&self.paths).github_auth(), chat)
+        self.prepare_for_repo_with(
+            repo,
+            Credentials::load(&self.paths).github_auth(),
+            chat,
+            true,
+        )
     }
 
+    /// Exercise the exact handoff before the board creates an attempt, without
+    /// recording that a run received credentials when no run exists yet.
+    pub fn verify_for_repo(&self, repo: &str) -> anyhow::Result<()> {
+        self.prepare_for_repo_with(
+            repo,
+            Credentials::load(&self.paths).github_auth(),
+            None,
+            false,
+        )
+        .map(|_| ())
+    }
+
+    #[cfg(test)]
     fn for_repo_with(
         &self,
         repo: &str,
         auth: GithubAuth,
         chat: Option<&str>,
-    ) -> Option<comet_harness::PushCredentials> {
+    ) -> anyhow::Result<comet_harness::PushCredentials> {
+        self.prepare_for_repo_with(repo, auth, chat, true)
+    }
+
+    fn prepare_for_repo_with(
+        &self,
+        repo: &str,
+        auth: GithubAuth,
+        chat: Option<&str>,
+        record_handoff: bool,
+    ) -> anyhow::Result<comet_harness::PushCredentials> {
         if repo.is_empty() {
-            return None;
+            anyhow::bail!("a board-dispatched GitHub chat has no repository to authenticate for");
         }
         if auth == GithubAuth::None {
-            self.warn_once(
-                "no GitHub credential configured — dispatched agents push with this \
-                 device's own git credentials (set GITHUB_TOKEN, or GITHUB_APP_ID and \
-                 GITHUB_APP_PRIVATE_KEY_PATH, in the board's .env)",
+            return self.unusable(
+                repo,
+                chat,
+                "no GitHub credential configured — set GITHUB_TOKEN, or GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY_PATH, in the board's .env",
             );
-            return None;
         }
         let Some(exe) = &self.board_exe else {
-            self.warn_once(
-                "the comet-board binary is not on this device — dispatched agents push \
-                 with its own git credentials (install it beside the engine, on PATH, or \
-                 name it with COMET_BOARD_EXECUTABLE)",
+            return self.unusable(
+                repo,
+                chat,
+                "the comet-board binary is not on this device — install it beside the engine, on PATH, or name it with COMET_BOARD_EXECUTABLE",
             );
-            return None;
         };
         // Everything above is a device that was never asked to do this. What
         // follows is a device that *was*, and the two must not read the same:
         // an operator who configured a credential and a binary is owed a noise
         // when the path between them does not work.
-        let askpass = match self.askpass_shim(exe) {
+        let askpass = match self.askpass_shim(exe, repo) {
             Ok(path) => path,
             Err(err) => {
                 let err = format!("{err:#}");
@@ -127,14 +143,30 @@ impl PushCredentials {
                      failure gh#68 exists to prevent"
                 );
                 comet_board::credential_ledger::unusable(&self.paths, repo, chat, &err);
-                return None;
+                anyhow::bail!("the board's credential handoff for {repo} failed: {err}");
             }
         };
-        comet_board::credential_ledger::handed(&self.paths, repo, chat);
-        Some(comet_harness::PushCredentials {
+        let bin_dir = match self.gh_shim(exe) {
+            Ok(dir) => dir,
+            Err(error) => {
+                let err = format!("{error:#}");
+                comet_board::credential_ledger::unusable(&self.paths, repo, chat, &err);
+                anyhow::bail!("the board's credential handoff for {repo} failed: {err}");
+            }
+        };
+        if record_handoff {
+            comet_board::credential_ledger::handed(&self.paths, repo, chat);
+        }
+        Ok(comet_harness::PushCredentials {
             env: git_credentials::agent_env(&askpass, repo, &self.paths),
-            bin_dir: self.gh_shim(exe),
+            bin_dir: Some(bin_dir),
         })
+    }
+
+    fn unusable<T>(&self, repo: &str, chat: Option<&str>, message: &str) -> anyhow::Result<T> {
+        tracing::error!(repo, error = message, "board credential handoff refused");
+        comet_board::credential_ledger::unusable(&self.paths, repo, chat, message);
+        anyhow::bail!("the board's credential handoff for {repo} failed: {message}")
     }
 
     /// Install the askpass shim and prove it answers, before a run is given it
@@ -150,35 +182,23 @@ impl PushCredentials {
     /// Doing it per run rather than once at boot costs a `fork` on a code path
     /// that already cuts a worktree, and it means a box that is repaired under
     /// a running engine is repaired without a restart.
-    fn askpass_shim(&self, board_exe: &Path) -> anyhow::Result<PathBuf> {
+    fn askpass_shim(&self, board_exe: &Path, repo: &str) -> anyhow::Result<PathBuf> {
         let dir = self.paths.state_dir.join(SHIM_DIR);
         let shim = git_credentials::install_askpass_shim(&dir, board_exe)?;
         git_credentials::verify_askpass(&shim)?;
+        git_credentials::verify_push_credential(&shim, repo, &self.paths)?;
         Ok(shim)
     }
 
     /// The PATH entry carrying the `gh` wrapper, when there is a `gh` to wrap.
     ///
-    /// A failure here is not a failure of the dispatch: git still pushes
-    /// through askpass, and an agent with no `gh` was never going to run it.
-    fn gh_shim(&self, board_exe: &Path) -> Option<PathBuf> {
+    /// This is part of the required handoff: allowing a missing wrapper would
+    /// make `gh` silently use the box user's ambient login.
+    fn gh_shim(&self, board_exe: &Path) -> anyhow::Result<PathBuf> {
         let dir = self.paths.state_dir.join(SHIM_DIR);
-        let gh = git_credentials::resolve_gh(Some(&dir))?;
-        match git_credentials::install_gh_shim(&dir, board_exe, &gh) {
-            Ok(dir) => Some(dir),
-            Err(err) => {
-                tracing::warn!(error = %err, "gh shim not installed — `gh` will use the box's own login");
-                None
-            }
-        }
-    }
-
-    fn warn_once(&self, message: &str) {
-        let mut warned = self.warned.lock().unwrap_or_else(PoisonError::into_inner);
-        if std::mem::replace(&mut *warned, true) {
-            return;
-        }
-        tracing::warn!("{message}");
+        let gh = git_credentials::resolve_gh(Some(&dir))
+            .ok_or_else(|| anyhow::anyhow!("the gh binary is not installed on this device"))?;
+        git_credentials::install_gh_shim(&dir, board_exe, &gh)
     }
 }
 
@@ -227,7 +247,6 @@ mod tests {
         PushCredentials {
             paths: paths_in(dir),
             board_exe: Some(fake_board(dir)),
-            warned: Mutex::new(false),
         }
     }
 
@@ -238,25 +257,23 @@ mod tests {
         }
     }
 
-    /// The gate that keeps a box without a board credential working the way it
-    /// always has: the child is spawned with nothing added, so the agent's
-    /// push uses whatever git the box already has.
+    /// A board-dispatched GitHub run without a board credential is refused.
     #[test]
-    fn a_device_with_no_github_credential_offers_nothing() {
+    fn a_device_with_no_github_credential_refuses_the_run() {
         let dir = scratch("nocred");
         assert!(
             resolver(dir.path())
                 .for_repo_with("o/r", GithubAuth::None, None)
-                .is_none()
+                .is_err()
         );
     }
 
     #[test]
-    fn a_device_with_no_comet_board_binary_offers_nothing() {
+    fn a_device_with_no_comet_board_binary_refuses_the_run() {
         let dir = scratch("nobin");
         let mut creds = resolver(dir.path());
         creds.board_exe = None;
-        assert!(creds.for_repo_with("o/r", app(), None).is_none());
+        assert!(creds.for_repo_with("o/r", app(), None).is_err());
     }
 
     /// The whole point: askpass wiring, the board's own directories, and not
@@ -307,11 +324,7 @@ mod tests {
     #[test]
     fn no_repo_means_no_credentials() {
         let dir = scratch("norepo");
-        assert!(
-            resolver(dir.path())
-                .for_repo_with("", app(), None)
-                .is_none()
-        );
+        assert!(resolver(dir.path()).for_repo_with("", app(), None).is_err());
     }
 
     /// gh#233. A device that was configured to hand out the board's credential
@@ -326,7 +339,7 @@ mod tests {
         // Installed, resolvable, and reaching nothing — a payload that shipped
         // the engine without the CLI beside it.
         creds.board_exe = Some(dir.path().join("not-installed"));
-        assert!(creds.for_repo_with("o/r", app(), Some("chat-1")).is_none());
+        assert!(creds.for_repo_with("o/r", app(), Some("chat-1")).is_err());
 
         let record = comet_board::credential_ledger::for_chat(&creds.paths, "chat-1");
         assert!(!record.handed, "a broken path was handed to a run");
