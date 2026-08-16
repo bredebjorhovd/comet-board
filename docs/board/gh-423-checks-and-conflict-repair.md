@@ -280,7 +280,7 @@ Delivered
   standing_reviews_schema_version   defaults to 0; current is 1
   standing_reviews_complete         defaults to false
   standing_reviews_updated_at       pull updated_at reconciled completely
-  next_standing_review_sequence     strictly increasing, PR-local
+  next_standing_review_sequence     next PR-local value, seeded above legacy watermarks
   legacy_review_blocker             null | LegacyReviewBlocker
   standing_reviews[]
   submission_tombstones[]
@@ -506,12 +506,32 @@ numeric `sequence`, from an unresolved legacy blocker's preserved
 arrived last.
 
 The schema marker makes migration distinguishable from a valid empty review
-set. The exact pre-upgrade input is the existing `Delivered::changes_requested`
-plus `Delivered::submissions[]`, whose `Submission` contains only
-`fingerprint`, `review_id`, `delivered`, `projection`, `refusal`, and
-`posted_as`. It contains no head, verified reviewer, kind field, or original
-body. Migration does not invent any of them and does not reinterpret the old
-fingerprint as a v2 identity.
+set. The exact pre-upgrade input includes `Delivered::review`,
+`Delivered::changes_requested`, `Delivered::fanned_out`, and
+`Delivered::submissions[]`, whose `Submission` contains only `fingerprint`,
+`review_id`, `delivered`, `projection`, `refusal`, and `posted_as`. It contains
+no head, verified reviewer, kind field, or original body. Migration does not
+invent any of them and does not reinterpret the old fingerprint as a v2
+identity.
+
+The new sequence and the retained fan-out watermarks stay in one numeric domain.
+Before importing or allocating any `StandingReview`, migration computes the
+legacy high-water mark as the checked maximum of:
+
+- `Delivered::review`;
+- `Delivered::changes_requested` when present;
+- every positive legacy `Submission::review_id`;
+- every value in `Delivered::fanned_out`;
+- and, when resuming an interrupted migration, every already stored standing
+  sequence and `next_standing_review_sequence - 1`.
+
+It atomically seeds `next_standing_review_sequence` to high-water plus one, then
+allocates imported GitHub reviews and later Comet decisions from that counter.
+Checked overflow leaves the schema incomplete and Merge unavailable. The
+existing per-dependent `fanned_out` map is retained unchanged: an old watermark
+still suppresses the old notice, while every new change request is necessarily
+greater and therefore reaches each existing dependent once. Reconciliation and
+aliasing never lower or reseed the counter.
 
 On load, an absent/older `standing_reviews_schema_version` or false
 `standing_reviews_complete` sets `acceptance = unknown` and bypasses
@@ -923,6 +943,9 @@ Authority stays separated by construction:
   mutation action enabled.
 - A changed `updated_at` or incomplete review marker that cannot be completely
   reconciled prevents local sequence allocation and every verdict side effect.
+- A legacy sequence high-water overflow or incomplete atomic seed keeps the
+  schema incomplete; per-edge fan-out watermarks are never compared with a
+  reset counter.
 - A full live-plus-tombstone submission ledger refuses a new identity; it never
   buys space by making an older delivery or GitHub post repeatable.
 - An absent or changed legacy-replacement token leaves the unresolved blocker
@@ -1001,6 +1024,11 @@ The implementation is complete when these seams are pinned:
    GitHub review id reconstructs the blocker, while an explicit matching-token
    replacement atomically swaps it for a v2 decision; absent/stale tokens
    refuse. Unchanged pull `updated_at` still bypasses the normal short circuit.
+   A serialized stacked parent carries `review = 900`, an outstanding blocker,
+   and `fanned_out[child] = 900`; after migration clears that blocker, a new
+   local Request changes receives a sequence above 900. The existing child gets
+   the new generic notice once, its edge watermark advances to the new sequence,
+   and a second fan-out pass is silent.
 8. V2 submission-identity fixtures prove an empty Approve retried by the same
    reviewer on the same head dedupes, the same reviewer on a new head is
    distinct, and two verified reviewers approving the same head are distinct.
