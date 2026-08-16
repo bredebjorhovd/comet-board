@@ -39,7 +39,8 @@ use crate::runs;
 use crate::runtime::{RunEnd, Runtime};
 use crate::settled::{self, Commits, Evidence, Verdict, Why};
 use crate::sources::github::{
-    AsUser, Github, HttpAsUser, HttpRest, MergeStatus, PullRequest, Rest, pr_matches_branch,
+    AsUser, Github, HttpAsUser, HttpRest, MergeStatus, PullRequest, PushCapabilities, Rest,
+    pr_matches_branch,
 };
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
@@ -173,6 +174,13 @@ pub struct SyncEngine {
     pub log: Arc<Logger>,
     pub linear: Option<Linear<Box<dyn GraphQl>>>,
     pub github: Option<Github<Box<dyn Rest>>>,
+    /// A pre-resolved push capability supplied by an embedding that already
+    /// established the credential out of band. `None` is the production path:
+    /// dispatch probes the configured GitHub credential immediately before it
+    /// creates an attempt. The engine's offline board tests supply the known
+    /// capability their fake runtime models, so they do not make network calls
+    /// or turn an intentionally credential-free fixture into a false failure.
+    pub push_capabilities: Option<PushCapabilities>,
     /// How a verdict is cast under the *reviewer's* identity rather than the
     /// board's (gh#369). A field for the same reason [`Self::webhook`] is one:
     /// which credential the review went out under is exactly what a test of
@@ -330,6 +338,7 @@ impl SyncEngine {
             log,
             linear,
             github,
+            push_capabilities: None,
             as_user: Rc::new(HttpAsUser),
             webhook: Arc::new(crate::notify::HttpWebhook),
         })
@@ -5366,6 +5375,7 @@ mod tests {
             log: Arc::new(Logger::new("", false)),
             linear,
             github: None,
+            push_capabilities: None,
             as_user: Rc::new(crate::sources::github::FixtureAsUser::default()),
             webhook: Arc::new(RecordingWebhook::default()),
         };

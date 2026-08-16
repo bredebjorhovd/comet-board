@@ -108,6 +108,16 @@ pub struct ChatConfig {
     /// to push the fix too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_repo: Option<String>,
+    /// The nonsecret GitHub write promise the board made when it dispatched
+    /// this chat (gh#440). The engine rechecks the current credential against
+    /// it before every new or steered turn, and the late-mint helpers enforce
+    /// it again when `git` or `gh` asks for a token.
+    ///
+    /// `None` is every ordinary chat and every board chat created before this
+    /// contract existed. A chat with `push_repo` but no contract fails closed:
+    /// there is no durable evidence of what its initial brief promised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_contract: Option<GithubPushContract>,
     /// Who this chat's commits are *by* (comet-board `git_identity`, gh#107).
     /// Set, the engine stamps `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` on the
     /// harness child, so a teammate's dispatch produces commits GitHub
@@ -146,6 +156,93 @@ pub struct ChatConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
 }
+
+impl ChatConfig {
+    /// The board-owned GitHub push tuple, validated as one value. A single
+    /// missing half is never an ordinary chat: treating it as one would allow
+    /// the run to fall through to ambient credentials.
+    pub fn github_push_state(&self) -> Result<Option<GithubPushState>, GithubPushStateError> {
+        match (self.push_repo.as_deref(), self.push_contract) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(GithubPushStateError::RepositoryWithoutContract),
+            (None, Some(_)) => Err(GithubPushStateError::ContractWithoutRepository),
+            (Some(repo), Some(contract)) => {
+                let state = GithubPushState {
+                    repo: repo.to_string(),
+                    contract,
+                };
+                state.validate()?;
+                Ok(Some(state))
+            }
+        }
+    }
+
+    /// Restore both halves from the doc-owned tuple in one operation.
+    pub fn apply_github_push_state(&mut self, state: &GithubPushState) {
+        self.push_repo = Some(state.repo.clone());
+        self.push_contract = Some(state.contract);
+    }
+}
+
+/// The GitHub writes a board-dispatched chat was told it could deliver.
+///
+/// Deliberately only booleans: the App/PAT identity, permission evidence and
+/// bearer remain device-local and are re-probed. This synced value is the
+/// minimum nonsecret contract needed to tell whether a replacement credential
+/// is weaker than the one that released the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPushContract {
+    pub contents_write: bool,
+    pub workflows_write: bool,
+}
+
+/// The atomic, nonsecret push state owned by a board-dispatched chat.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPushState {
+    pub repo: String,
+    pub contract: GithubPushContract,
+}
+
+impl GithubPushState {
+    pub fn validate(&self) -> Result<(), GithubPushStateError> {
+        if self.repo.trim().is_empty() {
+            return Err(GithubPushStateError::EmptyRepository);
+        }
+        if !self.contract.contents_write {
+            return Err(GithubPushStateError::InvalidContract);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GithubPushStateError {
+    RepositoryWithoutContract,
+    ContractWithoutRepository,
+    EmptyRepository,
+    InvalidContract,
+}
+
+impl std::fmt::Display for GithubPushStateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::RepositoryWithoutContract => {
+                "GitHub push state has a repository but no capability contract"
+            }
+            Self::ContractWithoutRepository => {
+                "GitHub push state has a capability contract but no repository"
+            }
+            Self::EmptyRepository => "GitHub push state has an empty repository",
+            Self::InvalidContract => {
+                "GitHub push state has an invalid contract without content-write capability"
+            }
+        })
+    }
+}
+
+impl std::error::Error for GithubPushStateError {}
 
 /// One local Model Context Protocol server a harness starts over stdio.
 ///

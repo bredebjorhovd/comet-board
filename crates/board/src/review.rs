@@ -1588,6 +1588,7 @@ pub(crate) mod tests {
             log: std::sync::Arc::new(crate::log::Logger::new("", false)),
             linear: None,
             github: Some(Github::new(Box::new(Shared(rest)) as Box<dyn Rest>)),
+            push_capabilities: None,
             // Nothing to hand out until a test says a member holds a token
             // (gh#369); a board that holds none never asks for a client.
             as_user: std::rc::Rc::new(crate::sources::github::FixtureAsUser::default()),

@@ -234,6 +234,11 @@ pub struct DispatchSpec {
     /// no GitHub remote at all, which is the case that keeps its own
     /// credentials.
     pub push_repo: Option<String>,
+    /// The nonsecret GitHub write contract established beside `push_repo`
+    /// (gh#440). The executor persists it on the chat so later turns and
+    /// push-time token mints can reject a weaker replacement credential.
+    #[serde(default)]
+    pub push_contract: Option<comet_proto::GithubPushContract>,
     /// Who the attempt's commits are by (gh#107) — the `[users]` entry for
     /// whoever released it, when this board has one. The engine stamps it on
     /// the harness child as `GIT_AUTHOR_*`, leaving the box's pinned identity
@@ -416,6 +421,18 @@ pub struct ReviewCandidate {
 /// exists so `sync`/`dispatch`/`settled` stay testable without an engine, not
 /// to abstract over multiple backends.
 pub trait Runtime {
+    /// Prove that a board-dispatched GitHub chat will receive the board's
+    /// credential handoff. Called before an attempt row or worktree exists.
+    /// The no-op default keeps source-level test runtimes lightweight; the
+    /// production engine runtime overrides it with the real handoff probe.
+    fn verify_push_credentials(
+        &self,
+        _repo: &str,
+        _contract: comet_proto::GithubPushContract,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Cut the worktree (when asked), create the chat on the host device, and
     /// queue the brief as the first send. Returns once the command entry is
     /// durably in the session doc — NOT once the agent starts: the ledger
@@ -848,6 +865,7 @@ mod tests {
             model: None,
             account: None,
             push_repo: None,
+            push_contract: None,
             git_author: None,
             turn_limits: Default::default(),
             mcp_servers: Vec::new(),

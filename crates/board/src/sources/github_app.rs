@@ -158,6 +158,14 @@ struct Minted {
     token: String,
     /// Unix seconds, parsed from GitHub's `expires_at`.
     expires_at: i64,
+    /// The repository permissions GitHub says this installation token carries.
+    ///
+    /// Kept beside the token because this is installation-specific evidence:
+    /// changing an App's permissions does not reach an installation until its
+    /// owner approves the update. The mint response is therefore a stronger
+    /// answer than the App registration itself. `None` is deliberately
+    /// distinct from an empty map — no evidence is not evidence of no grants.
+    permissions: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Default)]
@@ -279,14 +287,42 @@ impl AppAuth {
             .and_then(Value::as_str)
             .and_then(parse_expiry)
             .unwrap_or(now);
+        let permissions = v.get("permissions").and_then(Value::as_object).map(|p| {
+            p.iter()
+                .filter_map(|(name, level)| {
+                    level
+                        .as_str()
+                        .map(|level| (name.to_string(), level.to_string()))
+                })
+                .collect()
+        });
         self.cache.borrow_mut().tokens.insert(
             id,
             Minted {
                 token: token.clone(),
                 expires_at,
+                permissions,
             },
         );
         Ok(token)
+    }
+
+    /// The permissions on the installation token `repo` would push with.
+    ///
+    /// This intentionally returns no token. A caller asking whether a push can
+    /// update workflow files should never have to hold, print or persist the
+    /// credential in order to learn the answer. Minting is still necessary —
+    /// its response is the per-installation authority — but the secret stays
+    /// inside this module exactly as it does for every REST request.
+    pub fn permissions_for_repo(&self, repo: &str) -> Result<Option<BTreeMap<String, String>>> {
+        let id = self.installation_for(repo)?;
+        let _ = self.token_for_installation(id)?;
+        Ok(self
+            .cache
+            .borrow()
+            .tokens
+            .get(&id)
+            .and_then(|minted| minted.permissions.clone()))
     }
 
     /// Drop whatever `repo` is authenticating with, so the next call re-mints.
@@ -674,6 +710,9 @@ pub(crate) struct FakeAppApi {
     /// Minted token → the installation it was minted for, so a request carrying
     /// one can be answered as that installation.
     minted_for: RefCell<BTreeMap<String, i64>>,
+    /// The exact permission object a real mint response carries. Writable so
+    /// tests can model an installation that has not approved an App update.
+    permissions: RefCell<Value>,
 }
 
 #[cfg(test)]
@@ -689,7 +728,15 @@ impl FakeAppApi {
             calls: RefCell::new(Vec::new()),
             minted: std::cell::Cell::new(0),
             minted_for: RefCell::new(BTreeMap::new()),
+            permissions: RefCell::new(serde_json::json!({
+                "contents": "write",
+                "workflows": "write"
+            })),
         })
+    }
+
+    pub fn set_permissions(&self, permissions: Value) {
+        *self.permissions.borrow_mut() = permissions;
     }
 
     /// How many installation tokens were minted.
@@ -792,7 +839,11 @@ impl AppApi for Rc<FakeAppApi> {
         let expires = chrono::DateTime::from_timestamp(self.clock.now() + self.ttl, 0)
             .expect("a representable expiry")
             .to_rfc3339();
-        Ok(serde_json::json!({ "token": token, "expires_at": expires }))
+        Ok(serde_json::json!({
+            "token": token,
+            "expires_at": expires,
+            "permissions": self.permissions.borrow().clone()
+        }))
     }
 }
 

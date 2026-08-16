@@ -131,6 +131,7 @@ fn chat_config(turn_limits: TurnLimits) -> ChatConfig {
         sandbox: SandboxLevel::WorkspaceWrite,
         account: None,
         push_repo: None,
+        push_contract: None,
         git_author: None,
         turn_limits,
         mcp_servers: Vec::new(),
@@ -281,10 +282,10 @@ async fn a_chat_nobody_dispatched_is_never_policed() {
 }
 
 /// A model change mid-session is a full-config replace, and the frontends build
-/// that struct from their own picker state. It must not disarm the guardrails
-/// on a dispatched chat (gh#270).
+/// that struct from their own picker state. It must not disarm guardrails or
+/// erase the credential contract on a dispatched chat (gh#270, gh#440).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mid_session_config_change_keeps_the_guardrails() {
+async fn a_mid_session_config_change_keeps_board_owned_config() {
     let dir = tempfile::tempdir().unwrap();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(SpinningHarness::default()));
@@ -298,11 +299,18 @@ async fn a_mid_session_config_change_keeps_the_guardrails() {
         tool_failures: Some(7),
         tool_calls: Some(700),
     };
+    let push_contract = comet_proto::GithubPushContract {
+        contents_write: true,
+        workflows_write: true,
+    };
+    let mut dispatched_config = chat_config(limits);
+    dispatched_config.push_repo = Some("owner/widget".into());
+    dispatched_config.push_contract = Some(push_contract);
     core.workspace
         .create_chat(
             "chat-dispatched",
             "space-1",
-            Some(chat_config(limits)),
+            Some(dispatched_config),
             Some("/tmp".into()),
         )
         .unwrap();
@@ -319,4 +327,15 @@ async fn a_mid_session_config_change_keeps_the_guardrails() {
     let stored = core.workspace.chat_config("chat-dispatched").unwrap();
     assert_eq!(stored.model.as_deref(), Some("mock-1"));
     assert_eq!(stored.turn_limits, limits);
+    assert_eq!(stored.push_repo.as_deref(), Some("owner/widget"));
+    assert_eq!(stored.push_contract, Some(push_contract));
+
+    let mut retargeted = stored;
+    retargeted.push_repo = Some("attacker/other".into());
+    let error = core
+        .workspace
+        .set_chat_config("chat-dispatched", &retargeted)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot change the board-owned"), "{error}");
 }

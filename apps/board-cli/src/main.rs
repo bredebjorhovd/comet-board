@@ -733,7 +733,16 @@ fn main() -> Result<()> {
             let repo = std::env::var(comet_board::git_credentials::ASKPASS_REPO_ENV).ok();
             let prompt = prompt.unwrap_or_default();
             let chat = std::env::var(ops::CHAT_ID_ENV).ok();
-            match comet_board::git_credentials::askpass(&paths, &prompt, repo.as_deref()) {
+            let contract = comet_board::git_credentials::push_contract_from_env()?;
+            if chat.is_some() && contract.is_none() {
+                bail!("a board-dispatched credential request has no persisted push contract");
+            }
+            match comet_board::git_credentials::askpass_with_contract(
+                &paths,
+                &prompt,
+                repo.as_deref(),
+                contract,
+            ) {
                 Ok(secret) => {
                     // A username prompt is answered off a constant, so it is
                     // not a mint and must not be recorded as one — an alibi
@@ -780,7 +789,9 @@ fn main() -> Result<()> {
                     )
                 })?;
             let chat = std::env::var(ops::CHAT_ID_ENV).ok();
-            match comet_board::git_credentials::token(&paths, &repo) {
+            let contract = comet_board::git_credentials::push_contract_from_env()?
+                .context("a board-dispatched gh invocation has no persisted push contract")?;
+            match comet_board::git_credentials::token_with_contract(&paths, &repo, contract) {
                 Ok(token) => {
                     comet_board::credential_ledger::minted(
                         &paths,
@@ -791,9 +802,9 @@ fn main() -> Result<()> {
                     println!("{token}");
                     Ok(())
                 }
-                // The shim discards this too (`2>/dev/null`, so a box with its
-                // own `gh auth login` keeps working), which makes the ledger
-                // the only place a failed mint is written down.
+                // The shim suppresses this stderr and refuses the invocation;
+                // the ledger is therefore the durable, token-free record of
+                // why the board credential could not be handed to `gh`.
                 Err(e) => {
                     comet_board::credential_ledger::failed(
                         &paths,

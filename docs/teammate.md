@@ -152,6 +152,12 @@ about who is signed in against the slot's email, and cannot verify that claim
 
 If they bring work in a repo the board has never seen, the board's GitHub App
 has to be installed on it — by whoever owns the repo, on the repos they pick.
+The App itself needs repository permissions **Contents: read & write** and
+**Workflows: read & write** (as well as Issues and Pull requests read & write,
+and Metadata read). Contents alone can push ordinary source changes but GitHub
+rejects the whole ref update when it contains `.github/workflows/**`. If those
+permissions were added after installation, each owner must approve the update
+for that installation before its newly minted tokens carry them.
 What the App can already reach:
 
 ```bash
@@ -169,7 +175,8 @@ distinguish "no such repo" from "not yours", and neither can we — so `onboard`
 refuses before anything is cloned and says which of the two credentials needs
 widening. A repo already on the board whose installation was later narrowed
 fails later and less clearly: polls stop returning issues, and pushes from a
-dispatched agent fail on the credential.
+dispatched agent fail on the credential. `comet-board doctor` reports ordinary
+content and workflow-file push capability separately for each repo.
 
 ## 6. Let their verdict be a verdict
 

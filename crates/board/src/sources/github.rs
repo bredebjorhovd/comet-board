@@ -8,6 +8,7 @@ use crate::model::{PrStack, Source, UpstreamState};
 use crate::sources::github_app::{HttpAppApi, TokenProvider};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 pub const API: &str = "https://api.github.com";
 
@@ -73,6 +74,166 @@ pub const PAGE: usize = 100;
 /// is not in it.
 pub const MAX_PAGES: usize = 20;
 
+/// Whether the credential can write one class of repository content.
+///
+/// `Unknown` is intentionally not optimistic. GitHub exposes classic OAuth
+/// scopes and App installation permissions, but does not expose equivalent
+/// grant evidence for every token shape. Treating an opaque token as writable
+/// is how a completed workflow change first discovers the truth at push time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteCapability {
+    Write,
+    Missing,
+    Unknown,
+}
+
+impl WriteCapability {
+    pub fn word(self) -> &'static str {
+        match self {
+            WriteCapability::Write => "write",
+            WriteCapability::Missing => "missing",
+            WriteCapability::Unknown => "unknown",
+        }
+    }
+}
+
+/// Which GitHub evidence a push-capability verdict came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityEvidence {
+    /// The `permissions` object on an installation-token mint response.
+    AppInstallation,
+    /// `X-OAuth-Scopes` on a response authenticated by `GITHUB_TOKEN`.
+    ClassicOauthScopes,
+    /// A token answered, but GitHub exposed no OAuth-scope evidence. This is
+    /// the normal shape for fine-grained and otherwise opaque tokens.
+    OpaqueToken,
+    /// No board credential is configured.
+    Anonymous,
+    /// The preflight could not reach GitHub or build the configured client.
+    ProbeFailed,
+}
+
+/// The two different writes a dispatched git push may need.
+///
+/// Ordinary contents are not enough for `.github/workflows/**`: GitHub gates
+/// that namespace on a separate App permission / classic OAuth scope. Keeping
+/// the pair explicit prevents a reachable repo from being reported as a
+/// deliverable CI change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushCapabilities {
+    pub contents: WriteCapability,
+    pub workflows: WriteCapability,
+    pub evidence: CapabilityEvidence,
+}
+
+impl PushCapabilities {
+    pub fn anonymous() -> PushCapabilities {
+        PushCapabilities {
+            contents: WriteCapability::Missing,
+            workflows: WriteCapability::Missing,
+            evidence: CapabilityEvidence::Anonymous,
+        }
+    }
+
+    pub fn probe_failed() -> PushCapabilities {
+        PushCapabilities {
+            contents: WriteCapability::Unknown,
+            workflows: WriteCapability::Unknown,
+            evidence: CapabilityEvidence::ProbeFailed,
+        }
+    }
+
+    fn from_app_permissions(permissions: Option<&BTreeMap<String, String>>) -> PushCapabilities {
+        let Some(permissions) = permissions else {
+            return PushCapabilities {
+                contents: WriteCapability::Unknown,
+                workflows: WriteCapability::Unknown,
+                evidence: CapabilityEvidence::AppInstallation,
+            };
+        };
+        let has_write = |name: &str| {
+            if permissions.get(name).is_some_and(|level| level == "write") {
+                WriteCapability::Write
+            } else {
+                WriteCapability::Missing
+            }
+        };
+        PushCapabilities {
+            contents: has_write("contents"),
+            workflows: has_write("workflows"),
+            evidence: CapabilityEvidence::AppInstallation,
+        }
+    }
+
+    fn from_oauth_scopes(
+        scopes: Option<&[String]>,
+        private: bool,
+        repo_push: Option<bool>,
+    ) -> PushCapabilities {
+        let Some(scopes) = scopes.filter(|scopes| !scopes.is_empty()) else {
+            return PushCapabilities {
+                contents: WriteCapability::Unknown,
+                workflows: WriteCapability::Unknown,
+                evidence: CapabilityEvidence::OpaqueToken,
+            };
+        };
+        let has = |want: &str| scopes.iter().any(|scope| scope == want);
+        let scope_allows_repo = has("repo") || (!private && has("public_repo"));
+        let contents = match (scope_allows_repo, repo_push) {
+            (false, _) | (true, Some(false)) => WriteCapability::Missing,
+            (true, Some(true)) => WriteCapability::Write,
+            (true, None) => WriteCapability::Unknown,
+        };
+        PushCapabilities {
+            contents,
+            workflows: match (contents, has("workflow")) {
+                (_, false) | (WriteCapability::Missing, true) => WriteCapability::Missing,
+                (WriteCapability::Write, true) => WriteCapability::Write,
+                (WriteCapability::Unknown, true) => WriteCapability::Unknown,
+            },
+            evidence: CapabilityEvidence::ClassicOauthScopes,
+        }
+    }
+
+    pub fn can_write_workflows(self) -> bool {
+        self.contents == WriteCapability::Write && self.workflows == WriteCapability::Write
+    }
+
+    /// The nonsecret promise safe to persist on a dispatched chat.
+    pub fn contract(self) -> comet_proto::GithubPushContract {
+        comet_proto::GithubPushContract {
+            contents_write: self.contents == WriteCapability::Write,
+            workflows_write: self.can_write_workflows(),
+        }
+    }
+
+    /// Refuse a replacement credential that is weaker than the promise made
+    /// when the chat was dispatched. Unknown evidence is never accepted for a
+    /// write the contract requires.
+    pub fn require(self, contract: comet_proto::GithubPushContract) -> Result<()> {
+        let contents_ok = !contract.contents_write || self.contents == WriteCapability::Write;
+        let workflows_ok = !contract.workflows_write || self.workflows == WriteCapability::Write;
+        if contents_ok && workflows_ok {
+            return Ok(());
+        }
+        bail!(
+            "current GitHub credential is weaker than this chat's push contract: expected repository contents {} and workflow files {}, current evidence reports contents {} and workflows {}. Restore the board credential to those grants and run `comet-board doctor` before retrying",
+            if contract.contents_write {
+                "write"
+            } else {
+                "restricted"
+            },
+            if contract.workflows_write {
+                "write"
+            } else {
+                "restricted"
+            },
+            self.contents.word(),
+            self.workflows.word(),
+        )
+    }
+}
+
 /// The REST surface we use. A seam, so tests never touch the network.
 pub trait Rest {
     fn get(&self, path: &str) -> Result<Value>;
@@ -121,6 +282,10 @@ pub trait Transport {
 pub struct Reply {
     pub status: u16,
     pub body: Value,
+    /// GitHub's classic PAT / OAuth scope evidence. The header is absent for
+    /// fine-grained and other opaque token shapes; absence therefore remains
+    /// `None`, never an empty set that would claim permissions are missing.
+    pub oauth_scopes: Option<Vec<String>>,
 }
 
 /// The [`Transport`] against real GitHub.
@@ -150,8 +315,21 @@ impl Transport for HttpTransport {
         }
         let resp = req.send()?;
         let status = resp.status().as_u16();
+        let oauth_scopes = resp
+            .headers()
+            .get("x-oauth-scopes")
+            .and_then(|v| v.to_str().ok())
+            .map(|scopes| {
+                scopes
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|scope| !scope.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            });
         Ok(Reply {
             status,
+            oauth_scopes,
             // A 204 has no body; treat that as success rather than a parse error.
             body: resp.json().unwrap_or(Value::Null),
         })
@@ -206,6 +384,44 @@ impl HttpRest {
     /// The credential in force, for `doctor` and the git credential path.
     pub fn auth(&self) -> &TokenProvider {
         &self.auth
+    }
+
+    /// What a dispatched git push to `repo` can deliver, without exposing the
+    /// bearer used to establish it.
+    ///
+    /// App evidence comes from the installation-token mint response. A static
+    /// token gets one read-only repo request so GitHub can return its classic
+    /// OAuth scopes; a missing header is an opaque/fine-grained token and stays
+    /// unknown. Anonymous mode needs no request to know it cannot push.
+    pub fn push_capabilities(&self, repo: &str) -> Result<PushCapabilities> {
+        match &self.auth {
+            TokenProvider::Anonymous => Ok(PushCapabilities::anonymous()),
+            TokenProvider::App(app) => {
+                let permissions = app.permissions_for_repo(repo)?;
+                Ok(PushCapabilities::from_app_permissions(permissions.as_ref()))
+            }
+            TokenProvider::Static(_) => {
+                let path = format!("/repos/{repo}");
+                let reply = self.round_trip(reqwest::Method::GET, &path, None)?;
+                let scopes = reply.oauth_scopes.clone();
+                let body = Self::interpret(reply, &path, &self.auth)?;
+                let private = body
+                    .get("private")
+                    .and_then(Value::as_bool)
+                    // Missing is the conservative half: `public_repo` must not
+                    // be accepted for a repo GitHub did not identify as public.
+                    .unwrap_or(true);
+                let repo_push = body
+                    .get("permissions")
+                    .and_then(|permissions| permissions.get("push"))
+                    .and_then(Value::as_bool);
+                Ok(PushCapabilities::from_oauth_scopes(
+                    scopes.as_deref(),
+                    private,
+                    repo_push,
+                ))
+            }
+        }
     }
 
     fn request(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
@@ -1602,6 +1818,7 @@ struct ScriptedTransport {
     /// tests are about the status; a body is what the reason tests need
     /// (gh#338), since GitHub's words only exist there.
     body: Value,
+    oauth_scopes: Option<Vec<String>>,
     /// `(path, bearer)` for every call made.
     seen: std::cell::RefCell<Vec<(String, Option<String>)>>,
 }
@@ -1616,6 +1833,16 @@ impl ScriptedTransport {
         ScriptedTransport {
             statuses: statuses.to_vec(),
             body,
+            oauth_scopes: None,
+            seen: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn with_scopes(statuses: &[u16], body: Value, scopes: &[&str]) -> ScriptedTransport {
+        ScriptedTransport {
+            statuses: statuses.to_vec(),
+            body,
+            oauth_scopes: Some(scopes.iter().map(|scope| (*scope).to_string()).collect()),
             seen: std::cell::RefCell::new(Vec::new()),
         }
     }
@@ -1642,6 +1869,7 @@ impl Transport for std::rc::Rc<ScriptedTransport> {
         Ok(Reply {
             status,
             body: self.body.clone(),
+            oauth_scopes: self.oauth_scopes.clone(),
         })
     }
 }
@@ -1661,6 +1889,160 @@ mod auth_tests {
     fn saying(statuses: &[u16], body: Value, auth: TokenProvider) -> HttpRest {
         let t = Rc::new(ScriptedTransport::saying(statuses, body));
         HttpRest::over(Box::new(t), auth)
+    }
+
+    fn scoped_with_push(scopes: &[&str], private: bool, push: Option<bool>) -> HttpRest {
+        let t = Rc::new(ScriptedTransport::with_scopes(
+            &[200],
+            serde_json::json!({
+                "private": private,
+                "permissions": push.map(|push| serde_json::json!({ "push": push }))
+            }),
+            scopes,
+        ));
+        HttpRest::over(Box::new(t), TokenProvider::Static("secret".into()))
+    }
+
+    fn scoped(scopes: &[&str], private: bool) -> HttpRest {
+        scoped_with_push(scopes, private, Some(true))
+    }
+
+    #[test]
+    fn an_app_installation_reports_contents_and_workflows_separately() {
+        let (app, api, _) = test_app(&[("o/r", 42)]);
+        let rest = HttpRest::over(
+            Box::new(Rc::new(ScriptedTransport::new(&[200]))),
+            TokenProvider::App(app.clone()),
+        );
+        assert_eq!(
+            rest.push_capabilities("o/r").unwrap(),
+            PushCapabilities {
+                contents: WriteCapability::Write,
+                workflows: WriteCapability::Write,
+                evidence: CapabilityEvidence::AppInstallation,
+            }
+        );
+
+        // The App registration may have changed while this installation has
+        // not approved it. Invalidate so the next answer comes from a fresh
+        // mint carrying the installation's new permission object.
+        api.set_permissions(serde_json::json!({ "contents": "write" }));
+        app.invalidate_repo("o/r");
+        let missing = rest.push_capabilities("o/r").unwrap();
+        assert_eq!(missing.contents, WriteCapability::Write);
+        assert_eq!(missing.workflows, WriteCapability::Missing);
+        assert!(!missing.can_write_workflows());
+    }
+
+    #[test]
+    fn a_classic_pat_needs_repo_and_workflow_scopes_for_workflow_pushes() {
+        let ready = scoped(&["repo", "workflow"], true)
+            .push_capabilities("o/r")
+            .unwrap();
+        assert_eq!(ready.contents, WriteCapability::Write);
+        assert_eq!(ready.workflows, WriteCapability::Write);
+        assert_eq!(ready.evidence, CapabilityEvidence::ClassicOauthScopes);
+
+        let missing = scoped(&["repo"], true).push_capabilities("o/r").unwrap();
+        assert_eq!(missing.contents, WriteCapability::Write);
+        assert_eq!(missing.workflows, WriteCapability::Missing);
+    }
+
+    #[test]
+    fn an_app_rotation_to_repo_only_is_refused_before_the_token_is_handed_over() {
+        let (app, api, _) = test_app(&[("o/r", 42)]);
+        let rest = HttpRest::over(
+            Box::new(Rc::new(ScriptedTransport::new(&[200]))),
+            TokenProvider::App(app.clone()),
+        );
+        let contract = rest.push_capabilities("o/r").unwrap().contract();
+        assert!(crate::git_credentials::token_with_contract_from(&rest, "o/r", contract).is_ok());
+
+        // The installation approved a weaker App registration while this
+        // chat still carries the original workflow-write promise.
+        api.set_permissions(serde_json::json!({ "contents": "write" }));
+        app.invalidate_repo("o/r");
+        let error = crate::git_credentials::token_with_contract_from(&rest, "o/r", contract)
+            .expect_err("a repo-only token escaped a workflow-write contract")
+            .to_string();
+        assert!(
+            error.contains("weaker than this chat's push contract"),
+            "{error}"
+        );
+        assert!(error.contains("workflows missing"), "{error}");
+    }
+
+    #[test]
+    fn a_pat_rotation_without_workflow_scope_is_refused_by_the_same_contract() {
+        let contract = scoped(&["repo", "workflow"], true)
+            .push_capabilities("o/r")
+            .unwrap()
+            .contract();
+        let repo_only = scoped(&["repo"], true);
+        let error = crate::git_credentials::token_with_contract_from(&repo_only, "o/r", contract)
+            .expect_err("a repo-only PAT escaped a workflow-write contract")
+            .to_string();
+        assert!(error.contains("workflows missing"), "{error}");
+    }
+
+    #[test]
+    fn public_repo_scope_is_content_write_only_for_a_public_repo() {
+        assert_eq!(
+            scoped(&["public_repo", "workflow"], false)
+                .push_capabilities("o/r")
+                .unwrap()
+                .contents,
+            WriteCapability::Write
+        );
+        assert_eq!(
+            scoped(&["public_repo", "workflow"], true)
+                .push_capabilities("o/r")
+                .unwrap()
+                .contents,
+            WriteCapability::Missing
+        );
+    }
+
+    #[test]
+    fn classic_scope_does_not_override_the_tokens_repo_push_permission() {
+        let read_only = scoped_with_push(&["repo", "workflow"], true, Some(false))
+            .push_capabilities("o/r")
+            .unwrap();
+        assert_eq!(read_only.contents, WriteCapability::Missing);
+        assert_eq!(read_only.workflows, WriteCapability::Missing);
+
+        let absent = scoped_with_push(&["repo", "workflow"], true, None)
+            .push_capabilities("o/r")
+            .unwrap();
+        assert_eq!(absent.contents, WriteCapability::Unknown);
+        assert_eq!(absent.workflows, WriteCapability::Unknown);
+    }
+
+    #[test]
+    fn a_fine_grained_or_opaque_token_fails_closed_without_scope_evidence() {
+        let absent = saying(
+            &[200],
+            serde_json::json!({ "private": true }),
+            TokenProvider::Static("secret".into()),
+        )
+        .push_capabilities("o/r")
+        .unwrap();
+        let empty = scoped(&[], true).push_capabilities("o/r").unwrap();
+        for opaque in [absent, empty] {
+            assert_eq!(opaque.contents, WriteCapability::Unknown);
+            assert_eq!(opaque.workflows, WriteCapability::Unknown);
+            assert_eq!(opaque.evidence, CapabilityEvidence::OpaqueToken);
+        }
+    }
+
+    #[test]
+    fn no_credential_is_known_not_to_push_without_touching_the_wire() {
+        let wire = Rc::new(ScriptedTransport::new(&[500]));
+        let caps = HttpRest::over(Box::new(wire.clone()), TokenProvider::Anonymous)
+            .push_capabilities("o/r")
+            .unwrap();
+        assert_eq!(caps, PushCapabilities::anonymous());
+        assert!(wire.seen.borrow().is_empty());
     }
 
     #[test]

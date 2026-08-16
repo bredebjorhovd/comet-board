@@ -57,6 +57,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::{Credentials, Paths};
+use crate::sources::github::HttpRest;
 use crate::sources::github_app::TokenProvider;
 
 /// Which repo the askpass helper should mint for. It gets the prompt string and
@@ -65,6 +66,11 @@ use crate::sources::github_app::TokenProvider;
 /// The `gh` shim reads the same variable: one run authenticates for one repo,
 /// whichever tool is asking.
 pub const ASKPASS_REPO_ENV: &str = "COMET_BOARD_ASKPASS_REPO";
+
+/// The nonsecret write contract a dispatched chat's credential must still
+/// satisfy when a late-mint helper runs. A single variable makes a partial
+/// contract impossible; its values are parsed strictly and contain no bearer.
+pub const PUSH_CONTRACT_ENV: &str = "COMET_BOARD_PUSH_CONTRACT";
 
 /// GitHub's fixed username for installation-token HTTPS auth. The token is the
 /// password; this is not a secret and belongs in the URL.
@@ -185,6 +191,56 @@ pub fn agent_env(askpass: &Path, repo: &str, paths: &Paths) -> Vec<(String, Stri
     env
 }
 
+/// [`agent_env`] plus the durable capability promise for a board-dispatched
+/// chat. Both `git-askpass` and the `gh` wrapper inherit this marker and refuse
+/// to emit a credential that no longer satisfies it.
+pub fn agent_env_with_contract(
+    askpass: &Path,
+    repo: &str,
+    paths: &Paths,
+    contract: comet_proto::GithubPushContract,
+) -> Vec<(String, String)> {
+    let mut env = agent_env(askpass, repo, paths);
+    let value = match (contract.contents_write, contract.workflows_write) {
+        (false, false) => "none",
+        (true, false) => "contents",
+        (true, true) => "contents+workflows",
+        (false, true) => "workflows",
+    };
+    env.push((PUSH_CONTRACT_ENV.into(), value.into()));
+    env
+}
+
+/// Read the nonsecret contract marker inherited by a credential helper.
+/// Missing means this is a non-dispatched operation such as an engine-owned
+/// clone; dispatched helpers require `Some` at their CLI boundary.
+pub fn push_contract_from_env() -> Result<Option<comet_proto::GithubPushContract>> {
+    let Some(value) = std::env::var(PUSH_CONTRACT_ENV).ok() else {
+        return Ok(None);
+    };
+    let contract = match value.as_str() {
+        "none" => comet_proto::GithubPushContract {
+            contents_write: false,
+            workflows_write: false,
+        },
+        "contents" => comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: false,
+        },
+        "contents+workflows" => comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        },
+        "workflows" => anyhow::bail!(
+            "{PUSH_CONTRACT_ENV}=workflows is invalid: workflow writes require content writes"
+        ),
+        _ => anyhow::bail!(
+            "{PUSH_CONTRACT_ENV} has an unknown value; expected none, contents, or contents+workflows"
+        ),
+    };
+    Ok(Some(contract))
+}
+
 /// Single-quote for `sh`, the way `'` itself has to be escaped there: end the
 /// quote, emit an escaped quote, start a new one.
 fn sh_quote(s: &str) -> String {
@@ -202,6 +258,17 @@ fn sh_quote(s: &str) -> String {
 /// first. The credential is a GitHub App installation token and there is no
 /// such thing as sending it to the wrong host by accident.
 pub fn askpass(paths: &Paths, prompt: &str, repo: Option<&str>) -> Result<String> {
+    askpass_with_contract(paths, prompt, repo, None)
+}
+
+/// [`askpass`] with the dispatched chat's durable write contract enforced
+/// before its password is returned.
+pub fn askpass_with_contract(
+    paths: &Paths,
+    prompt: &str,
+    repo: Option<&str>,
+    contract: Option<comet_proto::GithubPushContract>,
+) -> Result<String> {
     if let Some(host) = prompt_host(prompt)
         && !is_github_host(host)
     {
@@ -216,7 +283,10 @@ pub fn askpass(paths: &Paths, prompt: &str, repo: Option<&str>) -> Result<String
     let repo = repo
         .filter(|r| !r.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{ASKPASS_REPO_ENV} is not set — nothing to mint for"))?;
-    token(paths, repo)
+    match contract {
+        Some(contract) => token_with_contract(paths, repo, contract),
+        None => token(paths, repo),
+    }
 }
 
 /// A live credential for `repo`, read off this box's board configuration —
@@ -224,6 +294,30 @@ pub fn askpass(paths: &Paths, prompt: &str, repo: Option<&str>) -> Result<String
 pub fn token(paths: &Paths, repo: &str) -> Result<String> {
     let credentials = Credentials::load(paths);
     token_for_push(&crate::sources::github::provider(&credentials)?, repo)
+}
+
+/// A live credential that is returned only when fresh per-repository evidence
+/// still satisfies the chat's persisted contract.
+pub fn token_with_contract(
+    paths: &Paths,
+    repo: &str,
+    contract: comet_proto::GithubPushContract,
+) -> Result<String> {
+    let rest = HttpRest::from_paths(paths)?;
+    token_with_contract_from(&rest, repo, contract)
+}
+
+/// The testable half of [`token_with_contract`]. For an App, the capability
+/// probe and returned token share the same provider/cache, so the permission
+/// object belongs to the exact token handed to git rather than an unrelated
+/// mint.
+pub(crate) fn token_with_contract_from(
+    rest: &HttpRest,
+    repo: &str,
+    contract: comet_proto::GithubPushContract,
+) -> Result<String> {
+    rest.push_capabilities(repo)?.require(contract)?;
+    token_for_push(rest.auth(), repo)
 }
 
 /// The host inside a git credential prompt — `Password for
@@ -364,6 +458,45 @@ pub fn verify_askpass(askpass: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Exercise the secret-bearing half of the exact askpass handoff a dispatched
+/// run will receive, then discard the answer without logging or persisting it.
+/// A fixed username only proves the shim can exec; this proves the configured
+/// board can still mint/read a credential for this repository.
+pub fn verify_push_credential(
+    askpass: &Path,
+    repo: &str,
+    paths: &Paths,
+    contract: comet_proto::GithubPushContract,
+) -> Result<()> {
+    let mut command = std::process::Command::new(askpass);
+    command.arg("Password for 'https://x-access-token@github.com': ");
+    for (key, value) in agent_env_with_contract(askpass, repo, paths, contract) {
+        command.env(key, value);
+    }
+    let out = exec_waiting_out_busy(&mut command).with_context(|| {
+        format!(
+            "running the askpass credential handoff at {}",
+            askpass.display()
+        )
+    })?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "the askpass credential handoff at {} exited {}: {}",
+            askpass.display(),
+            out.status,
+            err.trim().lines().next_back().unwrap_or("no output")
+        );
+    }
+    if out.stdout.iter().all(u8::is_ascii_whitespace) {
+        anyhow::bail!(
+            "the askpass credential handoff at {} returned no credential",
+            askpass.display()
+        );
+    }
+    Ok(())
+}
+
 /// How long [`verify_askpass`] will wait out an `ETXTBSY` before reporting it.
 ///
 /// Generous next to what it waits for (a forked child that has not reached its
@@ -436,12 +569,10 @@ fn exec_said_busy(stderr: &[u8]) -> bool {
 
 /// The `gh` wrapper's text: mint, export, exec the real thing.
 ///
-/// Everything about it is a fallback that leaves the box's own setup alone. An
-/// operator-set `GH_TOKEN`/`GITHUB_TOKEN` wins (they said what to authenticate
-/// as); a mint that fails leaves the variable unset rather than empty, so a
-/// developer machine with `gh auth login` behaves exactly as it did; and a
-/// `GH_HOST` pointing at an Enterprise instance is left alone for the same
-/// reason [`askpass`] refuses a non-github.com prompt.
+/// In a board-dispatched environment the repo marker is present, and the
+/// wrapper must mint the board credential or fail. It explicitly discards
+/// inherited `GH_TOKEN` / `GITHUB_TOKEN`; falling back to the box login would
+/// violate the board-credential-only delivery contract.
 pub fn gh_shim_script(board_exe: &Path, gh: &Path) -> String {
     SHIM.replace("@REPO_ENV@", ASKPASS_REPO_ENV)
         .replace("@BOARD@", &sh_quote(&board_exe.display().to_string()))
@@ -454,14 +585,23 @@ const SHIM: &str = r#"#!/bin/sh
 # `gh` reads GH_TOKEN once, at startup, and an installation token lives an hour;
 # an agent's run does not. So the mint happens here, at the moment gh runs, the
 # way GIT_ASKPASS mints at the moment git pushes.
-if [ -z "$GH_TOKEN" ] && [ -z "$GITHUB_TOKEN" ] && [ -n "$@REPO_ENV@" ] &&
-   { [ -z "$GH_HOST" ] || [ "$GH_HOST" = "github.com" ]; }
+if [ -n "$@REPO_ENV@" ]
 then
-    _comet_token=$(@BOARD@ gh-token 2>/dev/null) || _comet_token=
-    if [ -n "$_comet_token" ]; then
-        GH_TOKEN=$_comet_token
-        export GH_TOKEN
+    if [ -n "$GH_HOST" ] && [ "$GH_HOST" != "github.com" ]; then
+        echo "comet-board: refusing board credential handoff for GH_HOST=$GH_HOST" >&2
+        exit 1
     fi
+    unset GH_TOKEN GITHUB_TOKEN
+    _comet_token=$(@BOARD@ gh-token 2>/dev/null) || {
+        echo "comet-board: could not mint the board credential" >&2
+        exit 1
+    }
+    if [ -z "$_comet_token" ]; then
+        echo "comet-board: board credential mint returned no token" >&2
+        exit 1
+    fi
+    GH_TOKEN=$_comet_token
+    export GH_TOKEN
     unset _comet_token
 fi
 exec @GH@ "$@"
@@ -848,6 +988,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A helper can answer the fixed username while the configured board can
+    /// no longer mint a password. The dispatch preflight must exercise that
+    /// second half, and a blank line is not a credential.
+    #[test]
+    #[cfg(unix)]
+    fn the_push_credential_check_rejects_an_empty_secret_answer() {
+        let dir = scratch("askpass-empty-secret");
+        let board = dir.join("comet-board");
+        std::fs::write(
+            &board,
+            "#!/bin/sh\ncase \"$2\" in Username*) echo x-access-token ;; *) echo ' ' ;; esac\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
+        verify_askpass(&shim).expect("the username half answers");
+        let paths = Paths {
+            config_dir: dir.join("config"),
+            state_dir: dir.join("state"),
+        };
+        let error = verify_push_credential(
+            &shim,
+            "o/r",
+            &paths,
+            comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: true,
+            },
+        )
+        .expect_err("an empty secret answer verified")
+        .to_string();
+        assert!(error.contains("returned no credential"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// gh#301, the write side: an installed shim is exec'able *as installed*,
     /// with no second step to wait for. Everything here holds the moment
     /// `install_askpass_shim` returns, because the next thing every caller does
@@ -1080,7 +1258,7 @@ mod tests {
     /// wrapper rather than exported into the agent's environment, and that
     /// every path in it is quoted for `sh`.
     #[test]
-    fn the_gh_shim_mints_per_invocation_and_defers_to_a_configured_token() {
+    fn the_gh_shim_mints_per_invocation_and_refuses_ambient_credentials() {
         let script = gh_shim_script(
             Path::new("/Applications/My App/comet-board"),
             Path::new("/opt/homebrew/bin/gh"),
@@ -1094,13 +1272,12 @@ mod tests {
             script.contains("exec '/opt/homebrew/bin/gh' \"$@\""),
             "{script}"
         );
-        // A token the operator set wins, and so does an Enterprise host.
-        assert!(script.contains("[ -z \"$GH_TOKEN\" ]"), "{script}");
-        assert!(script.contains("[ -z \"$GITHUB_TOKEN\" ]"), "{script}");
+        assert!(script.contains("unset GH_TOKEN GITHUB_TOKEN"), "{script}");
         assert!(
-            script.contains("[ \"$GH_HOST\" = \"github.com\" ]"),
+            script.contains("could not mint the board credential"),
             "{script}"
         );
+        assert!(script.contains("GH_HOST=$GH_HOST"), "{script}");
         // The repo comes from the run's own environment — one variable for
         // git and gh both.
         assert!(
@@ -1143,7 +1320,7 @@ mod tests {
     /// objects to is a *copy* of one this thread had already dropped.
     #[test]
     #[cfg(unix)]
-    fn the_gh_shim_runs_and_falls_back_when_nothing_can_be_minted() {
+    fn the_gh_shim_fails_instead_of_falling_back_when_nothing_can_be_minted() {
         let dir = std::env::temp_dir().join(format!("comet-shim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -1168,15 +1345,14 @@ mod tests {
             std::process::Command::new(bin.join("gh"))
                 .arg("pr")
                 .env(ASKPASS_REPO_ENV, "o/r")
-                .env_remove("GH_TOKEN")
+                .env("GH_TOKEN", "ambient-box-token")
                 .env_remove("GITHUB_TOKEN"),
         )
         .unwrap();
-        // A mint that fails leaves GH_TOKEN unset rather than empty, so a box
-        // with its own `gh auth login` keeps working.
-        assert_eq!(
-            String::from_utf8_lossy(&out.stdout).trim(),
-            "gh:pr token:none"
+        assert!(!out.status.success());
+        assert!(out.stdout.is_empty(), "ambient gh ran: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("could not mint the board credential")
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

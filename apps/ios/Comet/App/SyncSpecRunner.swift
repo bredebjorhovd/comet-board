@@ -75,6 +75,7 @@ enum SyncSpecRunner {
         aWorkingSessionEarnsAFreshLadder()
         onlyALastingSessionCounts()
         aCommandQueuedAgainstReseedSurvives()
+        githubPushTupleRoundTrips()
 
         log(failures == 0
             ? "OK \(checks) checks, no drift"
@@ -239,6 +240,24 @@ enum SyncSpecRunner {
         expect(commands.count, 1, "the boundary command crosses the owner swap")
         expect(commands.first?.mapValue?["id"]?.stringValue, "boundary",
                "the recovered command is the one queued against the old owner")
+    }
+
+    /// gh#440: a phone-side model/reasoning edit serializes the whole config
+    /// value. The board-owned push tuple must survive that Codable round trip
+    /// even though no iOS picker owns or changes it.
+    private static func githubPushTupleRoundTrips() {
+        let contract = GithubPushContract(contentsWrite: true, workflowsWrite: true)
+        let config = ChatConfig(harness: "codex", model: "gpt-5.6-terra",
+                                reasoning: "high", sandbox: "workspace-write",
+                                pushRepo: "owner/widget", pushContract: contract)
+        do {
+            let encoded = try JSONEncoder().encode(config)
+            let decoded = try JSONDecoder().decode(ChatConfig.self, from: encoded)
+            expect(decoded.pushRepo, config.pushRepo, "iOS preserves pushRepo")
+            expect(decoded.pushContract, config.pushContract, "iOS preserves pushContract")
+        } catch {
+            expectTrue(false, "iOS ChatConfig push tuple round trip: \(error)")
+        }
     }
 }
 

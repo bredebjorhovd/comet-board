@@ -90,6 +90,52 @@ impl Harness for RecordingHarness {
     }
 }
 
+/// A steerable harness that keeps its run alive. The regression below never
+/// lets a follow-up reach this mailbox; holding the receiver open proves the
+/// engine took the live-steer path rather than the new-run fallback.
+struct HoldingHarness;
+
+#[async_trait]
+impl Harness for HoldingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Holding"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        Ok(
+            futures::stream::unfold(controls.steering, |mut steering| async move {
+                let message = steering.recv().await?;
+                Some((
+                    Ok(AgentEvent::Steered {
+                        assistant_message_id: None,
+                        next_assistant_message_id: message.message_id,
+                    }),
+                    steering,
+                ))
+            })
+            .boxed(),
+        )
+    }
+}
+
 fn run_request(cwd: &str) -> RunRequest {
     RunRequest {
         prompt: "push it".into(),
@@ -113,10 +159,32 @@ fn chat_config(push_repo: Option<&str>, git_author: Option<GitAuthor>) -> ChatCo
         sandbox: SandboxLevel::WorkspaceWrite,
         account: None,
         push_repo: push_repo.map(str::to_string),
+        push_contract: push_repo.map(|_| comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        }),
         git_author,
         turn_limits: Default::default(),
         mcp_servers: Vec::new(),
     }
+}
+
+/// Write the config value exactly as an older/remote CRDT client would. This
+/// deliberately bypasses WorkspaceHost's typed mutation seam so regressions in
+/// document-side reconciliation remain observable.
+fn replace_raw_config(core: &EngineCore, chat_id: &str, config: &ChatConfig) {
+    let workspace = core.workspace.doc();
+    let chats = workspace.doc().get_map("chats");
+    let row = match chats.get(chat_id) {
+        Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row,
+        other => panic!("missing chat row {chat_id}: {other:?}"),
+    };
+    row.insert(
+        "config",
+        loro::LoroValue::from(serde_json::to_value(config).unwrap()),
+    )
+    .unwrap();
+    workspace.doc().commit();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -301,6 +369,11 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         env.get("COMET_BOARD_ASKPASS_REPO").map(String::as_str),
         Some("owner/widget")
     );
+    assert_eq!(
+        env.get(comet_board::git_credentials::PUSH_CONTRACT_ENV)
+            .map(String::as_str),
+        Some("contents+workflows")
+    );
     // Terminal prompting off and the box's credential helper disabled: on a
     // headless box a prompt is a hang, and a keychain would cache an hourly
     // token forever.
@@ -321,14 +394,13 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         "the token reached the run's environment: {env:?}"
     );
 
-    // `gh` gets a wrapper on PATH rather than a token in the environment —
-    // when there is a `gh` on this box to wrap. Both are correct; what must
-    // never happen is a GH_TOKEN sitting in the agent's own environment.
-    if let Some(bin_dir) = &push.bin_dir {
-        let script = std::fs::read_to_string(bin_dir.join("gh")).unwrap();
-        assert!(script.contains("gh-token"), "{script}");
-        assert!(!script.contains("ghp_secret"), "{script}");
-    }
+    // `gh` gets a required wrapper on PATH rather than a token in the
+    // environment. A dispatched GitHub run is refused if this wrapper cannot
+    // be installed, so it may never fall through to the box's ambient login.
+    let bin_dir = push.bin_dir.as_ref().expect("the required gh wrapper");
+    let script = std::fs::read_to_string(bin_dir.join("gh")).unwrap();
+    assert!(script.contains("gh-token"), "{script}");
+    assert!(!script.contains("ghp_secret"), "{script}");
     assert!(
         !env.contains_key("GH_TOKEN"),
         "a token was exported into the agent's environment: {env:?}"
@@ -366,6 +438,43 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         "a chat the board never dispatched was handed credentials"
     );
 
+    // Chats created before the durable contract existed are not allowed to
+    // infer one from whatever credential happens to be configured now. That
+    // would silently replace the capability promise the original brief made.
+    let valid = chat_config(Some("owner/widget"), None);
+    core.workspace
+        .create_chat(
+            "chat-missing-contract",
+            "space-1",
+            Some(valid.clone()),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let mut inconsistent = valid;
+    inconsistent.push_contract = None;
+    replace_raw_config(&core, "chat-missing-contract", &inconsistent);
+    let error = core
+        .sessions
+        .dispatch(
+            "chat-missing-contract",
+            HarnessId::Mock,
+            run_request("/tmp"),
+            None,
+        )
+        .await
+        .expect_err("an inconsistent GitHub push tuple reached the harness")
+        .to_string();
+    assert!(
+        error.contains("repository but no capability contract"),
+        "{error}"
+    );
+    assert!(
+        !recorded()
+            .iter()
+            .any(|run| run.chat_id.as_deref() == Some("chat-missing-contract")),
+        "a chat with no durable contract reached the harness"
+    );
+
     // gh#184: every run — the dispatched one, the authored one, and the chat
     // the board never touched — can type `comet-board`. The failure this
     // replaces was silent: an agent that cannot reach the board does not stop,
@@ -378,6 +487,170 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
             "{chat} could not have run comet-board"
         );
     }
+
+    // The grant preflight may have passed earlier, but the handoff is resolved
+    // again for the actual run. If the board credential disappears in between,
+    // a board-dispatched GitHub chat refuses instead of reaching the harness
+    // with ambient box credentials.
+    std::fs::remove_file(paths.config_dir.join(".env")).unwrap();
+    core.workspace
+        .create_chat(
+            "chat-broken-handoff",
+            "space-1",
+            Some(chat_config(Some("owner/widget"), None)),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let error = core
+        .sessions
+        .dispatch(
+            "chat-broken-handoff",
+            HarnessId::Mock,
+            run_request("/tmp"),
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("credential handoff"), "{error}");
+    assert!(
+        !recorded()
+            .iter()
+            .any(|run| run.chat_id.as_deref() == Some("chat-broken-handoff")),
+        "broken handoff reached the harness"
+    );
+
+    core.sessions.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn removing_the_board_credential_refuses_a_live_steer_before_writing_its_prompt() {
+    let tmp = tempfile::Builder::new()
+        .prefix("comet-gh440-live-steer-")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = tmp.path();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let board_exe = dir.join("comet-board");
+    std::fs::write(
+        &board_exe,
+        "#!/bin/sh\n[ \"$1\" = git-askpass ] || exit 2\necho x-access-token\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&board_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let paths = Paths {
+        config_dir: data.join("board"),
+        state_dir: data.join("board/state"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=ghp_secret\n").unwrap();
+
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(HoldingHarness));
+    let core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles");
+    core.sessions
+        .set_push_credentials(Arc::new(PushCredentials::with_board_exe(
+            paths.clone(),
+            Some(board_exe.clone()),
+        )));
+
+    core.workspace
+        .create_space(
+            "space-live",
+            &core.device_id,
+            "/tmp",
+            Some("widget".into()),
+            true,
+        )
+        .unwrap();
+    core.workspace
+        .create_chat(
+            "chat-live",
+            "space-live",
+            Some(chat_config(Some("owner/widget"), None)),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+
+    // Simulate a config editor that predates the push fields, then persist and
+    // restart before the next turn. The board-owned shadow must survive even
+    // if the replaceable config value was the last thing written.
+    let mut uninformed = chat_config(None, None);
+    uninformed.model = Some("changed-before-reload".into());
+    replace_raw_config(&core, "chat-live", &uninformed);
+    core.workspace.flush();
+    core.shutdown().await;
+    drop(core);
+
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(HoldingHarness));
+    let core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core reloads");
+    core.sessions
+        .set_push_credentials(Arc::new(PushCredentials::with_board_exe(
+            paths.clone(),
+            Some(board_exe),
+        )));
+    let push = core
+        .workspace
+        .github_push_state("chat-live")
+        .unwrap()
+        .expect("reloaded chat remains board-dispatched");
+    assert_eq!(push.repo, "owner/widget");
+    assert!(push.contract.workflows_write);
+    assert_eq!(
+        core.workspace
+            .chat_config("chat-live")
+            .unwrap()
+            .github_push_state()
+            .unwrap(),
+        Some(push)
+    );
+    core.sessions
+        .dispatch("chat-live", HarnessId::Mock, run_request("/tmp"), None)
+        .await
+        .expect("initial run dispatches");
+
+    // Repeat the uninformed replacement while the harness is live. Even if a
+    // steer races document reconciliation, credential validation reads the
+    // immutable tuple and cannot classify the chat as ordinary.
+    uninformed.model = Some("changed-during-run".into());
+    replace_raw_config(&core, "chat-live", &uninformed);
+    std::fs::remove_file(paths.config_dir.join(".env")).unwrap();
+    let error = core
+        .sessions
+        .steer(
+            "chat-live",
+            "do the workflow follow-up",
+            Some("steer-2".into()),
+        )
+        .await
+        .expect_err("a live steer survived credential removal")
+        .to_string();
+    assert!(error.contains("credential handoff"), "{error}");
+
+    let entries = core
+        .doc_host
+        .open("chat-live")
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap();
+    assert!(
+        !entries.iter().flat_map(|entry| &entry.parts).any(|part| {
+            matches!(part, comet_doc::MessagePart::Text { text, .. } if text.contains("workflow follow-up"))
+        }),
+        "the refused steer was written into the transcript"
+    );
 
     core.sessions.shutdown().await;
 }

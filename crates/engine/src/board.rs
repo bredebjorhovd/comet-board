@@ -41,6 +41,7 @@ use comet_board::log::Logger;
 use comet_board::model::{AgentStatus, Outcome};
 use comet_board::rows::{TaskDetail, TaskRow, board_rows, task_detail};
 use comet_board::runtime::{Runtime, agent_status};
+use comet_board::sources::github::{HttpRest, PushCapabilities};
 use comet_board::stats::Stats as BoardStats;
 use comet_board::sync::{SessionStatuses, SyncEngine};
 use comet_board::verdict::{VerdictKind, VerdictReceipt};
@@ -180,10 +181,21 @@ impl BoardService {
     /// the seam the tests use.
     pub fn spawn_at(
         paths: Paths,
+        sessions: watch::Receiver<Vec<Session>>,
+        runtime: Arc<dyn Runtime + Send + Sync>,
+        spaces: watch::Receiver<Vec<Space>>,
+        handle: tokio::runtime::Handle,
+    ) -> anyhow::Result<BoardService> {
+        Self::spawn_at_with_capabilities(paths, sessions, runtime, spaces, handle, None)
+    }
+
+    fn spawn_at_with_capabilities(
+        paths: Paths,
         mut sessions: watch::Receiver<Vec<Session>>,
         runtime: Arc<dyn Runtime + Send + Sync>,
         spaces: watch::Receiver<Vec<Space>>,
         handle: tokio::runtime::Handle,
+        push_capabilities: Option<PushCapabilities>,
     ) -> anyhow::Result<BoardService> {
         let log = Arc::new(Logger::new(paths.logfile(), false));
         // Surface an unopenable store here, where the caller can log it as the
@@ -217,7 +229,8 @@ impl BoardService {
             .name("comet-board-sync".into())
             .spawn(
                 move || match SyncEngine::from_paths(&loop_paths, log.clone()) {
-                    Ok(engine) => {
+                    Ok(mut engine) => {
+                        engine.push_capabilities = push_capabilities;
                         let feeds = Feeds {
                             rows: rows_tx,
                             pin: loop_pin,
@@ -883,7 +896,49 @@ fn handle_dispatch(
     let by = origin.attribution();
     // `by` decides one thing in the spec: whose name the commits carry
     // (gh#107). Provenance, never authority — see `DispatchOrigin`.
-    let spec = build_spec(&engine.cfg, route, &task, &space, overrides, by.name())?;
+    let mut spec = build_spec(&engine.cfg, route, &task, &space, overrides, by.name())?;
+    // A reachable repository does not imply that the credential can update a
+    // workflow file. GitHub gates `.github/workflows/**` separately, and the
+    // old path learned that only after the agent had finished and `git push`
+    // rejected the entire ref update (gh#440). Probe before the attempt row,
+    // worktree and chat exist, then put the result in the first prompt.
+    //
+    // The probe never returns the bearer: App permissions come off the mint
+    // response inside the auth module, and classic token scopes come off a
+    // response header. An unreachable/opaque ordinary-write answer refuses the
+    // dispatch here; a known workflow-only gap takes the patch path in brief.
+    if let Some(repo) = spec.push_repo.as_deref() {
+        let capabilities = engine.push_capabilities.unwrap_or_else(|| {
+            // Read the credential again at the point of release. The sync
+            // engine reloads on its interval, while the handoff below reads
+            // `.env` per run; using its cached credential here could approve
+            // one credential and hand the run a different, newly configured
+            // one before the next poll.
+            HttpRest::from_paths(&engine.paths)
+                .and_then(|rest| rest.push_capabilities(repo))
+                .unwrap_or_else(|error| {
+                    engine.log.warn(format!(
+                        "{}: could not establish push capabilities for {repo}: {error:#}",
+                        task.identifier
+                    ));
+                    PushCapabilities::probe_failed()
+                })
+        });
+        if let Some(reason) = comet_board::dispatch::credential_preflight_refusal(capabilities) {
+            anyhow::bail!("credential preflight for {repo}: {reason}");
+        }
+        let contract = capabilities.contract();
+        spec.push_contract = Some(contract);
+        spec.prompt
+            .push_str(&comet_board::dispatch::credential_preflight_brief(
+                capabilities,
+            ));
+        runtime
+            .verify_push_credentials(repo, contract)
+            .map_err(|error| {
+                anyhow::anyhow!("credential handoff preflight for {repo}: {error:#}")
+            })?;
+    }
     // What the attempt actually runs under — the override, else the route's.
     let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
 
@@ -1241,6 +1296,9 @@ mod tests {
         /// When set, `dispatch` fails plainly — a failure after the pre-flight,
         /// which still burns the attempt.
         fail_dispatch: std::sync::atomic::AtomicBool,
+        /// The actual askpass/gh handoff cannot be established. Unlike a
+        /// dispatch failure, this must refuse before the attempt row exists.
+        fail_push_handoff: std::sync::atomic::AtomicBool,
     }
 
     impl Default for FakeRuntime {
@@ -1255,11 +1313,26 @@ mod tests {
                 unavailable: Default::default(),
                 refuse_dispatch: std::sync::atomic::AtomicBool::new(false),
                 fail_dispatch: std::sync::atomic::AtomicBool::new(false),
+                fail_push_handoff: std::sync::atomic::AtomicBool::new(false),
             }
         }
     }
 
     impl Runtime for FakeRuntime {
+        fn verify_push_credentials(
+            &self,
+            _repo: &str,
+            _contract: comet_proto::GithubPushContract,
+        ) -> anyhow::Result<()> {
+            if self
+                .fail_push_handoff
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("askpass helper is unavailable");
+            }
+            Ok(())
+        }
+
         fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
             if self
                 .refuse_dispatch
@@ -1346,12 +1419,17 @@ mod tests {
         let runtime = Arc::new(FakeRuntime::default());
         // A closed spaces channel still serves its last value via `borrow`.
         let (_, spaces_rx) = watch::channel(spaces);
-        let service = BoardService::spawn_at(
+        let service = BoardService::spawn_at_with_capabilities(
             paths.clone(),
             sessions,
             runtime.clone(),
             spaces_rx,
             tokio::runtime::Handle::current(),
+            Some(PushCapabilities {
+                contents: comet_board::sources::github::WriteCapability::Write,
+                workflows: comet_board::sources::github::WriteCapability::Write,
+                evidence: comet_board::sources::github::CapabilityEvidence::AppInstallation,
+            }),
         )
         .unwrap();
         (service, runtime)
@@ -1591,6 +1669,12 @@ runtime = "mock"
         assert_eq!(specs[0].branch, "board/gh-7-add-retry");
         assert_eq!(specs[0].space_id, "space-widget");
         assert_eq!(specs[0].harness, comet_proto::HarnessId::Mock);
+        assert!(
+            specs[0].prompt.contains("Credential preflight")
+                && specs[0].prompt.contains("files are both writable"),
+            "{}",
+            specs[0].prompt
+        );
         drop(specs);
 
         // …and the attempt row carries the chat id + provenance.
@@ -1616,6 +1700,150 @@ runtime = "mock"
         let rows = service.watch_rows().borrow().clone();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].chat_id.as_deref(), Some("chat-for-gh#7"));
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_credential_refuses_before_the_attempt_or_runtime_exists() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#70", "gh#70");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let runtime = Arc::new(FakeRuntime::default());
+        let (_, spaces_rx) = watch::channel(vec![space("widget")]);
+        // The production constructor: no capability override, and this fixture
+        // deliberately has no .env credential.
+        let service = BoardService::spawn_at(
+            paths.clone(),
+            rx,
+            runtime.clone(),
+            spaces_rx,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let error = service
+            .dispatch_task(
+                "gh:owner/widget#70",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("credential preflight"), "{error}");
+        assert!(error.contains("ordinary repository content write is missing"));
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let task = Db::open(&paths.db())
+            .unwrap()
+            .get_task("gh:owner/widget#70")
+            .unwrap()
+            .unwrap();
+        assert!(task.attempts.is_empty(), "preflight must burn no attempt");
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn missing_workflow_permission_dispatches_with_the_patch_fallback() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#71", "gh#71");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let runtime = Arc::new(FakeRuntime::default());
+        let (_, spaces_rx) = watch::channel(vec![space("widget")]);
+        let service = BoardService::spawn_at_with_capabilities(
+            paths.clone(),
+            rx,
+            runtime.clone(),
+            spaces_rx,
+            tokio::runtime::Handle::current(),
+            Some(PushCapabilities {
+                contents: comet_board::sources::github::WriteCapability::Write,
+                workflows: comet_board::sources::github::WriteCapability::Missing,
+                evidence: comet_board::sources::github::CapabilityEvidence::AppInstallation,
+            }),
+        )
+        .unwrap();
+
+        service
+            .dispatch_task(
+                "gh:owner/widget#71",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap();
+        let specs = runtime.dispatched.lock().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert!(
+            specs[0].prompt.contains("docs/workflow-patches/")
+                && specs[0].prompt.contains("workflow itself has not landed"),
+            "{}",
+            specs[0].prompt
+        );
+        assert_eq!(
+            specs[0].push_contract,
+            Some(comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: false,
+            })
+        );
+        drop(specs);
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn broken_credential_handoff_refuses_before_attempt_or_runtime() {
+        let paths = scratch_paths();
+        write_route(&paths, "widget", "owner/widget");
+        seed_task(&paths, "gh:owner/widget#72", "gh#72");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let runtime = Arc::new(FakeRuntime::default());
+        runtime
+            .fail_push_handoff
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (_, spaces_rx) = watch::channel(vec![space("widget")]);
+        let service = BoardService::spawn_at_with_capabilities(
+            paths.clone(),
+            rx,
+            runtime.clone(),
+            spaces_rx,
+            tokio::runtime::Handle::current(),
+            Some(PushCapabilities {
+                contents: comet_board::sources::github::WriteCapability::Write,
+                workflows: comet_board::sources::github::WriteCapability::Write,
+                evidence: comet_board::sources::github::CapabilityEvidence::AppInstallation,
+            }),
+        )
+        .unwrap();
+
+        let error = service
+            .dispatch_task(
+                "gh:owner/widget#72",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("credential handoff preflight"), "{error}");
+        assert!(error.contains("askpass helper is unavailable"), "{error}");
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        let task = Db::open(&paths.db())
+            .unwrap()
+            .get_task("gh:owner/widget#72")
+            .unwrap()
+            .unwrap();
+        assert!(
+            task.attempts.is_empty(),
+            "handoff failure burned an attempt"
+        );
 
         service.shutdown();
     }

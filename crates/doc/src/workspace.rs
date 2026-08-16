@@ -9,7 +9,7 @@
 //! - `spaces`: LoroMap keyed by spaceId → row map {id, deviceId, path, name?,
 //!   gitDetected, gitCheckedAt?, checkoutId?, branch?, createdAt}
 //! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
-//!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
+//!   branch?, checkoutId?, config?(json), boardPush?(json), lastMessagePreview?, lastMessageAt?, createdAt,
 //!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
 //!   updatedAt}
@@ -30,7 +30,7 @@ use chrono::{DateTime, Utc};
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{Chat, ChatConfig, Device, Session, SessionStatus, Space};
+use comet_proto::{Chat, ChatConfig, Device, GithubPushState, Session, SessionStatus, Space};
 
 use crate::schema::DocError;
 
@@ -38,6 +38,11 @@ use crate::schema::DocError;
 /// chat spaceId/lastSeenAt) — a destructive break shipped via a fresh doc/room
 /// (`workspace2` / `ws2/{orgId}`), so no v1 reader exists.
 pub const WORKSPACE_SCHEMA_VERSION: i64 = 2;
+
+/// An atomic shadow outside the replaceable config map. Remote clients edit
+/// `config` as one LWW value; keeping the board-owned tuple beside it means an
+/// old client cannot erase both halves and turn a dispatched chat ordinary.
+const BOARD_PUSH_KEY: &str = "boardPush";
 
 /// Ephemeral presence key for a device (`presence/{deviceId}` → online timestamp).
 pub fn presence_key(device_id: &str) -> String {
@@ -251,7 +256,10 @@ impl WorkspaceDoc {
         set_opt_str(&row, "branch", chat.branch.as_deref())?;
         set_opt_str(&row, "checkoutId", chat.checkout_id.as_deref())?;
         match &chat.config {
-            Some(config) => row.insert("config", LoroValue::from(serde_json::to_value(config)?))?,
+            Some(config) => {
+                let config = reconcile_config_write(&row, config)?;
+                row.insert("config", LoroValue::from(serde_json::to_value(config)?))?
+            }
             None => row.delete("config")?,
         }
         set_opt_str(
@@ -380,9 +388,89 @@ impl WorkspaceDoc {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(false);
         };
+        let config = reconcile_config_write(&row, config)?;
         row.insert("config", LoroValue::from(serde_json::to_value(config)?))?;
         self.doc.commit();
         Ok(true)
+    }
+
+    /// The authoritative board-owned push tuple for one chat. The shadow wins
+    /// only when the replaceable config omitted both fields; a half-state or a
+    /// conflicting full tuple is corruption and is returned as an error so the
+    /// engine refuses the turn.
+    pub fn github_push_state(&self, chat_id: &str) -> Result<Option<GithubPushState>, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(None);
+        };
+        let value = row.get_deep_value().to_json_value();
+        let config = value
+            .get("config")
+            .cloned()
+            .map(serde_json::from_value::<ChatConfig>)
+            .transpose()?;
+        let configured = config
+            .as_ref()
+            .map(ChatConfig::github_push_state)
+            .transpose()
+            .map_err(|error| DocError::Schema(error.to_string()))?
+            .flatten();
+        let shadow = board_push_from_value(&value)?;
+        match (shadow, configured) {
+            (Some(shadow), Some(configured)) if shadow != configured => Err(DocError::Schema(
+                "GitHub push config conflicts with the board-owned push tuple".into(),
+            )),
+            (Some(shadow), _) => Ok(Some(shadow)),
+            (None, configured) => Ok(configured),
+        }
+    }
+
+    /// Backfill the atomic shadow for legacy rows and repair config replacements
+    /// that omitted both push fields. Called on boot and after local or remote
+    /// CRDT changes; malformed half-states are left untouched so per-chat reads
+    /// fail closed instead of guessing.
+    pub fn reconcile_github_push_states(&self) -> Result<usize, DocError> {
+        let chats = self.doc.get_map("chats");
+        let ids: Vec<String> = chats.keys().map(|key| key.to_string()).collect();
+        let mut repaired = 0usize;
+        for chat_id in ids {
+            let Some(row) = self.existing_row("chats", &chat_id) else {
+                continue;
+            };
+            let value = row.get_deep_value().to_json_value();
+            let Some(config_value) = value.get("config").cloned() else {
+                continue;
+            };
+            let Ok(mut config) = serde_json::from_value::<ChatConfig>(config_value) else {
+                continue;
+            };
+            let configured = match config.github_push_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    tracing::warn!(chat = %chat_id, error = %error, "refusing to reconcile inconsistent GitHub push state");
+                    continue;
+                }
+            };
+            let shadow = board_push_from_value(&value)?;
+            match (shadow, configured) {
+                (None, Some(state)) => {
+                    write_board_push(&row, &state)?;
+                    repaired += 1;
+                }
+                (Some(shadow), None) => {
+                    config.apply_github_push_state(&shadow);
+                    row.insert("config", LoroValue::from(serde_json::to_value(config)?))?;
+                    repaired += 1;
+                }
+                (Some(shadow), Some(configured)) if shadow != configured => {
+                    tracing::warn!(chat = %chat_id, "refusing to reconcile conflicting GitHub push tuples");
+                }
+                _ => {}
+            }
+        }
+        if repaired > 0 {
+            self.doc.commit();
+        }
+        Ok(repaired)
     }
 
     /// Host-side resume continuity: the harness-native session id of the chat's
@@ -531,6 +619,52 @@ impl WorkspaceDoc {
     }
 }
 
+fn board_push_from_value(value: &serde_json::Value) -> Result<Option<GithubPushState>, DocError> {
+    let state = value
+        .get(BOARD_PUSH_KEY)
+        .cloned()
+        .map(serde_json::from_value::<GithubPushState>)
+        .transpose()
+        .map_err(DocError::from)?;
+    if let Some(state) = state.as_ref() {
+        state
+            .validate()
+            .map_err(|error| DocError::Schema(error.to_string()))?;
+    }
+    Ok(state)
+}
+
+fn write_board_push(row: &LoroMap, state: &GithubPushState) -> Result<(), DocError> {
+    row.insert(
+        BOARD_PUSH_KEY,
+        LoroValue::from(serde_json::to_value(state)?),
+    )?;
+    Ok(())
+}
+
+/// Merge an informed config write with the immutable board-owned shadow. The
+/// caller may change model/reasoning/etc.; it may neither erase nor retarget
+/// the credential tuple once the board has stamped one.
+fn reconcile_config_write(row: &LoroMap, config: &ChatConfig) -> Result<ChatConfig, DocError> {
+    let mut config = config.clone();
+    let configured = config
+        .github_push_state()
+        .map_err(|error| DocError::Schema(error.to_string()))?;
+    let value = row.get_deep_value().to_json_value();
+    let shadow = board_push_from_value(&value)?;
+    match (shadow, configured) {
+        (Some(shadow), Some(configured)) if shadow != configured => {
+            return Err(DocError::Schema(
+                "a config edit cannot change the board-owned GitHub push tuple".into(),
+            ));
+        }
+        (Some(shadow), None) => config.apply_github_push_state(&shadow),
+        (None, Some(configured)) => write_board_push(row, &configured)?,
+        _ => {}
+    }
+    Ok(config)
+}
+
 fn set_opt_str(row: &LoroMap, key: &str, value: Option<&str>) -> Result<(), DocError> {
     match value {
         Some(v) => row.insert(key, v)?,
@@ -643,6 +777,8 @@ struct RawChat {
     #[serde(default)]
     config: Option<ChatConfig>,
     #[serde(default)]
+    board_push: Option<GithubPushState>,
+    #[serde(default)]
     last_message_preview: Option<String>,
     #[serde(default)]
     last_message_at: Option<i64>,
@@ -660,6 +796,12 @@ struct RawChat {
 
 impl From<RawChat> for Chat {
     fn from(raw: RawChat) -> Self {
+        let mut config = raw.config;
+        if let (Some(config), Some(shadow)) = (&mut config, raw.board_push.as_ref())
+            && matches!(config.github_push_state(), Ok(None))
+        {
+            config.apply_github_push_state(shadow);
+        }
         Chat {
             id: raw.id,
             device_id: raw.device_id,
@@ -668,7 +810,7 @@ impl From<RawChat> for Chat {
             cwd: raw.cwd,
             branch: raw.branch,
             checkout_id: raw.checkout_id,
-            config: raw.config,
+            config,
             last_message_preview: raw.last_message_preview,
             last_message_at: raw.last_message_at.map(dt),
             created_at: dt(raw.created_at),
@@ -741,6 +883,7 @@ mod tests {
                 sandbox: SandboxLevel::WorkspaceWrite,
                 account: None,
                 push_repo: None,
+                push_contract: None,
                 git_author: None,
                 turn_limits: Default::default(),
                 mcp_servers: Vec::new(),
@@ -809,6 +952,10 @@ mod tests {
             // a full-config replace, so it has to survive the round trip or a
             // dispatched agent silently loses its push credentials (gh#68).
             push_repo: Some("Florin-AS/tripletex-mcp".into()),
+            push_contract: Some(comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: true,
+            }),
             git_author: None,
             // Same argument for the turn guardrails (gh#270): a model change
             // that dropped them would leave the run loop watching nothing.
@@ -828,6 +975,114 @@ mod tests {
         // No such row: false, nothing created.
         assert!(!ws.set_chat_config("nope", &config).unwrap());
         assert!(ws.chat("nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn remote_config_replacement_cannot_erase_the_board_push_tuple() {
+        let a = WorkspaceDoc::new();
+        let b = WorkspaceDoc::new();
+        let mut dispatched = chat("chat-1", "dev-a");
+        let original = GithubPushState {
+            repo: "owner/widget".into(),
+            contract: comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: true,
+            },
+        };
+        dispatched
+            .config
+            .as_mut()
+            .unwrap()
+            .apply_github_push_state(&original);
+        a.upsert_chat(&dispatched).unwrap();
+        cross_sync(&a, &b);
+
+        // Model/reasoning edits are whole-value CRDT replacements. Simulate an
+        // older remote client that knows neither push field.
+        let chats = b.doc().get_map("chats");
+        let row = match chats.get("chat-1") {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row,
+            other => panic!("missing chat row: {other:?}"),
+        };
+        let mut replacement = dispatched.config.unwrap();
+        replacement.model = Some("new-model".into());
+        replacement.push_repo = None;
+        replacement.push_contract = None;
+        row.insert(
+            "config",
+            LoroValue::from(serde_json::to_value(replacement).unwrap()),
+        )
+        .unwrap();
+        b.doc().commit();
+        cross_sync(&a, &b);
+
+        assert_eq!(
+            a.github_push_state("chat-1").unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(a.reconcile_github_push_states().unwrap(), 1);
+        let repaired = a.chat("chat-1").unwrap().unwrap().config.unwrap();
+        assert_eq!(
+            repaired.github_push_state().unwrap(),
+            Some(original.clone())
+        );
+
+        // The repair itself converges, so the uninformed device cannot keep
+        // propagating an ordinary-looking chat.
+        cross_sync(&a, &b);
+        assert_eq!(b.github_push_state("chat-1").unwrap(), Some(original));
+    }
+
+    #[test]
+    fn inconsistent_push_half_state_fails_closed_without_shadow_guessing() {
+        let ws = WorkspaceDoc::new();
+        let mut dispatched = chat("chat-1", "dev-a");
+        let config = dispatched.config.as_mut().unwrap();
+        config.push_repo = Some("owner/widget".into());
+        config.push_contract = Some(comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        });
+        ws.upsert_chat(&dispatched).unwrap();
+
+        let chats = ws.doc().get_map("chats");
+        let row = match chats.get("chat-1") {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row,
+            other => panic!("missing chat row: {other:?}"),
+        };
+        let mut inconsistent = dispatched.config.unwrap();
+        inconsistent.push_contract = None;
+        row.insert(
+            "config",
+            LoroValue::from(serde_json::to_value(&inconsistent).unwrap()),
+        )
+        .unwrap();
+        ws.doc().commit();
+
+        let error = ws.github_push_state("chat-1").unwrap_err().to_string();
+        assert!(
+            error.contains("repository but no capability contract"),
+            "{error}"
+        );
+        assert_eq!(ws.reconcile_github_push_states().unwrap(), 0);
+
+        inconsistent.push_repo = None;
+        inconsistent.push_contract = Some(comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        });
+        row.insert(
+            "config",
+            LoroValue::from(serde_json::to_value(inconsistent).unwrap()),
+        )
+        .unwrap();
+        ws.doc().commit();
+        let error = ws.github_push_state("chat-1").unwrap_err().to_string();
+        assert!(
+            error.contains("capability contract but no repository"),
+            "{error}"
+        );
+        assert_eq!(ws.reconcile_github_push_states().unwrap(), 0);
     }
 
     #[test]

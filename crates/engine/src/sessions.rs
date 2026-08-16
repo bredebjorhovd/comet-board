@@ -188,9 +188,9 @@ impl SessionsEngine {
     }
 
     /// Wire the board's push credentials (called at engine assembly, only when
-    /// the board is on). Without it — and for every chat the board did not
-    /// dispatch — an agent pushes with the device's own git credentials, which
-    /// is the behavior that predates gh#68.
+    /// the board is on). Without it a board-dispatched GitHub chat is refused;
+    /// chats the board did not dispatch still use the device's own git
+    /// credentials, which is the behavior that predates gh#68.
     pub fn set_push_credentials(&self, push: Arc<crate::push_credentials::PushCredentials>) {
         let _ = self.inner.push.set(push);
     }
@@ -311,6 +311,10 @@ impl SessionsEngine {
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
+        // Every turn boundary revalidates the current board credential against
+        // the nonsecret promise persisted at dispatch. This comes before the
+        // live-steer fast path and before any user message is written.
+        self.inner.verify_push_for_turn(chat_id)?;
         let routed = lock(&self.inner.runs)
             .get(chat_id)
             .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
@@ -346,6 +350,10 @@ impl SessionsEngine {
         // message is written, alongside harness resolution, so a refusal leaves
         // no prompt sitting in the transcript with nothing answering it.
         let (account, account_lease) = self.inner.account_for(chat_id, harness_id)?;
+        // A board-dispatched GitHub chat must never fall back to ambient box
+        // credentials if its late-minting handoff disappeared after dispatch.
+        // Resolve and verify it before writing the user message or spawning.
+        let push = self.inner.push_for(chat_id)?;
 
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
@@ -391,7 +399,7 @@ impl SessionsEngine {
             interrupt: interrupt_token.clone(),
             chat_id: Some(chat_id.to_string()),
             account,
-            push: self.inner.push_for(chat_id),
+            push,
             bin_dirs: self.inner.agent_bin_dirs.clone(),
             mcp_servers: self
                 .inner
@@ -461,6 +469,10 @@ impl SessionsEngine {
         let Some(steer_tx) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        // A live steer used to return before any credential check. Revalidate
+        // while the prompt still exists only in the command entry, before it
+        // reaches the harness mailbox or transcript.
+        self.inner.verify_push_for_turn(chat_id)?;
         let message = SteerMessage {
             prompt: prompt.to_string(),
             message_id: message_id.clone(),
@@ -840,23 +852,43 @@ impl Inner {
     /// neither and gets nothing, which leaves the agent on the box's own git
     /// credentials and identity.
     ///
-    /// The two halves are independent on purpose. A board with an author for
-    /// the dispatcher but no App credential still authors correctly (it just
-    /// pushes as the box user), and a board with the credential but no `[users]`
-    /// entry pushes as the App and commits as the box — which is what every
-    /// board did before this.
+    /// The two halves are independent on purpose. A non-GitHub dispatch can
+    /// still carry the dispatcher's author without any push credential, while
+    /// a GitHub dispatch with the credential but no `[users]` entry pushes as
+    /// the board and commits as the box. A GitHub dispatch with no board
+    /// credential is refused below.
     ///
-    /// Never fatal, unlike a named account that will not resolve: a missing
-    /// credential means the push falls back to what it used before, and
-    /// refusing the run would take away the agent that could still do the work.
-    fn push_for(&self, chat_id: &str) -> Option<comet_harness::PushCredentials> {
-        let config = self.workspace().and_then(|ws| ws.chat_config(chat_id))?;
-        let mut creds = config
-            .push_repo
-            .as_deref()
-            .and_then(|repo| self.push.get()?.for_repo(repo, Some(chat_id)));
-        let Some(author) = config.git_author.as_ref() else {
-            return creds;
+    /// A chat with the board-owned push tuple is fail-closed: an inconsistent
+    /// tuple or broken handoff refuses the run instead of inheriting ambient
+    /// auth.
+    fn push_for(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<comet_harness::PushCredentials>, EngineError> {
+        let Some(workspace) = self.workspace() else {
+            return Ok(None);
+        };
+        let config = workspace.chat_config(chat_id);
+        let mut creds = match workspace.github_push_state(chat_id)? {
+            Some(push) => Some(
+                self.push
+                    .get()
+                    .ok_or_else(|| {
+                        EngineError::Other(
+                            "board-dispatched GitHub chat has no credential handoff resolver"
+                                .into(),
+                        )
+                    })?
+                    .for_repo(&push.repo, push.contract, Some(chat_id))
+                    .map_err(|error| EngineError::Other(format!("{error:#}")))?,
+            ),
+            None => None,
+        };
+        let Some(author) = config
+            .as_ref()
+            .and_then(|config| config.git_author.as_ref())
+        else {
+            return Ok(creds);
         };
         let env = comet_board::git_identity::author_env(author);
         match &mut creds {
@@ -865,7 +897,29 @@ impl Inner {
                 creds = Some(comet_harness::PushCredentials { env, bin_dir: None });
             }
         }
-        creds
+        Ok(creds)
+    }
+
+    /// Recheck a board-dispatched chat's current credential without recording
+    /// a handoff. New runs call `push_for` again when they build their child
+    /// environment; live steers need this standalone check because they reuse
+    /// the already-running child.
+    fn verify_push_for_turn(&self, chat_id: &str) -> Result<(), EngineError> {
+        let Some(workspace) = self.workspace() else {
+            return Ok(());
+        };
+        let Some(push) = workspace.github_push_state(chat_id)? else {
+            return Ok(());
+        };
+        self.push
+            .get()
+            .ok_or_else(|| {
+                EngineError::Other(
+                    "board-dispatched GitHub chat has no credential handoff resolver".into(),
+                )
+            })?
+            .verify_for_repo(&push.repo, push.contract)
+            .map_err(|error| EngineError::Other(format!("{error:#}")))
     }
 
     /// The turn-level guardrails this chat's runs are held to (gh#270).

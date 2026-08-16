@@ -262,7 +262,8 @@ base = "origin/HEAD"
 #
 # With repos listed, the credential goes in `.env`, and there are two:
 #
-#   GITHUB_TOKEN=ghp_…                       a personal access token
+#   GITHUB_TOKEN=ghp_…                       a classic personal access token
+#                                              (`repo` + `workflow` scopes)
 #
 #   GITHUB_APP_ID=123456                     a GitHub App
 #   GITHUB_APP_PRIVATE_KEY_PATH=/…/app.pem   (chmod 600)
@@ -276,8 +277,14 @@ base = "origin/HEAD"
 # own repos. An App is installed by whoever owns the repos, on the repos they
 # pick, with no credential ever handed over; rate limits are per installation,
 # offboarding is an uninstall, and its comments land as `[bot]` rather than as a
-# person. The App wins when both are set. `comet-board doctor` reports which one
-# is live, which repos it reaches, and when its token expires.
+# person. Register the App with Repository permissions `Contents: Read and
+# write`, `Workflows: Read and write`, `Issues: Read and write`, `Pull requests:
+# Read and write`, and `Metadata: Read`. Existing installations must approve a
+# later permission increase before their tokens receive it. The App wins when
+# both credential forms are set. `comet-board doctor` reports which one is live,
+# which repos it reaches, whether ordinary and workflow-file pushes are
+# deliverable, and when an App token expires. Fine-grained/opaque tokens do not
+# expose equivalent scope evidence and therefore fail the push preflight closed.
 [github]
 repos = []
 # The fallback filter, not the law — an empty list means every open issue.
