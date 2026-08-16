@@ -283,6 +283,7 @@ Delivered
   next_standing_review_sequence     strictly increasing, PR-local
   legacy_review_blocker             null | LegacyReviewBlocker
   standing_reviews[]
+  submission_tombstones[]
 
 Submission v2 additions
   identity_version          2 (absent means legacy)
@@ -291,6 +292,7 @@ Submission v2 additions
   head_sha
   kind
   normalized_body_sha256
+  delivery_state            pending | completed | not_required
   standing_review_sequence  null for Comment
 
 StandingReview
@@ -311,6 +313,18 @@ LegacyReviewBlocker
   changes_requested_id      the pre-upgrade Delivered value
   submission_fingerprint    matching legacy fingerprint when one is identifiable
   projection                posted | posted_as_comment | unposted | unknown
+
+SubmissionTombstone
+  fingerprint               exact v2 identity
+  attempt
+  reviewer_key
+  head_sha
+  kind
+  review_id
+  delivery_state            completed | not_required
+  projection
+  posted_as
+  compacted_at
 ```
 
 The legacy token is SHA-256 over a canonical length-prefixed encoding of the
@@ -337,6 +351,25 @@ acting on the same head create distinct submissions. The board-owned body
 marker carries this v2 identity so a GitHub review id recovered after a crash
 can alias only the submission that produced it.
 
+`MAX_SUBMISSIONS = 20` remains the bound on full, retryable ledger entries, but
+v2 identities are not evicted with them. Before inserting entry 21, the board
+moves the oldest fully settled entry — delivery completed or was not required,
+and its projection is on GitHub — into an exact `SubmissionTombstone`. The
+tombstone retains only the fields needed to reconstruct an idempotency receipt
+with delivery/projection status and suppress both side effects; it retains no
+comment body or payload. A retry found in either tier returns `recorded = false`
+and never delivers or posts again. This applies uniformly to Comments, which
+have no `StandingReview`, and to decisive verdicts.
+
+`MAX_SUBMISSION_TOMBSTONES = 256` bounds that second tier per pull request.
+Unsettled live entries are never compacted because a retry may still have
+delivery or projection work to finish. If the 20 live slots contain no settled
+entry, or the exact tombstone tier is full, a new distinct submission refuses
+before recording, delivery, or posting instead of evicting an idempotency key.
+Retries of either tier remain available. Pull-request terminal cleanup removes
+both tiers with the existing `Delivered` retention; this adds no independent
+sweep or clock.
+
 A GitHub review read adds `commit_id`, `user.id`, and `user.login`. Its complete
 result replaces only records with `owner = github`; Comet-owned decisions are a
 separate durable partition and are never deleted merely because GitHub returned
@@ -361,19 +394,26 @@ reviewer, head, and ordering.
 
 A Comet verdict request carries the `expectedHeadSha` the reviewer actually
 saw. Before recording, delivering, or posting anything, the board performs a
-targeted pull refresh and compare-and-refuses unless that value equals the
-current head. The refusal persists the refreshed projection and leaves no
-submission, standing review, chat message, or GitHub review behind. Only then
-does the verdict submission record that same expected SHA and the transport's
-verified reviewer identity; Approve and Request changes also create the
-Comet-owned standing decision described below, while Comment does not. The
-`[users]` mapping resolves that identity to GitHub's numeric user id where
-possible; a normalized login is the legacy fallback, and the authenticated
-Comet subject is the stable fallback regardless of which GitHub credential
-posts the copy. If the transport cannot supply a verified subject, submission
-refuses before recording. Identity resolution happens before the v2 fingerprint
-is computed; a caller-provided display name and the posting credential never
-participate.
+targeted pull refresh. It compare-and-refuses unless that value equals the
+current head. It also compares the returned `updated_at` with
+`standing_reviews_updated_at`: when the timestamp moved, the schema is old, or
+`standing_reviews_complete` is false, the preflight completes the bounded review
+reconciliation above *before* allocating a local sequence. A failed or truncated
+reconciliation persists `acceptance = unknown` and refuses with no submission,
+standing review, chat message, or GitHub review. Thus a GitHub review that
+already moved `updated_at` is ingested and sequenced before the later Comet
+verdict even when the Comet request reaches the board first.
+
+Only after that ordered preflight does the verdict submission record the same
+expected SHA and the transport's verified reviewer identity; Approve and
+Request changes also allocate the next sequence and create the Comet-owned
+standing decision, while Comment does not. The `[users]` mapping resolves that
+identity to GitHub's numeric user id where possible; a normalized login is the
+legacy fallback, and the authenticated Comet subject is the stable fallback
+regardless of which GitHub credential posts the copy. If the transport cannot
+supply a verified subject, submission refuses before recording. Identity
+resolution happens before the v2 fingerprint is computed; a caller-provided
+display name and the posting credential never participate.
 
 Every outbound create-review request attributes the review to the head the
 reviewer saw:
@@ -386,29 +426,48 @@ reviewer saw:
 serializes it as `commit_id`. That includes the reviewer's credential, the board
 credential, and the self-review `COMMENT` fallback; no credential retry may
 omit or replace it. `commit_id` is attribution, not compare-and-set: GitHub may
-accept a review of A after B has become the pull request's latest head. On every
-successful response the board first aliases a returned review id to the local
-A-scoped submission (or leaves the v2 marker to recover an omitted id), then
-performs a targeted pull refresh and rederives the projection. If the refresh
-finds B, an approval of A does not count for B and B stays `needs_review`; a
-change request remains standing under the cross-push rule, and a Comment
-contributes no decision. The receipt exposes
-`reviewedHeadSha`, `currentHeadSha`, and `headMoved` so no surface describes the
-successful old-head post as approval of B, and the board never automatically
-reposts it on B.
+accept a review of A after B has become the pull request's latest head. A
+successful response aliases a returned review id to the local A-scoped
+submission (or leaves the v2 marker to recover an omitted id). A refusal still
+leaves the already durable local decision and any author delivery bound to A;
+for a plain Comment only the submission and delivery exist. Other credential
+failures may continue through the existing fallback order, but every attempt
+uses the same `commit_id`.
 
-A GitHub refusal still leaves the already durable local decision and any author
-delivery bound to the expected SHA; for a plain Comment only the submission and
-delivery exist. Other credential failures may continue through the existing
-fallback order, but every attempt uses the same `commit_id`.
+After that projection path reaches *any* final outcome — posted, posted as
+Comment, refused, transport failure, or exhausted credential fallback — the
+board performs a targeted pull refresh and rederives the repository projection.
+This is unconditional, not a success-only cleanup. If the refresh finds B, an
+approval of A does not count for B and B stays `needs_review`; a change request
+remains standing under the cross-push rule, and a Comment contributes no
+decision. The board never automatically reposts on B. The final pull refresh
+applies the same completeness rule as preflight: if its `updated_at` is not
+covered by `standing_reviews_updated_at`, it runs the complete bounded review
+reconciliation before calling repository state fresh.
+
+If the pull refresh fails, the last projection remains visible but gains
+`stale_reason`, `acceptance = unknown`, and no Repair, Ready, or Merge action
+until a later successful read. If the pull refresh succeeds but review
+reconciliation fails or truncates, the refreshed head is persisted while review
+state and `acceptance` remain unknown and mutation-ineligible.
+
+The receipt exposes `reviewedHeadSha = A`, nullable `currentHeadSha`, nullable
+`headMoved`, and `repositoryFresh`. A successful refresh fills both current
+fields; a failed refresh returns `currentHeadSha = null`, `headMoved = null`,
+and `repositoryFresh = false`, so no surface guesses whether A is still current.
+A known head with incomplete review reconciliation returns that SHA and movement
+answer but still sets `repositoryFresh = false`.
 
 The existing board-owned body marker is extended to carry the durable submission
 fingerprint on every create-review request. When GitHub returns a review id —
 for a decisive review or a `COMMENT` fallback — the board writes it onto the
 Comet-owned record as an alias; if the process dies between the POST and that
 write, reconciliation recovers the same alias from the marker. A later read of
-that id updates the same logical decision. A `COMMENTED` overlay may update its
-transport metadata but never replaces the Comet decision's kind. A verdict
+that id updates the same logical decision. Alias recovery indexes both live
+submissions and compacted tombstones by v2 fingerprint, updating a tombstone's
+transport fields without making it live or repeating a side effect. A
+`COMMENTED` overlay may update its transport metadata but never replaces the
+Comet decision's kind. A verdict
 projected only as a GitHub comment or left unposted remains a Comet-owned
 decision, consistent with the existing rule that the board's verdict stands
 even when GitHub refuses its copy. Ordinary comments do not create decisions in
@@ -811,7 +870,8 @@ The existing verdict and merge surfaces become:
   replacesLegacyDecision }` — the head is required for Comment, Approve, and
   Request changes alike; the optional legacy token is accepted only for a
   decisive verdict against the still-current blocker. Its receipt adds
-  `reviewedHeadSha`, `currentHeadSha`, and `headMoved`;
+  `reviewedHeadSha`, nullable `currentHeadSha`, nullable `headMoved`, and
+  `repositoryFresh`;
 - `MergeTask { taskId, confirmation, expectedHeadSha,
   expectedTopologyFingerprint }` — both optimistic-lock values are required
   when invoked from Review; its receipt exposes `atomicity`,
@@ -855,9 +915,16 @@ Authority stays separated by construction:
 - A verdict expected-head mismatch is side-effect free: no standing decision,
   author delivery, or GitHub post.
 - A push after verdict preflight may still leave a successful GitHub review of
-  the old `commit_id`. It aliases only to the old-head local submission; the
-  mandatory post-response refresh keeps the new head unapproved and surfaces
-  both SHAs in the receipt.
+  the old `commit_id`, or GitHub may refuse that post. Either outcome remains
+  bound to the old-head local submission; the mandatory final refresh keeps the
+  new head unapproved and surfaces both SHAs in the receipt.
+- A failed final verdict refresh marks repository state stale and acceptance
+  unknown; it never returns cached A as a known-current head or leaves a
+  mutation action enabled.
+- A changed `updated_at` or incomplete review marker that cannot be completely
+  reconciled prevents local sequence allocation and every verdict side effect.
+- A full live-plus-tombstone submission ledger refuses a new identity; it never
+  buys space by making an older delivery or GitHub post repeatable.
 - An absent or changed legacy-replacement token leaves the unresolved blocker
   and all verdict state untouched.
 - A merge topology mismatch or refreshed lower-layer blocker observed during
@@ -902,9 +969,14 @@ The implementation is complete when these seams are pinned:
    the narrower compare-to-POST race, the initial compare passes on A and B
    arrives before GitHub receives the request: reviewer credential, board
    credential, and `COMMENT` fallback bodies all retain `commit_id = A`; the
-   fixture accepts each old-head review, aliases its id only to the A-scoped
-   submission, refreshes B, and never derives B as accepted or reposts on B.
-   Receipts name both heads and `headMoved = true`.
+   accepted-old-head fixtures alias each id only to the A-scoped submission,
+   refresh B, and never derive B as accepted or repost on B. Refused-old-head
+   fixtures across the same paths also run the final refresh and expose B. A
+   pull-refresh failure after either result returns null current/head-moved
+   fields, `repositoryFresh = false`, stale/unknown projection state, and no
+   mutation action. A successful B refresh followed by truncated review
+   reconciliation retains B in the receipt but likewise reports repository
+   state not fresh and acceptance unknown.
 6. Review fixtures keep decisions per reviewer: A's approval cannot clear B's
    change request; B's later approval clears only B's request; dismissing B's
    exact latest review clears B without changing A; dismissing an older B
@@ -913,7 +985,12 @@ The implementation is complete when these seams are pinned:
    still requests changes. Equal-timestamp approval/change-request pairs use
    the greater numeric sequence in both arrival orders; reversing the kinds at
    those sequence values reverses the standing decision, regardless of key
-   sort order.
+   sort order. An approval is created on GitHub first and moves `updated_at`,
+   then a newer Comet Request changes reaches the board before GitHub ingestion:
+   verdict preflight reconciles and assigns the approval sequence N before
+   allocating N+1 to the local request, which remains the blocker. A failed or
+   truncated version of that preflight allocates no sequence and performs no
+   delivery or post.
 7. A pagination fixture with more than the review cap yields
    `review_state_truncated`, `acceptance = unknown`, and no Merge. Migration
    fixtures deserialize the exact pre-upgrade `Delivered` JSON rather than
@@ -935,7 +1012,11 @@ The implementation is complete when these seams are pinned:
    and dismissal updates that exact aliased decision. A `COMMENT` fallback
    aliases its review id for transport bookkeeping but remains the one
    Comet-owned decision; a crash after POST recovers the alias from its v2
-   submission marker.
+   submission marker. A settled Comment is compacted by 20 later live
+   submissions, survives a serialize/reload as an exact tombstone, and a retry
+   performs neither chat delivery nor GitHub POST. The same assertion covers a
+   decisive verdict; a full live-plus-tombstone ledger refuses a new identity
+   instead of evicting the oldest one.
 9. Every action-precedence row is table-tested, including no-check
    repositories, drafts, optional failures, stale data, and a REST transition
    from an actionable open projection to closed-unmerged. That transition
