@@ -9,8 +9,9 @@
 // qualify it in one line, and where the work went. Everything below that panel
 // is evidence for it, and the reader is free to stop after the first screen.
 //
-// The numbers come from `BoardStats` on whichever device owns `board.db` — a
-// call, not a stream, read when the screen opens and on every window change.
+// The numbers come from one on-demand `AggregateBoardStats` call. Its merged
+// `BoardStats` and each contributing board share one wire contract with the
+// desktop and CLI; missing hosts remain explicit instead of becoming zeroes.
 // Every derivation the rendering needs is in StatsModels.swift, the port of
 // `comet_proto::view::stats`, so this screen and the desktop page and the CLI
 // agree on the arithmetic.
@@ -27,9 +28,13 @@ struct StatsView: View {
     /// The window in days; nil is all time. Mirrors the CLI's `--since-days`
     /// and the desktop's picker, so all three surfaces ask one question.
     @State private var sinceDays: Int64? = 7
-    @State private var stats: BoardStats?
-    /// The device that answered — the board is on exactly one of them.
-    @State private var host: String?
+    @State private var aggregate: AggregateBoardStats?
+    /// Nil is the explicit union; a value selects one canonical board id.
+    @State private var boardId: String?
+    /// Keeps nil's two meanings apart: before the first reply, and the user
+    /// explicitly choosing All boards. Until somebody picks, a later board
+    /// sweep answer may still move the automatic choice to gh#434's host.
+    @State private var scopeWasPicked = false
     @State private var error: String?
     @State private var loaded = false
 
@@ -38,11 +43,17 @@ struct StatsView: View {
 
     var body: some View {
         List {
+            if let aggregate, aggregate.boards.count > 1 || aggregate.hosts.count > 1 {
+                boardPicker(aggregate)
+            }
             windowPicker
+            if boardId == nil, let note = aggregate?.completenessNote {
+                warningStrip(note)
+            }
             if let error {
                 errorStrip(error)
             }
-            if let stats {
+            if let stats = selectedStats {
                 if stats.isEmpty {
                     note("No dispatches in the \(stats.windowLabel). "
                          + "Release a task and this fills in.")
@@ -73,8 +84,8 @@ struct StatsView: View {
                     Text("Board stats")
                         .font(Theme.sans(Theme.textBody, weight: .medium))
                         .foregroundStyle(Theme.text)
-                    if let host {
-                        Text("on \(model.deviceName(host))")
+                    if aggregate != nil {
+                        Text(scopeLabel)
                             .font(Theme.sans(Theme.textCaption))
                             .foregroundStyle(Theme.textSubtle)
                     }
@@ -105,13 +116,68 @@ struct StatsView: View {
     private func load() async {
         error = nil
         switch await model.boardStats(sinceDays: sinceDays) {
-        case .read(let read, let answeredBy):
-            stats = read
-            host = answeredBy
+        case .read(let read):
+            aggregate = read
+            let selectedStillExists = boardId.map { selected in
+                read.boards.contains { $0.boardId == selected }
+            } ?? true
+            if !scopeWasPicked {
+                let sweptHost = model.boardHostDeviceId
+                boardId = read.boards.first { $0.host.deviceId == sweptHost }?.boardId
+                    ?? read.boards.first { $0.stats.dispatched }?.boardId
+                    ?? read.boards.first?.boardId
+            } else if !selectedStillExists {
+                boardId = nil
+            }
+            if read.boards.isEmpty {
+                error = read.completenessNote
+                    ?? "No device in this org is hosting a board"
+            }
         case .failed(let message):
             error = message
         }
         loaded = true
+    }
+
+    private var selectedStats: BoardStats? {
+        guard let aggregate else { return nil }
+        guard let boardId else { return aggregate.stats }
+        return aggregate.boards.first { $0.boardId == boardId }?.stats
+    }
+
+    private var scopeLabel: String {
+        guard let boardId,
+              let board = aggregate?.boards.first(where: { $0.boardId == boardId })
+        else { return "All boards" }
+        return "on \(board.host.label)"
+    }
+
+    private var boardSelection: Binding<String?> {
+        Binding(
+            get: { boardId },
+            set: { selected in
+                boardId = selected
+                scopeWasPicked = true
+            })
+    }
+
+    private func boardPicker(_ aggregate: AggregateBoardStats) -> some View {
+        HStack {
+            Text("Board")
+                .font(Theme.sans(Theme.textBody))
+                .foregroundStyle(Theme.text)
+            Spacer()
+            Picker("Board", selection: boardSelection) {
+                Text("All boards").tag(nil as String?)
+                ForEach(aggregate.boards) { board in
+                    Text(board.host.label).tag(Optional(board.boardId))
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .tint(Theme.textMuted)
+        }
+        .listRowBackground(Theme.surface)
     }
 
     // MARK: The window
@@ -605,6 +671,21 @@ struct StatsView: View {
             .padding(.vertical, 8)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(Theme.danger.opacity(0.10),
+                        in: RoundedRectangle(cornerRadius: Theme.radiusRow))
+            .listRowBackground(Color.clear)
+            .listRowSeparator(.hidden)
+            .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 4, trailing: 12))
+    }
+
+    private func warningStrip(_ message: String) -> some View {
+        Text(message)
+            .font(Theme.sans(Theme.textDense))
+            .foregroundStyle(Theme.warningText)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Theme.warning.opacity(0.10),
                         in: RoundedRectangle(cornerRadius: Theme.radiusRow))
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)

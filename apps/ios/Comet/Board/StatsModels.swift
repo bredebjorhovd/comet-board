@@ -1,10 +1,11 @@
 // What the board knows about its own throughput — the Swift half of
 // `comet_proto::view::stats`, rule for rule (gh#143, gh#151).
 //
-// The numbers are gathered by `comet_board::stats` on whichever device owns
+// The numbers are gathered by `comet_board::stats` on each device that owns a
 // `board.db`; this file is the *shape* plus the derivations a renderer needs,
 // which is exactly the split the Rust module exists to make: a viewport reads
-// a `BoardStats` reply without linking the board crate.
+// one `BoardStats` or their explicit `AggregateBoardStats` union without
+// linking the board crate.
 //
 // Ported rather than shared for the reason every file in here is: no Rust runs
 // on this device. The Rust tests in `crates/proto/src/view/stats.rs` are the
@@ -535,6 +536,67 @@ struct BoardStats: Decodable, Hashable {
         case .some(let days): return "last \(days) days"
         case nil: return "all time"
         }
+    }
+}
+
+// MARK: - All boards (gh#461)
+
+/// The shared `AggregateBoardStats` wire contract. The phone deliberately
+/// decodes the same merged `BoardStats` the desktop and CLI render; it does not
+/// reimplement host fan-out or arithmetic in Swift.
+struct StatsDevice: Decodable, Hashable, Identifiable {
+    var deviceId: String
+    var label: String
+    var id: String { deviceId }
+}
+
+enum StatsHostStatus: String, Decodable, Hashable {
+    case answered, duplicate, noBoard, unreachable, unreadable, unknown
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = StatsHostStatus(rawValue: raw) ?? .unknown
+    }
+
+    var compromisesAggregate: Bool {
+        self == .unreachable || self == .unreadable || self == .unknown
+    }
+}
+
+struct StatsHost: Decodable, Hashable, Identifiable {
+    var device: StatsDevice
+    var status: StatsHostStatus
+    var boardId: String?
+    var error: String?
+    var id: String { device.deviceId }
+}
+
+struct AggregateBoardStatsSource: Decodable, Hashable, Identifiable {
+    var boardId: String
+    var host: StatsDevice
+    var stats: BoardStats
+    var id: String { boardId }
+}
+
+struct AggregateBoardStats: Decodable, Hashable {
+    var sinceDays: Int64?
+    var stats: BoardStats
+    var boards: [AggregateBoardStatsSource]
+    var hosts: [StatsHost]
+    var complete: Bool
+
+    /// Mirrors `AggregateBoardStats::completeness_note`, including its promise
+    /// that missing hosts are never represented as zero activity.
+    var completenessNote: String? {
+        let missing = hosts.compactMap { host -> String? in
+            guard host.status.compromisesAggregate else { return nil }
+            return host.status == .unreadable
+                ? "\(host.device.label) was unreadable"
+                : "\(host.device.label) did not answer"
+        }
+        guard !missing.isEmpty else { return nil }
+        return "Partial aggregate — \(missing.joined(separator: "; ")). "
+            + "The totals include only the boards that answered."
     }
 }
 

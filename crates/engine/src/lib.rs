@@ -149,6 +149,9 @@ pub struct EngineCore {
     /// the sync loop over `board.db`, serving `WatchBoard` / `DispatchTask` /
     /// `CancelTask` through [`rpc::EngineRpc`].
     board: std::sync::Mutex<Option<Arc<board::BoardService>>>,
+    /// Startup failure retained for RPC callers; `None` with no service means
+    /// the board was explicitly disabled or absent, not that it was readable.
+    board_startup_error: std::sync::Mutex<Option<String>>,
     /// Liveness of the DeviceRoom host socket, registered by
     /// [`Self::start_host_relay`]. The relay handle itself lives in
     /// [`EngineRuntime`], but the question "can anyone remote reach this box"
@@ -274,6 +277,7 @@ impl EngineCore {
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
             board: std::sync::Mutex::new(None),
+            board_startup_error: std::sync::Mutex::new(None),
             host_relay: Arc::new(std::sync::Mutex::new(None)),
             _instance_lock: lock,
         })
@@ -327,6 +331,13 @@ impl EngineCore {
             .board
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(board);
+    }
+
+    pub fn set_board_startup_error(&self, error: String) {
+        *self
+            .board_startup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
     }
 
     pub fn board(&self) -> Option<Arc<board::BoardService>> {
@@ -437,6 +448,13 @@ impl EngineCore {
         }
         if let Some(board) = self.board() {
             rpc = rpc.with_board(board);
+        } else if let Some(error) = self
+            .board_startup_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            rpc = rpc.with_board_startup_error(error);
         }
         Arc::new(rpc.with_edge_health(self.edge_health_probe()))
     }
@@ -681,7 +699,10 @@ impl Engine {
                 tokio::runtime::Handle::current(),
             ) {
                 Ok(board) => core.set_board(Arc::new(board)),
-                Err(err) => tracing::warn!(error = %err, "board service failed to start"),
+                Err(err) => {
+                    core.set_board_startup_error(format!("{err:#}"));
+                    tracing::warn!(error = %err, "board service failed to start");
+                }
             }
         }
 

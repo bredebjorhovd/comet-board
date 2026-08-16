@@ -503,8 +503,17 @@ final class AppModel {
     func boardStats(sinceDays: Int64?) async -> BoardStore.StatsOutcome {
         if demo != nil {
             try? await Task.sleep(nanoseconds: 250_000_000)  // feel like a sweep
-            let box = demo?.devices.first { $0.platform != "ios" }?.id ?? "dev-vps"
-            return .read(DemoDataset.stats(sinceDays: sinceDays), host: box)
+            let id = demo?.devices.first { $0.platform != "ios" }?.id ?? "dev-vps"
+            let host = StatsDevice(deviceId: id, label: deviceName(id))
+            let stats = DemoDataset.stats(sinceDays: sinceDays)
+            return .read(AggregateBoardStats(
+                sinceDays: sinceDays,
+                stats: stats,
+                boards: [AggregateBoardStatsSource(
+                    boardId: "demo-board", host: host, stats: stats)],
+                hosts: [StatsHost(device: host, status: .answered,
+                                  boardId: "demo-board", error: nil)],
+                complete: true))
         }
         guard let board else { return .failed("Not connected to a board") }
         return await board.stats(sinceDays: sinceDays)

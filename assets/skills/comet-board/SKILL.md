@@ -201,7 +201,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `verdict` | `--task`, `--attempt`, `--comment`, `--approve`, `--request-changes`, `--json` | Give the verdict: record it, hand it to the agent still standing in the checkout, and post it on the pull request |
 | `merge` | `--task`, `--yes`, `--json` | Merge a task's pull request. Asks first, on the row's own words: merging a layer of a stack merges every open layer beneath it as one group, and the confirmation names them |
 | `new <title>` | `--body`, `--team`, `--label`, `--source`, `--repo`, `--dispatch` | Write a ticket. Cheaper than not writing one |
-| `stats` | `--since-days`, `--json` | What the board knows about its own throughput |
+| `stats` | `--since-days`, `--all-boards`, `--json` | What the board knows about its own throughput |
 | `doctor` | — | Check the environment: keys, engine, routes, repos. Exits non-zero on any failing check |
 | `init` | `--force` | Generate a starter routing.toml from the spaces on this device |
 | `routes` | — | Read and change the board's `routing.toml` — over the RPC, so `--device` reaches the box that hosts the board (gh#75) |
