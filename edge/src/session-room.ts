@@ -51,12 +51,13 @@
  * derives liveness from `getWebSocketAutoResponseTimestamp` — a stamp the
  * runtime maintains WHILE HIBERNATING, for free. This room now does the same.
  */
-import { LoroDoc, EphemeralStore, VersionVector } from "loro-crdt";
+import { LoroDoc, EphemeralStore, VersionVector, type PeerID } from "loro-crdt";
 import {
   CrdtType,
   JoinErrorCode,
   MAX_MESSAGE_SIZE,
   MessageType,
+  RoomErrorCode,
   UpdateStatusCode,
   bytesToHex,
   decode,
@@ -86,6 +87,17 @@ const RETAIN_MS = RETAIN_DAYS * DAY_MS;
 const REPLAY_CRASH_LIMIT = 3;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
+/** Maximum Loro operations exported by one ordinary join event.
+ *
+ * `sendUpdates` bounds WebSocket FRAME size, but it runs after Loro has
+ * synchronously walked and encoded the requested history. A causally complex
+ * workspace can hold years of small operations in a compact snapshot, so one
+ * fresh-device `export({ mode: "update" })` crossed the DO CPU limit before
+ * the first fragment existed (gh#452). Keep the expensive wasm call bounded
+ * by operation count; `RoomError(RejoinSuggested)` asks the client to send its
+ * newly advanced VV and collect the next prefix on the same hibernatable
+ * socket. */
+export const BACKFILL_OP_BUDGET = 512;
 /** Reject inbound fragment batches above these at the HEADER, before any
  * reassembly buffer exists — bounds DO memory against a runaway or hostile
  * sender. Comfortably above the 25MB session soft ceiling; the Rust client
@@ -249,6 +261,84 @@ export const livePresence = (
  * keep the immediate live-frontier trim the whale-import incident needed. */
 export const isConcurrentWriteRoom = (chatId: string | undefined): boolean =>
   /^(ws|orgdev)\d+\//.test(chatId ?? "");
+
+interface BackfillChunk {
+  bytes: Uint8Array;
+  more: boolean;
+}
+
+/** Export a causally closed prefix of the operations `from` lacks.
+ *
+ * Slicing Loro's peer spans by length is not sufficient: device B's next
+ * change can depend on a change from device A that appears later in the span
+ * list. Importing that slice advances nothing and every continuation repeats
+ * it forever. Instead, inspect only each peer's first missing change, select
+ * it when all dependencies are already in the client's advancing VV, and
+ * repeat until the fixed operation budget is full. A change may be sliced
+ * inside its contiguous op range; the next request resumes at that counter.
+ *
+ * Work is independent of total history length: at most
+ * `BACKFILL_OP_BUDGET` operations enter the wasm export. The peer/dependency
+ * factor is the number of devices represented in the workspace VV, normally
+ * single digits and independent of its accumulated session rows. */
+export const exportBackfillChunk = (
+  doc: LoroDoc,
+  from: VersionVector,
+  maxOps = BACKFILL_OP_BUDGET
+): BackfillChunk => {
+  if (!Number.isSafeInteger(maxOps) || maxOps <= 0) throw new Error("invalid backfill budget");
+  const target = doc.version();
+  try {
+    const have = new Map(from.toJSON());
+    const end = target.toJSON();
+    const peers = [...end.keys()].sort((a, b) => {
+      const left = BigInt(a);
+      const right = BigInt(b);
+      return left < right ? -1 : left > right ? 1 : 0;
+    });
+    const spans: { id: { peer: PeerID; counter: number }; len: number }[] = [];
+    let selected = 0;
+
+    while (selected < maxOps) {
+      let advanced = false;
+      for (const peer of peers) {
+        const counter = have.get(peer) ?? 0;
+        const peerEnd = end.get(peer) ?? 0;
+        if (counter >= peerEnd) continue;
+
+        const change = doc.getChangeAt({ peer, counter });
+        if (!change.deps.every((dep) => (have.get(dep.peer) ?? 0) > dep.counter)) continue;
+
+        const changeEnd = Math.min(change.counter + change.length, peerEnd);
+        const len = Math.min(changeEnd - counter, maxOps - selected);
+        if (len <= 0) continue;
+        spans.push({ id: { peer, counter }, len });
+        have.set(peer, counter + len);
+        selected += len;
+        advanced = true;
+        if (selected >= maxOps) break;
+      }
+      if (!advanced) break;
+    }
+
+    const more = peers.some((peer) => (have.get(peer) ?? 0) < (end.get(peer) ?? 0));
+    if (more && spans.length === 0) {
+      // A decoded VV that is a real subset of this oplog always has at least
+      // one causally-ready next change. Do not fall back to the unbounded
+      // export this function exists to remove if that invariant is violated.
+      throw new Error("client version has no causally ready backfill prefix");
+    }
+    return {
+      bytes:
+        spans.length === 0
+          ? new Uint8Array()
+          : doc.export({ mode: "updates-in-range", spans }),
+      more
+    };
+  } finally {
+    target.free();
+  }
+};
 
 /** What a caller may do with a chat room (gh#66).
  * - `claim`  — unclaimed; the first joiner becomes its owner;
@@ -747,39 +837,54 @@ export class SessionRoom implements DurableObject {
       } finally {
         vv.free();
       }
-      let backfill: Uint8Array;
+      let backfill: Uint8Array<ArrayBufferLike> = new Uint8Array();
+      let continueBackfill = false;
       if (message.version.length > 0) {
         let from: VersionVector | undefined;
         try {
           from = VersionVector.decode(message.version);
-          // A shallow doc cannot diff across its trimmed root, and loro does
-          // NOT throw for a `from` behind the shallow start — it silently
-          // exports only the post-root ops (~90 bytes of nothing for a fresh
-          // reader), which import client-side as forever-pending deps: zero
-          // messages, zero errors anywhere (found 2026-08-05 — every fresh
-          // device joining a force-trimmed whale room got an empty
-          // transcript). An encoded EMPTY version vector is 1 byte, so
-          // `version.length > 0` does not mean "has state" — detect
-          // behind-the-root explicitly and serve the §3.1 stale-peer full
-          // snapshot instead of trusting the export.
-          let stale = false;
-          if (doc.isShallow()) {
-            const since = doc.shallowSinceVV();
-            try {
-              const cmp = from.compare(since);
-              stale = cmp === undefined || cmp < 0;
-            } finally {
-              since.free();
-            }
-          }
-          backfill = stale
-            ? doc.export({ mode: "snapshot" })
-            : doc.export({ mode: "update", from });
         } catch {
-          // Unknown/garbled client version — fall back to a full snapshot.
+          // Unknown/garbled client version — fall back to the recovery
+          // snapshot expected by existing clients.
           backfill = doc.export({ mode: "snapshot" });
-        } finally {
-          from?.free();
+        }
+        if (from) {
+          try {
+            // A shallow doc cannot diff across its trimmed root, and loro does
+            // NOT throw for a `from` behind the shallow start — it silently
+            // exports only the post-root ops (~90 bytes of nothing for a fresh
+            // reader), which import client-side as forever-pending deps: zero
+            // messages, zero errors anywhere (found 2026-08-05 — every fresh
+            // device joining a force-trimmed whale room got an empty
+            // transcript). An encoded EMPTY version vector is 1 byte, so
+            // `version.length > 0` does not mean "has state" — detect
+            // behind-the-root explicitly and serve the §3.1 stale-peer full
+            // snapshot instead of trusting the export.
+            let stale = false;
+            if (doc.isShallow()) {
+              const since = doc.shallowSinceVV();
+              try {
+                const cmp = from.compare(since);
+                stale = cmp === undefined || cmp < 0;
+              } finally {
+                since.free();
+              }
+            }
+            if (stale) {
+              // Snapshot reseeding is intentionally atomic: the Rust client's
+              // recovery path validates one snapshot against the advertised VV
+              // before swapping documents. A shallow snapshot has already
+              // discarded old history, so it does not have the unbounded oplog
+              // shape this continuation path is for.
+              backfill = doc.export({ mode: "snapshot" });
+            } else {
+              const chunk = exportBackfillChunk(doc, from);
+              backfill = chunk.bytes;
+              continueBackfill = chunk.more;
+            }
+          } finally {
+            from.free();
+          }
         }
       } else {
         backfill = doc.export({ mode: "snapshot" });
@@ -787,10 +892,23 @@ export class SessionRoom implements DurableObject {
       if (backfill.length > 0) {
         this.sendUpdates(ws, message.crdt, message.roomId, [backfill]);
       }
+      if (continueBackfill) {
+        // Ordered after the update frames. Existing phone clients handle
+        // RejoinSuggested by immediately sending another JoinRequest with
+        // their now-advanced VV on THIS socket, so each message event gets a
+        // fresh CPU budget without reconnect/backoff or server-side timers.
+        this.send(ws, {
+          type: MessageType.RoomError,
+          crdt: message.crdt,
+          roomId: message.roomId,
+          code: RoomErrorCode.RejoinSuggested,
+          message: "continue backfill"
+        });
+      }
       // A doc-only joiner still carries a device id, so its arrival changes the
       // answer for everyone already watching presence.
       this.publishPresence();
-      // A full join answer just exported cleanly — the wasm heap is healthy.
+      // This join chunk exported cleanly — the wasm heap is healthy.
       // Without this reset, occasional transient RangeErrors accumulated
       // over an isolate's lifetime and the tripwire aborted HEALTHY
       // isolates, each abort causing a reconnect herd that produced more

@@ -3,20 +3,20 @@ import { AlarmArmer } from "../../src/alarm";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 export { DeviceRoom } from "../../src/device-room";
+export { SessionRoom } from "../../src/session-room";
 
 /** Bare SQLite-backed DO; tests reach its real `ctx.storage.sql` via
- * `runInDurableObject`. SessionRoom stays out of this fixture because its
- * loro-crdt wasm cannot be compiled in the pool's test runner (see
- * vitest.workerd.config.ts). DeviceRoom only needs loro-protocol, so it is
- * exported directly above for real hibernation WebSocket coverage. */
+ * `runInDurableObject`. The fixture also re-exports the production
+ * SessionRoom and DeviceRoom so their Loro and hibernation handlers run in
+ * the same real workerd tier. */
 export class TestLogRoom extends DurableObject {}
 
 /**
  * Real-runtime seam for SessionRoom's alarm armer. It deliberately contains
  * only the state transitions relevant to the alarm: a write makes backup work
  * owed, and a client event can revive a room after its retry budget gave up.
- * The shared AlarmArmer is the production implementation under test; keeping
- * loro-crdt out lets this run in the workerd pool (see the config comment).
+ * The shared AlarmArmer is the production implementation under test; this
+ * small seam isolates its durable state transitions from the room handlers.
  */
 export class TestAlarmRoom extends DurableObject {
   private readonly dailyAlarm = new AlarmArmer(this.ctx.storage);

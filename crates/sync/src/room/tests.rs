@@ -59,6 +59,10 @@ struct FakeEdge {
     advertised_vv: Mutex<Option<VersionVector>>,
     /// Deterministic window for a test to subscribe before backfill arrives.
     backfill_delay_ms: AtomicU64,
+    /// When present, the next join receives this causally-closed prefix plus
+    /// RejoinSuggested instead of the ordinary full backfill. Mirrors the
+    /// edge's CPU-bounded continuation path (gh#452).
+    continuation_backfill: Mutex<Option<Vec<u8>>>,
     /// Persistently advertise undecodable VV bytes after the initial join.
     malformed_versions: AtomicBool,
     /// Swallow this many `%EPH` JoinRequests (consume, answer nothing) — the
@@ -92,6 +96,7 @@ impl FakeEdge {
             full_snapshot_requests: AtomicUsize::new(0),
             advertised_vv: Mutex::new(None),
             backfill_delay_ms: AtomicU64::new(0),
+            continuation_backfill: Mutex::new(None),
             malformed_versions: AtomicBool::new(false),
             swallow_eph_joins: AtomicUsize::new(0),
             eph_join_requests: AtomicUsize::new(0),
@@ -226,6 +231,22 @@ impl FakeEdge {
                 let backfill_delay_ms = self.backfill_delay_ms.load(Ordering::SeqCst);
                 if backfill_delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(backfill_delay_ms)).await;
+                }
+                let continuation = self.continuation_backfill.lock().unwrap().take();
+                if let Some(prefix) = continuation {
+                    self.send_updates(reply_to, CrdtType::Loro, &room_id, prefix)
+                        .await;
+                    self.reply(
+                        reply_to,
+                        &ProtocolMessage::RoomError {
+                            crdt: CrdtType::Loro,
+                            room_id,
+                            code: RoomErrorCode::RejoinSuggested,
+                            message: "continue backfill".into(),
+                        },
+                    )
+                    .await;
+                    return;
                 }
                 let backfill = if version.is_empty() {
                     self.doc.export(ExportMode::Snapshot)
@@ -502,6 +523,45 @@ async fn join_backfills_server_state_into_fresh_doc() {
         .await
         .expect("connect");
     wait_until(|| doc_text(&doc) == "server state").await;
+    client.shutdown().await.unwrap();
+}
+
+/// gh#452: a large workspace backfill is delivered over several bounded
+/// JoinRequest events on one hibernatable socket. The production phone client
+/// already treats RejoinSuggested as "send my newly advanced VV again"; pin
+/// that behavior so edge chunking cannot turn into reconnect/backoff churn.
+#[tokio::test]
+async fn rejoin_suggested_backfill_converges_on_the_same_phone_connection() {
+    let server = LoroDoc::new();
+    server.set_peer_id(1).unwrap();
+    server.get_text("t").insert(0, "first half ").unwrap();
+    server.commit();
+    let prefix = server
+        .export(ExportMode::updates(&VersionVector::default()))
+        .unwrap();
+    server
+        .get_text("t")
+        .insert("first half ".len(), "second half")
+        .unwrap();
+    server.commit();
+
+    let edge = FakeEdge::with_doc(server);
+    *edge.continuation_backfill.lock().unwrap() = Some(prefix);
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("initial bounded join answers");
+
+    wait_until(|| doc_text(&doc) == doc_text(&edge.doc)).await;
+    assert_eq!(
+        edge.dials.load(Ordering::SeqCst),
+        1,
+        "continuation must stay on the hibernatable socket"
+    );
+    assert!(
+        edge.join_requests.load(Ordering::SeqCst) >= 2,
+        "the phone must request the remaining prefix with its advanced VV"
+    );
     client.shutdown().await.unwrap();
 }
 
