@@ -29,10 +29,19 @@ has the check name, provider/workflow when known, result, duration, and its
 GitHub link. Successful contexts may be collapsed initially, but every context
 the projection contains remains reachable.
 
-The verdict bar keeps the three review verdicts exactly as it has them. The
-repository action occupies the existing quiet `Merge…` position and changes
-with repository state. A repair is not a verdict, an approval, or permission to
-merge. It starts another turn in the authoring chat and nothing else.
+The verdict bar keeps the three review verdict types exactly as it has them,
+but their availability is a core-derived fact on the Review response. A
+`changes-below` row disables Comment, Approve, and Request changes together and
+names the lower pull request that must settle first: the diff is about to be
+replayed and cannot be reviewed yet. A closed or merged pull request disables
+them too. Clients show the disabled controls and reason rather than hiding the
+review boundary or attempting a verdict GitHub and the existing verdict path
+will refuse.
+
+The repository action occupies the existing quiet `Merge…` position and
+changes with repository state. A repair is not a verdict, an approval, or
+permission to merge. It starts another turn in the authoring chat and nothing
+else.
 
 ### One head, one observation
 
@@ -44,13 +53,20 @@ RepositoryProjection
   head_sha
   base_ref
   base_sha
+  state                     OPEN | CLOSED
+  merged_at                 timestamp | null
   draft
   mergeable                 MERGEABLE | CONFLICTING | UNKNOWN
   merge_state_status        GitHub's value, retained verbatim
   github_review_decision    APPROVED | CHANGES_REQUESTED | REVIEW_REQUIRED | null
-  acceptance                accepted | changes_requested | needs_review
+  acceptance                accepted | changes_requested | needs_review | unknown
+  review_state_truncated
   checks                    passing | failing | pending | none | unknown
   contexts_truncated
+  stack_gate                standalone | complete | partial
+  visible_layer_count
+  github_stack_size
+  verdict_controls          enabled | disabled_changes_below | disabled_closed
   contexts[]
   stale_reason
   action
@@ -79,26 +95,36 @@ invalidates the old projection, including its approval, before any slower
 repository query runs. Stale data may still be shown with its observation time
 and reason, but stale data never derives `Mark ready`, `Repair`, or `Merge`.
 
-The task record grows `pr_node_id`, `pr_head_sha`, `pr_base_sha`, `pr_draft`,
+The task record keeps its existing `pr_open` and `pr_merged` lifecycle keys and
+grows `pr_node_id`, `pr_head_sha`, `pr_base_sha`, `pr_merged_at`, `pr_draft`,
 `pr_repository_json`, and `pr_repository_observed_at`. The variable-length
-contexts stay in the versioned JSON projection; the identity and head fields
-stay flat because the sync, mutations, and stack join need them without
-decoding a UI payload. Data written before these fields existed reads as an
-unknown projection, never as a clean one.
+contexts stay in the versioned JSON projection; the identity, lifecycle, and
+head fields stay flat because the sync, mutations, and stack join need them
+without decoding a UI payload. Data written before these fields existed reads
+as an unknown projection, never as a clean one.
 
 `AttemptReview.repository` carries the full current-layer projection. A
-`StackLayer` carries only its `RepositoryGate` summary — head, acceptance,
-checks, draft, mergeability, freshness, and blocker — so a review can explain
-each layer without duplicating every sibling's check list on the wire.
+`StackLayer` carries only its `RepositoryGate` summary — lifecycle, head,
+acceptance, checks, draft, mergeability, freshness, and blocker — so a review
+can explain each layer without duplicating every sibling's check list on the
+wire. `stack_gate` is derived from the existing `RowStack`: standalone when
+there is no stack, complete only when `size` is known and the visible layers
+contain exactly one of every position `1..=size` including the current pull
+request, and partial otherwise. `layers.len() < size`, a missing/duplicate
+position, or an absent size is therefore action-visible uncertainty, not an
+implicitly healthy stack.
 
 ### Exactly what GitHub is asked
 
 No new timer is added.
 
 The existing board cycle is `[sync] interval` from `routing.toml`, 30 seconds by
-default and clamped to at least five seconds. Its existing REST pull-list call
-continues to run once per configured repository per cycle. The parser retains
-these fields from each item:
+default and clamped to at least five seconds. Its existing
+`GET /repos/{owner}/{repo}/pulls?state=all&per_page=100` call continues to run
+once per configured repository per cycle. `state=all` is the lifecycle clock:
+closure cannot disappear merely because the more detailed repository query is
+restricted to open pull requests. The parser retains these fields from each
+item:
 
 - `node_id`, `number`, `html_url`, `state`, `draft`, `merged_at`, and
   `updated_at`;
@@ -140,13 +166,25 @@ The board's GitHub provider must choose the installation token using the
 repository before posting `/graphql`; a cross-repository query cannot rely on
 the current REST client's path-to-repository inference.
 
-The query is due for an open pull request when any of these is true:
+The GraphQL query is due for an open pull request when any of these is true:
 
 - it has no projection;
 - the REST list observed a different head or base;
 - its last projection contains a pending context;
 - its `observed_at` is at least the existing 120-second `FULL_SWEEP_SECS`
   cadence old.
+
+A REST item with `state = closed` is projected in that same ordinary cycle and
+is never queued for the open-PR GraphQL batch. Non-null `merged_at` produces
+the terminal `merged` state and hands off to retention. Null `merged_at`
+produces terminal `closed_unmerged`, sets `action = Open closed PR`, disables
+the verdict controls, and explains that the branch was closed without landing.
+Both terminal transitions clear every cached mutation action immediately;
+historical checks may remain visible with their observation time, but cannot
+derive Repair, Mark ready, or Merge. A GraphQL response that races the REST
+list is accepted only if its `state`, `mergedAt`, and head still match those
+REST lifecycle facts, so an older open response cannot resurrect a closed
+pull request.
 
 Thus a running build updates on the ordinary board clock, while a stable,
 unchanged pull request costs only its slot in a batched response every existing
@@ -168,38 +206,77 @@ GitHub source unhealthy through the existing metadata. It does not blank the
 Review screen. Rate-limit replies obey `Retry-After`/reset on the normal sync
 loop; they never start a retry loop of their own.
 
-The existing review-feedback read gains `commit_id` and `user.login` from pull
-request reviews. It already rides `updated_at` watermarks and therefore adds no
-call. `reviewDecision` is displayed as GitHub's branch-policy answer; Comet's
+The existing review-feedback read gains `commit_id`, `user.id`, and
+`user.login` from pull-request reviews. It rides the same `updated_at` trigger;
+only a changed pull request can spend the bounded continuation pages described
+below. `reviewDecision` is displayed as GitHub's branch-policy answer; Comet's
 authority is the head-scoped standing verdict below.
 
 ### Acceptance belongs to the reviewed head
 
 Today `Delivered::changes_requested = None` means both “approved” and “nobody
-approved.” That cannot drive a merge action. `Delivered` therefore gains a
-standing review record:
+approved,” and its single last verdict lets one reviewer accidentally erase
+another reviewer's objection. Neither can drive a merge action. `Delivered`
+therefore gains a collection keyed by review, not one standing record:
 
 ```text
 StandingReview
-  kind                      approved | changes_requested
-  review_id
+  key                       github:<review_id> | comet:<submission_fingerprint>
+  sequence                  monotonic PR-local id used by stack fan-out
+  github_review_id          null until/unless GitHub accepts it as a review
+  reviewer_key              GitHub user id (login only if absent), else verified Comet identity
+  kind                      approved | changes_requested | unknown
+  disposition               active | dismissed
   head_sha
   submitted_at
   source                    comet | github
-  reviewer
 ```
 
-A Comet verdict records the projection's current `head_sha` before it is
-delivered or posted. An inbound GitHub review records its `commit_id`. Comments
-do not replace the standing decision; dismissed reviews withdraw the decision
-they dismissed. The existing `pr_changes_requested` mirror remains the stack
-fan-out key, while `StandingReview` answers the richer question.
+A GitHub review read adds `commit_id`, `user.id`, and `user.login` and upserts
+every decisive or dismissed review by its immutable review id *before* the
+new-message watermark is applied. The review endpoint is paged at 100 records,
+to a hard maximum of ten pages, only when the existing pull `updated_at` gate
+says feedback moved. More pages set `review_state_truncated`; that projection
+cannot derive Merge. A rewritten `DISMISSED` response marks that exact review
+dismissed while retaining its previous kind when known. Seeing a dismissal for
+the first time may leave `kind = unknown`; the tombstone still has the review's
+identity, reviewer, head, and ordering.
 
-`acceptance` is `accepted` only when the last standing approval names the
-current head and no standing change request remains. A push changes the head,
-so an approval of the old head becomes `needs_review` immediately even in a
-repository configured not to dismiss stale GitHub approvals. Existing records
-with no `head_sha` do not grandfather themselves into approval.
+A Comet verdict records the projection's current `head_sha` and the transport's
+verified reviewer identity before it is delivered or posted. The `[users]`
+mapping resolves that identity to GitHub's numeric user id where possible; a
+normalized login is the legacy fallback, and the authenticated Comet subject is
+the fallback for an unposted verdict. When GitHub returns a review id, that id
+aliases the local submission rather than adding a second decision. A verdict
+projected only as a comment or left unposted remains a Comet decision,
+consistent with the existing rule that the board's verdict stands even when
+GitHub refuses its copy. Comments do not enter this collection.
+
+Aggregation is deterministic and per reviewer:
+
+1. order that reviewer's records by `submitted_at`, then immutable key;
+2. take the newest record, even when it is dismissed;
+3. an active approval or change request is that reviewer's standing decision;
+   a dismissed newest record contributes no decision and does not resurrect an
+   older review;
+4. an approval changes only that reviewer's decision. It never clears another
+   reviewer's change request.
+
+`acceptance` is `changes_requested` while any reviewer has a standing change
+request. A change request remains standing across pushes until that reviewer
+replaces it or its exact review is dismissed. With no standing change request,
+`acceptance` is `accepted` only when at least one standing approval names the
+current head; approvals of older heads do not count. Otherwise it is
+`needs_review`. Thus reviewer A's approval cannot erase reviewer B's request,
+and a push invalidates every old-head approval even in a repository configured
+not to dismiss stale GitHub approvals.
+
+The existing `pr_changes_requested` column remains the cheap stack blocker. It
+is recomputed from the collection as the newest active change request's
+numeric `sequence` (or null), rather than mutated by whichever verdict arrived
+last. Existing singular state forces one review reconciliation after upgrade;
+until that bounded read succeeds, acceptance is unknown and Merge is
+unavailable.
 
 This is how repair reopens review on evidence rather than on optimism: a new
 commit invalidates acceptance, the new run replaces the attempt's observed
@@ -231,30 +308,54 @@ irrelevant.
 
 ### The dominant action
 
-The core derives `RepositoryAction`; clients only render and invoke it. For a
-stack, inspect the current layer and every open layer below it, bottom first.
-The lowest blocker owns the action. A blocker above the current layer is shown
-on the map but does not stop this layer landing.
+The core derives `RepositoryAction` and `verdict_controls`; clients only render
+and invoke them. The verdict, repair, ready, and merge handlers recompute the
+same gates on the board loop before writing anything, so a stale or hand-written
+RPC cannot bypass a disabled control. Derivation starts with three current-pull
+gates that outrank every cached check or stack summary:
 
-If the blocker is a lower layer, the action is `Open PR #N`. Comet never sends
-the current layer's author a generic “the stack is red” prompt. The lower
-layer's own Review screen offers the repair that belongs to its checkout.
+1. `merged` → no repository mutation; disable verdicts and hand off to
+   retention;
+2. `closed_unmerged` → `Open closed PR`; disable verdicts, and never retain an
+   earlier Repair, Mark ready, or Merge action;
+3. `changes_below = #N` → `Open PR #N`; disable all three verdict controls and
+   every mutation on this row until the existing derivation returns it from
+   `blocked` to `review`.
 
-For the layer that owns the blocker, precedence is:
+That third gate is the canonical replay boundary: Comment is disabled along
+with Approve and Request changes because this diff is about to change. It
+outranks a conflict or failed check on the current head; repairing or reviewing
+that disposable head would only create work the ordered upstack replay moves
+underneath.
 
-1. merged → no repository mutation; hand off to retention;
-2. stale, truncated, or unknown → `Open on GitHub` and say what could not be
-   established;
-3. merge conflict (`CONFLICTING` or `DIRTY`) → `Resolve conflict`;
-4. failed GitHub Actions checks → `Fix failed checks`;
-5. only non-Actions checks failed → `Open failed check`;
-6. queued/running checks → `View running checks`;
-7. draft, with no earlier blocker → `Mark ready` when Comet owns an authoring
+For an open, reviewable row, inspect the current layer and every *visible* open
+layer below it, bottom first. The lowest visible blocker owns the action. If it
+is a lower layer, the action is `Open PR #N`; Comet never sends the current
+layer's author a generic “the stack is red” prompt. The lower layer's own
+Review screen offers the repair that belongs to its checkout. A blocker above
+the current layer is shown on the map but does not block this layer by itself.
+
+For the visible layer that owns the blocker, precedence is:
+
+1. stale, truncated, or unknown repository/review state → `Open on GitHub` and
+   say what could not be established;
+2. merge conflict (`CONFLICTING` or `DIRTY`) → `Resolve conflict`;
+3. failed GitHub Actions checks → `Fix failed checks`;
+4. only non-Actions checks failed → `Open failed check`;
+5. queued/running checks → `View running checks`;
+6. draft, with no earlier blocker → `Mark ready` when Comet owns an authoring
    attempt, otherwise `Open draft`;
-8. not accepted for this head → no repository mutation; the existing verdict
-   controls are the dominant review act;
-9. accepted, non-draft, complete checks, known mergeable state, and every open
-   layer below satisfying the same gate → `Merge…`.
+7. current layer not accepted for this head → no repository mutation; the
+   enabled verdict controls are the dominant review act.
+
+Only after no visible layer owns one of those blockers does topology decide
+landing. `stack_gate = partial` produces `Open stack on GitHub`, says “showing
+X of Y layers,” and cannot derive Merge: an unseen lower layer may be the real
+blocker. Standalone or `stack_gate = complete` may derive `Merge…` only when the
+current layer and every open layer below is accepted, non-draft, fresh,
+untruncated, checks-complete, and known mergeable. Equal visible and GitHub
+counts are necessary but not sufficient; the exact `1..=size` position check
+defined above prevents duplicates from masquerading as completeness.
 
 `BEHIND`, `BLOCKED`, and unrecognised `mergeStateStatus` values get their own
 honest blocker text and an `Open on GitHub` action until a later design gives
@@ -471,26 +572,41 @@ The implementation is complete when these seams are pinned:
    take two serial batches rather than 100 per-PR requests.
 3. A REST head change invalidates projection and approval before the next
    GraphQL answer.
-4. An approval for SHA A never derives Merge on SHA B; a fresh approval on B
-   does.
-5. Every action-precedence row is table-tested, including no-check repositories,
-   drafts, optional failures, stale data, and closed-unmerged PRs.
-6. Stack fixtures cover parent conflict/current clean, parent failure/current
+4. Review fixtures keep decisions per reviewer: A's approval cannot clear B's
+   change request; B's later approval clears only B's request; dismissing B's
+   exact latest review clears B without changing A; dismissing an older B
+   review leaves B's newer decision standing. An approval for SHA A never
+   derives Merge on SHA B, while a fresh approval on B does when no reviewer
+   still requests changes.
+5. A pagination fixture with more than the review cap yields
+   `review_state_truncated`, `acceptance = unknown`, and no Merge. Migration
+   from the singular verdict state does the same until its one reconciliation
+   succeeds.
+6. Every action-precedence row is table-tested, including no-check
+   repositories, drafts, optional failures, stale data, and a REST transition
+   from an actionable open projection to closed-unmerged. That transition
+   yields only `Open closed PR`, disables verdict controls, and proves stale
+   Repair and Merge actions cannot survive it.
+7. Stack fixtures cover parent conflict/current clean, parent failure/current
    passing, current conflict, current failure, an unknown lower layer, and a
-   failure above the current layer. Each names the layer that owns the action.
-7. Log fixtures prove transfer, artifact, line, job-count, and aggregate caps;
+   failure above the current layer. A `changes_below = #N` fixture asserts all
+   verdict controls and mutations are disabled and the sole action opens #N.
+   A partial fixture with GitHub size three and only two unique visible layers
+   asserts `stack_gate = partial`, `Open stack on GitHub`, and no Merge even
+   when every visible gate passes. Each blocker fixture names its owning layer.
+8. Log fixtures prove transfer, artifact, line, job-count, and aggregate caps;
    ANSI stripping; every redaction class; mode `0600`; atomic writes; and a
    clean `git status`.
-8. Repair preflight refuses moved heads and rerun checks. Double clicks, RPC
+9. Repair preflight refuses moved heads and rerun checks. Double clicks, RPC
    retry, and a crash after durable enqueue all produce one command/message.
-9. A repair starts the same chat/worktree/account configuration, reopens the
+10. A repair starts the same chat/worktree/account configuration, reopens the
    settled attempt through the existing status path, and returns to Review only
    after a new run end.
-10. Repair never changes `StandingReview`, `pr_changes_requested`, draft, or
+11. Repair never changes `StandingReview`, `pr_changes_requested`, draft, or
     merge state. Mark ready never records a verdict. Merge still reaches only
     `SyncEngine::merge_pull_request` through `MergeTask` and the existing
     confirmation.
-11. Merged rows follow each existing chat/worktree retention choice, including
+12. Merged rows follow each existing chat/worktree retention choice, including
     the non-board-managed exemption.
 
 The GitHub facts used here are documented by GitHub's
