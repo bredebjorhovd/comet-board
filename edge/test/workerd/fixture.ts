@@ -2,11 +2,13 @@ import { DurableObject } from "cloudflare:workers";
 import { AlarmArmer } from "../../src/alarm";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+export { DeviceRoom } from "../../src/device-room";
 
 /** Bare SQLite-backed DO; tests reach its real `ctx.storage.sql` via
- * `runInDurableObject`. Deliberately not SessionRoom/DeviceRoom: those import
- * loro-crdt, whose wasm cannot be compiled in the pool's test runner (see
- * vitest.workerd.config.ts). The storage underneath is the same real SQLite. */
+ * `runInDurableObject`. SessionRoom stays out of this fixture because its
+ * loro-crdt wasm cannot be compiled in the pool's test runner (see
+ * vitest.workerd.config.ts). DeviceRoom only needs loro-protocol, so it is
+ * exported directly above for real hibernation WebSocket coverage. */
 export class TestLogRoom extends DurableObject {}
 
 /**
