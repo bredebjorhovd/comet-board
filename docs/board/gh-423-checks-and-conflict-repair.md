@@ -13,7 +13,7 @@ product question only. No Zuse source, UI, strings, schema, assets, or tests are
 reused here; the data flow below is derived from Comet's existing sync,
 `AttemptReview`, stack, verdict, runtime, and retention seams.
 
-## The decision
+### The decision
 
 `AttemptReview` gains a `repository` projection for its current pull-request
 head. The projection owns the rollup, individual check contexts, draft and
@@ -34,7 +34,7 @@ repository action occupies the existing quiet `Merge…` position and changes
 with repository state. A repair is not a verdict, an approval, or permission to
 merge. It starts another turn in the authoring chat and nothing else.
 
-## One head, one observation
+### One head, one observation
 
 The new wire shape is deliberately about an immutable head:
 
@@ -91,7 +91,7 @@ unknown projection, never as a clean one.
 checks, draft, mergeability, freshness, and blocker — so a review can explain
 each layer without duplicating every sibling's check list on the wire.
 
-## Exactly what GitHub is asked
+### Exactly what GitHub is asked
 
 No new timer is added.
 
@@ -173,7 +173,7 @@ request reviews. It already rides `updated_at` watermarks and therefore adds no
 call. `reviewDecision` is displayed as GitHub's branch-policy answer; Comet's
 authority is the head-scoped standing verdict below.
 
-## Acceptance belongs to the reviewed head
+### Acceptance belongs to the reviewed head
 
 Today `Delivered::changes_requested = None` means both “approved” and “nobody
 approved.” That cannot drive a merge action. `Delivered` therefore gains a
@@ -206,7 +206,7 @@ commit invalidates acceptance, the new run replaces the attempt's observed
 evidence, and the reviewer must accept that head. “Fix checks” never writes this
 record.
 
-## Check normalization
+### Check normalization
 
 Comet derives the rollup from the contexts and keeps GitHub's rollup value for
 diagnostics. The worse answer wins if they disagree.
@@ -229,7 +229,7 @@ UNSTABLE` may permit GitHub to merge, but a reviewer who can see a failing test
 should be offered repair before Merge, not silently taught that “optional” means
 irrelevant.
 
-## The dominant action
+### The dominant action
 
 The core derives `RepositoryAction`; clients only render and invoke it. For a
 stack, inspect the current layer and every open layer below it, bottom first.
@@ -267,7 +267,7 @@ existing merge implementation checks it before `merge_pull_request`. GitHub
 still makes the final branch-protection decision. A race is a refusal and a
 fresh projection, never a merge of an unreviewed head.
 
-## Failed-check repair
+### Failed-check repair
 
 Logs are demand-driven. Pressing `Fix failed checks` sends a request containing
 the task, attempt, expected head, and exact failed check identities. The board
@@ -295,7 +295,7 @@ addition to its existing pull-request access. Missing permission is a visible
 action refusal and a `doctor` finding; it does not queue an agent with a promise
 of logs that were never captured.
 
-### Redaction and storage
+#### Redaction and storage
 
 GitHub's own `***` masks are preserved. Before anything reaches disk, Comet
 also replaces:
@@ -332,7 +332,7 @@ checks, not the log contents. The agent is told to inspect the artifacts, make
 the smallest repair in this checkout, rerun the relevant checks locally,
 commit, push, update claims, and stop without approving or merging.
 
-## Conflict repair
+### Conflict repair
 
 `Resolve conflict` uses the same delivery path without a log artifact. Its
 preflight verifies current head SHA, base ref, base SHA, and conflict verdict.
@@ -356,7 +356,7 @@ After a lower repair moves its head, the existing changes-below/upstack replay
 semantics still apply. gh#407's direct child owns that replay; this feature does
 not ask every layer to repair itself in parallel.
 
-## Once, into the authoring checkout
+### Once, into the authoring checkout
 
 Both repair kinds use `review::authoring_attempt` and
 `still_the_authors_checkout`. A missing, archived, or repointed chat disables
@@ -391,7 +391,7 @@ When the turn ends, existing settle/evidence/claims logic closes it back into
 Review. A no-op repair returns with the same failed head visibly still failed;
 delivery is not success.
 
-## Draft, merge, and retention mutations
+### Draft, merge, and retention mutations
 
 `Mark ready` is a GraphQL `markPullRequestReadyForReview` mutation with the
 stored pull-request node id and a deterministic `clientMutationId`. It is
@@ -419,7 +419,7 @@ Once GitHub reports `merged`, the task derives `done` and the existing
 
 There is no second “merged cleanup” policy inside Review.
 
-## RPC and ownership boundaries
+### RPC and ownership boundaries
 
 The implementation adds two forwardable board RPCs:
 
@@ -445,7 +445,7 @@ Authority stays separated by construction:
   never an approval;
 - merge is still gh#408's explicit reviewer confirmation and single executor.
 
-## Failure semantics
+### Failure semantics
 
 - A partial/stale projection is visible and action-ineligible, not clean.
 - A changed head/base/check set refuses the stale action and asks the screen to
@@ -460,7 +460,7 @@ Authority stays separated by construction:
 - GitHub refusing Mark ready or Merge returns GitHub's words. Neither is
   recorded as successful locally.
 
-## Tests that make the contract executable
+### Tests that make the contract executable
 
 The implementation is complete when these seams are pinned:
 
