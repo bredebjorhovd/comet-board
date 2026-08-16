@@ -28,6 +28,7 @@ use crate::config::{Route, RoutingConfig, interpolate, slugify};
 use crate::db::Db;
 use crate::model::{Dispatcher, Task, UpstreamState};
 use crate::runtime::{DispatchSpec, harness_for_runtime};
+use crate::sources::github::{CapabilityEvidence, PushCapabilities, WriteCapability};
 use crate::sync::route_context;
 
 /// The branch slug for a task: `gh#341` titled "The review page loads nothing"
@@ -210,6 +211,124 @@ fn pr_base_line(base: &str) -> String {
          `{base}`, so a request that targets anything else carries commits \
          that are not yours."
     )
+}
+
+/// The credential preflight every GitHub-backed dispatch receives (gh#440).
+///
+/// A workflow file is not ordinary repository content to GitHub. A credential
+/// with `Contents: write` / `repo` can push a whole completed branch until one
+/// commit touches `.github/workflows/**`, at which point GitHub rejects the
+/// ref update. This block makes that difference part of the first prompt,
+/// before an agent promises or attempts a delivery the credential cannot make.
+///
+/// Unknown evidence fails closed. For ordinary contents that means stop before
+/// editing — the task has no deliverable branch. When only workflow permission
+/// is absent, ordinary work remains deliverable and the intended workflow
+/// becomes a committed patch artifact outside the protected namespace, so the
+/// pull request still carries exact work a human can apply.
+pub fn credential_preflight_brief(capabilities: PushCapabilities) -> String {
+    let evidence = match capabilities.evidence {
+        CapabilityEvidence::AppInstallation => "the GitHub App installation token",
+        CapabilityEvidence::ClassicOauthScopes => "GITHUB_TOKEN's OAuth scopes",
+        CapabilityEvidence::OpaqueToken => {
+            "an opaque/fine-grained GITHUB_TOKEN for which GitHub exposed no OAuth scopes"
+        }
+        CapabilityEvidence::Anonymous => "the absence of a board GitHub credential",
+        CapabilityEvidence::ProbeFailed => "a GitHub capability probe that did not complete",
+    };
+
+    if capabilities.contents != WriteCapability::Write {
+        let remediation = match capabilities.evidence {
+            CapabilityEvidence::AppInstallation => {
+                "Have the operator grant the App `Contents: Read and write` and approve the updated permission on this installation."
+            }
+            CapabilityEvidence::ClassicOauthScopes => {
+                "Have the operator refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope."
+            }
+            CapabilityEvidence::OpaqueToken => {
+                "Have the operator use a GitHub App whose installation reports `Contents: Read and write`, or a classic token whose `repo` scope GitHub can report."
+            }
+            CapabilityEvidence::Anonymous => {
+                "Have the operator configure GITHUB_TOKEN or the GITHUB_APP_ID/GITHUB_APP_PRIVATE_KEY_PATH pair."
+            }
+            CapabilityEvidence::ProbeFailed => {
+                "Have the operator restore GitHub access and run `comet-board doctor` before retrying."
+            }
+        };
+        return format!(
+            "\n\nCredential preflight — **stop before changing files**: ordinary repository \
+             content write is {} and workflow-file write is {} according to {evidence}. \
+             This attempt cannot establish a deliverable push; do not edit, commit, or \
+             promise the requested change. Report the credential preflight as the blocker. \
+             {remediation}",
+            capabilities.contents.word(),
+            capabilities.workflows.word(),
+        );
+    }
+
+    if !capabilities.can_write_workflows() {
+        let remediation = match capabilities.evidence {
+            CapabilityEvidence::AppInstallation => {
+                "The operator can remove this restriction by granting the App `Workflows: Read and write` and approving the updated permission on this installation."
+            }
+            CapabilityEvidence::ClassicOauthScopes => {
+                "The operator can remove this restriction by refreshing or replacing GITHUB_TOKEN with the classic `workflow` scope in addition to its repository scope."
+            }
+            CapabilityEvidence::OpaqueToken => {
+                "The operator can remove this restriction with a GitHub App installation that reports `Contents` and `Workflows` write, or a classic token whose `repo` and `workflow` scopes GitHub reports."
+            }
+            CapabilityEvidence::Anonymous | CapabilityEvidence::ProbeFailed => {
+                "The operator can remove this restriction by repairing the credential and confirming it with `comet-board doctor`."
+            }
+        };
+        return format!(
+            "\n\nCredential preflight — ordinary repository content is writable, but \
+             `.github/workflows/**` write is {} according to {evidence}. Do not add, \
+             edit, stage, or commit workflow files on this branch: GitHub will reject the \
+             entire push. If the task needs a workflow change, develop it only as a patch \
+             artifact outside `.github/workflows` (for example under `docs/workflow-patches/`), \
+             commit that artifact, and put its path and exact apply command in the pull \
+             request description. Say plainly that the workflow itself has not landed. \
+             {remediation}",
+            capabilities.workflows.word(),
+        );
+    }
+
+    format!(
+        "\n\nCredential preflight — ordinary repository content and \
+         `.github/workflows/**` files are both writable according to {evidence}."
+    )
+}
+
+/// A pre-cut refusal when even an ordinary branch cannot be established as
+/// pushable. Missing workflow permission alone is not a refusal — that route
+/// has the patch-artifact fallback above — but missing or unknown content write
+/// leaves no pull request an agent can deliver at all.
+pub fn credential_preflight_refusal(capabilities: PushCapabilities) -> Option<String> {
+    if capabilities.contents == WriteCapability::Write {
+        return None;
+    }
+    let remediation = match capabilities.evidence {
+        CapabilityEvidence::AppInstallation => {
+            "grant the GitHub App `Contents: Read and write` and approve the updated installation permission"
+        }
+        CapabilityEvidence::ClassicOauthScopes => {
+            "refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope"
+        }
+        CapabilityEvidence::OpaqueToken => {
+            "GitHub exposed no OAuth-scope evidence for this fine-grained/unknown token; use an App installation reporting Contents write or a classic token reporting `repo`"
+        }
+        CapabilityEvidence::Anonymous => {
+            "configure GITHUB_TOKEN or GITHUB_APP_ID with GITHUB_APP_PRIVATE_KEY_PATH"
+        }
+        CapabilityEvidence::ProbeFailed => {
+            "restore GitHub access and confirm it with `comet-board doctor`"
+        }
+    };
+    Some(format!(
+        "ordinary repository content write is {} and cannot be established as deliverable — {remediation}",
+        capabilities.contents.word()
+    ))
 }
 
 /// The block [`resolve_prompt`] appends when a dispatch asks for a
@@ -1227,6 +1346,62 @@ mod tests {
         assert!(
             prompt.contains("comet-board claim --task gh:owner/widget#7"),
             "{prompt}"
+        );
+    }
+
+    // ---- the credential preflight reaches the first prompt (§gh#440) -----
+
+    #[test]
+    fn a_workflow_capable_credential_says_both_writes_are_deliverable() {
+        let brief = credential_preflight_brief(PushCapabilities {
+            contents: WriteCapability::Write,
+            workflows: WriteCapability::Write,
+            evidence: CapabilityEvidence::AppInstallation,
+        });
+        assert!(brief.contains("ordinary repository content"), "{brief}");
+        assert!(brief.contains("both writable"), "{brief}");
+        assert!(brief.contains("installation token"), "{brief}");
+    }
+
+    #[test]
+    fn missing_workflow_permission_keeps_ordinary_work_and_requires_a_patch_artifact() {
+        let brief = credential_preflight_brief(PushCapabilities {
+            contents: WriteCapability::Write,
+            workflows: WriteCapability::Missing,
+            evidence: CapabilityEvidence::ClassicOauthScopes,
+        });
+        assert!(!brief.contains("stop before changing files"), "{brief}");
+        assert!(brief.contains("Do not add, edit, stage, or commit workflow files"));
+        assert!(brief.contains("docs/workflow-patches/"), "{brief}");
+        assert!(brief.contains("exact apply command"), "{brief}");
+        assert!(brief.contains("`workflow` scope"), "{brief}");
+    }
+
+    #[test]
+    fn unknown_or_absent_content_write_fails_closed_before_work_starts() {
+        for capabilities in [
+            PushCapabilities {
+                contents: WriteCapability::Unknown,
+                workflows: WriteCapability::Unknown,
+                evidence: CapabilityEvidence::OpaqueToken,
+            },
+            PushCapabilities::anonymous(),
+        ] {
+            let brief = credential_preflight_brief(capabilities);
+            assert!(brief.contains("stop before changing files"), "{brief}");
+            assert!(brief.contains("do not edit, commit, or promise"), "{brief}");
+            assert!(brief.contains("Report the credential preflight"), "{brief}");
+            let refusal = credential_preflight_refusal(capabilities).expect("must refuse");
+            assert!(refusal.contains("cannot be established as deliverable"));
+        }
+        assert_eq!(
+            credential_preflight_refusal(PushCapabilities {
+                contents: WriteCapability::Write,
+                workflows: WriteCapability::Missing,
+                evidence: CapabilityEvidence::AppInstallation,
+            }),
+            None,
+            "missing workflow permission takes the patch-artifact path"
         );
     }
 

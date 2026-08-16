@@ -58,9 +58,12 @@ for the push, so an hourly token cannot end up cached in the keychain. Who runs
 that push is §gh#70.
 
 Operator work, not the agent's: register the App, set **Issues: RW, Pull
-requests: RW, Contents: RW, Metadata: R** (Contents write is what `merge_pr`'s
-`PUT /pulls/{n}/merge` needs), generate the key, make the App public so others
-can install it, and drop the PEM on the box.
+requests: RW, Contents: RW, Workflows: RW, Metadata: R** (Contents write is
+what ordinary git pushes and `merge_pr` need; Workflows write is the separate
+grant GitHub requires when a ref update touches `.github/workflows/**`),
+generate the key, make the App public so others can install it, and drop the
+PEM on the box. An installation predating a permission increase must approve
+the update before its tokens receive the new grant.
 
 Deliberately out of scope, each its own ticket: webhooks replacing polling (a
 separate delivery path with its own endpoint and secret), and repo

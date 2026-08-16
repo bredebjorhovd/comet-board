@@ -16,6 +16,7 @@ use crate::git_credentials;
 use crate::git_identity;
 use crate::runtime::harness_for_runtime;
 use crate::skill;
+use crate::sources::github::{CapabilityEvidence, PushCapabilities, WriteCapability};
 use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
 use comet_proto::view::board::RuntimeOption;
@@ -427,6 +428,11 @@ pub fn doctor(
             // installation tokens, so this reports what the board is actually
             // holding rather than what it would hold if it ever asked.
             checks.extend(app_token_checks(repos, rest.as_ref().ok()));
+            // A token that can reach a repo — and even write its ordinary
+            // contents — can still be refused when a ref update contains
+            // `.github/workflows/**`. Report the two grants independently so
+            // the box is repaired before a completed CI task reaches push.
+            checks.extend(push_capability_checks(repos, rest.as_ref().ok()));
 
             // A repo whose space exists but whose config does not is silent,
             // not broken — `ok` stays true, or a repo you are only reading
@@ -2302,6 +2308,76 @@ fn app_token_checks(
             },
         )
         .collect()
+}
+
+/// Whether each configured repo can receive ordinary and workflow-file pushes.
+///
+/// One check per repo because App permissions are installation-specific and a
+/// classic token's `public_repo` scope depends on whether that repo is public.
+/// The probe returns only permission evidence, never the bearer used to obtain
+/// it (gh#440).
+fn push_capability_checks(
+    repos: &[String],
+    rest: Option<&crate::sources::github::HttpRest>,
+) -> Vec<Check> {
+    repos
+        .iter()
+        .map(|repo| {
+            let capabilities = rest
+                .ok_or_else(|| "could not build the configured GitHub client".to_string())
+                .and_then(|rest| rest.push_capabilities(repo).map_err(|e| format!("{e:#}")));
+            push_capability_check(repo, capabilities)
+        })
+        .collect()
+}
+
+fn push_capability_check(repo: &str, capabilities: Result<PushCapabilities, String>) -> Check {
+    let name = format!("github {repo} pushes");
+    let Ok(capabilities) = capabilities else {
+        return Check {
+            name,
+            ok: false,
+            detail: "repository contents: unknown · workflow files: unknown — the capability \
+                     probe failed. Restore GitHub access, then run `comet-board doctor` again"
+                .into(),
+        };
+    };
+    let status = format!(
+        "repository contents: {} · workflow files: {}",
+        capabilities.contents.word(),
+        capabilities.workflows.word()
+    );
+    let remediation = match capabilities.evidence {
+        CapabilityEvidence::AppInstallation if capabilities.contents != WriteCapability::Write => {
+            " — grant the GitHub App `Contents: Read and write`, then approve the updated permission on this installation"
+        }
+        CapabilityEvidence::AppInstallation if !capabilities.can_write_workflows() => {
+            " — grant the GitHub App `Workflows: Read and write`, then approve the updated permission on this installation"
+        }
+        CapabilityEvidence::ClassicOauthScopes
+            if capabilities.contents != WriteCapability::Write =>
+        {
+            " — refresh or replace GITHUB_TOKEN with `repo` (or `public_repo` for a public repository) scope"
+        }
+        CapabilityEvidence::ClassicOauthScopes if !capabilities.can_write_workflows() => {
+            " — refresh or replace GITHUB_TOKEN with the classic `workflow` scope in addition to its repository scope"
+        }
+        CapabilityEvidence::OpaqueToken => {
+            " — GitHub exposed no OAuth-scope evidence (fine-grained/unknown token), so this fails closed; use an App installation reporting Contents + Workflows write, or a classic token reporting `repo` + `workflow`"
+        }
+        CapabilityEvidence::Anonymous => {
+            " — configure GITHUB_TOKEN, or GITHUB_APP_ID with GITHUB_APP_PRIVATE_KEY_PATH"
+        }
+        CapabilityEvidence::ProbeFailed => {
+            " — capability evidence was unavailable; restore GitHub access and run `comet-board doctor` again"
+        }
+        _ => "",
+    };
+    Check {
+        name,
+        ok: capabilities.can_write_workflows(),
+        detail: format!("{status}{remediation}"),
+    }
 }
 
 fn minutes(secs: i64) -> String {
@@ -5036,6 +5112,77 @@ mod tests {
     fn a_personal_access_token_has_no_token_checks_to_report() {
         let rest = HttpRest::new(Some("ghp_x".into())).unwrap();
         assert!(app_token_checks(&["o/r".into()], Some(&rest)).is_empty());
+    }
+
+    #[test]
+    fn workflow_push_reporting_distinguishes_the_apps_two_permissions() {
+        let missing = push_capability_check(
+            "o/r",
+            Ok(PushCapabilities {
+                contents: WriteCapability::Write,
+                workflows: WriteCapability::Missing,
+                evidence: CapabilityEvidence::AppInstallation,
+            }),
+        );
+        assert!(!missing.ok, "{}", missing.detail);
+        assert!(missing.detail.contains("repository contents: write"));
+        assert!(missing.detail.contains("workflow files: missing"));
+        assert!(missing.detail.contains("Workflows: Read and write"));
+        assert!(missing.detail.contains("approve the updated permission"));
+
+        let ready = push_capability_check(
+            "o/r",
+            Ok(PushCapabilities {
+                contents: WriteCapability::Write,
+                workflows: WriteCapability::Write,
+                evidence: CapabilityEvidence::AppInstallation,
+            }),
+        );
+        assert!(ready.ok, "{}", ready.detail);
+        assert_eq!(
+            ready.detail,
+            "repository contents: write · workflow files: write"
+        );
+    }
+
+    #[test]
+    fn classic_pat_reporting_names_the_missing_workflow_scope() {
+        let check = push_capability_check(
+            "o/r",
+            Ok(PushCapabilities {
+                contents: WriteCapability::Write,
+                workflows: WriteCapability::Missing,
+                evidence: CapabilityEvidence::ClassicOauthScopes,
+            }),
+        );
+        assert!(!check.ok, "{}", check.detail);
+        assert!(check.detail.contains("classic `workflow` scope"));
+        assert!(check.detail.contains("repository scope"));
+    }
+
+    #[test]
+    fn opaque_fine_grained_token_evidence_fails_closed() {
+        let check = push_capability_check(
+            "o/r",
+            Ok(PushCapabilities {
+                contents: WriteCapability::Unknown,
+                workflows: WriteCapability::Unknown,
+                evidence: CapabilityEvidence::OpaqueToken,
+            }),
+        );
+        assert!(!check.ok, "{}", check.detail);
+        assert!(check.detail.contains("fine-grained/unknown token"));
+        assert!(check.detail.contains("fails closed"));
+        assert!(check.detail.contains("`repo` + `workflow`"));
+    }
+
+    #[test]
+    fn no_credential_push_reporting_is_explicit_and_actionable() {
+        let check = push_capability_check("o/r", Ok(PushCapabilities::anonymous()));
+        assert!(!check.ok, "{}", check.detail);
+        assert!(check.detail.contains("repository contents: missing"));
+        assert!(check.detail.contains("workflow files: missing"));
+        assert!(check.detail.contains("GITHUB_APP_PRIVATE_KEY_PATH"));
     }
 
     // ── git identity (gh#107) ───────────────────────────────────────────────
