@@ -5867,7 +5867,10 @@ mod tests {
                 state,
                 detail: Some("installing toolchain".into()),
                 recipe_digest: Some("abc123".into()),
+                execution_digest: Some("tree123".into()),
                 log: Some("/data/prep.log".into()),
+                log_excerpt: Some("installing".into()),
+                run_command: Some("cargo run".into()),
                 requires_approval,
                 projections: Vec::new(),
             }

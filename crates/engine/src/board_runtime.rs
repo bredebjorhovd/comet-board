@@ -302,16 +302,31 @@ pub(crate) fn settle_preparation(
             return;
         }
     };
-    if let Err(e) = doc_host.queue_command_with_id(
-        &parked.chat_id,
-        &parked.command_id,
-        parked.command.clone(),
-    ) {
-        // Dropping the claim rolls the durable payload back for retry.
-        tracing::error!(chat = %parked.chat_id, error = %e, "releasing the prepared brief");
-        return;
+    match claim.deliver(|_| {
+        doc_host.queue_command_with_id_durable(
+            &parked.chat_id,
+            &parked.command_id,
+            parked.command.clone(),
+        )
+    }) {
+        Ok(true) => {}
+        Ok(false) => tracing::info!(chat = %parked.chat_id, "prepared brief was revoked before release"),
+        Err(e) => {
+            // Dropping the claim rolls the durable payload back for retry.
+            tracing::error!(chat = %parked.chat_id, error = %e, "releasing the prepared brief");
+        }
     }
-    claim.complete();
+}
+
+/// Complete ready handoffs left across an engine crash. Both crash windows use
+/// the same path as the live completion: `ready + parked` queues the stable id;
+/// `ready + claimed` queues that same id again, which the durable ledger
+/// deduplicates before the state machine acknowledges and removes the payload.
+pub(crate) fn reconcile_prepared_checkouts(prep: &CheckoutPrep, doc_host: &DocHost) {
+    for (worktree, record) in prep.ready_handoffs() {
+        tracing::info!(worktree = %worktree.display(), "reconciling ready checkout handoff");
+        settle_preparation(prep, doc_host, &worktree, &record);
+    }
 }
 
 fn peek_parked(
@@ -506,6 +521,9 @@ impl Runtime for CometRuntime {
                         cwd
                     ));
                 }
+                if spec.worktree {
+                    self.prep.forget(Path::new(&cwd));
+                }
                 return Err(error);
             }
         };
@@ -513,8 +531,11 @@ impl Runtime for CometRuntime {
             comet_proto::view::board::CheckoutPreparation {
                 state: comet_proto::view::board::CheckoutPreparationState::Preparing,
                 recipe_digest: None,
+                execution_digest: None,
                 detail: Some("preparing checkout before the agent starts".to_string()),
                 log: None,
+                log_excerpt: None,
+                run_command: None,
                 requires_approval: false,
                 projections: Vec::new(),
             }
@@ -535,25 +556,46 @@ impl Runtime for CometRuntime {
         &self,
         worktree: &str,
     ) -> anyhow::Result<Option<comet_proto::view::board::CheckoutPreparation>> {
-        Ok(self
-            .prep
-            .status(Path::new(worktree))
-            .map(|record| record.board_view()))
+        Ok(self.prep.status(Path::new(worktree)).map(|record| {
+            let excerpt = record
+                .log
+                .as_ref()
+                .and_then(|_| self.prep.log_head(Path::new(worktree), 8 * 1024));
+            record.board_view(excerpt)
+        }))
     }
 
     fn retry_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
         let parked = peek_parked(&self.prep, Path::new(worktree))
             .ok_or_else(|| anyhow::anyhow!("{} has no parked dispatch to release", worktree))?;
-        self.start_preparation(&parked.chat_id, worktree, parked.repository_id);
+        let repository_id = self
+            .handle
+            .block_on(self.repos.repository_identity(Path::new(worktree)))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            repository_id == parked.repository_id,
+            "{} no longer belongs to the repository that parked this dispatch",
+            worktree
+        );
+        self.start_preparation(&parked.chat_id, worktree, repository_id);
         Ok(())
     }
 
     fn approve_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
         let parked = peek_parked(&self.prep, Path::new(worktree))
             .ok_or_else(|| anyhow::anyhow!("{} has no parked dispatch to approve", worktree))?;
+        let repository_id = self
+            .handle
+            .block_on(self.repos.repository_identity(Path::new(worktree)))
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        anyhow::ensure!(
+            repository_id == parked.repository_id,
+            "{} no longer belongs to the repository that parked this dispatch",
+            worktree
+        );
         let digest = self
             .prep
-            .approve(Path::new(worktree), &parked.repository_id)
+            .approve(Path::new(worktree), &repository_id)
             .map_err(|error| anyhow::anyhow!(error))?;
         notice(
             &self.doc_host,
@@ -564,7 +606,7 @@ impl Runtime for CometRuntime {
             ),
             false,
         );
-        self.start_preparation(&parked.chat_id, worktree, parked.repository_id);
+        self.start_preparation(&parked.chat_id, worktree, repository_id);
         Ok(())
     }
 
@@ -993,6 +1035,20 @@ pub(crate) fn repo_of_checkout(worktree: &Path) -> Option<std::path::PathBuf> {
 mod review_candidate_tests {
     use super::*;
 
+    fn git(repo: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn pull_request_provenance_reads_plain_and_markdown_urls_only() {
         assert_eq!(
@@ -1016,5 +1072,83 @@ mod review_candidate_tests {
             failed: true,
         };
         assert!(!ran_gh_pr_create(&failed));
+    }
+
+    #[tokio::test]
+    async fn startup_reconciles_ready_parked_and_abandoned_claimed_handoffs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".comet")).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        git(&repo, &["config", "user.email", "prep@test.invalid"]);
+        git(&repo, &["config", "user.name", "Checkout Prep Test"]);
+        std::fs::write(
+            repo.join(crate::checkout_prep::RECIPE_PATH),
+            "version = 1\n[setup]\nrun = \"true\"\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "fixture"]);
+
+        let core = crate::EngineCore::assemble(
+            &dir.path().join("data"),
+            Arc::new(crate::HarnessRegistry::new()),
+            comet_proto::HarnessId::Mock,
+            None,
+        )
+        .unwrap();
+        let prep = core.checkout_prep.clone();
+        let repository_id = "startup-reconcile-repository";
+        prep.approve(&repo, repository_id).unwrap();
+        let record = prep
+            .prepare(crate::checkout_prep::PrepareRequest {
+                worktree: &repo,
+                repository_id,
+                force: false,
+                cancel: None,
+            })
+            .await;
+        assert!(record.is_ready());
+
+        let payload = |chat: &str, command: &str| {
+            serde_json::to_string(&ParkedBrief {
+                chat_id: chat.to_string(),
+                command_id: command.to_string(),
+                repository_id: repository_id.to_string(),
+                command: SessionCommandPayload::Interrupt {},
+            })
+            .unwrap()
+        };
+
+        prep.park(&repo, &payload("chat-ready-parked", "ready-parked"))
+            .unwrap();
+        reconcile_prepared_checkouts(&prep, &core.doc_host);
+        assert!(prep.parked(&repo).is_none());
+        assert!(core
+            .doc_host
+            .open("chat-ready-parked")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap()
+            .iter()
+            .any(|command| command.id == "ready-parked"));
+
+        prep.park(&repo, &payload("chat-ready-claimed", "ready-claimed"))
+            .unwrap();
+        let abandoned = prep.claim_parked(&repo).expect("claimed before crash");
+        std::mem::forget(abandoned);
+        let restarted = CheckoutPrep::new(&dir.path().join("data"));
+        reconcile_prepared_checkouts(&restarted, &core.doc_host);
+        assert!(restarted.parked(&repo).is_none());
+        assert!(core
+            .doc_host
+            .open("chat-ready-claimed")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap()
+            .iter()
+            .any(|command| command.id == "ready-claimed"));
     }
 }

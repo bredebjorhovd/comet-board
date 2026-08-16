@@ -190,6 +190,9 @@ struct DocHostInner {
     sessions: OnceLock<SessionsEngine>,
     workspace: OnceLock<WorkspaceHost>,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// Commands whose session snapshot must be durable before the executor may
+    /// see them. Checkout-preparation handoff is the only producer.
+    durable_pending: Mutex<HashSet<String>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -481,6 +484,7 @@ impl DocHost {
                 sessions: OnceLock::new(),
                 workspace: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
+                durable_pending: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -870,6 +874,34 @@ impl DocHost {
         Ok(())
     }
 
+    /// Queue under a stable id and force the containing session snapshot to
+    /// disk before returning. Checkout preparation keeps its parked command
+    /// until this acknowledgement: a crash between the in-memory append and
+    /// the normal debounce can therefore replay the same id, never lose the
+    /// only copy and never append a second run.
+    pub fn queue_command_with_id_durable(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+    ) -> Result<(), EngineError> {
+        lock(&self.inner.durable_pending).insert(id.to_string());
+        if let Err(error) = self.queue_command_with_id(chat_id, id, payload) {
+            lock(&self.inner.durable_pending).remove(id);
+            return Err(error);
+        }
+        let handle = self.open(chat_id)?;
+        // A failed save deliberately leaves the id gated. The caller keeps its
+        // parked payload, and a retry persists this same command id before
+        // opening the gate. No run starts from an unacknowledged memory append.
+        self.persist_snapshot(&handle)?;
+        lock(&self.inner.durable_pending).remove(id);
+        // The notification raised by the append may already have drained while
+        // this id was gated. Raise another after the durable acknowledgement.
+        handle.changed_tx.send_modify(|value| *value = value.wrapping_add(1));
+        Ok(())
+    }
+
     /// The device hosting `chat_id`, when anything says: the session doc's own
     /// stamp first (it travels with a chat shared into the org — the only
     /// source a teammate has), then this user's workspace row. `None` = nobody
@@ -1059,6 +1091,7 @@ impl DocHost {
                 .find(|c| {
                     c.status == SessionCommandStatus::Pending
                         && !skipped.contains(&c.id)
+                        && !lock(&self.inner.durable_pending).contains(&c.id)
                         && !is_processed(&c.id)
                 })
                 .cloned()
@@ -1318,9 +1351,16 @@ impl DocHost {
         })
     }
 
+    fn persist_snapshot(&self, handle: &ChatDocHandle) -> Result<usize, EngineError> {
+        let bytes = handle.doc().export_snapshot()?;
+        self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+        handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+        Ok(bytes.len())
+    }
+
     fn save_snapshot(&self, handle: &ChatDocHandle) {
-        if let Some(bytes) = self.save_doc(&handle.chat_id, &handle.doc()) {
-            handle.snapshot_bytes.store(bytes, Ordering::Relaxed);
+        if let Err(err) = self.persist_snapshot(handle) {
+            tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
         }
     }
 
@@ -1888,6 +1928,33 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn a_durable_command_is_in_a_fresh_hosts_snapshot_before_acknowledgement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = host(dir.path());
+        first
+            .queue_command_with_id_durable(
+                "chat-durable-command",
+                "prep-release-durable",
+                SessionCommandPayload::Interrupt {},
+            )
+            .expect("durable queue acknowledged");
+
+        // Do not flush or wait for the ordinary debounce. A new host reading
+        // only the store models a crash immediately after the acknowledgement.
+        let restarted = host(dir.path());
+        let commands = restarted
+            .open("chat-durable-command")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == "prep-release-durable"
+                && command.status == SessionCommandStatus::Pending
+        }));
     }
 
     #[tokio::test]

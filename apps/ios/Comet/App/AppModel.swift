@@ -542,6 +542,12 @@ final class AppModel {
         return await board.cancel(taskId: taskId)
     }
 
+    func retryBoardPreparation(taskId: String) async -> String? {
+        guard demo == nil else { return nil }
+        guard let board else { return "Not connected to a board" }
+        return await board.retryPreparation(taskId: taskId)
+    }
+
     // MARK: The repo picker (gh#118)
 
     /// The board hosts, and what each knows about repos. Demo mode answers with

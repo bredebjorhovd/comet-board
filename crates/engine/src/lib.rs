@@ -666,6 +666,12 @@ impl Engine {
         }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
+        // A crash can land after preparation persisted `ready` but before its
+        // parked brief was durably acknowledged by the command ledger. Reuse
+        // the live settlement path before the board starts reconciling rows;
+        // the stable command id makes either crash window exact-once.
+        board_runtime::reconcile_prepared_checkouts(&core.checkout_prep, &core.doc_host);
+
         // The board service (§board-service): the sync loop herdr-board ran
         // as `syncd`, fed by the same merged session stream `WatchSessions`
         // serves. Failure to start is a warning, not fatal — the engine's job

@@ -265,9 +265,17 @@ pub struct CheckoutPreparation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<String>,
+    /// Bounded output head for operators who cannot read the host path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_excerpt: Option<String>,
+    /// Canonical development command, offered explicitly and never auto-run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_command: Option<String>,
     #[serde(default)]
     pub requires_approval: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

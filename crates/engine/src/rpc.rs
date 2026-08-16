@@ -81,7 +81,6 @@ use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, pars
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
-use crate::board_runtime::repo_of_checkout;
 use crate::checkout_prep::CheckoutPrep;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
@@ -252,8 +251,9 @@ struct PrepareCheckoutParams {
     /// has in hand.
     #[serde(alias = "path", alias = "cwd")]
     worktree_path: String,
-    /// The repository it was cut from — only needed to resolve `[[link]]`
-    /// sources, and derived from the checkout when omitted.
+    /// Compatibility metadata for older callers. Authority is always derived
+    /// from `worktree_path`; when supplied this must resolve to the same Git
+    /// common directory or the request is refused.
     #[serde(default)]
     repo_path: Option<String>,
     /// Prepare even if the record says ready. Defaults to *true* on this verb;
@@ -2462,22 +2462,29 @@ impl RpcService for EngineRpc {
                         worktree.display()
                     )));
                 }
-                // The repo the checkout belongs to decides which box-local
-                // directory a `[[link]]` resolves under, so every worktree of
-                // one repo shares one set of machine-local files. Derived from
-                // the checkout when the caller does not say, which is what a
-                // frontend holding only a chat's cwd can do.
-                let repo = p
-                    .repo_path
-                    .as_deref()
-                    .map(std::path::PathBuf::from)
-                    .or_else(|| repo_of_checkout(&worktree))
-                    .unwrap_or_else(|| worktree.clone());
+                // Authority comes from the checkout's verified Git common dir,
+                // never from a caller-supplied `repoPath`. The optional legacy
+                // field is checked for consistency so a relayed caller cannot
+                // make repository B borrow A's approval or locals namespace.
                 let repository_id = self
                     .repos
-                    .repository_identity(&repo)
+                    .repository_identity(&worktree)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if let Some(repo) = p.repo_path.as_deref() {
+                    let claimed_id = self
+                        .repos
+                        .repository_identity(std::path::Path::new(repo))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if claimed_id != repository_id {
+                        return Err(RpcError::Failed(format!(
+                            "{} does not belong to repository {}",
+                            worktree.display(),
+                            repo
+                        )));
+                    }
+                }
                 let record = self
                     .prep
                     .prepare(crate::checkout_prep::PrepareRequest {
@@ -2527,7 +2534,7 @@ impl RpcService for EngineRpc {
                     .prep
                     .approve(&worktree, &repository_id)
                     .map_err(RpcError::Failed)?;
-                RpcReply::value(&serde_json::json!({ "recipeDigest": digest }))
+                RpcReply::value(&serde_json::json!({ "executionDigest": digest }))
             }
             methods::CHECKOUT_PREP => {
                 let p: PrepareCheckoutParams = parse_params(params)?;

@@ -1927,6 +1927,83 @@ impl BoardPanel {
         .detach();
     }
 
+    /// Host-local trust decision for a failed preparation. A remote desktop
+    /// cannot relay approval by design; it gets the exact CLI recovery command
+    /// in the preparation card instead of a button which would always refuse.
+    fn approve_preparation(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.model.task(id) else { return };
+        if self.host.is_some() {
+            self.set_notice(
+                format!(
+                    "Approve on the worktree host: comet-board approve-preparation --task {}",
+                    row.id
+                ),
+                cx,
+            );
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            self.set_notice("Engine not connected", cx);
+            return;
+        };
+        let task_id = row.id.clone();
+        let identifier = row.identifier.clone();
+        cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(
+                    methods::APPROVE_TASK_PREPARATION,
+                    serde_json::json!({ "taskId": task_id }),
+                )
+                .await;
+            this.update(cx, |panel, cx| match result {
+                Ok(_) => panel.set_notice(
+                    format!("Approved {identifier}'s committed preparation tree; retrying"),
+                    cx,
+                ),
+                Err(error) => panel.set_notice(
+                    format!("Couldn't approve {identifier}'s preparation: {error}"),
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Recovery for a failed recipe which needs no new trust decision. Unlike
+    /// an ordinary blocked-agent Retry, this preserves the live attempt and
+    /// has no runtime/account choice to make: the parked brief already owns
+    /// those facts.
+    fn retry_preparation(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            self.set_notice("Engine not connected", cx);
+            return;
+        };
+        let Some(row) = self.model.task(id) else { return };
+        let task_id = row.id.clone();
+        let identifier = row.identifier.clone();
+        let params = self.host_params(serde_json::json!({
+            "taskId": task_id,
+            "replace": true,
+        }));
+        cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::DISPATCH_TASK, params).await;
+            this.update(cx, |panel, cx| match result {
+                Ok(_) => panel.set_notice(
+                    format!("Retrying {identifier}'s preparation in the same checkout"),
+                    cx,
+                ),
+                Err(error) => panel.set_notice(
+                    format!("Couldn't retry {identifier}'s preparation: {error}"),
+                    cx,
+                ),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// `r`: open the selected row's review (gh#180).
     ///
     /// Offered on any row that has been attempted at all, not only on `review`
@@ -3947,6 +4024,120 @@ impl BoardPanel {
                 .into_any_element()
         };
 
+        // Preparation is operational evidence, not a time-cell subtitle. Put
+        // its recovery, retained output and every credential projection in the
+        // opened row where both the state and the action are visible together.
+        let preparation_element: Option<AnyElement> = row.preparation.as_ref().map(|preparation| {
+            let state = match preparation.state {
+                comet_proto::view::board::CheckoutPreparationState::Preparing => "preparing",
+                comet_proto::view::board::CheckoutPreparationState::Ready => "ready",
+                comet_proto::view::board::CheckoutPreparationState::Failed => "failed",
+            };
+            let mut lines = vec![format!("Checkout preparation: {state}")];
+            if let Some(detail) = &preparation.detail {
+                lines.push(detail.clone());
+            }
+            if let Some(digest) = &preparation.execution_digest {
+                lines.push(format!("Execution tree: {}", &digest[..digest.len().min(12)]));
+            }
+            if let Some(command) = &preparation.run_command {
+                lines.push(format!("Run explicitly: {command}"));
+            }
+            if let Some(path) = &preparation.log {
+                lines.push(format!("Retained output: {path}"));
+            }
+            for projection in &preparation.projections {
+                lines.push(format!(
+                    "{} -> {}: {}{}",
+                    projection.from,
+                    projection.to,
+                    projection.result,
+                    projection
+                        .mode
+                        .as_deref()
+                        .map(|mode| format!(" ({mode})"))
+                        .unwrap_or_default()
+                ));
+            }
+            if preparation.requires_approval {
+                lines.push(format!(
+                    "Recovery: comet-board approve-preparation --task {} (on the worktree host)",
+                    row.id
+                ));
+            } else if preparation.state == comet_proto::view::board::CheckoutPreparationState::Failed {
+                lines.push(format!("Recovery: comet-board retry --task {}", row.id));
+            }
+            if let Some(excerpt) = &preparation.log_excerpt {
+                lines.push(format!("\nOutput head:\n{}", excerpt.trim_end()));
+            }
+            let approve = preparation.requires_approval;
+            let failed = preparation.state
+                == comet_proto::view::board::CheckoutPreparationState::Failed;
+            let local = self.host.is_none();
+            let approve_id = id.clone();
+            let retry_id = id.clone();
+            div()
+                .id(SharedString::from(format!("board-preparation-{id}")))
+                .flex_none()
+                .max_h(px(180.0))
+                .overflow_y_scroll()
+                .px(px(8.0))
+                .py(px(7.0))
+                .rounded(px(Theme::RADIUS_CHIP))
+                .bg(theme.wash(0.08))
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(lines.join("\n"))),
+                )
+                .when(approve && local, |element| {
+                    element.child(
+                        div()
+                            .id(SharedString::from(format!("board-prep-approve-{id}")))
+                            .h(px(22.0))
+                            .px(px(9.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
+                            .bg(theme.wash(0.14))
+                            .flex()
+                            .items_center()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text)
+                            .hover(|style| style.bg(theme.wash(0.2)))
+                            .child(SharedString::from("Approve committed tree and retry"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.approve_preparation(&approve_id, cx);
+                            })),
+                    )
+                })
+                .when(!approve && failed, |element| {
+                    element.child(
+                        div()
+                            .id(SharedString::from(format!("board-prep-retry-{id}")))
+                            .h(px(22.0))
+                            .px(px(9.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
+                            .bg(theme.wash(0.14))
+                            .flex()
+                            .items_center()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text)
+                            .hover(|style| style.bg(theme.wash(0.2)))
+                            .child(SharedString::from("Retry in this checkout"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.retry_preparation(&retry_id, cx);
+                            })),
+                    )
+                })
+                .into_any_element()
+        });
+
         let actions = board::detail_actions(&row);
         // The review (gh#180) leads the chip row on any row that has been
         // attempted, and it is spelled for what it opens rather than for what
@@ -4030,6 +4221,7 @@ impl BoardPanel {
             .children(facts)
             .children(stack_map)
             .children(labels)
+            .children(preparation_element)
             // The body is the only part that can outgrow the panel, so it is
             // the only part that scrolls — bounded here rather than on the card
             // (the model list next door is bounded the same way), so a short

@@ -55,14 +55,15 @@ declines to execute at all.
 `preparing → ready | failed`, persisted per checkout under
 `{data_dir}/checkout-prep/{hash of the canonical path}/`:
 
-- `prep.json` — the record: state, recipe digest, command, exit code, one
+- `prep.json` — the record: state, recipe and committed-tree digests, command, exit code, one
   human sentence, what every `[[link]]` did, and the recipe's `run` command so
   whoever holds the status also holds the offer.
 - `prep.log` — the step's interleaved stdout+stderr, command at the top,
   capped at 256KB **keeping the head**: the first error diagnoses a broken
   setup, and the 200MB of `npm install` progress that pushed it out is a file
   nobody can read anyway.
-- `brief.json` — see recovery.
+- `brief.json` — the durable `parked | claimed | revoked` handoff; cancellation
+  leaves a tombstone so a late setup completion cannot enqueue the agent.
 
 The live attempt stores the same lifecycle in `board.db`, and `TaskRow` carries
 it to the CLI, desktop, and phone: state, diagnostic/log path, approval need,
@@ -70,13 +71,15 @@ and every projected file. The first dispatch frame already says `preparing`;
 it does not wait for the session poll, because there is deliberately no session
 until preparation succeeds.
 
-The record is keyed by the checkout and by the sha256 of the recipe: a
-checkout that is `ready` for this digest is not prepared again (a retry lands
-in an already-warm worktree at zero cost), and an *edited* recipe re-prepares
-without anybody remembering to force anything. Only `ready` short-circuits — a
-`failed` record retries on the next visit, and a `preparing` record left by a
-killed engine reads as failed and re-runs, which is why the contract demands
-setup be idempotent.
+The recipe is read from the immutable `HEAD` object, and approval/idempotency
+bind to the whole committed Git tree rather than the TOML alone. A checkout
+that is `ready` for this execution digest is not prepared again (a retry lands
+in an already-warm worktree at zero cost). Changing a referenced script,
+lockfile, hook, or the recipe itself changes the digest; tracked worktree/index
+edits are refused before host execution so they cannot borrow the approval of
+`HEAD`. Only `ready` short-circuits — a `failed` record retries on the next
+visit, and a `preparing` record left by a killed engine reads as failed and
+re-runs, which is why the contract demands setup be idempotent.
 
 Bounded, all of it: the step runs in its own process group (`sh` alone dying
 while its `npm` grandchild runs on is how a bounded setup becomes an unbounded
@@ -109,10 +112,14 @@ Recovery reuses everything: the board's ordinary Retry and `PrepareCheckout`
 (below) re-run the recipe against the same worktree, and on success release
 the same parked brief
 through the same `settle_preparation` — the same attempt continues, no second
-attempt is minted, no new checkout is cut. Delivery is an atomic filesystem
-claim plus a command id minted before parking. A crash rolls the claim back; a
-crash after queueing sees the same id in the command ledger and does not append
-a second billable run. Two racing retries therefore cannot both release it.
+attempt is minted, no new checkout is cut. Delivery is one durable
+`parked → claimed → removed` state machine plus a command id minted before
+parking. The command-ledger snapshot is durably saved before the handoff is
+removed, and engine startup reconciles any `ready` checkout still carrying a
+parked or crash-abandoned claimed handoff. A cancel uses the same lock and
+writes `revoked`; a late completion therefore cannot enqueue behind it. Two
+racing retries cannot both release the brief, and a crash on either side of
+queueing cannot lose or duplicate the billable run.
 
 The `[archive]` step rides reclamation: `reclaim_build_output` runs the
 repository's own cleanup first (best-effort, its own shorter budget), then
@@ -134,15 +141,18 @@ operator already on that host:
   and a parse error said out loud (a viewport offering nothing because the
   file is malformed and one offering nothing because there is no file are not
   the same thing to the person looking at it).
-- `PrepareCheckout { worktreePath, repoPath?, force? }` — run the recipe.
+- `PrepareCheckout { worktreePath, repoPath?, force? }` — run the recipe. The
+  repository identity is always derived from `worktreePath`; an optional
+  `repoPath` is compatibility metadata and is refused when it identifies a
+  different repository, never accepted as authority.
   `force` defaults to **true** here (a person pressed this because the last
   answer was wrong; handing back the cached `ready` helps nobody) and false on
   the automatic path.
 - `CancelCheckoutPreparation { worktreePath }` — cancel the checkout-owned
   token and kill the command's process group.
 - `ApproveCheckoutPreparation { worktreePath }` — host-local only: approve the
-  exact stable repository identity plus current recipe digest. Repository code
-  cannot relay this call or approve itself.
+  exact stable repository identity plus current committed-tree execution
+  digest. Repository code cannot relay this call or approve itself.
 
 For board work, `comet-board approve-preparation --task <id>` performs that
 host-local approval and retries the same attempt. Plain `comet-board retry`
@@ -165,13 +175,17 @@ repository-authored effect requires an engine-owned trust decision:
 
 - **A recipe cannot approve itself.** `[[link]]` projection and `[setup]` or
   `[archive]` execution occur only after the host approves the exact repository
-  identity + recipe sha256. An edit invalidates approval. Before that, the
+  identity + committed-tree digest. Any committed edit invalidates approval;
+  any tracked uncommitted edit is refused. Before that, the
   lifecycle is `failed` with `requires_approval = true`: no file is projected
   and no command is spawned.
 - **The child does not inherit the engine's environment.** It receives a small
-  shell/toolchain baseline (`PATH`, `HOME`, locale and common tool homes), the
-  committed `[env]`, and `COMET_WORKTREE`/`COMET_PREPARE`. Board credentials,
-  GitHub tokens, askpass state, and unrelated ambient values do not ride along.
+  shell baseline (`PATH`, user/shell names and locale), an empty engine-owned
+  `HOME` and temporary directory, the committed `[env]`, and
+  `COMET_WORKTREE`/`COMET_PREPARE`. Board credentials, GitHub tokens, askpass
+  state, SSH/npm/Cargo credentials, tool-manager homes and unrelated ambient
+  values do not ride along. Anything intentionally machine-local uses an
+  explicit `[[link]]` instead.
 - **A `[[link]]` names a leaf; comet names the root.** `from` resolves under
   `{data_dir}/locals/{hash of stable repository identity}/`, a directory the
   operator fills by hand. The identity hashes the device and Git common dir,
@@ -179,9 +193,10 @@ repository-authored effect requires an engine-owned trust decision:
   Absolute paths and `..` are refused at parse, on the spelling, before
   anything exists to check. `~/.ssh/id_ed25519` is not reachable because it is
   not *spellable*.
-- **Symlinks at the leaf or in any existing source/destination ancestor are
-  refused, not followed** — one `ln -s` would otherwise reintroduce exactly
-  the reach the roots removed.
+- **Symlinks at the leaf or in any source/destination ancestor are refused,
+  not followed.** Unix traversal and creation are descriptor-relative
+  (`openat`/`mkdirat`, `O_NOFOLLOW`, create-exclusive), so swapping an ancestor
+  after it was checked cannot redirect the eventual read or write.
 - **Projection copies, never symlinks, preserving mode** — a symlink out of
   the checkout is unreadable to a sandboxed run and editable-through by an
   unsandboxed one; a 0600 credential that lands 0644 is a finding.
@@ -208,7 +223,7 @@ repository-authored effect requires an engine-owned trust decision:
 - *Agent not started or billed until preparation succeeds* — the brief is
   parked before preparation begins and released only by `settle_preparation`
   on a `ready` record; a failure queues nothing.
-- *Idempotent, bounded, cancellable, diagnosable* — digest short-circuit +
+- *Idempotent, bounded, cancellable, diagnosable* — committed-tree digest short-circuit +
   re-run-on-failure; process-group kill on a ceilinged timeout and on a
   `CancellationToken`; head-kept capped log that outlives the attempt.
 - *Retry reuses the worktree* — Board Retry and `PrepareCheckout` run against

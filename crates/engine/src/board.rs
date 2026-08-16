@@ -326,7 +326,7 @@ impl BoardService {
         self.dispatch_with(task_id, origin, overrides, true).await
     }
 
-    /// Host-local approval for the exact recipe digest blocking this task.
+    /// Host-local approval for the exact committed-tree digest blocking this task.
     pub async fn approve_preparation(&self, task_id: &str) -> anyhow::Result<()> {
         let (reply, rx) = oneshot::channel();
         self.tx
@@ -3133,8 +3133,11 @@ max_concurrent_per_workspace = 1
             &CheckoutPreparation {
                 state: CheckoutPreparationState::Failed,
                 recipe_digest: Some("abc".into()),
+                execution_digest: Some("tree-abc".into()),
                 detail: Some("setup exited 7".into()),
                 log: Some("/logs/prep.log".into()),
+                log_excerpt: Some("setup failed".into()),
+                run_command: Some("cargo run".into()),
                 requires_approval: false,
                 projections: Vec::new(),
             },

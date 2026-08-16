@@ -460,7 +460,7 @@ pub trait Runtime {
         anyhow::bail!("this runtime cannot retry checkout preparation")
     }
 
-    /// Approve the checkout's exact repository + recipe digest on this host,
+    /// Approve the checkout's exact repository + committed-tree digest on this host,
     /// then retry it. Transport policy decides who may invoke this mutation.
     fn approve_checkout_preparation(&self, _worktree: &str) -> anyhow::Result<()> {
         anyhow::bail!("this runtime cannot approve checkout preparation")

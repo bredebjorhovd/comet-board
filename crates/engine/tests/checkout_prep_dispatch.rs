@@ -16,7 +16,7 @@ use comet_engine::checkout_prep::{PrepState, RECIPE_PATH};
 use comet_engine::{CometRuntime, EngineCore, HarnessRegistry};
 use comet_harness::mock::MockHarness;
 use comet_proto::{AgentEvent, DoneStatus, HarnessId, SessionStatus};
-use comet_rpc::methods;
+use comet_rpc::{RpcService, methods};
 
 fn git(repo: &std::path::Path, args: &[&str]) {
     let out = Command::new("git")
@@ -170,7 +170,10 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         .await
         .unwrap()
         .expect_err("an unrecoverable dispatch must fail");
-    assert!(error.to_string().contains("parking the dispatch"), "{error:#}");
+    assert!(
+        error.to_string().contains("parking the dispatch"),
+        "{error:#}"
+    );
     assert!(
         !expected_worktree.exists(),
         "the failed dispatch rolled its checkout back"
@@ -179,8 +182,10 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         core.workspace.watch_chats().borrow().is_empty(),
         "the failed dispatch rolled its chat back"
     );
-    core.checkout_prep.revoke_parked(&expected_worktree);
-
+    assert!(
+        !core.checkout_prep.state_dir(&expected_worktree).exists(),
+        "the failed dispatch rolled its preparation state back"
+    );
     let rt = runtime.clone();
     let handle = tokio::task::spawn_blocking(move || rt.dispatch(&spec))
         .await
@@ -203,7 +208,10 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
     }
     let record = prep.status(&worktree).unwrap();
     assert_eq!(record.exit_code, Some(7));
-    assert!(worktree.exists(), "a failed preparation preserves the checkout");
+    assert!(
+        worktree.exists(),
+        "a failed preparation preserves the checkout"
+    );
 
     // The one property the issue is named for: no run started, nothing billed.
     // The brief is parked, not queued — the journal has no run and the session
@@ -214,6 +222,31 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         "no run may start in an unprepared checkout"
     );
     // And the chat says why, in a message nobody typed.
+    {
+        let doc_host = core.doc_host.clone();
+        let chat_id = handle.chat_id.clone();
+        wait_for(
+            move || {
+                doc_host
+                    .open(&chat_id)
+                    .ok()
+                    .and_then(|handle| handle.doc().read_entries().ok())
+                    .is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry.parts.iter().any(|part| {
+                                matches!(
+                                    part,
+                                    MessagePart::Error { message, .. }
+                                        if message.contains("could not be prepared")
+                                )
+                            })
+                        })
+                    })
+            },
+            "the preparation failure notice",
+        )
+        .await;
+    }
     let entries = core
         .doc_host
         .open(&handle.chat_id)
@@ -238,7 +271,42 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         "version = 1\n[setup]\nrun = \"echo ran >> prep-count.txt\"\n",
     )
     .unwrap();
+    git(&worktree, &["add", RECIPE_PATH]);
+    git(&worktree, &["commit", "-m", "fix setup"]);
     let client = comet_rpc::memory_client(core.rpc_service());
+    let mismatched = client
+        .call(
+            methods::PREPARE_CHECKOUT,
+            serde_json::json!({
+                "worktreePath": handle.cwd.clone(),
+                "repoPath": origin.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect_err("another repository cannot lend its trust namespace");
+    assert!(
+        mismatched.to_string().contains("does not belong"),
+        "{mismatched}"
+    );
+    let relayed = core
+        .rpc_service()
+        .handle_as(
+            methods::PREPARE_CHECKOUT,
+            serde_json::json!({
+                "worktreePath": handle.cwd.clone(),
+                "repoPath": origin.to_string_lossy(),
+            }),
+            &comet_rpc::Caller {
+                user: Some("relayed-user".into()),
+                org: Some("test-org".into()),
+            },
+        )
+        .await;
+    let relayed = match relayed {
+        Err(error) => error,
+        Ok(_) => panic!("relayed callers have the same repository boundary"),
+    };
+    assert!(relayed.to_string().contains("does not belong"), "{relayed}");
     client
         .call(
             methods::APPROVE_CHECKOUT_PREPARATION,
