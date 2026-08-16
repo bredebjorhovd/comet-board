@@ -280,7 +280,9 @@ Delivered
   standing_reviews_schema_version   defaults to 0; current is 1
   standing_reviews_complete         defaults to false
   standing_reviews_updated_at       pull updated_at reconciled completely
-  next_standing_review_sequence     next PR-local value, seeded above legacy watermarks
+  next_standing_review_sequence     next PR-local value, seeded above legacy review ids
+  next_fanout_generation            next monotonic blocker-notice generation
+  active_fanout_generation          null while no aggregate blocker stands
   chronology_ambiguous_reviewers[] verified reviewer keys; nonempty fails closed
   legacy_review_blocker             null | LegacyReviewBlocker
   standing_reviews[]
@@ -288,7 +290,8 @@ Delivered
 
 Submission v2 additions
   identity_version          2 (absent means legacy)
-  fingerprint               v2:<digest>
+  submission_id            caller-generated UUID; occurrence identity
+  payload_digest           reviewer/head/kind/normalized-body validation
   reviewer_key
   head_sha
   kind
@@ -297,10 +300,10 @@ Submission v2 additions
   standing_review_sequence  null for Comment
 
 StandingReview
-  key                       github:<review_id> | comet:<submission_fingerprint>
+  key                       github:<review_id> | comet:<submission_id>
   sequence                  immutable chronological PR-local integer
   owner                     comet | github
-  submission_fingerprint    required when owner is comet
+  submission_id             required when owner is comet
   github_review_id          null until/unless GitHub accepts it as a review
   reviewer_key              GitHub user id (login only if absent), else verified Comet identity
   kind                      approved | changes_requested | unknown
@@ -316,7 +319,8 @@ LegacyReviewBlocker
   projection                posted | posted_as_comment | unposted | unknown
 
 SubmissionTombstone
-  fingerprint               exact v2 identity
+  submission_id             exact occurrence identity
+  payload_digest
   attempt
   reviewer_key
   head_sha
@@ -347,28 +351,28 @@ matching legacy submission (or an explicit absent marker). It changes if the
 blocker is reconstructed, projected, or otherwise replaced, and cannot confirm
 a different pull request's migration.
 
-The persisted identity for every new submission is versioned separately from
-the old `verdict::fingerprint`. The core first resolves the verified
-`reviewer_key`, checks `expectedHeadSha`, and normalizes the body by converting
-CRLF/CR to LF and trimming leading and trailing Unicode whitespace. It then
-hashes a canonical length-prefixed encoding of `(attempt, reviewer_key,
-expectedHeadSha, kind, normalized_body)` with SHA-256 and stores
-`v2:<digest>`. Length prefixes, rather than delimiters, make the encoding
-unambiguous. This identity is used for Comment delivery/post idempotency as well
-as the `comet:` key of a decisive standing review. The old three-field
-fingerprint remains readable only as legacy state; it is never used to dedupe a
-new request.
+Every UI/CLI submission occurrence generates a UUID `submissionId` before the
+RPC and reuses it only for transport retries of that occurrence. A later button
+press or CLI invocation generates a new UUID even when reviewer, head, kind, and
+body are identical; automation may supply `--idempotency-key` and must likewise
+use a new value for a new intentional action. The server scopes the key to task
+and attempt.
 
-Thus the same reviewer retrying the same verdict on the same head finds the same
-submission, while that reviewer acting on a new head and a second verified
-reviewer acting on the same head create distinct submissions. The board-owned
-body marker carries this v2 identity so a GitHub review id recovered after a
-crash can alias only the submission that produced it.
+The core separately resolves the verified `reviewer_key`, checks
+`expectedHeadSha`, normalizes CRLF/CR to LF and trims boundary Unicode
+whitespace, then SHA-256 hashes a canonical length-prefixed encoding of
+`(reviewer_key, expectedHeadSha, kind, normalized_body)` as `payload_digest`.
+Reusing a `submissionId` with the same digest is a retry; reusing it with any
+different validated payload is a conflict and has no effects. The old
+three-field `verdict::fingerprint` remains legacy-only. The board-owned GitHub
+body marker carries `submissionId`, so crash recovery aliases the review id to
+the occurrence that produced it.
 
 `MAX_SUBMISSIONS = 20` remains the bound on full, retryable ledger entries, but
-v2 identities are not evicted with them. Before inserting entry 21, the board
-moves the oldest fully settled entry — delivery completed or was not required,
-and its projection is on GitHub — into an exact `SubmissionTombstone`. The
+submission occurrence ids are not evicted with them. Before inserting entry 21,
+the board moves the oldest fully settled entry — delivery completed or was not
+required, and its projection is on GitHub — into an exact
+`SubmissionTombstone`. The
 tombstone retains only the fields needed to reconstruct an idempotency receipt
 with delivery/projection status and suppress both side effects; it retains no
 comment body or payload. A retry found in either tier returns `recorded = false`
@@ -405,9 +409,10 @@ changing its Comet ownership. Board-marked `COMMENTED` reviews are read only to
 recover that alias and transport state; an ordinary GitHub comment is never
 imported as a decision.
 
-The review endpoint is paged at 100 records, to a hard maximum of ten pages,
-only when the existing pull `updated_at` gate says feedback moved. Once that
-timestamp differs, the board persists `standing_reviews_complete = false`
+For ordinary background polling, the review endpoint is paged at 100 records,
+to a hard maximum of ten pages, only when the existing pull `updated_at` gate
+says feedback moved. Once that timestamp differs, the board persists
+`standing_reviews_complete = false`
 before the read; a crash cannot leave the GitHub-owned partition labeled
 current. More pages set `review_state_truncated`; that projection cannot derive
 Merge. A rewritten `DISMISSED` response marks that exact review dismissed while
@@ -417,28 +422,27 @@ reviewer, head, and ordering.
 
 A Comet verdict request carries the `expectedHeadSha` the reviewer actually
 saw. Before recording, delivering, or posting anything, the board performs a
-targeted pull refresh. It compare-and-refuses unless that value equals the
-current head. It also compares the returned `updated_at` with
-`standing_reviews_updated_at`: when the timestamp moved, the schema is old, or
-`standing_reviews_complete` is false, the preflight completes the bounded review
-reconciliation above *before* allocating a local sequence. A failed or truncated
-reconciliation persists `acceptance = unknown` and refuses with no submission,
-standing review, chat message, or GitHub review. Thus a GitHub review that
-already moved `updated_at` is ingested and sequenced before the later Comet
-verdict even when the Comet request reaches the board first.
+targeted pull refresh and compare-and-refuses unless that value equals the
+current head. Unlike background polling, every verdict preflight then performs
+a complete bounded review reconciliation regardless of `updated_at` equality;
+GitHub's second-resolution timestamp is not a review-event fence. A failed or
+truncated reconciliation persists `acceptance = unknown` and refuses with no
+submission, standing review, chat message, or GitHub review. Thus a GitHub
+review already present is ingested and sequenced before the later Comet verdict
+even when both events share one represented timestamp.
 
-Immediately before the record transaction, a second targeted pull read fences
-the allocation window. If `updated_at` moved since reconciliation, the board
-reconciles that timestamp before allocating; failure or truncation refuses
-without effects. The transaction stores the fenced timestamp beside the new
-sequence. Immediately after commit and before delivery, one more targeted read
-detects movement that raced the fence itself. A newly discovered decisive
+Immediately before the record transaction, a second targeted pull read plus
+complete bounded review reconciliation fences the allocation window
+unconditionally. Failure or truncation refuses without effects. The transaction
+stores the fenced observation beside the new sequence. Immediately after commit
+and before delivery, one more complete reconciliation detects a review that
+raced the fence even when `updated_at` is unchanged. A newly discovered decisive
 review by the same reviewer makes that reviewer's chronology ambiguous rather
 than receiving a falsely newer sequence: the board persists the review and
 reviewer key in `chronology_ambiguous_reviewers`, sets `acceptance = unknown`,
 retains any conservative change-request blocker, and disables Merge. A later
 decisive verdict from that reviewer clears the latch only after its own fence
-observes one stable, completely reconciled timestamp. Different reviewers stay
+observes one stable, completely reconciled review set. Different reviewers stay
 independently ordered. No retry loop is added.
 
 Only after that ordered preflight does the verdict submission record the same
@@ -449,8 +453,9 @@ identity to GitHub's numeric user id where possible; a normalized login is the
 legacy fallback, and the authenticated Comet subject is the stable fallback
 regardless of which GitHub credential posts the copy. If the transport cannot
 supply a verified subject, submission refuses before recording. Identity
-resolution happens before the v2 fingerprint is computed; a caller-provided
-display name and the posting credential never participate.
+resolution and payload validation happen before the occurrence is
+recorded; a caller-provided display name and the posting credential never
+participate.
 
 Every outbound create-review request attributes the review to the head the
 reviewer saw:
@@ -478,9 +483,8 @@ This is unconditional, not a success-only cleanup. If the refresh finds B, an
 approval of A does not count for B and B stays `needs_review`; a change request
 remains standing under the cross-push rule, and a Comment contributes no
 decision. The board never automatically reposts on B. The final pull refresh
-applies the same completeness rule as preflight: if its `updated_at` is not
-covered by `standing_reviews_updated_at`, it runs the complete bounded review
-reconciliation before calling repository state fresh.
+always runs complete bounded review reconciliation before calling repository
+state fresh, regardless of `updated_at` equality.
 
 If the pull refresh fails, the last projection remains visible but gains
 `stale_reason`, `acceptance = unknown`, and no Repair, Ready, or Merge action
@@ -495,13 +499,13 @@ and `repositoryFresh = false`, so no surface guesses whether A is still current.
 A known head with incomplete review reconciliation returns that SHA and movement
 answer but still sets `repositoryFresh = false`.
 
-The existing board-owned body marker is extended to carry the durable submission
-fingerprint on every create-review request. When GitHub returns a review id —
+The existing board-owned body marker is extended to carry the durable
+`submissionId` on every create-review request. When GitHub returns a review id —
 for a decisive review or a `COMMENT` fallback — the board writes it onto the
 Comet-owned record as an alias; if the process dies between the POST and that
 write, reconciliation recovers the same alias from the marker. A later read of
 that id updates the same logical decision. Alias recovery indexes both live
-submissions and compacted tombstones by v2 fingerprint, updating a tombstone's
+submissions and compacted tombstones by `submissionId`, updating a tombstone's
 transport fields without making it live or repeating a side effect. A
 `COMMENTED` overlay may update its transport metadata but never replaces the
 Comet decision's kind. A verdict
@@ -536,11 +540,14 @@ current head; approvals of older heads do not count. Otherwise it is
 and a push invalidates every old-head approval even in a repository configured
 not to dismiss stale GitHub approvals.
 
-The existing `pr_changes_requested` column remains the cheap stack blocker. It
-is recomputed from the collection as the newest active change request's
-numeric `sequence`, from an unresolved legacy blocker's preserved
-`changes_requested_id`, or null, rather than mutated by whichever verdict
-arrived last.
+The existing `pr_changes_requested` column remains the cheap stack blocker, but
+its numeric value becomes `active_fanout_generation`, not a review sequence.
+The board allocates the next generation whenever the aggregate blocker set
+transitions from clear to blocked or changes identity; clearing sets only the
+active value null and never resets the counter. `Delivered::fanned_out[child]`
+stores that same generation. A continuously active blocker retains its
+generation, while a request re-exposed after a false clear receives a new one
+strictly above every edge watermark and reaches each dependent once.
 
 The schema marker makes migration distinguishable from a valid empty review
 set. The exact pre-upgrade input includes `Delivered::review`,
@@ -548,18 +555,17 @@ set. The exact pre-upgrade input includes `Delivered::review`,
 `Delivered::submissions[]`, whose `Submission` contains only `fingerprint`,
 `review_id`, `delivered`, `projection`, `refusal`, and `posted_as`. It contains
 no head, verified reviewer, kind field, or original body. Migration does not
-invent any of them and does not reinterpret the old fingerprint as a v2
-identity.
+invent any of them and does not reinterpret the old fingerprint as a new
+submission occurrence id.
 
-The new sequence and the retained fan-out watermarks stay in one numeric domain.
-Before importing or allocating any `StandingReview`, migration computes the
-legacy high-water mark as the checked maximum of:
+Standing-review chronology and fan-out generation are separate monotonic
+domains. Before importing or allocating any `StandingReview`, migration computes
+the review-sequence high-water mark as the checked maximum of:
 
 - `Delivered::review`;
 - `Delivered::changes_requested` when present;
 - every positive legacy `Submission::review_id`;
-- every value in `Delivered::fanned_out`;
-- and, when resuming an interrupted migration, every already stored standing
+- when resuming an interrupted migration, every already stored standing
   sequence and `next_standing_review_sequence - 1`.
 
 The complete migration read also contributes every returned GitHub review id to
@@ -567,12 +573,18 @@ the high-water mark. It gives reconstructed legacy GitHub reviews their own
 positive review id as `sequence`, including an active
 `changes_requested_id`; it does not renumber review 900 to 901. It then
 atomically seeds `next_standing_review_sequence` above the final high-water and
-allocates later Comet decisions from that counter. Checked overflow leaves the
-schema incomplete and Merge unavailable. The existing per-dependent
-`fanned_out` map is retained unchanged: watermark 900 still suppresses the
-already-delivered notice for reconstructed active review 900, while every new
-change request is greater and reaches each dependent once. Reconciliation and
-aliasing never lower or reseed the counter.
+allocates later Comet decisions from that counter.
+
+Separately, `next_fanout_generation` is seeded above legacy
+`changes_requested` and every `fanned_out` value. If per-reviewer reconstruction
+confirms the exact singular legacy blocker continuously active, migration reuses
+its old id as `active_fanout_generation`; watermark 900 therefore still
+suppresses the already-delivered notice for active review 900. If reconstruction
+re-exposes a request that the singular legacy state had cleared or replaced, it
+allocates a new generation above all legacy edge watermarks before reblocking
+the row. Checked overflow in either domain leaves the schema incomplete and
+Merge unavailable. Neither reconciliation nor aliasing lowers or reseeds a
+counter.
 
 On load, an absent/older `standing_reviews_schema_version` or false
 `standing_reviews_complete` sets `acceptance = unknown` and bypasses
@@ -727,9 +739,9 @@ over the current layer and every layer below it:
    head SHA, base ref/SHA, and `updated_at`;
 2. the exact GraphQL selection above refreshes checks and mergeability for
    those node ids, in batches of 50;
-3. a moved `updated_at` or incomplete standing-review marker triggers the
-   complete bounded review reconciliation, so Comet-local standing requests
-   and current-head approvals are rederived;
+3. every gate-bearing layer receives complete bounded review reconciliation,
+   regardless of `updated_at` equality, so Comet-local standing requests and
+   current-head approvals are rederived;
 4. the board requires complete topology and every refreshed gate to pass, then
    recomputes the canonical fingerprint;
 5. any gate failure or mismatch with either expected value persists the fresh
@@ -933,7 +945,7 @@ The implementation adds two forwardable board RPCs:
 
 The existing verdict and merge surfaces become:
 
-- `SubmitVerdict { taskId, attempt, kind, comment, expectedHeadSha,
+- `SubmitVerdict { taskId, attempt, submissionId, kind, comment, expectedHeadSha,
   replacesLegacyDecision }` — the head is required for Comment, Approve, and
   Request changes alike; the optional legacy token is accepted only for a
   decisive verdict against the still-current blocker. It returns the tagged
@@ -949,7 +961,9 @@ The existing verdict and merge surfaces become:
 Desktop and iOS submit the values held by the rendered Review, never a fresh
 client-side lookup. The CLI prints `head_sha` in `review` and requires
 `verdict --expected-head-sha <sha>`; automation reading JSON passes that same
-field. Replacing a legacy blocker additionally requires
+field. Each client creates and retains `submissionId` for one occurrence and its
+transport retries, then discards it after the definitive receipt; a new user
+action gets a new id. Replacing a legacy blocker additionally requires
 `--replace-legacy-decision <token>`; no CLI or client infers consent from an
 ordinary Approve. This makes a human's reviewed head and any migration override
 explicit on every path rather than letting a surface silently bless whichever
@@ -989,8 +1003,9 @@ Authority stays separated by construction:
 - A failed final verdict refresh marks repository state stale and acceptance
   unknown; it never returns cached A as a known-current head or leaves a
   mutation action enabled.
-- A changed `updated_at` or incomplete review marker that cannot be completely
-  reconciled prevents local sequence allocation and every verdict side effect.
+- A mutation-path review reconciliation that cannot complete prevents local
+  sequence allocation and every verdict side effect; timestamp equality never
+  substitutes for that read.
 - Same-reviewer movement racing the allocation fence persists chronology
   ambiguity and keeps acceptance unknown; an imported hash order never decides.
 - A legacy sequence high-water overflow or incomplete atomic seed keeps the
@@ -998,6 +1013,8 @@ Authority stays separated by construction:
   reset counter.
 - A full live-plus-tombstone submission ledger refuses a new identity; it never
   buys space by making an older delivery or GitHub post repeatable.
+- Reusing a `submissionId` with a different validated payload refuses; a new id
+  is always a new intentional occurrence even when its payload is identical.
 - An absent or changed legacy-replacement token leaves the unresolved blocker
   and all verdict state untouched.
 - A closed-unmerged lower layer is a lifecycle blocker, not an absent open gate;
@@ -1066,10 +1083,13 @@ The implementation is complete when these seams are pinned:
    allocating N+1 to the local request, which remains the blocker. A failed or
    truncated version of that preflight allocates no sequence and performs no
    delivery or post. In the exact post-preflight/pre-allocation race, the second
-   targeted read sees the moved timestamp, imports the older approval first,
-   and then gives the local request the greater sequence. Movement racing that
-   fence sets the same-reviewer ambiguity latch and cannot derive Merge until a
-   stable explicit replacement.
+   targeted read imports the older approval first even if `updated_at` did not
+   change, and then gives the local request the greater sequence. A review
+   arriving after that read but before allocation is found by the post-commit
+   reconciliation, sets the same-reviewer ambiguity latch, and cannot derive
+   Merge until a stable explicit replacement. Same-second fixtures keep
+   `updated_at` byte-for-byte equal for each of those races and prove the
+   unconditional preflight and fences still observe the external review.
 7. A pagination fixture with more than the review cap yields
    `review_state_truncated`, `acceptance = unknown`, and no Merge. Migration
    fixtures deserialize the exact pre-upgrade `Delivered` JSON rather than
@@ -1086,13 +1106,16 @@ The implementation is complete when these seams are pinned:
    the new generic notice once, its edge watermark advances to the new sequence,
    and a second fan-out pass is silent. A companion serialized fixture keeps
    review 900 active: reconstruction assigns sequence 900, preserves the child's
-   watermark 900, and sends no duplicate generic notice.
-8. V2 submission-identity fixtures prove an empty Approve retried by the same
-   reviewer on the same head dedupes, the same reviewer on a new head is
-   distinct, and two verified reviewers approving the same head are distinct.
-   CRLF/LF and boundary whitespace normalize to one identity, while internal
-   body changes do not; a legacy v1 fingerprint for otherwise identical input
-   does not dedupe the v2 request. New-schema comment-only and unposted decisions
+   watermark 900, and sends no duplicate generic notice. A false-clear fixture
+   serializes A request 900, B request 950, B approval, and child watermark 950;
+   reconstruction re-exposes A under a new fan-out generation above 950, tells
+   the child once, and is silent on the second pass.
+8. Submission-occurrence fixtures prove one `submissionId` retried with the same
+   validated payload dedupes and reuse with changed payload refuses. Request
+   changes("x") → Approve("") → Request changes("x") with three ids creates
+   three increasing sequences and the third blocks. A new id for an otherwise
+   identical empty Approve clears a chronology-ambiguity latch whether the old
+   occurrence is live or tombstoned. New-schema comment-only and unposted decisions
    survive a complete zero-review reconciliation. A locally posted decisive
    review later read by its GitHub id aliases to one decision rather than two,
    and dismissal updates that exact aliased decision. A `COMMENT` fallback
@@ -1135,7 +1158,9 @@ The implementation is complete when these seams are pinned:
     A lower-head move in that same post-preflight window is not asserted to be
     atomic: the fixture accepts the unchanged current head, records
     `atomicity = current_head_only`, immediately refreshes all landing layers,
-    and exposes the changed fingerprint in Review.
+    and exposes the changed fingerprint in Review. A decisive external review
+    with unchanged same-second `updated_at` is still found by unconditional
+    Merge reconciliation and blocks the executor.
 13. Log fixtures prove transfer, artifact, line, job-count, and aggregate caps;
    ANSI stripping; every redaction class; mode `0600`; atomic writes; and a
    clean `git status`.
