@@ -57,7 +57,15 @@ enum DocDisk {
     @discardableResult
     static func load(into doc: LoroDoc, id: String) -> Bool {
         guard let data = try? Data(contentsOf: url(for: id)), !data.isEmpty else { return false }
-        return (try? doc.importWith(bytes: data, origin: "disk")) != nil
+        // Validate away from the live owner. Loro can return a non-throwing
+        // pending status after mutating its target, and carrying that partial
+        // state into the room just recreates the merge trap recovery handles.
+        let candidate = LoroDoc()
+        guard let candidateStatus = try? candidate.importWith(bytes: data, origin: "disk-probe"),
+              candidateStatus.pending == nil,
+              let installedStatus = try? doc.importWith(bytes: data, origin: "disk"),
+              installedStatus.pending == nil else { return false }
+        return true
     }
 
     /// Atomically persist the doc's snapshot.
@@ -102,13 +110,13 @@ enum DocDisk {
 @MainActor
 final class DocSaver {
     private let docId: String
-    private let doc: LoroDoc
+    private let document: RoomDocument
     private var generation = 0
     private var dirty = false
 
-    init(docId: String, doc: LoroDoc) {
+    init(docId: String, document: RoomDocument) {
         self.docId = docId
-        self.doc = doc
+        self.document = document
     }
 
     func poke() {
@@ -125,6 +133,6 @@ final class DocSaver {
     func flush() {
         guard dirty else { return }
         dirty = false
-        DocDisk.save(doc: doc, id: docId)
+        DocDisk.save(doc: document.current(), id: docId)
     }
 }

@@ -30,9 +30,9 @@ final class SessionStore {
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
 
-    let doc = LoroDoc()
+    private let document = RoomDocument()
+    var doc: LoroDoc { document.current() }
     private var room: RoomClient?
-    private var subscriptions: [Subscription] = []
     private let config: AppConfig
 
     /// Demo mode: no room, entries driven externally.
@@ -61,20 +61,20 @@ final class SessionStore {
         if DocDisk.load(into: doc, id: chatId) {
             project()
         }
-        saver = DocSaver(docId: chatId, doc: doc)
-        let client = RoomClient(roomId: chatId, doc: doc) { [config, chatId] in
+        saver = DocSaver(docId: chatId, document: document)
+        let client = RoomClient(roomId: chatId, document: document,
+                                localDeviceId: config.deviceId) { [config, chatId] in
             await config.sessionSocketURL(chatId: chatId)
         } events: { [weak self] event in
             Task { @MainActor [weak self] in self?.handle(event) }
         }
         room = client
-        let localSub = doc.subscribeLocalUpdate { [weak client, weak self] update in
+        document.observeLocalUpdates { [weak client, weak self] generation, update in
             guard let client else { return }
             let bytes = [UInt8](update)
-            Task { await client.sendLocalUpdate(bytes) }
+            Task { await client.sendLocalUpdate(bytes, generation: generation) }
             Task { @MainActor [weak self] in self?.saver?.poke() }
         }
-        subscriptions.append(localSub)
         Task { await client.start() }
         project()
     }
@@ -85,7 +85,7 @@ final class SessionStore {
     }
 
     func stop() {
-        subscriptions.removeAll()
+        document.stopObservingLocalUpdates()
         saver?.flush()
         if let room {
             Task { await room.stop() }

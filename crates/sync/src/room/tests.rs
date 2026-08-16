@@ -4,7 +4,7 @@
 //! payload budget, and injectable InvalidUpdate acks for the stale-peer path.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::*;
 
@@ -52,6 +52,13 @@ struct FakeEdge {
     die_after_join: AtomicBool,
     leaves: AtomicUsize,
     join_requests: AtomicUsize,
+    /// Empty-VV joins ask for a full snapshot. Recovery must cap these at one
+    /// per connection episode even if the answer remains incomplete.
+    full_snapshot_requests: AtomicUsize,
+    /// Optional JoinResponse VV override for validation-failure tests.
+    advertised_vv: Mutex<Option<VersionVector>>,
+    /// Deterministic window for a test to subscribe before backfill arrives.
+    backfill_delay_ms: AtomicU64,
     /// Swallow this many `%EPH` JoinRequests (consume, answer nothing) — the
     /// gh#126 shape: the doc room joins fine while the presence sub-join is
     /// lost, and nothing at any layer notices.
@@ -66,8 +73,12 @@ struct FakeEdge {
 
 impl FakeEdge {
     fn new() -> Arc<Self> {
+        Self::with_doc(LoroDoc::new())
+    }
+
+    fn with_doc(doc: LoroDoc) -> Arc<Self> {
         Arc::new(Self {
-            doc: LoroDoc::new(),
+            doc,
             eph: EphemeralStore::new(30_000),
             conns: Mutex::new(Vec::new()),
             fragments: Mutex::new(HashMap::new()),
@@ -76,6 +87,9 @@ impl FakeEdge {
             die_after_join: AtomicBool::new(false),
             leaves: AtomicUsize::new(0),
             join_requests: AtomicUsize::new(0),
+            full_snapshot_requests: AtomicUsize::new(0),
+            advertised_vv: Mutex::new(None),
+            backfill_delay_ms: AtomicU64::new(0),
             swallow_eph_joins: AtomicUsize::new(0),
             eph_join_requests: AtomicUsize::new(0),
             dials: AtomicUsize::new(0),
@@ -182,23 +196,44 @@ impl FakeEdge {
                 ..
             } => {
                 self.join_requests.fetch_add(1, Ordering::SeqCst);
+                if version.is_empty() {
+                    self.full_snapshot_requests.fetch_add(1, Ordering::SeqCst);
+                }
+                let advertised_vv = self
+                    .advertised_vv
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| self.doc.oplog_vv());
                 self.reply(
                     reply_to,
                     &ProtocolMessage::JoinResponseOk {
                         crdt: CrdtType::Loro,
                         room_id: room_id.clone(),
                         permission: Permission::Write,
-                        version: self.doc.oplog_vv().encode(),
+                        version: advertised_vv.encode(),
                         extra: None,
                     },
                 )
                 .await;
+                let backfill_delay_ms = self.backfill_delay_ms.load(Ordering::SeqCst);
+                if backfill_delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(backfill_delay_ms)).await;
+                }
                 let backfill = if version.is_empty() {
                     self.doc.export(ExportMode::Snapshot)
                 } else {
                     match VersionVector::decode(&version) {
-                        Ok(vv) => self.doc.export(ExportMode::updates(&vv)),
-                        Err(_) => self.doc.export(ExportMode::Snapshot),
+                        Ok(vv)
+                            if !self.doc.is_shallow()
+                                || vv.includes_vv(&self.doc.shallow_since_vv().to_vv()) =>
+                        {
+                            self.doc.export(ExportMode::updates(&vv))
+                        }
+                        // Production's stale-peer rule: a client VV behind
+                        // the shallow root gets a full snapshot, never a
+                        // post-root delta with dependencies it cannot satisfy.
+                        Ok(_) | Err(_) => self.doc.export(ExportMode::Snapshot),
                     }
                 }
                 .expect("export backfill");
@@ -447,6 +482,203 @@ async fn join_backfills_server_state_into_fresh_doc() {
         .await
         .expect("connect");
     wait_until(|| doc_text(&doc) == "server state").await;
+    client.shutdown().await.unwrap();
+}
+
+/// gh#450: a full old replica cannot merge a newer server snapshot whose
+/// history was trimmed past that replica. Loro returns `Ok(ImportStatus)` with
+/// pending ranges and leaves the transcript at its old prefix; a room client
+/// that treats `Ok(_)` as convergence stalls forever. Recovery must reseed
+/// from the validated server snapshot and replay device-local unresolved
+/// command intent into the replacement.
+#[tokio::test]
+async fn stale_full_client_reseeds_from_shallow_server_without_losing_local_command() {
+    let server = LoroDoc::new();
+    server.set_peer_id(1).unwrap();
+    let messages = server.get_list("messages");
+    for id in ["m1", "m2", "m3"] {
+        messages.insert(messages.len(), id).unwrap();
+        server.commit();
+    }
+    let old_snapshot = server.export(ExportMode::Snapshot).unwrap();
+
+    let client_doc = LoroDoc::new();
+    client_doc.import(&old_snapshot).unwrap();
+    client_doc.set_peer_id(2).unwrap();
+    let stale_session = comet_doc::SessionDoc::from_doc(client_doc.clone());
+    let local_command = comet_doc::SessionCommandEntry {
+        id: "local-command".into(),
+        payload: comet_doc::SessionCommandPayload::Interrupt {},
+        issued_by: "phone-1".into(),
+        issued_at: 1,
+        based_on: None,
+        expires_at: None,
+        status: comet_doc::SessionCommandStatus::Pending,
+        resolution: None,
+    };
+    stale_session.queue_command(&local_command).unwrap();
+    stale_session
+        .queue_command(&comet_doc::SessionCommandEntry {
+            id: "already-applied".into(),
+            status: comet_doc::SessionCommandStatus::Applied,
+            ..local_command.clone()
+        })
+        .unwrap();
+    stale_session
+        .queue_command(&comet_doc::SessionCommandEntry {
+            id: "another-device".into(),
+            issued_by: "tablet-1".into(),
+            ..local_command.clone()
+        })
+        .unwrap();
+
+    for id in ["m4", "m5"] {
+        messages.insert(messages.len(), id).unwrap();
+        server.commit();
+    }
+    let shallow = server
+        .export(ExportMode::shallow_snapshot(&server.oplog_frontiers()))
+        .unwrap();
+    let shallow_server = LoroDoc::new();
+    let fresh_status = shallow_server.import(&shallow).unwrap();
+    assert!(
+        fresh_status.pending.is_none(),
+        "fresh reseed must be complete"
+    );
+    assert!(
+        shallow_server.is_shallow(),
+        "fixture must trim real history"
+    );
+
+    // Pin the exact non-throwing failure signature from the incident.
+    let probe = LoroDoc::new();
+    probe
+        .import(&client_doc.export(ExportMode::Snapshot).unwrap())
+        .unwrap();
+    let stale_status = probe.import(&shallow).unwrap();
+    assert!(
+        stale_status.pending.is_some(),
+        "shallow snapshot must remain pending in the stale full replica"
+    );
+    assert_eq!(probe.get_list("messages").len(), 3);
+
+    let edge = FakeEdge::with_doc(shallow_server);
+    let replacement_owner = Arc::new(Mutex::new(None));
+    let replacement_owner_for_callback = replacement_owner.clone();
+    let client = RoomClient::connect_with_recovery(
+        edge.connector(),
+        "room-1",
+        client_doc,
+        DocRecovery::for_device(
+            "phone-1",
+            Arc::new(move |replacement| {
+                *replacement_owner_for_callback.lock().unwrap() = Some(replacement);
+            }),
+        ),
+    )
+    .await
+    .expect("connect");
+
+    wait_until(|| client.doc().get_list("messages").len() == 5).await;
+    wait_until(|| edge.doc.get_list("commands").len() == 1).await;
+    let replacement = replacement_owner
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("application ownership must move to the replacement");
+    assert_eq!(replacement.get_list("messages").len(), 5);
+    let recovered = comet_doc::SessionDoc::from_doc(client.doc())
+        .read_commands()
+        .unwrap();
+    assert_eq!(recovered, vec![local_command.clone()]);
+    let received = comet_doc::SessionDoc::from_doc(edge.doc.clone())
+        .read_commands()
+        .unwrap();
+    assert_eq!(received, vec![local_command]);
+    assert_eq!(
+        edge.join_requests.load(Ordering::SeqCst),
+        1,
+        "a server-initiated shallow backfill needs only the normal join"
+    );
+    assert_eq!(
+        edge.full_snapshot_requests.load(Ordering::SeqCst),
+        0,
+        "a valid shallow snapshot reseeds locally without another DO request"
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn repeated_pending_imports_request_only_one_recovery_snapshot_and_publish_nothing() {
+    let server = LoroDoc::new();
+    server.set_peer_id(11).unwrap();
+    let messages = server.get_list("messages");
+    for id in ["m1", "m2", "m3"] {
+        messages.insert(messages.len(), id).unwrap();
+        server.commit();
+    }
+    let old_snapshot = server.export(ExportMode::Snapshot).unwrap();
+    let stale_client = LoroDoc::new();
+    stale_client.import(&old_snapshot).unwrap();
+    for id in ["m4", "m5"] {
+        messages.insert(messages.len(), id).unwrap();
+        server.commit();
+    }
+    let shallow = server
+        .export(ExportMode::shallow_snapshot(&server.oplog_frontiers()))
+        .unwrap();
+    let shallow_server = LoroDoc::new();
+    assert!(shallow_server.import(&shallow).unwrap().pending.is_none());
+
+    // Advertise one op beyond the snapshot. A fresh import is complete but
+    // cannot validate against this VV, so both the normal backfill and the one
+    // explicit recovery snapshot remain incomplete from the client's point of
+    // view. This pins the bounded failure path, not the happy reseed path.
+    let advertised = LoroDoc::new();
+    advertised.import(&shallow).unwrap();
+    advertised.set_peer_id(99).unwrap();
+    advertised.get_map("fixture").insert("ahead", true).unwrap();
+    advertised.commit();
+
+    let edge = FakeEdge::with_doc(shallow_server);
+    *edge.advertised_vv.lock().unwrap() = Some(advertised.oplog_vv());
+    edge.backfill_delay_ms.store(25, Ordering::SeqCst);
+
+    let client = RoomClient::connect_with(edge.connector(), "room-1", stale_client)
+        .await
+        .expect("normal join answers");
+    let mut events = client.events();
+    wait_until(|| edge.join_requests.load(Ordering::SeqCst) == 2).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(
+        edge.join_requests.load(Ordering::SeqCst),
+        2,
+        "one normal join plus one explicit recovery exchange"
+    );
+    assert_eq!(
+        edge.full_snapshot_requests.load(Ordering::SeqCst),
+        1,
+        "pending imports must not poll or repeatedly fetch snapshots"
+    );
+    assert_eq!(
+        edge.eph_join_requests.load(Ordering::SeqCst),
+        1,
+        "the recovery answer must not repeat ordinary presence-join work"
+    );
+    assert_eq!(
+        edge.loro_doc_updates.load(Ordering::SeqCst),
+        0,
+        "the recovery answer must not upload the stale graph"
+    );
+    assert_eq!(client.doc().get_list("messages").len(), 3);
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(
+            event,
+            RoomEvent::RemoteUpdate,
+            "an unvalidated pending import is not convergence"
+        );
+    }
     client.shutdown().await.unwrap();
 }
 

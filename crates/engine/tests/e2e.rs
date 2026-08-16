@@ -145,7 +145,8 @@ fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
 
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
 /// pending entry appended under the viewer's device id (ledger rule 1).
-fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
+fn queue_as_viewer(doc: impl AsRef<SessionDoc>, id: &str, payload: SessionCommandPayload) {
+    let doc = doc.as_ref();
     let now = chrono::Utc::now().timestamp_millis();
     let based_on =
         doc.read_entries()

@@ -357,7 +357,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     runtime
         .set_chat_archived(&handle.chat_id, true)
         .expect("archive");
-    assert!(archived(core.workspace.doc()), "the chat is off the shelf");
+    assert!(archived(&core.workspace.doc()), "the chat is off the shelf");
     assert!(
         !runtime.chat_alive(&handle.chat_id).unwrap(),
         "which is exactly why review delivery must never be archived out from under"
@@ -365,7 +365,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     runtime
         .set_chat_archived(&handle.chat_id, false)
         .expect("unarchive");
-    assert!(!archived(core.workspace.doc()), "and back on it");
+    assert!(!archived(&core.workspace.doc()), "and back on it");
     assert!(runtime.chat_alive(&handle.chat_id).unwrap());
 
     // ── build output (gh#186): the cache goes, the checkout stays ───────────
