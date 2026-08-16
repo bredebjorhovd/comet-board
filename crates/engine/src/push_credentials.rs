@@ -68,6 +68,7 @@ impl PushCredentials {
     pub fn for_repo(
         &self,
         repo: &str,
+        contract: comet_proto::GithubPushContract,
         chat: Option<&str>,
     ) -> anyhow::Result<comet_harness::PushCredentials> {
         // Re-read per run rather than at boot: an operator who drops a PEM on
@@ -76,6 +77,7 @@ impl PushCredentials {
         self.prepare_for_repo_with(
             repo,
             Credentials::load(&self.paths).github_auth(),
+            contract,
             chat,
             true,
         )
@@ -83,10 +85,15 @@ impl PushCredentials {
 
     /// Exercise the exact handoff before the board creates an attempt, without
     /// recording that a run received credentials when no run exists yet.
-    pub fn verify_for_repo(&self, repo: &str) -> anyhow::Result<()> {
+    pub fn verify_for_repo(
+        &self,
+        repo: &str,
+        contract: comet_proto::GithubPushContract,
+    ) -> anyhow::Result<()> {
         self.prepare_for_repo_with(
             repo,
             Credentials::load(&self.paths).github_auth(),
+            contract,
             None,
             false,
         )
@@ -98,15 +105,17 @@ impl PushCredentials {
         &self,
         repo: &str,
         auth: GithubAuth,
+        contract: comet_proto::GithubPushContract,
         chat: Option<&str>,
     ) -> anyhow::Result<comet_harness::PushCredentials> {
-        self.prepare_for_repo_with(repo, auth, chat, true)
+        self.prepare_for_repo_with(repo, auth, contract, chat, true)
     }
 
     fn prepare_for_repo_with(
         &self,
         repo: &str,
         auth: GithubAuth,
+        contract: comet_proto::GithubPushContract,
         chat: Option<&str>,
         record_handoff: bool,
     ) -> anyhow::Result<comet_harness::PushCredentials> {
@@ -131,7 +140,7 @@ impl PushCredentials {
         // follows is a device that *was*, and the two must not read the same:
         // an operator who configured a credential and a binary is owed a noise
         // when the path between them does not work.
-        let askpass = match self.askpass_shim(exe, repo) {
+        let askpass = match self.askpass_shim(exe, repo, contract) {
             Ok(path) => path,
             Err(err) => {
                 let err = format!("{err:#}");
@@ -158,7 +167,7 @@ impl PushCredentials {
             comet_board::credential_ledger::handed(&self.paths, repo, chat);
         }
         Ok(comet_harness::PushCredentials {
-            env: git_credentials::agent_env(&askpass, repo, &self.paths),
+            env: git_credentials::agent_env_with_contract(&askpass, repo, &self.paths, contract),
             bin_dir: Some(bin_dir),
         })
     }
@@ -182,11 +191,16 @@ impl PushCredentials {
     /// Doing it per run rather than once at boot costs a `fork` on a code path
     /// that already cuts a worktree, and it means a box that is repaired under
     /// a running engine is repaired without a restart.
-    fn askpass_shim(&self, board_exe: &Path, repo: &str) -> anyhow::Result<PathBuf> {
+    fn askpass_shim(
+        &self,
+        board_exe: &Path,
+        repo: &str,
+        contract: comet_proto::GithubPushContract,
+    ) -> anyhow::Result<PathBuf> {
         let dir = self.paths.state_dir.join(SHIM_DIR);
         let shim = git_credentials::install_askpass_shim(&dir, board_exe)?;
         git_credentials::verify_askpass(&shim)?;
-        git_credentials::verify_push_credential(&shim, repo, &self.paths)?;
+        git_credentials::verify_push_credential(&shim, repo, &self.paths, contract)?;
         Ok(shim)
     }
 
@@ -257,13 +271,20 @@ mod tests {
         }
     }
 
+    fn contract() -> comet_proto::GithubPushContract {
+        comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        }
+    }
+
     /// A board-dispatched GitHub run without a board credential is refused.
     #[test]
     fn a_device_with_no_github_credential_refuses_the_run() {
         let dir = scratch("nocred");
         assert!(
             resolver(dir.path())
-                .for_repo_with("o/r", GithubAuth::None, None)
+                .for_repo_with("o/r", GithubAuth::None, contract(), None)
                 .is_err()
         );
     }
@@ -273,7 +294,7 @@ mod tests {
         let dir = scratch("nobin");
         let mut creds = resolver(dir.path());
         creds.board_exe = None;
-        assert!(creds.for_repo_with("o/r", app(), None).is_err());
+        assert!(creds.for_repo_with("o/r", app(), contract(), None).is_err());
     }
 
     /// The whole point: askpass wiring, the board's own directories, and not
@@ -283,7 +304,7 @@ mod tests {
         let dir = scratch("env");
         let resolver = resolver(dir.path());
         let push = resolver
-            .for_repo_with("o/r", app(), Some("chat-1"))
+            .for_repo_with("o/r", app(), contract(), Some("chat-1"))
             .expect("credentials");
         let env: std::collections::BTreeMap<_, _> = push.env.into_iter().collect();
         // A path, and one that names a file — since gh#233, GIT_ASKPASS
@@ -324,7 +345,11 @@ mod tests {
     #[test]
     fn no_repo_means_no_credentials() {
         let dir = scratch("norepo");
-        assert!(resolver(dir.path()).for_repo_with("", app(), None).is_err());
+        assert!(
+            resolver(dir.path())
+                .for_repo_with("", app(), contract(), None)
+                .is_err()
+        );
     }
 
     /// gh#233. A device that was configured to hand out the board's credential
@@ -339,7 +364,11 @@ mod tests {
         // Installed, resolvable, and reaching nothing — a payload that shipped
         // the engine without the CLI beside it.
         creds.board_exe = Some(dir.path().join("not-installed"));
-        assert!(creds.for_repo_with("o/r", app(), Some("chat-1")).is_err());
+        assert!(
+            creds
+                .for_repo_with("o/r", app(), contract(), Some("chat-1"))
+                .is_err()
+        );
 
         let record = comet_board::credential_ledger::for_chat(&creds.paths, "chat-1");
         assert!(!record.handed, "a broken path was handed to a run");

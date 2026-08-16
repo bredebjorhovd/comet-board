@@ -126,7 +126,10 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     std::fs::create_dir_all(&paths.config_dir).unwrap();
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=ghp_secret\n").unwrap();
-    let push = Arc::new(PushCredentials::with_board_exe(paths, Some(board_exe)));
+    let push = Arc::new(PushCredentials::with_board_exe(
+        paths.clone(),
+        Some(board_exe),
+    ));
     core.sessions.set_push_credentials(push.clone());
 
     core.workspace
@@ -150,8 +153,12 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         tokio::runtime::Handle::current(),
     ));
     runtime.set_push_credentials(push);
+    let push_contract = comet_proto::GithubPushContract {
+        contents_write: true,
+        workflows_write: true,
+    };
     runtime
-        .verify_push_credentials("o/widget")
+        .verify_push_credentials("o/widget", push_contract)
         .expect("the dispatch preflight accepts the explicit handoff");
 
     // What the box user's own instruction files say before any of this
@@ -184,6 +191,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         model: None,
         account: None,
         push_repo: Some("o/widget".into()),
+        push_contract: Some(push_contract),
         git_author: Some(comet_proto::GitAuthor {
             name: "Ana Ruiz".into(),
             email: "22494697+ana@users.noreply.github.com".into(),
@@ -253,6 +261,10 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
     assert_eq!(
         chat.config.as_ref().and_then(|c| c.push_repo.as_deref()),
         Some("o/widget")
+    );
+    assert_eq!(
+        chat.config.as_ref().and_then(|c| c.push_contract),
+        Some(push_contract)
     );
     // And whose name its commits carry (gh#107), on the chat for the same
     // reason: that later fix should be by the same person as the first commit.
@@ -351,6 +363,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         model: None,
         account: Some("ffffffffffffffff".into()),
         push_repo: None,
+        push_contract: None,
         git_author: None,
         turn_limits: Default::default(),
         mcp_servers: Vec::new(),
@@ -374,6 +387,26 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         .prompt(&handle.chat_id, "and a follow-up")
         .expect("prompt queues");
     wait_for(|| complete_turns(&doc) == 2, "the follow-up to execute").await;
+
+    // The contract is checked again on a later board-delivered turn, before a
+    // durable command or transcript entry is written. Rotating/removing the
+    // credential after dispatch cannot leave the old brief's promise alive.
+    std::fs::remove_file(paths.config_dir.join(".env")).unwrap();
+    let error = runtime
+        .prompt(&handle.chat_id, "an undeliverable review follow-up")
+        .expect_err("a later turn survived credential removal")
+        .to_string();
+    assert!(error.contains("credential handoff"), "{error}");
+    assert_eq!(complete_turns(&doc), 2);
+    assert!(
+        !doc.doc()
+            .read_entries()
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|entry| &entry.parts)
+            .any(|part| matches!(part, comet_doc::MessagePart::Text { text, .. } if text.contains("undeliverable review"))),
+        "the refused later prompt reached the transcript"
+    );
 
     // ── shelf (archive without interrupting, and back again) ────────────────
     // gh#139's verb: the retention sweep files a finished chat away a week

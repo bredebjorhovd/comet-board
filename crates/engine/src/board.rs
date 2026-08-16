@@ -905,13 +905,17 @@ fn handle_dispatch(
         if let Some(reason) = comet_board::dispatch::credential_preflight_refusal(capabilities) {
             anyhow::bail!("credential preflight for {repo}: {reason}");
         }
+        let contract = capabilities.contract();
+        spec.push_contract = Some(contract);
         spec.prompt
             .push_str(&comet_board::dispatch::credential_preflight_brief(
                 capabilities,
             ));
-        runtime.verify_push_credentials(repo).map_err(|error| {
-            anyhow::anyhow!("credential handoff preflight for {repo}: {error:#}")
-        })?;
+        runtime
+            .verify_push_credentials(repo, contract)
+            .map_err(|error| {
+                anyhow::anyhow!("credential handoff preflight for {repo}: {error:#}")
+            })?;
     }
     // What the attempt actually runs under — the override, else the route's.
     let runtime_name = overrides.runtime.as_deref().unwrap_or(&route.runtime);
@@ -1293,7 +1297,11 @@ mod tests {
     }
 
     impl Runtime for FakeRuntime {
-        fn verify_push_credentials(&self, _repo: &str) -> anyhow::Result<()> {
+        fn verify_push_credentials(
+            &self,
+            _repo: &str,
+            _contract: comet_proto::GithubPushContract,
+        ) -> anyhow::Result<()> {
             if self
                 .fail_push_handoff
                 .load(std::sync::atomic::Ordering::SeqCst)
@@ -1754,6 +1762,13 @@ runtime = "mock"
                 && specs[0].prompt.contains("workflow itself has not landed"),
             "{}",
             specs[0].prompt
+        );
+        assert_eq!(
+            specs[0].push_contract,
+            Some(comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: false,
+            })
         );
         drop(specs);
 

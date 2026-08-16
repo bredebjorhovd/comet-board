@@ -421,6 +421,7 @@ async fn chat_config_selects_the_run_harness() {
                 sandbox: SandboxLevel::WorkspaceWrite,
                 account: None,
                 push_repo: None,
+                push_contract: None,
                 git_author: None,
                 turn_limits: Default::default(),
                 mcp_servers: Vec::new(),

@@ -57,6 +57,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use crate::config::{Credentials, Paths};
+use crate::sources::github::HttpRest;
 use crate::sources::github_app::TokenProvider;
 
 /// Which repo the askpass helper should mint for. It gets the prompt string and
@@ -65,6 +66,11 @@ use crate::sources::github_app::TokenProvider;
 /// The `gh` shim reads the same variable: one run authenticates for one repo,
 /// whichever tool is asking.
 pub const ASKPASS_REPO_ENV: &str = "COMET_BOARD_ASKPASS_REPO";
+
+/// The nonsecret write contract a dispatched chat's credential must still
+/// satisfy when a late-mint helper runs. A single variable makes a partial
+/// contract impossible; its values are parsed strictly and contain no bearer.
+pub const PUSH_CONTRACT_ENV: &str = "COMET_BOARD_PUSH_CONTRACT";
 
 /// GitHub's fixed username for installation-token HTTPS auth. The token is the
 /// password; this is not a secret and belongs in the URL.
@@ -185,6 +191,56 @@ pub fn agent_env(askpass: &Path, repo: &str, paths: &Paths) -> Vec<(String, Stri
     env
 }
 
+/// [`agent_env`] plus the durable capability promise for a board-dispatched
+/// chat. Both `git-askpass` and the `gh` wrapper inherit this marker and refuse
+/// to emit a credential that no longer satisfies it.
+pub fn agent_env_with_contract(
+    askpass: &Path,
+    repo: &str,
+    paths: &Paths,
+    contract: comet_proto::GithubPushContract,
+) -> Vec<(String, String)> {
+    let mut env = agent_env(askpass, repo, paths);
+    let value = match (contract.contents_write, contract.workflows_write) {
+        (false, false) => "none",
+        (true, false) => "contents",
+        (true, true) => "contents+workflows",
+        (false, true) => "workflows",
+    };
+    env.push((PUSH_CONTRACT_ENV.into(), value.into()));
+    env
+}
+
+/// Read the nonsecret contract marker inherited by a credential helper.
+/// Missing means this is a non-dispatched operation such as an engine-owned
+/// clone; dispatched helpers require `Some` at their CLI boundary.
+pub fn push_contract_from_env() -> Result<Option<comet_proto::GithubPushContract>> {
+    let Some(value) = std::env::var(PUSH_CONTRACT_ENV).ok() else {
+        return Ok(None);
+    };
+    let contract = match value.as_str() {
+        "none" => comet_proto::GithubPushContract {
+            contents_write: false,
+            workflows_write: false,
+        },
+        "contents" => comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: false,
+        },
+        "contents+workflows" => comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        },
+        "workflows" => anyhow::bail!(
+            "{PUSH_CONTRACT_ENV}=workflows is invalid: workflow writes require content writes"
+        ),
+        _ => anyhow::bail!(
+            "{PUSH_CONTRACT_ENV} has an unknown value; expected none, contents, or contents+workflows"
+        ),
+    };
+    Ok(Some(contract))
+}
+
 /// Single-quote for `sh`, the way `'` itself has to be escaped there: end the
 /// quote, emit an escaped quote, start a new one.
 fn sh_quote(s: &str) -> String {
@@ -202,6 +258,17 @@ fn sh_quote(s: &str) -> String {
 /// first. The credential is a GitHub App installation token and there is no
 /// such thing as sending it to the wrong host by accident.
 pub fn askpass(paths: &Paths, prompt: &str, repo: Option<&str>) -> Result<String> {
+    askpass_with_contract(paths, prompt, repo, None)
+}
+
+/// [`askpass`] with the dispatched chat's durable write contract enforced
+/// before its password is returned.
+pub fn askpass_with_contract(
+    paths: &Paths,
+    prompt: &str,
+    repo: Option<&str>,
+    contract: Option<comet_proto::GithubPushContract>,
+) -> Result<String> {
     if let Some(host) = prompt_host(prompt)
         && !is_github_host(host)
     {
@@ -216,7 +283,10 @@ pub fn askpass(paths: &Paths, prompt: &str, repo: Option<&str>) -> Result<String
     let repo = repo
         .filter(|r| !r.is_empty())
         .ok_or_else(|| anyhow::anyhow!("{ASKPASS_REPO_ENV} is not set — nothing to mint for"))?;
-    token(paths, repo)
+    match contract {
+        Some(contract) => token_with_contract(paths, repo, contract),
+        None => token(paths, repo),
+    }
 }
 
 /// A live credential for `repo`, read off this box's board configuration —
@@ -224,6 +294,30 @@ pub fn askpass(paths: &Paths, prompt: &str, repo: Option<&str>) -> Result<String
 pub fn token(paths: &Paths, repo: &str) -> Result<String> {
     let credentials = Credentials::load(paths);
     token_for_push(&crate::sources::github::provider(&credentials)?, repo)
+}
+
+/// A live credential that is returned only when fresh per-repository evidence
+/// still satisfies the chat's persisted contract.
+pub fn token_with_contract(
+    paths: &Paths,
+    repo: &str,
+    contract: comet_proto::GithubPushContract,
+) -> Result<String> {
+    let rest = HttpRest::from_paths(paths)?;
+    token_with_contract_from(&rest, repo, contract)
+}
+
+/// The testable half of [`token_with_contract`]. For an App, the capability
+/// probe and returned token share the same provider/cache, so the permission
+/// object belongs to the exact token handed to git rather than an unrelated
+/// mint.
+pub(crate) fn token_with_contract_from(
+    rest: &HttpRest,
+    repo: &str,
+    contract: comet_proto::GithubPushContract,
+) -> Result<String> {
+    rest.push_capabilities(repo)?.require(contract)?;
+    token_for_push(rest.auth(), repo)
 }
 
 /// The host inside a git credential prompt — `Password for
@@ -368,10 +462,15 @@ pub fn verify_askpass(askpass: &Path) -> Result<()> {
 /// run will receive, then discard the answer without logging or persisting it.
 /// A fixed username only proves the shim can exec; this proves the configured
 /// board can still mint/read a credential for this repository.
-pub fn verify_push_credential(askpass: &Path, repo: &str, paths: &Paths) -> Result<()> {
+pub fn verify_push_credential(
+    askpass: &Path,
+    repo: &str,
+    paths: &Paths,
+    contract: comet_proto::GithubPushContract,
+) -> Result<()> {
     let mut command = std::process::Command::new(askpass);
     command.arg("Password for 'https://x-access-token@github.com': ");
-    for (key, value) in agent_env(askpass, repo, paths) {
+    for (key, value) in agent_env_with_contract(askpass, repo, paths, contract) {
         command.env(key, value);
     }
     let out = exec_waiting_out_busy(&mut command).with_context(|| {
@@ -912,9 +1011,17 @@ mod tests {
             config_dir: dir.join("config"),
             state_dir: dir.join("state"),
         };
-        let error = verify_push_credential(&shim, "o/r", &paths)
-            .expect_err("an empty secret answer verified")
-            .to_string();
+        let error = verify_push_credential(
+            &shim,
+            "o/r",
+            &paths,
+            comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: true,
+            },
+        )
+        .expect_err("an empty secret answer verified")
+        .to_string();
         assert!(error.contains("returned no credential"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }

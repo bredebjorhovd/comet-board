@@ -108,6 +108,16 @@ pub struct ChatConfig {
     /// to push the fix too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_repo: Option<String>,
+    /// The nonsecret GitHub write promise the board made when it dispatched
+    /// this chat (gh#440). The engine rechecks the current credential against
+    /// it before every new or steered turn, and the late-mint helpers enforce
+    /// it again when `git` or `gh` asks for a token.
+    ///
+    /// `None` is every ordinary chat and every board chat created before this
+    /// contract existed. A chat with `push_repo` but no contract fails closed:
+    /// there is no durable evidence of what its initial brief promised.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub push_contract: Option<GithubPushContract>,
     /// Who this chat's commits are *by* (comet-board `git_identity`, gh#107).
     /// Set, the engine stamps `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` on the
     /// harness child, so a teammate's dispatch produces commits GitHub
@@ -145,6 +155,19 @@ pub struct ChatConfig {
     /// or overwrites another chat's tools.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mcp_servers: Vec<McpServer>,
+}
+
+/// The GitHub writes a board-dispatched chat was told it could deliver.
+///
+/// Deliberately only booleans: the App/PAT identity, permission evidence and
+/// bearer remain device-local and are re-probed. This synced value is the
+/// minimum nonsecret contract needed to tell whether a replacement credential
+/// is weaker than the one that released the work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPushContract {
+    pub contents_write: bool,
+    pub workflows_write: bool,
 }
 
 /// One local Model Context Protocol server a harness starts over stdio.

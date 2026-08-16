@@ -198,6 +198,40 @@ impl PushCapabilities {
     pub fn can_write_workflows(self) -> bool {
         self.contents == WriteCapability::Write && self.workflows == WriteCapability::Write
     }
+
+    /// The nonsecret promise safe to persist on a dispatched chat.
+    pub fn contract(self) -> comet_proto::GithubPushContract {
+        comet_proto::GithubPushContract {
+            contents_write: self.contents == WriteCapability::Write,
+            workflows_write: self.can_write_workflows(),
+        }
+    }
+
+    /// Refuse a replacement credential that is weaker than the promise made
+    /// when the chat was dispatched. Unknown evidence is never accepted for a
+    /// write the contract requires.
+    pub fn require(self, contract: comet_proto::GithubPushContract) -> Result<()> {
+        let contents_ok = !contract.contents_write || self.contents == WriteCapability::Write;
+        let workflows_ok = !contract.workflows_write || self.workflows == WriteCapability::Write;
+        if contents_ok && workflows_ok {
+            return Ok(());
+        }
+        bail!(
+            "current GitHub credential is weaker than this chat's push contract: expected repository contents {} and workflow files {}, current evidence reports contents {} and workflows {}. Restore the board credential to those grants and run `comet-board doctor` before retrying",
+            if contract.contents_write {
+                "write"
+            } else {
+                "restricted"
+            },
+            if contract.workflows_write {
+                "write"
+            } else {
+                "restricted"
+            },
+            self.contents.word(),
+            self.workflows.word(),
+        )
+    }
 }
 
 /// The REST surface we use. A seam, so tests never touch the network.
@@ -1912,6 +1946,43 @@ mod auth_tests {
         let missing = scoped(&["repo"], true).push_capabilities("o/r").unwrap();
         assert_eq!(missing.contents, WriteCapability::Write);
         assert_eq!(missing.workflows, WriteCapability::Missing);
+    }
+
+    #[test]
+    fn an_app_rotation_to_repo_only_is_refused_before_the_token_is_handed_over() {
+        let (app, api, _) = test_app(&[("o/r", 42)]);
+        let rest = HttpRest::over(
+            Box::new(Rc::new(ScriptedTransport::new(&[200]))),
+            TokenProvider::App(app.clone()),
+        );
+        let contract = rest.push_capabilities("o/r").unwrap().contract();
+        assert!(crate::git_credentials::token_with_contract_from(&rest, "o/r", contract).is_ok());
+
+        // The installation approved a weaker App registration while this
+        // chat still carries the original workflow-write promise.
+        api.set_permissions(serde_json::json!({ "contents": "write" }));
+        app.invalidate_repo("o/r");
+        let error = crate::git_credentials::token_with_contract_from(&rest, "o/r", contract)
+            .expect_err("a repo-only token escaped a workflow-write contract")
+            .to_string();
+        assert!(
+            error.contains("weaker than this chat's push contract"),
+            "{error}"
+        );
+        assert!(error.contains("workflows missing"), "{error}");
+    }
+
+    #[test]
+    fn a_pat_rotation_without_workflow_scope_is_refused_by_the_same_contract() {
+        let contract = scoped(&["repo", "workflow"], true)
+            .push_capabilities("o/r")
+            .unwrap()
+            .contract();
+        let repo_only = scoped(&["repo"], true);
+        let error = crate::git_credentials::token_with_contract_from(&repo_only, "o/r", contract)
+            .expect_err("a repo-only PAT escaped a workflow-write contract")
+            .to_string();
+        assert!(error.contains("workflows missing"), "{error}");
     }
 
     #[test]

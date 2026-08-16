@@ -783,6 +783,7 @@ pub fn build_spec(
         harness,
         model: overrides.model.clone(),
         account: effective_account(route, overrides).map(str::to_string),
+        push_contract: None,
         // What the engine's run loop will hold this attempt's turns to
         // (gh#270). Resolved here because the route is here — the loop that
         // enforces it sees events, not config.

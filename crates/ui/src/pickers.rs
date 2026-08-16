@@ -112,6 +112,7 @@ impl ResolvedRunConfig {
             // Same story for push credentials: a chat somebody opened pushes
             // with the device's own git, not with the board's App (gh#68).
             push_repo: None,
+            push_contract: None,
             git_author: None,
             // …and the turn guardrails are the board's too (gh#270): a chat
             // somebody is sitting in front of is not one that needs watching.
@@ -143,6 +144,7 @@ fn preserve_picker_unowned_fields(existing: &ChatConfig, replacement: &mut ChatC
     replacement.sandbox = existing.sandbox;
     replacement.account.clone_from(&existing.account);
     replacement.push_repo.clone_from(&existing.push_repo);
+    replacement.push_contract = existing.push_contract;
     replacement.git_author.clone_from(&existing.git_author);
     replacement.turn_limits = existing.turn_limits;
     replacement.mcp_servers.clone_from(&existing.mcp_servers);
@@ -2877,7 +2879,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_edit_preserves_dispatched_mcp_servers() {
+    fn picker_edit_preserves_board_owned_config() {
         let resolved = ResolvedRunConfig {
             harness: Some(HarnessId::ClaudeCode),
             model: Some("sonnet".into()),
@@ -2889,11 +2891,16 @@ mod tests {
             command: "comet-board".into(),
             args: vec!["mcp".into()],
         }];
+        existing.push_contract = Some(comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        });
         let mut replacement = resolved.chat_config().unwrap();
 
         preserve_picker_unowned_fields(&existing, &mut replacement);
 
         assert_eq!(replacement.mcp_servers, existing.mcp_servers);
+        assert_eq!(replacement.push_contract, existing.push_contract);
     }
 
     #[test]

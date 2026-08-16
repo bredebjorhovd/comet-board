@@ -709,7 +709,16 @@ fn main() -> Result<()> {
             let repo = std::env::var(comet_board::git_credentials::ASKPASS_REPO_ENV).ok();
             let prompt = prompt.unwrap_or_default();
             let chat = std::env::var(ops::CHAT_ID_ENV).ok();
-            match comet_board::git_credentials::askpass(&paths, &prompt, repo.as_deref()) {
+            let contract = comet_board::git_credentials::push_contract_from_env()?;
+            if chat.is_some() && contract.is_none() {
+                bail!("a board-dispatched credential request has no persisted push contract");
+            }
+            match comet_board::git_credentials::askpass_with_contract(
+                &paths,
+                &prompt,
+                repo.as_deref(),
+                contract,
+            ) {
                 Ok(secret) => {
                     // A username prompt is answered off a constant, so it is
                     // not a mint and must not be recorded as one — an alibi
@@ -756,7 +765,9 @@ fn main() -> Result<()> {
                     )
                 })?;
             let chat = std::env::var(ops::CHAT_ID_ENV).ok();
-            match comet_board::git_credentials::token(&paths, &repo) {
+            let contract = comet_board::git_credentials::push_contract_from_env()?
+                .context("a board-dispatched gh invocation has no persisted push contract")?;
+            match comet_board::git_credentials::token_with_contract(&paths, &repo, contract) {
                 Ok(token) => {
                     comet_board::credential_ledger::minted(
                         &paths,

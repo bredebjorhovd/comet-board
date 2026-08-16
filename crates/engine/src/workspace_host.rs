@@ -961,8 +961,9 @@ impl WorkspaceHost {
     /// composer's mid-session model/reasoning/options changes). Returns false
     /// when the chat doesn't exist.
     ///
-    /// One field survives the replace: the chat's [`comet_proto::TurnLimits`]
-    /// (gh#270). A full-config write is what a composer sends to change a
+    /// Board-owned fields survive the replace: the chat's
+    /// [`comet_proto::TurnLimits`] (gh#270) and GitHub push contract (gh#440).
+    /// A full-config write is what a composer sends to change a
     /// *model*, and one sent by a viewport that predates the field — or by any
     /// of the several that build the struct from their own picker state —
     /// carries the default, which is "no guardrail". Letting that land would
@@ -972,10 +973,13 @@ impl WorkspaceHost {
     /// `off` is an uninformed writer rather than a decision.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {
         let mut config = config.clone();
-        if config.turn_limits.is_off()
-            && let Some(existing) = self.chat_config(chat_id)
-        {
-            config.turn_limits = existing.turn_limits;
+        if let Some(existing) = self.chat_config(chat_id) {
+            if config.turn_limits.is_off() {
+                config.turn_limits = existing.turn_limits;
+            }
+            if config.push_contract.is_none() {
+                config.push_contract = existing.push_contract;
+            }
         }
         Ok(self.inner.doc().set_chat_config(chat_id, &config)?)
     }

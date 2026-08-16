@@ -311,6 +311,10 @@ impl SessionsEngine {
         message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
+        // Every turn boundary revalidates the current board credential against
+        // the nonsecret promise persisted at dispatch. This comes before the
+        // live-steer fast path and before any user message is written.
+        self.inner.verify_push_for_turn(chat_id)?;
         let routed = lock(&self.inner.runs)
             .get(chat_id)
             .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
@@ -465,6 +469,10 @@ impl SessionsEngine {
         let Some(steer_tx) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
+        // A live steer used to return before any credential check. Revalidate
+        // while the prompt still exists only in the command entry, before it
+        // reaches the harness mailbox or transcript.
+        self.inner.verify_push_for_turn(chat_id)?;
         let message = SteerMessage {
             prompt: prompt.to_string(),
             message_id: message_id.clone(),
@@ -860,18 +868,25 @@ impl Inner {
             return Ok(None);
         };
         let mut creds = match config.push_repo.as_deref() {
-            Some(repo) => Some(
-                self.push
-                    .get()
-                    .ok_or_else(|| {
-                        EngineError::Other(
-                            "board-dispatched GitHub chat has no credential handoff resolver"
-                                .into(),
-                        )
-                    })?
-                    .for_repo(repo, Some(chat_id))
-                    .map_err(|error| EngineError::Other(format!("{error:#}")))?,
-            ),
+            Some(repo) => {
+                let contract = config.push_contract.ok_or_else(|| {
+                    EngineError::Other(
+                        "board-dispatched GitHub chat has no persisted push contract".into(),
+                    )
+                })?;
+                Some(
+                    self.push
+                        .get()
+                        .ok_or_else(|| {
+                            EngineError::Other(
+                                "board-dispatched GitHub chat has no credential handoff resolver"
+                                    .into(),
+                            )
+                        })?
+                        .for_repo(repo, contract, Some(chat_id))
+                        .map_err(|error| EngineError::Other(format!("{error:#}")))?,
+                )
+            }
             None => None,
         };
         let Some(author) = config.git_author.as_ref() else {
@@ -885,6 +900,31 @@ impl Inner {
             }
         }
         Ok(creds)
+    }
+
+    /// Recheck a board-dispatched chat's current credential without recording
+    /// a handoff. New runs call `push_for` again when they build their child
+    /// environment; live steers need this standalone check because they reuse
+    /// the already-running child.
+    fn verify_push_for_turn(&self, chat_id: &str) -> Result<(), EngineError> {
+        let Some(config) = self.workspace().and_then(|ws| ws.chat_config(chat_id)) else {
+            return Ok(());
+        };
+        let Some(repo) = config.push_repo.as_deref() else {
+            return Ok(());
+        };
+        let contract = config.push_contract.ok_or_else(|| {
+            EngineError::Other("board-dispatched GitHub chat has no persisted push contract".into())
+        })?;
+        self.push
+            .get()
+            .ok_or_else(|| {
+                EngineError::Other(
+                    "board-dispatched GitHub chat has no credential handoff resolver".into(),
+                )
+            })?
+            .verify_for_repo(repo, contract)
+            .map_err(|error| EngineError::Other(format!("{error:#}")))
     }
 
     /// The turn-level guardrails this chat's runs are held to (gh#270).

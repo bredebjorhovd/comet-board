@@ -84,17 +84,37 @@ impl CometRuntime {
     fn chat_config(&self, chat_id: &str) -> Option<ChatConfig> {
         self.workspace.chat_config(chat_id)
     }
+
+    fn verify_chat_push_credentials(&self, chat_id: &str) -> anyhow::Result<()> {
+        let Some(config) = self.chat_config(chat_id) else {
+            return Ok(());
+        };
+        let Some(repo) = config.push_repo.as_deref() else {
+            return Ok(());
+        };
+        let contract = config.push_contract.ok_or_else(|| {
+            anyhow::anyhow!("board-dispatched GitHub chat {chat_id} has no persisted push contract")
+        })?;
+        self.verify_push_credentials(repo, contract)
+    }
 }
 
 impl Runtime for CometRuntime {
-    fn verify_push_credentials(&self, repo: &str) -> anyhow::Result<()> {
+    fn verify_push_credentials(
+        &self,
+        repo: &str,
+        contract: comet_proto::GithubPushContract,
+    ) -> anyhow::Result<()> {
         self.push
             .get()
             .ok_or_else(|| anyhow::anyhow!("the engine has no board credential handoff resolver"))?
-            .verify_for_repo(repo)
+            .verify_for_repo(repo, contract)
     }
 
     fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+        if spec.push_repo.is_some() && spec.push_contract.is_none() {
+            anyhow::bail!("board-dispatched GitHub work has no persisted push contract");
+        }
         // The checkout first: a failure here leaves nothing behind to clean up.
         // That includes an unreachable origin — `create_worktree_on` fetches
         // `spec.base` before cutting and refuses rather than branching from a
@@ -174,6 +194,9 @@ impl Runtime for CometRuntime {
             // (gh#68): the fix for a review comment three days from now is a
             // new run in this chat, and it has to reach the same branch.
             push_repo: spec.push_repo.clone(),
+            // The nonsecret grant promise made in the brief, so every later
+            // turn and token mint can reject a weaker replacement credential.
+            push_contract: spec.push_contract,
             // And whose name is on what it commits (gh#107) — same reasoning
             // again: that later fix should be by the same person as the first
             // commit, not by whoever the box is.
@@ -225,6 +248,10 @@ impl Runtime for CometRuntime {
     }
 
     fn prompt(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
+        // Refuse before the durable command (and therefore before the user
+        // message) exists. The command executor checks again because prompts
+        // can also arrive from another viewport without going through board.
+        self.verify_chat_push_credentials(chat_id)?;
         // Steer a live run, send otherwise — the same split the composers make.
         // AwaitingInput steers too: the ledger's supersede rules queue it
         // behind the pending question instead of starting a second run.

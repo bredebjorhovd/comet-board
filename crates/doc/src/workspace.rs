@@ -741,6 +741,7 @@ mod tests {
                 sandbox: SandboxLevel::WorkspaceWrite,
                 account: None,
                 push_repo: None,
+                push_contract: None,
                 git_author: None,
                 turn_limits: Default::default(),
                 mcp_servers: Vec::new(),
@@ -809,6 +810,10 @@ mod tests {
             // a full-config replace, so it has to survive the round trip or a
             // dispatched agent silently loses its push credentials (gh#68).
             push_repo: Some("Florin-AS/tripletex-mcp".into()),
+            push_contract: Some(comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: true,
+            }),
             git_author: None,
             // Same argument for the turn guardrails (gh#270): a model change
             // that dropped them would leave the run loop watching nothing.
