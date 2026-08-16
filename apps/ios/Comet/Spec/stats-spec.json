@@ -1,4 +1,323 @@
 {
+  "aggregateStats": [
+    {
+      "aggregate": {
+        "boards": [
+          {
+            "boardId": "board-a",
+            "host": {
+              "deviceId": "mac",
+              "label": "Mac"
+            },
+            "stats": {
+              "agentDispatched": 0,
+              "agentUsage": [],
+              "attempts": 2,
+              "attemptsWithAgentUsage": 0,
+              "attemptsWithTokens": 2,
+              "breakdown": [],
+              "byAccount": {},
+              "byRuntime": {},
+              "bySource": {},
+              "byWorkspace": {},
+              "completionRate": null,
+              "context": {
+                "attemptsReported": 0,
+                "nearCompaction": 0,
+                "peakPercent": null
+              },
+              "daily": [],
+              "dailyTokens": [],
+              "dispatched": false,
+              "friction": {
+                "blockedEntries": 0,
+                "earlySettles": 0,
+                "overruns": 0,
+                "retriedTasks": 0
+              },
+              "hourOfDay": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "hoursByWorkspace": {},
+              "landing": {
+                "closedUnmerged": 0,
+                "inFlight": 0,
+                "merged": 0,
+                "noPr": 0,
+                "open": 0
+              },
+              "live": 0,
+              "longestMinutes": null,
+              "medianMinutes": null,
+              "outcomes": {
+                "done": 2
+              },
+              "p90Minutes": null,
+              "pricingBasis": "listPriceApiEstimate",
+              "sinceDays": 7,
+              "spend": null,
+              "tasksTouched": 1,
+              "tokenCoverage": 1.0,
+              "tokens": {
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "inputTokens": 100,
+                "outputTokens": 20
+              },
+              "tokensByAccount": {},
+              "tokensByModel": {},
+              "tokensByRuntime": {},
+              "totalMinutes": 0
+            }
+          },
+          {
+            "boardId": "board-b",
+            "host": {
+              "deviceId": "cloud",
+              "label": "Cloud box"
+            },
+            "stats": {
+              "agentDispatched": 0,
+              "agentUsage": [],
+              "attempts": 1,
+              "attemptsWithAgentUsage": 0,
+              "attemptsWithTokens": 0,
+              "breakdown": [],
+              "byAccount": {},
+              "byRuntime": {},
+              "bySource": {},
+              "byWorkspace": {},
+              "completionRate": null,
+              "context": {
+                "attemptsReported": 0,
+                "nearCompaction": 0,
+                "peakPercent": null
+              },
+              "daily": [],
+              "dailyTokens": [],
+              "dispatched": false,
+              "friction": {
+                "blockedEntries": 0,
+                "earlySettles": 0,
+                "overruns": 0,
+                "retriedTasks": 0
+              },
+              "hourOfDay": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "hoursByWorkspace": {},
+              "landing": {
+                "closedUnmerged": 0,
+                "inFlight": 0,
+                "merged": 0,
+                "noPr": 0,
+                "open": 0
+              },
+              "live": 1,
+              "longestMinutes": null,
+              "medianMinutes": null,
+              "outcomes": {},
+              "p90Minutes": null,
+              "pricingBasis": "listPriceApiEstimate",
+              "sinceDays": 7,
+              "spend": null,
+              "tasksTouched": 1,
+              "tokenCoverage": null,
+              "tokens": {
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "inputTokens": 0,
+                "outputTokens": 0
+              },
+              "tokensByAccount": {},
+              "tokensByModel": {},
+              "tokensByRuntime": {},
+              "totalMinutes": 0
+            }
+          }
+        ],
+        "complete": false,
+        "hosts": [
+          {
+            "boardId": "board-a",
+            "device": {
+              "deviceId": "mac",
+              "label": "Mac"
+            },
+            "status": "answered"
+          },
+          {
+            "boardId": "board-a",
+            "device": {
+              "deviceId": "mac-vpn",
+              "label": "Mac via VPN"
+            },
+            "status": "duplicate"
+          },
+          {
+            "boardId": "board-b",
+            "device": {
+              "deviceId": "cloud",
+              "label": "Cloud box"
+            },
+            "status": "answered"
+          },
+          {
+            "device": {
+              "deviceId": "dark",
+              "label": "Offline laptop"
+            },
+            "error": "timed out after 5s",
+            "status": "unreachable"
+          }
+        ],
+        "sinceDays": 7,
+        "stats": {
+          "agentDispatched": 0,
+          "agentUsage": [],
+          "attempts": 3,
+          "attemptsWithAgentUsage": 0,
+          "attemptsWithTokens": 2,
+          "breakdown": [],
+          "byAccount": {},
+          "byRuntime": {},
+          "bySource": {},
+          "byWorkspace": {},
+          "completionRate": 1.0,
+          "context": {
+            "attemptsReported": 0,
+            "nearCompaction": 0,
+            "peakPercent": null
+          },
+          "daily": [],
+          "dailyTokens": [],
+          "dispatched": false,
+          "friction": {
+            "blockedEntries": 0,
+            "earlySettles": 0,
+            "overruns": 0,
+            "retriedTasks": 0
+          },
+          "hourOfDay": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "hoursByWorkspace": {},
+          "landing": {
+            "closedUnmerged": 0,
+            "inFlight": 0,
+            "merged": 0,
+            "noPr": 0,
+            "open": 0
+          },
+          "live": 1,
+          "longestMinutes": 74,
+          "medianMinutes": 18,
+          "outcomes": {
+            "done": 2
+          },
+          "p90Minutes": 74,
+          "pricingBasis": "listPriceApiEstimate",
+          "sinceDays": 7,
+          "spend": null,
+          "tasksTouched": 2,
+          "tokenCoverage": 0.6666666666666666,
+          "tokens": {
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "inputTokens": 100,
+            "outputTokens": 20
+          },
+          "tokensByAccount": {},
+          "tokensByModel": {},
+          "tokensByRuntime": {},
+          "totalMinutes": 0
+        }
+      },
+      "expect": {
+        "attempts": 3,
+        "boardCount": 2,
+        "complete": false,
+        "completenessNote": "Partial aggregate — Offline laptop did not answer. The totals include only the boards that answered.",
+        "hostStatuses": [
+          "answered",
+          "duplicate",
+          "answered",
+          "unreachable"
+        ],
+        "tokenTotal": 120
+      },
+      "name": "two boards, an alias, and an unreachable host"
+    }
+  ],
   "barFraction": [
     {
       "expect": 1.0,

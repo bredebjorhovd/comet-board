@@ -142,6 +142,7 @@ impl Db {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let db = Db { conn };
         db.migrate()?;
+        db.ensure_board_id()?;
         Ok(db)
     }
 
@@ -636,6 +637,28 @@ impl Db {
     }
 
     // ---- meta -----------------------------------------------------------
+
+    /// The store's durable identity (gh#461).
+    ///
+    /// A device id identifies a route to a board, not the board itself: an
+    /// alias or a copied device registration can reach the same `board.db`.
+    /// The random value is minted once inside SQLite and travels with the
+    /// database if it is moved or restored, which is exactly the ownership
+    /// needed to collapse transport aliases without collapsing two boards
+    /// that happen to poll the same repositories.
+    fn ensure_board_id(&self) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value)
+             VALUES('board_id', 'board-' || lower(hex(randomblob(16))))",
+            [],
+        )?;
+        Ok(())
+    }
+
+    pub fn board_id(&self) -> Result<String> {
+        self.meta_get("board_id")?
+            .ok_or_else(|| anyhow::anyhow!("board store has no identity"))
+    }
 
     pub fn meta_get(&self, key: &str) -> Result<Option<String>> {
         Ok(self
@@ -2078,6 +2101,7 @@ mod tests {
         }
 
         let db = Db::open(&path).unwrap();
+        let board_id = db.board_id().unwrap();
         let tasks = db.load_tasks().unwrap();
         assert_eq!(tasks.len(), 1, "the existing row survives the upgrade");
         assert_eq!(tasks[0].attempts.len(), 1);
@@ -2094,6 +2118,7 @@ mod tests {
         // And it is idempotent — opening again must not try to add them twice.
         let db = Db::open(&path).unwrap();
         assert_eq!(db.load_tasks().unwrap().len(), 1);
+        assert_eq!(db.board_id().unwrap(), board_id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2532,6 +2557,9 @@ mod tests {
     #[test]
     fn meta_round_trips() {
         let db = db();
+        let identity = db.board_id().unwrap();
+        assert!(identity.starts_with("board-"));
+        assert_eq!(db.board_id().unwrap(), identity, "the store id is stable");
         assert_eq!(db.meta_get("cursor").unwrap(), None);
         db.meta_set("cursor", "2026-07-25T00:00:00Z").unwrap();
         db.meta_set("cursor", "2026-07-26T00:00:00Z").unwrap();

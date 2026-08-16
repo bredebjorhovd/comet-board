@@ -38,6 +38,9 @@
 //!   `{ok}`, `ListBoardRuntimes` → `[{name, label}]`. Served off the
 //!   engine-hosted board service, and relay-forwardable (gh#55): one box hosts
 //!   the board, every teammate's device drives it with `targetDeviceId`.
+//!   `BoardStats` remains the one-store reply; `BoardStatsSnapshot` adds the
+//!   store identity and exact merge inputs; `AggregateBoardStats` performs one
+//!   bounded, on-demand fan-out and is intentionally not forwardable.
 //! - Board config (gh#75): `ReadBoardConfig` → `{routing, unadopted}` — the
 //!   host's `routing.toml`, its parse, everything wrong with it, and the repos
 //!   with a space there that nothing on the board watches; `WriteBoardConfig
@@ -69,6 +72,10 @@ use serde::Deserialize;
 use tokio::sync::watch;
 
 use comet_doc::SessionCommandPayload;
+use comet_proto::view::stats::{
+    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe, StatsProbeResult,
+    aggregate_board_stats,
+};
 use comet_proto::{ChatConfig, HarnessId};
 use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
@@ -854,6 +861,149 @@ impl EngineRpc {
             .collect()
     }
 
+    // ---- all-board stats (gh#461) ---------------------------------------
+
+    /// This engine's canonical name in a stats audit row.
+    fn stats_device(&self, device_id: &str) -> StatsDevice {
+        let label = self
+            .workspace
+            .devices()
+            .into_iter()
+            .find(|device| device.id == device_id)
+            .map(|device| device.name)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| device_id.to_string());
+        StatsDevice {
+            device_id: device_id.to_string(),
+            label,
+        }
+    }
+
+    /// Engine devices that can host a board, in deterministic sweep order.
+    ///
+    /// iOS registrations are not failed probes: they have no engine and can
+    /// never host `board.db`, so asking them would make every aggregate look
+    /// partial whenever a phone sleeps. Local is first (free), then creation
+    /// order + id, matching the rest of the board-host discovery surface.
+    fn stats_candidates(&self) -> Vec<StatsDevice> {
+        let local = self.doc_host.device_id().to_string();
+        let mut devices: Vec<comet_proto::Device> = self
+            .workspace
+            .devices()
+            .into_iter()
+            .filter(|device| device.platform != "ios" && device.id != local)
+            .collect();
+        devices.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut seen = std::collections::BTreeSet::new();
+        let mut candidates = Vec::new();
+        seen.insert(local.clone());
+        candidates.push(self.stats_device(&local));
+        for device in devices {
+            if seen.insert(device.id.clone()) {
+                candidates.push(StatsDevice {
+                    label: if device.name.trim().is_empty() {
+                        device.id.clone()
+                    } else {
+                        device.name
+                    },
+                    device_id: device.id,
+                });
+            }
+        }
+        candidates
+    }
+
+    async fn local_stats_snapshot(
+        &self,
+        since_days: Option<i64>,
+    ) -> Result<BoardStatsSnapshot, RpcError> {
+        let board = self.board()?;
+        let (stats, merge_basis) = board
+            .stats_mergeable(since_days)
+            .await
+            .map_err(|error| RpcError::Failed(format!("reading board stats: {error:#}")))?;
+        let host = self.stats_device(self.doc_host.device_id());
+        Ok(BoardStatsSnapshot {
+            board_id: board.board_id().to_string(),
+            host,
+            stats,
+            merge_basis,
+        })
+    }
+
+    fn stats_probe_error(error: RpcError) -> StatsProbeResult {
+        match error {
+            RpcError::Refused(_) => StatsProbeResult::NoBoard,
+            RpcError::Closed | RpcError::Transport(_) => {
+                StatsProbeResult::Unreachable(error.to_string())
+            }
+            RpcError::Failed(message)
+                if message.contains("cannot reach device") || message.contains("offline") =>
+            {
+                StatsProbeResult::Unreachable(message)
+            }
+            RpcError::UnknownMethod(_) | RpcError::BadParams(_) | RpcError::Failed(_) => {
+                StatsProbeResult::Unreadable(error.to_string())
+            }
+        }
+    }
+
+    /// Ask one candidate under the same per-device budget as the existing
+    /// board census. All candidates run concurrently, so one dark laptop costs
+    /// five seconds of wall time, not five seconds multiplied by the fleet.
+    async fn stats_probe(&self, candidate: StatsDevice, since_days: Option<i64>) -> StatsProbe {
+        let local = self.doc_host.device_id();
+        let answer = if candidate.device_id == local {
+            tokio::time::timeout(PEER_SWEEP_BUDGET, self.local_stats_snapshot(since_days))
+                .await
+                .map(|answer| answer.and_then(|snapshot| RpcReply::value(&snapshot)))
+        } else {
+            tokio::time::timeout(
+                PEER_SWEEP_BUDGET,
+                self.forward(
+                    &candidate.device_id,
+                    methods::BOARD_STATS_SNAPSHOT,
+                    serde_json::json!({ "sinceDays": since_days }),
+                ),
+            )
+            .await
+        };
+        let result = match answer {
+            Err(_) => StatsProbeResult::Unreachable(format!(
+                "timed out after {}s",
+                PEER_SWEEP_BUDGET.as_secs()
+            )),
+            Ok(Err(error)) => Self::stats_probe_error(error),
+            Ok(Ok(RpcReply::Stream(_))) => {
+                StatsProbeResult::Unreadable("stats snapshot answered with a stream".into())
+            }
+            Ok(Ok(RpcReply::Value(value))) => {
+                match serde_json::from_value::<BoardStatsSnapshot>(value) {
+                    Ok(snapshot) => StatsProbeResult::Answered(snapshot),
+                    Err(error) => StatsProbeResult::Unreadable(format!(
+                        "could not decode stats snapshot: {error}"
+                    )),
+                }
+            }
+        };
+        StatsProbe { candidate, result }
+    }
+
+    /// One on-demand fan-out. No cache and no background task: freshness is
+    /// each board's current poll state, cost is one bounded read per engine
+    /// device only while a CLI or stats screen is asking.
+    async fn aggregate_stats(&self, since_days: Option<i64>) -> AggregateBoardStats {
+        let asks = self
+            .stats_candidates()
+            .into_iter()
+            .map(|candidate| self.stats_probe(candidate, since_days));
+        aggregate_board_stats(since_days, futures::future::join_all(asks).await)
+    }
+
     /// Refuse a repo another board on this account already polls (gh#343),
     /// unless the caller said `force`.
     ///
@@ -1528,6 +1678,10 @@ fn forwardable(method: &str) -> bool {
             // (gh#143) — a laptop's stats page is asking about the board, not
             // about itself.
             | methods::BOARD_STATS
+            // The aggregate collector asks each candidate for the canonical
+            // store identity plus merge basis. The aggregate method itself is
+            // deliberately not forwarded: its receiver owns the fan-out.
+            | methods::BOARD_STATS_SNAPSHOT
             // `routing.toml` is a file on the board's device, which is exactly
             // why it is forwarded (gh#75): the alternative for a teammate who
             // needs a repo routed is an ssh account on the box.
@@ -1960,6 +2114,27 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&stats)
+            }
+            methods::BOARD_STATS_SNAPSHOT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    #[serde(default)]
+                    since_days: Option<i64>,
+                }
+                let p: P = parse_params(params)?;
+                let snapshot = self.local_stats_snapshot(p.since_days).await?;
+                RpcReply::value(&snapshot)
+            }
+            methods::AGGREGATE_BOARD_STATS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    #[serde(default)]
+                    since_days: Option<i64>,
+                }
+                let p: P = parse_params(params)?;
+                RpcReply::value(&self.aggregate_stats(p.since_days).await)
             }
             // The issue text behind one row (gh#132) — read when a detail
             // surface opens it, never streamed with the rows.
@@ -2463,6 +2638,27 @@ mod tests {
         // Skills are files on the chat's host, and which files depends on the
         // agent account that chat names (gh#134).
         assert!(forwardable(methods::LIST_SKILLS));
+    }
+
+    #[test]
+    fn aggregate_stats_fans_out_once_and_keeps_missing_hosts_explicit() {
+        assert!(forwardable(methods::BOARD_STATS_SNAPSHOT));
+        assert!(!forwardable(methods::AGGREGATE_BOARD_STATS));
+        assert!(!is_stream_method(methods::BOARD_STATS_SNAPSHOT));
+        assert!(!is_stream_method(methods::AGGREGATE_BOARD_STATS));
+
+        assert!(matches!(
+            EngineRpc::stats_probe_error(RpcError::Refused("no board".into())),
+            StatsProbeResult::NoBoard
+        ));
+        assert!(matches!(
+            EngineRpc::stats_probe_error(RpcError::Transport("offline".into())),
+            StatsProbeResult::Unreachable(_)
+        ));
+        assert!(matches!(
+            EngineRpc::stats_probe_error(RpcError::UnknownMethod("old engine".into())),
+            StatsProbeResult::Unreadable(_)
+        ));
     }
 
     /// gh#97: onboarding is three device-local effects behind one verb — a

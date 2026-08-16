@@ -24,7 +24,7 @@ pub use comet_proto::TokenUsage;
 pub use comet_proto::view::rates::human_usd;
 pub use comet_proto::view::stats::{
     AgentSpend, BREAKDOWN_ROWS, BoardStats as Stats, Breakdown, BreakdownRow, DayBucket, Dimension,
-    Friction, HOURS, Landing, Ranking, TokenDay, human_tokens, rank_breakdown,
+    Friction, HOURS, Landing, Ranking, StatsMergeBasis, TokenDay, human_tokens, rank_breakdown,
 };
 
 /// Whose subscription a dispatch that named no slot spent (gh#101).
@@ -188,15 +188,31 @@ fn attempt_agents(a: &Attempt) -> Option<&[comet_proto::AgentTokenUsage]> {
 /// rather than as free work. Anything that *has* a config calls
 /// [`gather_priced`] instead.
 pub fn gather(tasks: &[Task], since_days: Option<i64>) -> Stats {
-    gather_with(tasks, since_days, None)
+    gather_with(tasks, since_days, None).0
 }
 
 /// The same, priced at `prices` (gh#182).
 pub fn gather_priced(tasks: &[Task], since_days: Option<i64>, prices: &Prices) -> Stats {
+    gather_with(tasks, since_days, Some(prices)).0
+}
+
+/// The same read with the two lossless inputs an all-board collector needs.
+///
+/// Not a second derivation: both values are produced by the one pass below.
+/// The basis is sent only by the snapshot RPC and never persisted or streamed.
+pub fn gather_mergeable_priced(
+    tasks: &[Task],
+    since_days: Option<i64>,
+    prices: &Prices,
+) -> (Stats, StatsMergeBasis) {
     gather_with(tasks, since_days, Some(prices))
 }
 
-fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>) -> Stats {
+fn gather_with(
+    tasks: &[Task],
+    since_days: Option<i64>,
+    prices: Option<&Prices>,
+) -> (Stats, StatsMergeBasis) {
     let attempts: Vec<(&Task, &Attempt)> = tasks
         .iter()
         .flat_map(|t| {
@@ -490,7 +506,7 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
     // nothing under is left out of the vector entirely rather than sent as an
     // empty one: the toggle is built from what is here, and a segment that
     // opens onto no rows is a segment that should not have been offered.
-    let breakdown: Vec<Breakdown> = Dimension::ALL
+    let full_breakdown: Vec<Breakdown> = Dimension::ALL
         .iter()
         .filter_map(|dimension| {
             let rows: Vec<BreakdownRow> = cuts
@@ -507,11 +523,20 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
                     }
                 })
                 .collect();
-            (!rows.is_empty()).then(|| rank_breakdown(*dimension, rows, BREAKDOWN_ROWS))
+            (!rows.is_empty()).then(|| rank_breakdown(*dimension, rows, 0))
         })
         .collect();
+    let breakdown = full_breakdown
+        .iter()
+        .map(|cut| rank_breakdown(cut.dimension, cut.rows.clone(), BREAKDOWN_ROWS))
+        .collect();
 
-    Stats {
+    let merge_basis = StatsMergeBasis {
+        duration_minutes: durations.clone(),
+        breakdown: full_breakdown,
+    };
+
+    let stats = Stats {
         since_days,
         attempts: attempts.len(),
         tasks_touched: touched.len(),
@@ -557,7 +582,8 @@ fn gather_with(tasks: &[Task], since_days: Option<i64>, prices: Option<&Prices>)
         // `attempts` is `task.attempts.len()`, unfiltered — so the stats
         // sweep and the board pane settle on the same host.
         dispatched: tasks.iter().any(|t| !t.attempts.is_empty()),
-    }
+    };
+    (stats, merge_basis)
 }
 
 pub fn run(paths: &Paths, _log: Arc<Logger>, since_days: Option<i64>) -> Result<Stats> {

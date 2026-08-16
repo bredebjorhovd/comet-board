@@ -77,8 +77,9 @@ struct Cli {
     /// (gh#408), `routes`, which reads and writes the host's routing.toml
     /// (gh#75), and `onboard`, whose clone, space and route all land on the
     /// host (gh#97).
-    /// The rest (doctor, init, adopt, stats) read this device's own files
-    /// either way, and are unaffected.
+    /// The rest (doctor, init, adopt, and single-board stats) read this
+    /// device's own files either way. `stats --all-boards` instead asks the
+    /// local engine to fan out and refuses a device target.
     #[arg(long, global = true)]
     device: Option<String>,
     #[command(subcommand)]
@@ -392,6 +393,11 @@ enum Command {
         /// Only the last N days. Omit for everything.
         #[arg(long)]
         since_days: Option<i64>,
+        /// Read every reachable board and print their explicit aggregate.
+        /// Without this flag the command keeps its original, deterministic
+        /// single-board output from this device's store.
+        #[arg(long)]
+        all_boards: bool,
         #[arg(long)]
         json: bool,
     },
@@ -669,6 +675,23 @@ enum RoutesCommand {
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+fn validate_stats_target(command: &Command, device: Option<&str>) -> Result<()> {
+    if device.is_some()
+        && matches!(
+            command,
+            Command::Stats {
+                all_boards: true,
+                ..
+            }
+        )
+    {
+        anyhow::bail!(
+            "--device / COMET_BOARD_DEVICE cannot be combined with stats --all-boards; the local engine owns the aggregate fan-out"
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let port = cli
@@ -691,6 +714,7 @@ fn main() -> Result<()> {
         .or_else(|| std::env::var("COMET_BOARD_DEVICE").ok())
         .filter(|d| !d.is_empty());
     let device = device.as_deref();
+    validate_stats_target(&cli.command, device)?;
 
     // One-shot commands on a current-thread runtime; the async work is the IPC
     // round-trips (`wait` holds its subscription open, but it is still the
@@ -1093,13 +1117,37 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Stats { since_days, json } => {
-            let log = Arc::new(Logger::new(paths.logfile(), false));
-            let s = comet_board::stats::run(&paths, log, since_days)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&s)?);
+        Command::Stats {
+            since_days,
+            all_boards,
+            json,
+        } => {
+            if all_boards {
+                let aggregate = runtime.block_on(async {
+                    let board = ops::attach(port, None).await?;
+                    ops::aggregate_stats(&board, since_days).await
+                })?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&aggregate)?);
+                } else {
+                    println!(
+                        "All boards ({} board{})",
+                        aggregate.boards.len(),
+                        if aggregate.boards.len() == 1 { "" } else { "s" }
+                    );
+                    if let Some(note) = aggregate.completeness_note() {
+                        println!("{note}\n");
+                    }
+                    comet_board::stats::print(&aggregate.stats);
+                }
             } else {
-                comet_board::stats::print(&s);
+                let log = Arc::new(Logger::new(paths.logfile(), false));
+                let s = comet_board::stats::run(&paths, log, since_days)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&s)?);
+                } else {
+                    comet_board::stats::print(&s);
+                }
             }
             Ok(())
         }
@@ -2000,6 +2048,35 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aggregate_stats_is_explicit_and_cannot_be_misdirected_to_one_device() {
+        let cli = Cli::try_parse_from([
+            "comet-board",
+            "stats",
+            "--all-boards",
+            "--since-days",
+            "7",
+            "--json",
+        ])
+        .expect("the aggregate spelling parses");
+        assert!(matches!(
+            cli.command,
+            Command::Stats {
+                since_days: Some(7),
+                all_boards: true,
+                json: true,
+            }
+        ));
+
+        let directed =
+            Cli::try_parse_from(["comet-board", "--device", "box", "stats", "--all-boards"])
+                .expect("global flags parse before semantic validation");
+        assert!(
+            validate_stats_target(&directed.command, directed.device.as_deref()).is_err(),
+            "one-device routing and an all-board collector are contradictory"
+        );
+    }
 
     /// The two halves of gh#155's rule, on the verb this sweep uses: a refusal
     /// is the device's own answer, and a dead connection is not an answer at

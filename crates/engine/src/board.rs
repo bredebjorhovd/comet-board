@@ -45,6 +45,7 @@ use comet_board::stats::Stats as BoardStats;
 use comet_board::sync::{SessionStatuses, SyncEngine};
 use comet_board::verdict::{VerdictKind, VerdictReceipt};
 use comet_proto::view::board::OrchestratorPin;
+use comet_proto::view::stats::StatsMergeBasis;
 use comet_proto::{Session, Space};
 use tokio::sync::{oneshot, watch};
 
@@ -87,7 +88,7 @@ enum Msg {
     /// reason `Detail` is: that thread owns `board.db`.
     Stats {
         since_days: Option<i64>,
-        reply: oneshot::Sender<anyhow::Result<BoardStats>>,
+        reply: oneshot::Sender<anyhow::Result<(BoardStats, StatsMergeBasis)>>,
     },
     /// An agent's file-anchored claims about what its attempt did (§gh#183).
     /// A write, so it could only ever have been on this thread; it answers with
@@ -154,6 +155,10 @@ pub struct BoardService {
     /// is one too many, and [`BoardService::spawn_at`] means the loop's own
     /// answer is not always the one a data dir would give.
     paths: Paths,
+    /// Stable identity minted by and stored inside `board.db` (gh#461).
+    /// Device ids are transport paths; this is what lets an aggregate tell an
+    /// alias to one board from a genuinely second board.
+    board_id: String,
 }
 
 impl BoardService {
@@ -184,7 +189,9 @@ impl BoardService {
         // Surface an unopenable store here, where the caller can log it as the
         // reason the board is absent. The loop's own `SyncEngine` (holding
         // `!Send` boxed source clients) is constructed on its thread below.
-        drop(comet_board::db::Db::open(&paths.db())?);
+        let db = comet_board::db::Db::open(&paths.db())?;
+        let board_id = db.board_id()?;
+        drop(db);
         let (tx, rx) = mpsc::channel::<Msg>();
         let (rows_tx, rows_rx) = watch::channel(Vec::<TaskRow>::new());
         let pin_tx = Arc::new(watch::Sender::new(OrchestratorPin::default()));
@@ -228,6 +235,7 @@ impl BoardService {
             rows: rows_rx,
             orchestrator: pin_tx,
             paths,
+            board_id,
         })
     }
 
@@ -239,6 +247,10 @@ impl BoardService {
     /// read and fix.
     pub fn paths(&self) -> &Paths {
         &self.paths
+    }
+
+    pub fn board_id(&self) -> &str {
+        &self.board_id
     }
 
     /// The board's rows, current value first — what `WatchBoard` streams.
@@ -352,6 +364,17 @@ impl BoardService {
     /// What the board knows about its own throughput over a window (gh#143).
     /// `None` days is all time.
     pub async fn stats(&self, since_days: Option<i64>) -> anyhow::Result<BoardStats> {
+        self.stats_mergeable(since_days)
+            .await
+            .map(|(stats, _)| stats)
+    }
+
+    /// One stats answer plus the lossless percentile/breakdown basis used by
+    /// the all-board collector. Still one board-loop read and one gather pass.
+    pub async fn stats_mergeable(
+        &self,
+        since_days: Option<i64>,
+    ) -> anyhow::Result<(BoardStats, StatsMergeBasis)> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::Stats { since_days, reply })
@@ -592,10 +615,9 @@ fn run_loop(
                 // window is never priced against rates the board has stopped
                 // using.
                 let prices = comet_board::prices::Prices::from_config(&engine.cfg);
-                let result = engine
-                    .db
-                    .load_tasks()
-                    .map(|tasks| comet_board::stats::gather_priced(&tasks, since_days, &prices));
+                let result = engine.db.load_tasks().map(|tasks| {
+                    comet_board::stats::gather_mergeable_priced(&tasks, since_days, &prices)
+                });
                 let _ = reply.send(result);
             }
             Ok(Msg::Detail { task_id, reply }) => {

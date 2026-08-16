@@ -122,13 +122,12 @@ use std::path::{Path, PathBuf};
 use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
 use serde::{Deserialize, Serialize};
 
-use comet_proto::view::board;
 use comet_proto::view::rates::human_usd;
 use comet_proto::view::stats::{
-    AgentSpend, BREAKDOWN_ROWS, BoardSpend, BoardStats, Breakdown, BreakdownRow, CostSplit,
-    Dimension, HostBoard, LandingKind, WINDOWS, bar_fraction, day_captions_fit, day_columns,
-    elsewhere_note, hour_grid, human_minutes, human_multiple, human_tokens, other_boards_note,
-    peak_tokens, percent,
+    AgentSpend, AggregateBoardStats, BREAKDOWN_ROWS, BoardSpend, BoardStats, Breakdown,
+    BreakdownRow, CostSplit, Dimension, HostBoard, LandingKind, WINDOWS, bar_fraction,
+    day_captions_fit, day_columns, elsewhere_note, hour_grid, human_minutes, human_multiple,
+    human_tokens, other_boards_note, peak_tokens, percent,
 };
 use comet_rpc::methods;
 
@@ -278,6 +277,7 @@ impl TrackSize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum HostChoice {
+    All,
     ThisDevice,
     Device(String),
 }
@@ -295,12 +295,19 @@ impl HostChoice {
     /// spellings — its own id, and the absent target the sweep asks it by.
     fn matches(&self, target: Option<&str>, local: Option<&str>) -> bool {
         match self {
+            Self::All => false,
             Self::ThisDevice => target.is_none() || (target == local && local.is_some()),
             Self::Device(id) => {
                 target == Some(id.as_str()) || (target.is_none() && local == Some(id.as_str()))
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatsSelection {
+    All,
+    Board(usize),
 }
 
 /// Where the stats page's own preferences live.
@@ -372,22 +379,25 @@ fn resolve(
     pinned: Option<&HostChoice>,
     local: Option<&str>,
     swept: bool,
-) -> Option<usize> {
+) -> Option<StatsSelection> {
     if let Some(pin) = pinned {
+        if *pin == HostChoice::All && !answers.is_empty() {
+            return Some(StatsSelection::All);
+        }
         if let Some(found) = answers
             .iter()
             .position(|(target, _)| pin.matches(target.as_deref(), local))
         {
-            return Some(found);
+            return Some(StatsSelection::Board(found));
         }
         if !swept {
             return None;
         }
     }
     if let Some(evidenced) = answers.iter().position(|(_, stats)| stats.dispatched) {
-        return Some(evidenced);
+        return Some(StatsSelection::Board(evidenced));
     }
-    (swept && !answers.is_empty()).then_some(0)
+    (swept && !answers.is_empty()).then_some(StatsSelection::Board(0))
 }
 
 pub struct StatsPage {
@@ -404,6 +414,9 @@ pub struct StatsPage {
     /// an empty board names instead of only its own emptiness. `None` in the
     /// target is this device, exactly as the sweep spells it.
     answers: Vec<(Option<String>, BoardStats)>,
+    /// The shared all-board contract that supplied `answers` and the explicit
+    /// aggregate choice. Retained whole for host completeness/audit notes.
+    aggregate: Option<AggregateBoardStats>,
     /// The remembered pick. `None` follows the sweep.
     pinned: Option<HostChoice>,
     /// Every candidate has been asked. Until then, a pin with no answer yet —
@@ -430,6 +443,7 @@ impl StatsPage {
             // page could not ask about at all before gh#227.
             dimension: Dimension::Model,
             answers: Vec::new(),
+            aggregate: None,
             pinned,
             swept: false,
             error: None,
@@ -439,24 +453,8 @@ impl StatsPage {
         page
     }
 
-    /// Read the numbers off **every** device that hosts a board (gh#254).
-    ///
-    /// A candidate that errors has answered "I host no board" — the engine's
-    /// contract for every board method — so the sweep moves on. It no longer
-    /// *stops* on the first that answers: two boards on one account is the
-    /// state this page handled worst, and a control that offers only the
-    /// candidate already on screen is not a control. When nobody answers, the
-    /// last error is what the page shows: "board unavailable" from every device
-    /// is a true and useful thing to read.
-    ///
-    /// Answers land one at a time and in sweep order, so the first board
-    /// **with dispatch evidence** still paints as soon as it replies rather
-    /// than waiting on a device that is asleep — and the numbers already on
-    /// screen stay there until the first new one lands, which is what makes a
-    /// two-click window comparison readable. An answer *without* evidence is
-    /// held by [`resolve`] until the sweep ends (gh#434): painting the local
-    /// furniture board first and then flipping to the box is exactly the
-    /// "defaults to the mac board" the page was reported for.
+    /// Read the shared aggregate contract once. The engine owns the bounded
+    /// concurrent fan-out; this page owns only selection and rendering.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
@@ -464,47 +462,54 @@ impl StatsPage {
             self.swept = true;
             return;
         };
-        let (devices, local) = {
-            let state = self.state.read(cx);
-            (state.devices.clone(), state.local_device_id.clone())
-        };
-        let candidates = board::host_candidates(&devices, local.as_deref());
+        let local = self.state.read(cx).local_device_id.clone();
         let since_days = self.since_days;
         self.error = None;
         self.swept = false;
         self.task = Some(cx.spawn(async move |this, cx| {
-            let mut last: Option<String> = None;
-            let mut found: Vec<(Option<String>, BoardStats)> = Vec::new();
-            for candidate in candidates {
-                let mut params = serde_json::json!({ "sinceDays": since_days });
-                if let (Some(host), Some(object)) = (candidate.as_deref(), params.as_object_mut()) {
-                    object.insert("targetDeviceId".into(), serde_json::json!(host));
-                }
-                match engine.client().call(methods::BOARD_STATS, params).await {
-                    Ok(value) => match serde_json::from_value::<BoardStats>(value) {
-                        Ok(stats) => {
-                            found.push((candidate, stats));
-                            let answers = found.clone();
-                            let _ = this.update(cx, |page, cx| {
-                                page.answers = answers;
-                                cx.notify();
-                            });
-                        }
-                        // A board that answered unreadably has still answered,
-                        // but there is nothing to draw from it — carry it as
-                        // the error the page falls back to.
-                        Err(err) => last = Some(format!("Unreadable stats: {err}")),
-                    },
-                    Err(err) => last = Some(err.to_string()),
-                }
+            let mut params = serde_json::json!({});
+            if let (Some(days), Some(object)) = (since_days, params.as_object_mut()) {
+                object.insert("sinceDays".into(), serde_json::json!(days));
             }
+            let result = engine
+                .client()
+                .call(methods::AGGREGATE_BOARD_STATS, params)
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|value| {
+                    serde_json::from_value::<AggregateBoardStats>(value)
+                        .map_err(|error| format!("Unreadable aggregate stats: {error}"))
+                });
             let _ = this.update(cx, |page, cx| {
                 page.swept = true;
-                if page.answers.is_empty() {
-                    page.error = Some(
-                        last.unwrap_or_else(|| "No device on this account hosts a board".into())
-                            .into(),
-                    );
+                match result {
+                    Ok(aggregate) => {
+                        let answers = aggregate
+                            .boards
+                            .iter()
+                            .map(|board| {
+                                let target = (Some(board.host.device_id.as_str())
+                                    != local.as_deref())
+                                .then(|| board.host.device_id.clone());
+                                (target, board.stats.clone())
+                            })
+                            .collect::<Vec<_>>();
+                        page.error = if answers.is_empty() {
+                            Some(
+                                aggregate
+                                    .completeness_note()
+                                    .unwrap_or_else(|| {
+                                        "No device on this account hosts a board".into()
+                                    })
+                                    .into(),
+                            )
+                        } else {
+                            None
+                        };
+                        page.answers = answers;
+                        page.aggregate = Some(aggregate);
+                    }
+                    Err(error) => page.error = Some(error.into()),
                 }
                 cx.notify();
             });
@@ -517,7 +522,7 @@ impl StatsPage {
     }
 
     /// Which answer is on screen.
-    fn resolved(&self, cx: &gpui::App) -> Option<usize> {
+    fn resolved(&self, cx: &gpui::App) -> Option<StatsSelection> {
         resolve(
             &self.answers,
             self.pinned.as_ref(),
@@ -557,6 +562,21 @@ impl StatsPage {
             if let Err(err) = prefs.save(&dir) {
                 // The pick still applies to this session; only the memory of
                 // it was lost, and that is not worth a strip over the page.
+                tracing::warn!(error = %err, "failed to persist the stats host");
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_all_boards(&mut self, cx: &mut Context<Self>) {
+        let choice = HostChoice::All;
+        if self.pinned.as_ref() == Some(&choice) {
+            return;
+        }
+        self.pinned = Some(choice.clone());
+        if let Some(dir) = self.state.read(cx).data_dir.clone() {
+            let prefs = StatsPrefs { host: Some(choice) };
+            if let Err(err) = prefs.save(&dir) {
                 tracing::warn!(error = %err, "failed to persist the stats host");
             }
         }
@@ -709,31 +729,45 @@ impl StatsPage {
         row.into_any_element()
     }
 
-    /// **The host picker (gh#254): the same segmented control, one segment per
-    /// board the sweep found.**
+    /// **The host picker (gh#254/gh#461): All boards, then one segment per
+    /// canonical board the aggregate found.**
     ///
-    /// It is drawn only when there is a choice to make. One board is every
-    /// ordinary install, and a segmented control with a single segment in it is
-    /// furniture that implies an alternative there isn't — on those the header
-    /// names the host in its subtitle, as it always did.
+    /// It is drawn only when there is a choice to make. One board on one
+    /// candidate is every ordinary install, and a segmented control there is
+    /// furniture. A second candidate still earns the aggregate segment even if
+    /// it failed: selecting All boards is how the partial warning becomes
+    /// visible rather than how the missing host becomes a zero.
     ///
-    /// The segments are the boards that *answered*, not the devices on the
-    /// account: a laptop that hosts no board is not a board you can read, and
-    /// offering it would be offering an error.
+    /// Individual segments are only boards that answered. Candidate failures
+    /// stay in the All boards audit; offering one as a board would be offering
+    /// an error.
     fn render_hosts(
         &self,
         boards: &[HostBoard],
-        current: Option<&str>,
+        selection: Option<StatsSelection>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if boards.len() < 2 {
+        let has_multiple_candidates = self
+            .aggregate
+            .as_ref()
+            .is_some_and(|aggregate| aggregate.hosts.len() > 1);
+        if boards.len() < 2 && !has_multiple_candidates {
             return None;
         }
-        let mut row = Self::track(theme, TrackSize::Page);
+        let mut row = Self::track(theme, TrackSize::Page).child(
+            Self::segment(
+                theme,
+                "stats-host-all".into(),
+                "All boards",
+                Theme::TEXT_DENSE,
+                selection == Some(StatsSelection::All),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.set_all_boards(cx))),
+        );
         for (index, host) in boards.iter().enumerate() {
             let target = host.device_id.clone();
-            let selected = host.device_id.as_deref() == current;
+            let selected = matches!(selection, Some(StatsSelection::Board(ix)) if ix == index);
             row = row.child(
                 Self::segment(
                     theme,
@@ -2152,17 +2186,32 @@ impl Render for StatsPage {
         // answering the same question, and three of them used to answer it by
         // not asking.
         let boards = self.boards(cx);
-        let resolved = self.resolved(cx);
-        let current: Option<String> = resolved.and_then(|ix| self.answers[ix].0.clone());
-        let stats = resolved.map(|ix| self.answers[ix].1.clone());
-        let host = self.device_label(current.as_deref(), cx);
-        let picker = self.render_hosts(&boards, current.as_deref(), &theme, cx);
+        let selection = self.resolved(cx);
+        let all_boards = selection == Some(StatsSelection::All);
+        let current: Option<String> = match selection {
+            Some(StatsSelection::Board(ix)) => self.answers[ix].0.clone(),
+            _ => None,
+        };
+        let stats = match selection {
+            Some(StatsSelection::All) => self.aggregate.as_ref().map(|all| all.stats.clone()),
+            Some(StatsSelection::Board(ix)) => Some(self.answers[ix].1.clone()),
+            None => None,
+        };
+        let host = if all_boards {
+            "all boards".to_string()
+        } else {
+            self.device_label(current.as_deref(), cx)
+        };
+        let picker = self.render_hosts(&boards, selection, &theme, cx);
         // The subtitle stops stating the host as a fact once a control names
         // it — the same sentence twice, one of them un-clickable, was half of
         // what made the wrong board so easy to believe.
-        let subtitle = match picker.is_some() {
-            true => "What the board you are reading did with the work it was given.".to_string(),
-            false => format!("What the board on {host} did with the work it was given."),
+        let subtitle = match (all_boards, picker.is_some()) {
+            (true, _) => "What every reachable board did with the work it was given.".to_string(),
+            (false, true) => {
+                "What the board you are reading did with the work it was given.".to_string()
+            }
+            (false, false) => format!("What the board on {host} did with the work it was given."),
         };
         // The wide column the shared layer declares (gh#178) — this page is a
         // dashboard, and picking the width is a choice between two named ones
@@ -2205,16 +2254,27 @@ impl Render for StatsPage {
             column = column.child(widgets::error_strip(&theme, error));
         }
 
+        if all_boards
+            && let Some(note) = self
+                .aggregate
+                .as_ref()
+                .and_then(AggregateBoardStats::completeness_note)
+        {
+            column = column.child(widgets::warning_strip(&theme, note));
+        }
+
         // A pin whose board has stopped answering: the page falls back to the
         // sweep rather than showing nothing, and says which board it is
         // showing instead of quietly becoming the bug this ticket is about.
-        if self.swept
-            && self.pinned.is_some()
-            && !self.answers.is_empty()
-            && !self.pinned.as_ref().is_some_and(|pin| {
+        let pinned_is_showing = match (&self.pinned, selection) {
+            (Some(HostChoice::All), Some(StatsSelection::All)) => true,
+            (Some(pin), Some(StatsSelection::Board(_))) => {
                 pin.matches(current.as_deref(), self.local_device(cx).as_deref())
-            })
-        {
+            }
+            (None, _) => true,
+            _ => false,
+        };
+        if self.swept && self.pinned.is_some() && !self.answers.is_empty() && !pinned_is_showing {
             column = column.child(widgets::warning_strip(
                 &theme,
                 format!("The board you picked did not answer. Showing the board on {host}."),
@@ -2250,14 +2310,25 @@ impl Render for StatsPage {
                 .gap(px(6.0))
                 .text_size(px(Theme::TEXT_BODY))
                 .text_color(theme.text_subtle)
-                .child(SharedString::from(format!(
-                    "No dispatches on the board on {host} in the {}. Release a task and this \
-                     fills in.",
-                    stats.window_label()
-                )))
-                .when_some(elsewhere_note(&boards, current.as_deref()), |el, note| {
-                    el.child(SharedString::from(note))
-                });
+                .child(SharedString::from(if all_boards {
+                    format!(
+                        "No dispatches across any board in the {}. Release a task and this fills \
+                         in.",
+                        stats.window_label()
+                    )
+                } else {
+                    format!(
+                        "No dispatches on the board on {host} in the {}. Release a task and this \
+                         fills in.",
+                        stats.window_label()
+                    )
+                }))
+                .when_some(
+                    (!all_boards)
+                        .then(|| elsewhere_note(&boards, current.as_deref()))
+                        .flatten(),
+                    |el, note| el.child(SharedString::from(note)),
+                );
             return scroll_page(column.child(empty));
         }
 
@@ -2265,9 +2336,10 @@ impl Render for StatsPage {
         // page read as "nothing metered to price" forever. The sentence names
         // the other candidates; the spend card is where a reader is standing
         // when they need it.
-        let wrong_board = match stats.has_tokens() {
-            true => None,
-            false => other_boards_note(&boards, current.as_deref()),
+        let wrong_board = match (all_boards, stats.has_tokens()) {
+            (true, _) => None,
+            (false, true) => None,
+            (false, false) => other_boards_note(&boards, current.as_deref()),
         };
 
         // Five cards in four rows, and the order is the argument: what it cost,
@@ -2345,7 +2417,10 @@ mod tests {
     #[test]
     fn with_nothing_pinned_the_page_shows_the_sweep_s_answer() {
         let answers = vec![answer(None, 19), answer(Some("box"), 12)];
-        assert_eq!(resolve(&answers, None, Some("mac"), true), Some(0));
+        assert_eq!(
+            resolve(&answers, None, Some("mac"), true),
+            Some(StatsSelection::Board(0))
+        );
         // And nothing at all before anybody has answered.
         assert_eq!(resolve(&[], None, Some("mac"), true), None);
     }
@@ -2356,9 +2431,15 @@ mod tests {
     #[test]
     fn a_furniture_board_never_outranks_one_with_dispatch_evidence() {
         let answers = vec![answer(None, 0), answer(Some("box"), 12)];
-        assert_eq!(resolve(&answers, None, Some("mac"), true), Some(1));
+        assert_eq!(
+            resolve(&answers, None, Some("mac"), true),
+            Some(StatsSelection::Board(1))
+        );
         // Mid-sweep too: the box's answer paints the moment it lands.
-        assert_eq!(resolve(&answers, None, Some("mac"), false), Some(1));
+        assert_eq!(
+            resolve(&answers, None, Some("mac"), false),
+            Some(StatsSelection::Board(1))
+        );
     }
 
     /// A furniture answer is held while the sweep keeps asking, and settles
@@ -2368,7 +2449,10 @@ mod tests {
     fn a_furniture_answer_is_held_until_the_sweep_ends() {
         let answers = vec![answer(None, 0)];
         assert_eq!(resolve(&answers, None, Some("mac"), false), None);
-        assert_eq!(resolve(&answers, None, Some("mac"), true), Some(0));
+        assert_eq!(
+            resolve(&answers, None, Some("mac"), true),
+            Some(StatsSelection::Board(0))
+        );
     }
 
     /// The pin outranks the furniture rule: an operator who picked a board
@@ -2378,7 +2462,23 @@ mod tests {
     fn a_pin_beats_the_furniture_rule() {
         let answers = vec![answer(None, 0), answer(Some("box"), 12)];
         let here = HostChoice::ThisDevice;
-        assert_eq!(resolve(&answers, Some(&here), Some("mac"), false), Some(0));
+        assert_eq!(
+            resolve(&answers, Some(&here), Some("mac"), false),
+            Some(StatsSelection::Board(0))
+        );
+    }
+
+    #[test]
+    fn all_boards_is_an_explicit_choice_not_the_sweeps_new_default() {
+        let answers = vec![answer(None, 19), answer(Some("box"), 12)];
+        assert_eq!(
+            resolve(&answers, Some(&HostChoice::All), Some("mac"), true),
+            Some(StatsSelection::All)
+        );
+        assert_eq!(
+            resolve(&answers, None, Some("mac"), true),
+            Some(StatsSelection::Board(0))
+        );
     }
 
     /// The fix, in one assertion: the operator picked the box, so the box is
@@ -2388,7 +2488,10 @@ mod tests {
     fn a_pinned_board_beats_the_one_that_answered_first() {
         let answers = vec![answer(None, 19), answer(Some("box"), 12)];
         let pin = HostChoice::Device("box".into());
-        assert_eq!(resolve(&answers, Some(&pin), Some("mac"), true), Some(1));
+        assert_eq!(
+            resolve(&answers, Some(&pin), Some("mac"), true),
+            Some(StatsSelection::Board(1))
+        );
     }
 
     /// A pin still being swept for holds the page rather than flashing the
@@ -2400,7 +2503,10 @@ mod tests {
         assert_eq!(resolve(&answers, Some(&pin), Some("mac"), false), None);
         // Once every candidate has been asked, the sweep's answer is the best
         // there is — shown, and said out loud in a strip above it.
-        assert_eq!(resolve(&answers, Some(&pin), Some("mac"), true), Some(0));
+        assert_eq!(
+            resolve(&answers, Some(&pin), Some("mac"), true),
+            Some(StatsSelection::Board(0))
+        );
     }
 
     /// The local board answers to both of its spellings — the absent target
@@ -2410,9 +2516,15 @@ mod tests {
     fn this_device_is_the_same_board_under_either_name() {
         let answers = vec![answer(Some("box"), 12), answer(None, 19)];
         let here = HostChoice::ThisDevice;
-        assert_eq!(resolve(&answers, Some(&here), Some("mac"), true), Some(1));
+        assert_eq!(
+            resolve(&answers, Some(&here), Some("mac"), true),
+            Some(StatsSelection::Board(1))
+        );
         let by_id = HostChoice::Device("mac".into());
-        assert_eq!(resolve(&answers, Some(&by_id), Some("mac"), true), Some(1));
+        assert_eq!(
+            resolve(&answers, Some(&by_id), Some("mac"), true),
+            Some(StatsSelection::Board(1))
+        );
         // And picking the local candidate is remembered as `ThisDevice`, so it
         // survives the device being registered again under a new id.
         assert_eq!(HostChoice::of(None, Some("mac")), HostChoice::ThisDevice);

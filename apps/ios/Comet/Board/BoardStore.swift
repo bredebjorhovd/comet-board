@@ -445,17 +445,17 @@ final class BoardStore {
     // MARK: Throughput (gh#143)
 
     enum StatsOutcome {
-        case read(BoardStats, host: String)
+        case read(AggregateBoardStats)
         case failed(String)
     }
 
     /// What the board did with the work it was given, over a window.
     ///
-    /// `board.db` lives on whichever device hosts the board, so this asks the
-    /// host the watch sweep already settled on and falls back to the rest of
-    /// the candidates — the screen can be opened before `WatchBoard` has
-    /// answered anybody, and a candidate that refuses has said "I host no
-    /// board", which is this store's contract everywhere else.
+    /// Any engine can collect this: it fans out concurrently to every engine
+    /// device under a fixed budget and returns canonical board ids, individual
+    /// board answers, and explicit missing hosts. The phone tries candidate
+    /// collectors only until one answers; it never performs or merges the
+    /// board reads itself.
     ///
     /// A reply that will not decode ends the sweep rather than continuing it:
     /// that host HAS a board and is running a different version, and asking
@@ -475,9 +475,9 @@ final class BoardStore {
         var last: String?
         for deviceId in candidates {
             do {
-                let stats: BoardStats = try await relay(for: deviceId)
-                    .call(method: "BoardStats", params: params)
-                return .read(stats, host: deviceId)
+                let stats: AggregateBoardStats = try await relay(for: deviceId)
+                    .call(method: "AggregateBoardStats", params: params)
+                return .read(stats)
             } catch is DecodingError {
                 return .failed("Unreadable stats — the board is on another version")
             } catch {

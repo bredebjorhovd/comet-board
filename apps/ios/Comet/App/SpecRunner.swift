@@ -72,6 +72,7 @@ enum SpecRunner {
         var barFraction: [BarCase]
         var humanUsd: [UsdCase]
         var boardStats: [StatsCase]
+        var aggregateStats: [AggregateCase]
     }
 
     private struct RankedCase: Decodable {
@@ -153,6 +154,23 @@ enum SpecRunner {
         }
     }
 
+    private struct AggregateCase: Decodable {
+        var name: String
+        /// A real serialized `AggregateBoardStats`: this pins the envelope,
+        /// canonical board attribution, and explicit partial-host states.
+        var aggregate: AggregateBoardStats
+        var expect: Expect
+
+        struct Expect: Decodable {
+            var boardCount: Int
+            var hostStatuses: [StatsHostStatus]
+            var complete: Bool
+            var completenessNote: String?
+            var attempts: Int
+            var tokenTotal: UInt64
+        }
+    }
+
     // MARK: The run
 
     static func run() {
@@ -230,6 +248,17 @@ enum SpecRunner {
                    "\(what): context reported")
             // 24 slots exist even before anything has run in them.
             expect(s.hourOfDay.count, 24, "\(what): hour slots")
+        }
+        for c in spec.aggregateStats {
+            let a = c.aggregate
+            let what = "aggregateStats — \(c.name)"
+            expect(a.boards.count, c.expect.boardCount, "\(what): board count")
+            expect(a.hosts.map(\.status), c.expect.hostStatuses, "\(what): host statuses")
+            expect(a.complete, c.expect.complete, "\(what): complete")
+            expect(a.completenessNote, c.expect.completenessNote,
+                   "\(what): completeness note")
+            expect(a.stats.attempts, c.expect.attempts, "\(what): attempts")
+            expect(a.stats.tokens.total, c.expect.tokenTotal, "\(what): token total")
         }
 
         log(failures == 0

@@ -31,6 +31,7 @@ use comet_board::runtime::{RuntimeOption, harness_for_runtime, runtime_name};
 use comet_board::verdict::{self, Projection, VerdictReceipt};
 use comet_proto::Device;
 use comet_proto::view::board as view;
+use comet_proto::view::stats::AggregateBoardStats;
 use comet_rpc::{RpcClient, connect_ws, methods};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -206,6 +207,23 @@ pub async fn board_rows(board: &Board) -> Result<Vec<TaskRow>> {
         .subscribe(methods::WATCH_BOARD, board.params(serde_json::json!({})))
         .await?;
     snapshot(&mut stream, board.host()).await
+}
+
+/// The on-demand union of every board host reachable from this engine.
+pub async fn aggregate_stats(
+    board: &Board,
+    since_days: Option<i64>,
+) -> Result<AggregateBoardStats> {
+    let mut params = serde_json::json!({});
+    if let (Some(days), Some(object)) = (since_days, params.as_object_mut()) {
+        object.insert("sinceDays".into(), serde_json::json!(days));
+    }
+    let reply = board
+        .client
+        .call(methods::AGGREGATE_BOARD_STATS, board.params(params))
+        .await
+        .context("reading aggregate board stats")?;
+    serde_json::from_value(reply).context("parsing AggregateBoardStats reply")
 }
 
 /// The row named by a canonical id or an unambiguous display identifier.

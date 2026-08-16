@@ -147,6 +147,18 @@ pub mod methods {
     /// worst, and streaming a full aggregate on every board tick would cost
     /// every connected viewport a recompute nobody is looking at.
     pub const BOARD_STATS: &str = "BoardStats";
+    /// One board's stats with its durable store identity and the lossless merge
+    /// basis used by [`AGGREGATE_BOARD_STATS`]. Relay-forwardable, but normally
+    /// only called by another engine's bounded fan-out.
+    pub const BOARD_STATS_SNAPSHOT: &str = "BoardStatsSnapshot";
+    /// On-demand union of every board host this engine can currently ask.
+    /// Params: `{sinceDays?}` →
+    /// `comet_proto::view::stats::AggregateBoardStats`.
+    ///
+    /// Deliberately not relay-forwardable: whichever engine receives it is the
+    /// collector and performs one concurrent, five-second-bounded read per
+    /// non-iOS device. No background polling or edge persistence is involved.
+    pub const AGGREGATE_BOARD_STATS: &str = "AggregateBoardStats";
     /// Stream: which chat is pinned as this board's orchestrator (gh#104),
     /// current value first, then every change. Params: `{}` → `{chatId}`.
     ///

@@ -1,11 +1,12 @@
 //! What the board knows about its own throughput, as every surface reads it.
 //!
-//! The numbers are gathered by `comet_board::stats` on the box, which owns
-//! `board.db`; the *shape* lives here so a viewport can deserialize a
-//! `BoardStats` reply without depending on the board crate — the same split
+//! The numbers are gathered by `comet_board::stats` on each host that owns a
+//! `board.db`; the *shape* lives here so a viewport can deserialize either one
+//! [`BoardStats`] or their explicit [`AggregateBoardStats`] union without
+//! depending on the board crate — the same split
 //! [`super::board::RuntimeOption`] makes, and for the same reason: the phone
-//! and the laptop asking a remote box for its stats must not have to link a
-//! SQLite store to read the answer.
+//! and the laptop asking remote boxes for stats must not have to link a SQLite
+//! store to read the answer.
 //!
 //! The derivations here are the ones a *renderer* needs and should not each
 //! invent: ordering a tally, scaling a bar against the busiest bucket,
@@ -1170,6 +1171,154 @@ pub struct BoardStats {
     pub dispatched: bool,
 }
 
+// -- all boards (gh#461) ----------------------------------------------------
+
+/// The two facts that a finished [`BoardStats`] has intentionally compressed,
+/// but an all-board answer needs in order to compress the union correctly.
+///
+/// Percentiles cannot be averaged, and the per-dimension rows in
+/// [`BoardStats::breakdown`] have already folded their tail. A board therefore
+/// sends these two small, bounded-by-history inputs only to the on-demand
+/// aggregate collector. They are not stored, streamed, or rendered.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StatsMergeBasis {
+    /// Every ended attempt's duration, already window-filtered and sorted.
+    pub duration_minutes: Vec<i64>,
+    /// The same five cuts as [`BoardStats::breakdown`], before its display cap.
+    pub breakdown: Vec<Breakdown>,
+}
+
+/// A device as the aggregate contract names it.
+///
+/// Kept separate from `Device`: a stats answer needs only the durable id and
+/// the human label, and carrying presence/platform fields into an audit record
+/// would make them look like facts about when the stats were produced.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsDevice {
+    pub device_id: String,
+    pub label: String,
+}
+
+/// One board's answer before duplicate transport paths are collapsed.
+///
+/// `board_id` belongs to `board.db`, not to the device. Copying or aliasing the
+/// same store therefore keeps one identity, while two boards polling the same
+/// repository remain two identities and keep both sets of attempts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BoardStatsSnapshot {
+    pub board_id: String,
+    /// The engine that actually read the store. This may differ from the
+    /// candidate path used to reach it, which is recorded in [`StatsHost`].
+    pub host: StatsDevice,
+    pub stats: BoardStats,
+    #[serde(default)]
+    pub merge_basis: StatsMergeBasis,
+}
+
+/// One board after transport aliases have been collapsed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateBoardStatsSource {
+    pub board_id: String,
+    pub host: StatsDevice,
+    pub stats: BoardStats,
+}
+
+/// What happened when the collector asked one device candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StatsHostStatus {
+    /// This path contributed a board.
+    Answered,
+    /// This path answered the same canonical board as an earlier path.
+    Duplicate,
+    /// The engine answered and explicitly hosts no board.
+    NoBoard,
+    /// Nobody answered within the collection budget, or the transport failed.
+    Unreachable,
+    /// A host answered, but not with a snapshot this collector could read.
+    Unreadable,
+}
+
+impl StatsHostStatus {
+    pub fn compromises_aggregate(self) -> bool {
+        matches!(self, Self::Unreachable | Self::Unreadable)
+    }
+}
+
+/// The audit row for one candidate transport path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsHost {
+    pub device: StatsDevice,
+    pub status: StatsHostStatus,
+    /// Present on both `answered` and `duplicate`, linking aliases to the
+    /// single entry in [`AggregateBoardStats::boards`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_id: Option<String>,
+    /// Human-readable transport/schema failure. Never used for `noBoard`:
+    /// hosting no board is a complete answer, not a failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// The one aggregate contract shared by CLI JSON, desktop and iOS.
+///
+/// `stats` has exactly the single-board shape renderers already understand.
+/// `boards` preserves the individual answers and their canonical ownership;
+/// `hosts` says how complete the fan-out was. An empty `stats` value is never
+/// evidence of zero activity unless `complete` is true.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggregateBoardStats {
+    pub since_days: Option<i64>,
+    pub stats: BoardStats,
+    pub boards: Vec<AggregateBoardStatsSource>,
+    pub hosts: Vec<StatsHost>,
+    pub complete: bool,
+}
+
+impl AggregateBoardStats {
+    /// The warning every surface says over a partial union.
+    pub fn completeness_note(&self) -> Option<String> {
+        let missing: Vec<String> = self
+            .hosts
+            .iter()
+            .filter(|host| host.status.compromises_aggregate())
+            .map(|host| match host.status {
+                StatsHostStatus::Unreadable => format!("{} was unreadable", host.device.label),
+                _ => format!("{} did not answer", host.device.label),
+            })
+            .collect();
+        (!missing.is_empty()).then(|| {
+            format!(
+                "Partial aggregate — {}. The totals include only the boards that answered.",
+                missing.join("; ")
+            )
+        })
+    }
+}
+
+/// One candidate's result, before [`aggregate_board_stats`] turns transport
+/// outcomes into the stable wire contract. This is the collector's test seam:
+/// production supplies relay answers; tests supply values directly.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatsProbe {
+    pub candidate: StatsDevice,
+    pub result: StatsProbeResult,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StatsProbeResult {
+    Answered(BoardStatsSnapshot),
+    NoBoard,
+    Unreachable(String),
+    Unreadable(String),
+}
+
 /// The context half of the page: not what the window's work cost, but how
 /// close it ran to the limit of what its agents could hold (gh#271).
 ///
@@ -1301,6 +1450,516 @@ impl BoardStats {
             None => "all time".to_string(),
         }
     }
+}
+
+/// Collapse a bounded set of host probes into one auditable union.
+///
+/// Boards are keyed only by their store identity. Repository/task ids are not
+/// deduplication keys: two stores may legitimately poll the same repository,
+/// and the distinct attempts they released are precisely what this view must
+/// reveal. Probe order is retained for host audit rows; contributing boards
+/// retain their first candidate's order. The collector supplies local-first,
+/// then registration order, and `join_all` preserves it despite concurrent
+/// completion — deterministic JSON without changing the per-board selector's
+/// established tie-break.
+pub fn aggregate_board_stats(
+    since_days: Option<i64>,
+    probes: Vec<StatsProbe>,
+) -> AggregateBoardStats {
+    let mut hosts = Vec::with_capacity(probes.len());
+    let mut snapshots: Vec<BoardStatsSnapshot> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    for probe in probes {
+        let candidate = probe.candidate;
+        match probe.result {
+            StatsProbeResult::Answered(snapshot) if snapshot.board_id.trim().is_empty() => {
+                hosts.push(StatsHost {
+                    device: candidate,
+                    status: StatsHostStatus::Unreadable,
+                    board_id: None,
+                    error: Some("the board answered without a stable board id".into()),
+                });
+            }
+            StatsProbeResult::Answered(snapshot) => {
+                let board_id = snapshot.board_id.clone();
+                let duplicate = !seen.insert(board_id.clone());
+                if !duplicate {
+                    snapshots.push(snapshot);
+                }
+                hosts.push(StatsHost {
+                    device: candidate,
+                    status: if duplicate {
+                        StatsHostStatus::Duplicate
+                    } else {
+                        StatsHostStatus::Answered
+                    },
+                    board_id: Some(board_id),
+                    error: None,
+                });
+            }
+            StatsProbeResult::NoBoard => hosts.push(StatsHost {
+                device: candidate,
+                status: StatsHostStatus::NoBoard,
+                board_id: None,
+                error: None,
+            }),
+            StatsProbeResult::Unreachable(error) => hosts.push(StatsHost {
+                device: candidate,
+                status: StatsHostStatus::Unreachable,
+                board_id: None,
+                error: Some(error),
+            }),
+            StatsProbeResult::Unreadable(error) => hosts.push(StatsHost {
+                device: candidate,
+                status: StatsHostStatus::Unreadable,
+                board_id: None,
+                error: Some(error),
+            }),
+        }
+    }
+
+    let stats = merge_board_stats(since_days, &snapshots);
+    let boards = snapshots
+        .iter()
+        .map(|snapshot| AggregateBoardStatsSource {
+            board_id: snapshot.board_id.clone(),
+            host: snapshot.host.clone(),
+            stats: snapshot.stats.clone(),
+        })
+        .collect();
+    let complete = !hosts.iter().any(|host| host.status.compromises_aggregate());
+
+    AggregateBoardStats {
+        since_days,
+        stats,
+        boards,
+        hosts,
+        complete,
+    }
+}
+
+fn add_counts(into: &mut BTreeMap<String, usize>, from: &BTreeMap<String, usize>) {
+    for (key, count) in from {
+        *into.entry(key.clone()).or_default() += count;
+    }
+}
+
+fn add_tokens(into: &mut BTreeMap<String, TokenUsage>, from: &BTreeMap<String, TokenUsage>) {
+    for (key, usage) in from {
+        into.entry(key.clone()).or_default().add(*usage);
+    }
+}
+
+fn nearest_rank(sorted: &[i64], p: f64) -> Option<i64> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let rank = ((sorted.len() as f64) * p).ceil() as usize;
+    sorted.get(rank.saturating_sub(1)).copied()
+}
+
+#[derive(Default)]
+struct AgentSpendMerge {
+    agent: Option<AgentKind>,
+    name: Option<String>,
+    model: String,
+    usage: TokenUsage,
+    priced: bool,
+    list_price: Usd,
+    unpriced_tokens: u64,
+}
+
+fn merge_agent_usage(snapshots: &[BoardStatsSnapshot]) -> Vec<AgentSpend> {
+    let mut rows: Vec<AgentSpendMerge> = Vec::new();
+    for row in snapshots
+        .iter()
+        .flat_map(|snapshot| &snapshot.stats.agent_usage)
+    {
+        let found = rows.iter_mut().find(|found| {
+            found.agent == Some(row.agent) && found.name == row.name && found.model == row.model
+        });
+        let found = match found {
+            Some(found) => found,
+            None => {
+                rows.push(AgentSpendMerge {
+                    agent: Some(row.agent),
+                    name: row.name.clone(),
+                    model: row.model.clone(),
+                    ..Default::default()
+                });
+                rows.last_mut().expect("just pushed")
+            }
+        };
+        found.usage.add(row.usage);
+        match row.list_price_api_estimate {
+            Some(cost) => {
+                found.priced = true;
+                found.list_price += cost;
+                found.unpriced_tokens += row.unpriced_tokens;
+            }
+            None => {
+                // A board with no rates is not free. If another board did
+                // price this row, its known dollars remain visible and this
+                // board's whole slice is carried beside them as unpriced.
+                found.unpriced_tokens += row.usage.total();
+            }
+        }
+    }
+    let mut rows: Vec<AgentSpend> = rows
+        .into_iter()
+        .map(|row| AgentSpend {
+            agent: row.agent.expect("every row came from an agent"),
+            name: row.name,
+            model: row.model,
+            usage: row.usage,
+            list_price_api_estimate: row.priced.then_some(row.list_price),
+            unpriced_tokens: row.unpriced_tokens,
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.list_price_api_estimate
+            .cmp(&a.list_price_api_estimate)
+            .then_with(|| b.usage.total().cmp(&a.usage.total()))
+            .then_with(|| a.label().cmp(&b.label()))
+    });
+    rows
+}
+
+#[derive(Default)]
+struct BreakdownMerge {
+    dispatches: usize,
+    usage: TokenUsage,
+    cost: Usd,
+    saw_price: bool,
+    unpriced_tokens: u64,
+}
+
+fn merge_breakdown(snapshots: &[BoardStatsSnapshot]) -> Vec<Breakdown> {
+    let mut cuts: BTreeMap<(Dimension, String), BreakdownMerge> = BTreeMap::new();
+    for snapshot in snapshots {
+        let source = if snapshot.merge_basis.breakdown.is_empty() {
+            &snapshot.stats.breakdown
+        } else {
+            &snapshot.merge_basis.breakdown
+        };
+        for cut in source {
+            for row in &cut.rows {
+                let merged = cuts.entry((cut.dimension, row.label.clone())).or_default();
+                merged.dispatches += row.dispatches;
+                merged.usage.add(row.usage);
+                match row.cost {
+                    Some(cost) => {
+                        merged.saw_price = true;
+                        merged.cost += cost;
+                        merged.unpriced_tokens += row.unpriced_tokens;
+                    }
+                    None => merged.unpriced_tokens += row.usage.total(),
+                }
+            }
+        }
+    }
+    Dimension::ALL
+        .iter()
+        .filter_map(|dimension| {
+            let rows: Vec<BreakdownRow> = cuts
+                .iter()
+                .filter(|((candidate, _), _)| candidate == dimension)
+                .map(|((_, label), row)| BreakdownRow {
+                    label: label.clone(),
+                    dispatches: row.dispatches,
+                    usage: row.usage,
+                    cost: row.saw_price.then_some(row.cost),
+                    unpriced_tokens: row.unpriced_tokens,
+                })
+                .collect();
+            (!rows.is_empty()).then(|| rank_breakdown(*dimension, rows, BREAKDOWN_ROWS))
+        })
+        .collect()
+}
+
+fn merge_rate_tables(spends: &[&BoardSpend]) -> RateTable {
+    let mut tables = spends.iter().map(|spend| &spend.rates);
+    let Some(first) = tables.next() else {
+        return RateTable::empty("");
+    };
+    let mut merged = first.clone();
+    let mut conflicted = std::collections::BTreeSet::new();
+    for table in tables {
+        if !table.as_of.is_empty() && (merged.as_of.is_empty() || table.as_of < merged.as_of) {
+            merged.as_of = table.as_of.clone();
+        }
+        for (key, rate) in &table.entries {
+            match merged.entries.get(key) {
+                Some(existing) if existing != rate => {
+                    merged.entries.remove(key);
+                    conflicted.insert(key.clone());
+                }
+                None if !conflicted.contains(key) => {
+                    merged.entries.insert(key.clone(), *rate);
+                }
+                _ => {}
+            }
+        }
+        merged.overridden.extend(table.overridden.iter().cloned());
+    }
+    merged.overridden.sort();
+    merged.overridden.dedup();
+    merged
+        .overridden
+        .retain(|key| merged.entries.contains_key(key));
+    merged
+}
+
+#[derive(Default)]
+struct AccountSpendMerge {
+    attempts: usize,
+    usage: TokenUsage,
+    list_price: Usd,
+    unpriced_tokens: u64,
+    plan: Option<AccountPlan>,
+    plan_in_window: Option<Usd>,
+    plan_conflict: bool,
+}
+
+fn add_account_row(accounts: &mut BTreeMap<String, AccountSpendMerge>, row: AccountSpend) {
+    let merged = accounts.entry(row.label).or_default();
+    merged.attempts += row.attempts;
+    merged.usage.add(row.usage);
+    merged.list_price += row.list_price;
+    merged.unpriced_tokens += row.unpriced_tokens;
+    if let Some(plan) = row.plan {
+        match &merged.plan {
+            None if !merged.plan_conflict => {
+                merged.plan = Some(plan);
+                merged.plan_in_window = row.plan_in_window;
+            }
+            Some(existing) if existing == &plan => {
+                if merged.plan_in_window.is_none() {
+                    merged.plan_in_window = row.plan_in_window;
+                }
+            }
+            _ => {
+                // Two different declarations for one subscription cannot be
+                // added or arbitrarily preferred. The per-board entries keep
+                // both for audit; the union leaves the plan unconfigured.
+                merged.plan = None;
+                merged.plan_in_window = None;
+                merged.plan_conflict = true;
+            }
+        }
+    }
+}
+
+fn merge_spend(snapshots: &[BoardStatsSnapshot]) -> Option<BoardSpend> {
+    let spends: Vec<&BoardSpend> = snapshots
+        .iter()
+        .filter_map(|snapshot| snapshot.stats.spend.as_ref())
+        .collect();
+    if spends.is_empty() {
+        return None;
+    }
+
+    let mut by_model: Vec<ModelSpend> = Vec::new();
+    let mut unpriced: BTreeMap<String, TokenUsage> = BTreeMap::new();
+    let mut accounts: BTreeMap<String, AccountSpendMerge> = BTreeMap::new();
+    let mut list_price = Usd::ZERO;
+
+    for snapshot in snapshots {
+        match &snapshot.stats.spend {
+            Some(spend) => {
+                list_price += spend.list_price;
+                for row in &spend.by_model {
+                    if let Some(existing) = by_model.iter_mut().find(|existing| {
+                        existing.label == row.label
+                            && existing.rate_key == row.rate_key
+                            && existing.source == row.source
+                            && existing.rate == row.rate
+                    }) {
+                        existing.usage.add(row.usage);
+                        existing.cost += row.cost;
+                    } else {
+                        by_model.push(row.clone());
+                    }
+                }
+                for row in &spend.unpriced {
+                    unpriced
+                        .entry(row.label.clone())
+                        .or_default()
+                        .add(row.usage);
+                }
+                for row in &spend.accounts {
+                    add_account_row(&mut accounts, row.clone());
+                }
+            }
+            None => {
+                // Rates absent on this board: every metered model is explicitly
+                // outside the known total once any other board supplies rates.
+                for (model, usage) in &snapshot.stats.tokens_by_model {
+                    unpriced.entry(model.clone()).or_default().add(*usage);
+                }
+                for (label, attempts) in &snapshot.stats.by_account {
+                    let usage = snapshot
+                        .stats
+                        .tokens_by_account
+                        .get(label)
+                        .copied()
+                        .unwrap_or_default();
+                    add_account_row(
+                        &mut accounts,
+                        AccountSpend {
+                            label: label.clone(),
+                            attempts: *attempts,
+                            usage,
+                            list_price: Usd::ZERO,
+                            unpriced_tokens: usage.total(),
+                            plan: None,
+                            plan_in_window: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    by_model.sort_by(|a, b| b.cost.cmp(&a.cost).then_with(|| a.label.cmp(&b.label)));
+    let mut unpriced: Vec<TokenTally> = unpriced
+        .into_iter()
+        .filter(|(_, usage)| !usage.is_zero())
+        .map(|(label, usage)| TokenTally { label, usage })
+        .collect();
+    unpriced.sort_by(|a, b| {
+        b.usage
+            .total()
+            .cmp(&a.usage.total())
+            .then_with(|| a.label.cmp(&b.label))
+    });
+    let unpriced_tokens = unpriced.iter().map(|row| row.usage.total()).sum();
+    let mut accounts: Vec<AccountSpend> = accounts
+        .into_iter()
+        .map(|(label, row)| AccountSpend {
+            label,
+            attempts: row.attempts,
+            usage: row.usage,
+            list_price: row.list_price,
+            unpriced_tokens: row.unpriced_tokens,
+            plan: row.plan,
+            plan_in_window: row.plan_in_window,
+        })
+        .collect();
+    accounts.sort_by(|a, b| {
+        b.list_price
+            .cmp(&a.list_price)
+            .then_with(|| a.label.cmp(&b.label))
+    });
+
+    Some(BoardSpend {
+        rates: merge_rate_tables(&spends),
+        list_price,
+        by_model,
+        unpriced,
+        unpriced_tokens,
+        accounts,
+    })
+}
+
+fn merge_board_stats(since_days: Option<i64>, snapshots: &[BoardStatsSnapshot]) -> BoardStats {
+    let mut merged = BoardStats::empty(since_days);
+    let mut durations = Vec::new();
+    let mut days: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut token_days: BTreeMap<String, TokenUsage> = BTreeMap::new();
+
+    for snapshot in snapshots {
+        let stats = &snapshot.stats;
+        merged.attempts += stats.attempts;
+        merged.tasks_touched += stats.tasks_touched;
+        add_counts(&mut merged.outcomes, &stats.outcomes);
+        merged.live += stats.live;
+        merged.total_minutes += stats.total_minutes;
+        merged.tokens.add(stats.tokens);
+        merged.attempts_with_tokens += stats.attempts_with_tokens;
+        merged.attempts_with_agent_usage += stats.attempts_with_agent_usage;
+        merged.landing.merged += stats.landing.merged;
+        merged.landing.open += stats.landing.open;
+        merged.landing.closed_unmerged += stats.landing.closed_unmerged;
+        merged.landing.no_pr += stats.landing.no_pr;
+        merged.landing.in_flight += stats.landing.in_flight;
+        merged.friction.retried_tasks += stats.friction.retried_tasks;
+        merged.friction.early_settles += stats.friction.early_settles;
+        merged.friction.blocked_entries += stats.friction.blocked_entries;
+        merged.friction.overruns += stats.friction.overruns;
+        merged.agent_dispatched += stats.agent_dispatched;
+        merged.context.attempts_reported += stats.context.attempts_reported;
+        merged.context.near_compaction += stats.context.near_compaction;
+        merged.context.peak_percent =
+            match (merged.context.peak_percent, stats.context.peak_percent) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (a, b) => a.or(b),
+            };
+        merged.dispatched |= stats.dispatched;
+
+        for day in &stats.daily {
+            let entry = days.entry(day.date.clone()).or_default();
+            entry.0 += day.dispatches;
+            entry.1 += day.done;
+        }
+        for day in &stats.daily_tokens {
+            token_days
+                .entry(day.date.clone())
+                .or_default()
+                .add(day.usage);
+        }
+        for (slot, count) in merged.hour_of_day.iter_mut().zip(&stats.hour_of_day) {
+            *slot += count;
+        }
+        for (workspace, hours) in &stats.hours_by_workspace {
+            let row = merged
+                .hours_by_workspace
+                .entry(workspace.clone())
+                .or_insert_with(|| vec![0; HOURS]);
+            for (slot, count) in row.iter_mut().zip(hours) {
+                *slot += count;
+            }
+        }
+        add_counts(&mut merged.by_workspace, &stats.by_workspace);
+        add_counts(&mut merged.by_runtime, &stats.by_runtime);
+        add_counts(&mut merged.by_source, &stats.by_source);
+        add_counts(&mut merged.by_account, &stats.by_account);
+        add_tokens(&mut merged.tokens_by_model, &stats.tokens_by_model);
+        add_tokens(&mut merged.tokens_by_runtime, &stats.tokens_by_runtime);
+        add_tokens(&mut merged.tokens_by_account, &stats.tokens_by_account);
+        durations.extend(snapshot.merge_basis.duration_minutes.iter().copied());
+    }
+
+    durations.sort_unstable();
+    let ended: usize = merged.outcomes.values().sum();
+    let done = merged.outcomes.get("done").copied().unwrap_or(0);
+    merged.completion_rate = (ended > 0).then(|| done as f64 / ended as f64);
+    merged.token_coverage =
+        (merged.attempts > 0).then(|| merged.attempts_with_tokens as f64 / merged.attempts as f64);
+    merged.median_minutes = nearest_rank(&durations, 0.5);
+    merged.p90_minutes = nearest_rank(&durations, 0.9);
+    merged.longest_minutes = durations.last().copied();
+    merged.agent_usage = merge_agent_usage(snapshots);
+    merged.breakdown = merge_breakdown(snapshots);
+    merged.spend = merge_spend(snapshots);
+    merged.daily = days
+        .into_iter()
+        .map(|(date, (dispatches, done))| DayBucket {
+            date,
+            dispatches,
+            done,
+        })
+        .collect();
+    merged.daily_tokens = merged
+        .daily
+        .iter()
+        .map(|day| TokenDay {
+            date: day.date.clone(),
+            usage: token_days.get(&day.date).copied().unwrap_or_default(),
+        })
+        .collect();
+    merged
 }
 
 /// One tally, ordered for reading: biggest first, ties alphabetical so the rows
@@ -2363,6 +3022,218 @@ mod tests {
         }
     }
 
+    fn stats_device(id: &str, label: &str) -> StatsDevice {
+        StatsDevice {
+            device_id: id.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    fn snapshot(
+        board_id: &str,
+        host: StatsDevice,
+        stats: BoardStats,
+        durations: &[i64],
+    ) -> BoardStatsSnapshot {
+        BoardStatsSnapshot {
+            board_id: board_id.to_string(),
+            host,
+            stats,
+            merge_basis: StatsMergeBasis {
+                duration_minutes: durations.to_vec(),
+                breakdown: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn all_boards_is_an_auditable_union_not_a_transport_sum() {
+        let mac = stats_device("mac", "Mac");
+        let alias = stats_device("mac-alias", "Mac via VPN");
+        let cloud = stats_device("cloud", "Cloud box");
+        let dark = stats_device("dark", "Offline laptop");
+
+        let mut local = BoardStats::empty(Some(7));
+        local.attempts = 2;
+        local.tasks_touched = 1;
+        local.outcomes.insert("done".into(), 2);
+        local.total_minutes = 60;
+        local.tokens = usage(100, 20, 0, 0);
+        local.attempts_with_tokens = 2;
+        local
+            .tokens_by_model
+            .insert("priced-model".into(), local.tokens);
+        local.by_source.insert("github".into(), 2);
+        local.by_account.insert("alice@example.com".into(), 2);
+        local
+            .tokens_by_account
+            .insert("alice@example.com".into(), local.tokens);
+        local.daily = vec![bucket("2026-08-15", 2, 2)];
+        local.daily_tokens = vec![spent_on("2026-08-15", local.tokens.total())];
+        local.spend = Some(split_of(vec![model(
+            "priced-model",
+            5.0,
+            25.0,
+            local.tokens,
+        )]));
+        let local_price = local.spend.as_ref().expect("priced").list_price;
+        local.spend.as_mut().expect("priced").accounts = vec![AccountSpend {
+            label: "alice@example.com".into(),
+            attempts: 2,
+            usage: local.tokens,
+            list_price: local_price,
+            unpriced_tokens: 0,
+            plan: Some(AccountPlan {
+                label: Some("Team seat".into()),
+                monthly: Usd::from_dollars(20.0),
+            }),
+            plan_in_window: Some(Usd::from_dollars(4.666_667)),
+        }];
+
+        // The second store deliberately polls the same source. That is not an
+        // alias: its attempts happened, even when the task names overlap.
+        let mut remote = BoardStats::empty(Some(7));
+        remote.attempts = 2;
+        remote.tasks_touched = 1;
+        remote.outcomes.insert("failed".into(), 1);
+        remote.live = 1;
+        remote.total_minutes = 100;
+        remote.tokens = usage(800, 200, 0, 0);
+        remote.attempts_with_tokens = 1;
+        remote
+            .tokens_by_model
+            .insert("unknown-model".into(), remote.tokens);
+        remote.by_source.insert("github".into(), 2);
+        remote.by_account.insert("alice@example.com".into(), 2);
+        remote
+            .tokens_by_account
+            .insert("alice@example.com".into(), remote.tokens);
+        remote.spend = Some(BoardSpend {
+            rates: RateTable::empty("2026-08-16"),
+            list_price: Usd::ZERO,
+            by_model: Vec::new(),
+            unpriced: vec![TokenTally {
+                label: "unknown-model".into(),
+                usage: remote.tokens,
+            }],
+            unpriced_tokens: remote.tokens.total(),
+            accounts: vec![AccountSpend {
+                label: "alice@example.com".into(),
+                attempts: 2,
+                usage: remote.tokens,
+                list_price: Usd::ZERO,
+                unpriced_tokens: remote.tokens.total(),
+                // The same subscription appears on both boards. The aggregate
+                // keeps it once while adding the work attributed to it.
+                plan: Some(AccountPlan {
+                    label: Some("Team seat".into()),
+                    monthly: Usd::from_dollars(20.0),
+                }),
+                plan_in_window: Some(Usd::from_dollars(4.666_667)),
+            }],
+        });
+        remote.daily = vec![bucket("2026-08-15", 2, 0)];
+        remote.daily_tokens = vec![spent_on("2026-08-15", remote.tokens.total())];
+
+        let local_snapshot = snapshot("board-a", mac.clone(), local, &[10, 50]);
+        let probes = vec![
+            StatsProbe {
+                candidate: mac,
+                result: StatsProbeResult::Answered(local_snapshot.clone()),
+            },
+            StatsProbe {
+                candidate: alias,
+                // Same store through another path. Different contents would
+                // still be ignored: board identity, not arrival order or row
+                // similarity, is the deduplication key.
+                result: StatsProbeResult::Answered(local_snapshot),
+            },
+            StatsProbe {
+                candidate: cloud.clone(),
+                result: StatsProbeResult::Answered(snapshot("board-b", cloud, remote, &[100])),
+            },
+            StatsProbe {
+                candidate: dark,
+                result: StatsProbeResult::Unreachable("timed out after 5s".into()),
+            },
+        ];
+
+        let aggregate = aggregate_board_stats(Some(7), probes.clone());
+        assert_eq!(aggregate.boards.len(), 2);
+        assert_eq!(
+            aggregate
+                .boards
+                .iter()
+                .map(|board| board.board_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["board-a", "board-b"],
+            "the existing local-first board selector keeps its tie-break"
+        );
+        assert_eq!(aggregate.stats.attempts, 4, "the alias is not counted");
+        assert_eq!(
+            aggregate.stats.tasks_touched, 2,
+            "independent stores are not collapsed merely for polling one repo"
+        );
+        assert_eq!(aggregate.stats.outcomes.get("done"), Some(&2));
+        assert_eq!(aggregate.stats.outcomes.get("failed"), Some(&1));
+        assert_eq!(aggregate.stats.live, 1);
+        assert_eq!(aggregate.stats.completion_rate, Some(2.0 / 3.0));
+        assert_eq!(aggregate.stats.token_coverage, Some(0.75));
+        assert_eq!(aggregate.stats.median_minutes, Some(50));
+        assert_eq!(aggregate.stats.p90_minutes, Some(100));
+        assert_eq!(aggregate.stats.longest_minutes, Some(100));
+        assert_eq!(aggregate.stats.daily[0].dispatches, 4);
+        assert_eq!(aggregate.stats.daily[0].done, 2);
+        assert_eq!(
+            aggregate.stats.by_account.get("alice@example.com"),
+            Some(&4)
+        );
+        assert_eq!(
+            aggregate.stats.tokens_by_account["alice@example.com"].total(),
+            1_120
+        );
+
+        let spend = aggregate.stats.spend.as_ref().expect("one board had rates");
+        assert!(spend.list_price > Usd::ZERO);
+        assert_eq!(spend.unpriced_tokens, 1_000);
+        assert_eq!(spend.unpriced[0].label, "unknown-model");
+        assert_eq!(spend.accounts[0].attempts, 4);
+        assert_eq!(spend.accounts[0].unpriced_tokens, 1_000);
+        assert_eq!(
+            spend.accounts[0]
+                .plan
+                .as_ref()
+                .and_then(|plan| plan.label.as_deref()),
+            Some("Team seat")
+        );
+        assert_eq!(spend.monthly_subscriptions(), Usd::from_dollars(20.0));
+        assert_eq!(
+            spend.subscriptions_in_window(),
+            Some(Usd::from_dollars(4.666_667))
+        );
+
+        assert_eq!(aggregate.hosts[0].status, StatsHostStatus::Answered);
+        assert_eq!(aggregate.hosts[1].status, StatsHostStatus::Duplicate);
+        assert_eq!(aggregate.hosts[1].board_id.as_deref(), Some("board-a"));
+        assert_eq!(aggregate.hosts[3].status, StatsHostStatus::Unreachable);
+        assert!(!aggregate.complete);
+        assert_eq!(
+            aggregate.completeness_note().as_deref(),
+            Some(
+                "Partial aggregate — Offline laptop did not answer. The totals include only the boards that answered."
+            )
+        );
+
+        // Concurrent replies must not leak arrival-order instability into the
+        // JSON that the CLI and both viewports share.
+        let again = aggregate_board_stats(Some(7), probes);
+        assert_eq!(aggregate, again);
+        let json = serde_json::to_string(&aggregate).expect("serializes");
+        let decoded: AggregateBoardStats = serde_json::from_str(&json).expect("decodes");
+        assert_eq!(decoded, aggregate);
+        assert_eq!(serde_json::to_string(&again).expect("serializes"), json);
+    }
+
     #[test]
     fn a_token_tally_ranks_on_the_total_and_folds_the_tail_without_losing_it() {
         let tally: BTreeMap<String, TokenUsage> = [
@@ -2959,6 +3830,24 @@ mod spec {
         })
     }
 
+    /// The all-board envelope and the derivations every viewport reads from
+    /// it. The merge itself is exercised exhaustively in `mod tests`; this
+    /// case prevents the Rust JSON shape and the phone's decoder from drifting.
+    fn aggregate_case(name: &str, aggregate: &AggregateBoardStats) -> Value {
+        json!({
+            "name": name,
+            "aggregate": aggregate,
+            "expect": {
+                "boardCount": aggregate.boards.len(),
+                "hostStatuses": aggregate.hosts.iter().map(|host| host.status).collect::<Vec<_>>(),
+                "complete": aggregate.complete,
+                "completenessNote": aggregate.completeness_note(),
+                "attempts": aggregate.stats.attempts,
+                "tokenTotal": aggregate.stats.tokens.total(),
+            }
+        })
+    }
+
     /// A priced window, built by hand (gh#182).
     ///
     /// The arithmetic that produces one of these lives in `comet_board::prices`
@@ -3263,6 +4152,85 @@ mod spec {
             &[],
         ));
 
+        // Two real stores, one alias path to the first, and one host that did
+        // not answer. This is the entire gh#461 contract in one decode case:
+        // board identity deduplicates transport, independent stores add, and
+        // partial collection is never mistaken for a complete zero.
+        let mut fixture_board_a = BoardStats::empty(Some(7));
+        fixture_board_a.attempts = 2;
+        fixture_board_a.tasks_touched = 1;
+        fixture_board_a.outcomes.insert("done".into(), 2);
+        fixture_board_a.tokens = usage(100, 20, 0, 0);
+        fixture_board_a.attempts_with_tokens = 2;
+        fixture_board_a.token_coverage = Some(1.0);
+        let mut fixture_board_b = BoardStats::empty(Some(7));
+        fixture_board_b.attempts = 1;
+        fixture_board_b.tasks_touched = 1;
+        fixture_board_b.live = 1;
+        let aggregate = aggregate_board_stats(
+            Some(7),
+            vec![
+                StatsProbe {
+                    candidate: StatsDevice {
+                        device_id: "mac".into(),
+                        label: "Mac".into(),
+                    },
+                    result: StatsProbeResult::Answered(BoardStatsSnapshot {
+                        board_id: "board-a".into(),
+                        host: StatsDevice {
+                            device_id: "mac".into(),
+                            label: "Mac".into(),
+                        },
+                        stats: fixture_board_a.clone(),
+                        merge_basis: StatsMergeBasis {
+                            duration_minutes: vec![18, 74],
+                            breakdown: Vec::new(),
+                        },
+                    }),
+                },
+                StatsProbe {
+                    candidate: StatsDevice {
+                        device_id: "mac-vpn".into(),
+                        label: "Mac via VPN".into(),
+                    },
+                    result: StatsProbeResult::Answered(BoardStatsSnapshot {
+                        board_id: "board-a".into(),
+                        host: StatsDevice {
+                            device_id: "mac".into(),
+                            label: "Mac".into(),
+                        },
+                        stats: fixture_board_a,
+                        merge_basis: StatsMergeBasis::default(),
+                    }),
+                },
+                StatsProbe {
+                    candidate: StatsDevice {
+                        device_id: "cloud".into(),
+                        label: "Cloud box".into(),
+                    },
+                    result: StatsProbeResult::Answered(BoardStatsSnapshot {
+                        board_id: "board-b".into(),
+                        host: StatsDevice {
+                            device_id: "cloud".into(),
+                            label: "Cloud box".into(),
+                        },
+                        stats: fixture_board_b,
+                        merge_basis: StatsMergeBasis {
+                            duration_minutes: vec![5],
+                            breakdown: Vec::new(),
+                        },
+                    }),
+                },
+                StatsProbe {
+                    candidate: StatsDevice {
+                        device_id: "dark".into(),
+                        label: "Offline laptop".into(),
+                    },
+                    result: StatsProbeResult::Unreachable("timed out after 5s".into()),
+                },
+            ],
+        );
+
         // Scalar rules, one case per input. Built before the object below
         // because `json!` reads a `[` as an array literal, not as a Rust one.
         let human_token_cases: Vec<Value> = [
@@ -3358,6 +4326,9 @@ mod spec {
                 stats_case("a busy week, priced", &priced),
                 stats_case("rates configured, nothing priceable", &nothing_priceable),
                 stats_case("one model the table has no rate for", &unpriced_model),
+            ],
+            "aggregateStats": [
+                aggregate_case("two boards, an alias, and an unreachable host", &aggregate),
             ],
         })
     }
