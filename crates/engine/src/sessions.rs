@@ -858,38 +858,36 @@ impl Inner {
     /// the board and commits as the box. A GitHub dispatch with no board
     /// credential is refused below.
     ///
-    /// A chat with `push_repo` is board-dispatched and fail-closed: missing or
-    /// broken handoff refuses the run instead of inheriting ambient auth.
+    /// A chat with the board-owned push tuple is fail-closed: an inconsistent
+    /// tuple or broken handoff refuses the run instead of inheriting ambient
+    /// auth.
     fn push_for(
         &self,
         chat_id: &str,
     ) -> Result<Option<comet_harness::PushCredentials>, EngineError> {
-        let Some(config) = self.workspace().and_then(|ws| ws.chat_config(chat_id)) else {
+        let Some(workspace) = self.workspace() else {
             return Ok(None);
         };
-        let mut creds = match config.push_repo.as_deref() {
-            Some(repo) => {
-                let contract = config.push_contract.ok_or_else(|| {
-                    EngineError::Other(
-                        "board-dispatched GitHub chat has no persisted push contract".into(),
-                    )
-                })?;
-                Some(
-                    self.push
-                        .get()
-                        .ok_or_else(|| {
-                            EngineError::Other(
-                                "board-dispatched GitHub chat has no credential handoff resolver"
-                                    .into(),
-                            )
-                        })?
-                        .for_repo(repo, contract, Some(chat_id))
-                        .map_err(|error| EngineError::Other(format!("{error:#}")))?,
-                )
-            }
+        let config = workspace.chat_config(chat_id);
+        let mut creds = match workspace.github_push_state(chat_id)? {
+            Some(push) => Some(
+                self.push
+                    .get()
+                    .ok_or_else(|| {
+                        EngineError::Other(
+                            "board-dispatched GitHub chat has no credential handoff resolver"
+                                .into(),
+                        )
+                    })?
+                    .for_repo(&push.repo, push.contract, Some(chat_id))
+                    .map_err(|error| EngineError::Other(format!("{error:#}")))?,
+            ),
             None => None,
         };
-        let Some(author) = config.git_author.as_ref() else {
+        let Some(author) = config
+            .as_ref()
+            .and_then(|config| config.git_author.as_ref())
+        else {
             return Ok(creds);
         };
         let env = comet_board::git_identity::author_env(author);
@@ -907,15 +905,12 @@ impl Inner {
     /// environment; live steers need this standalone check because they reuse
     /// the already-running child.
     fn verify_push_for_turn(&self, chat_id: &str) -> Result<(), EngineError> {
-        let Some(config) = self.workspace().and_then(|ws| ws.chat_config(chat_id)) else {
+        let Some(workspace) = self.workspace() else {
             return Ok(());
         };
-        let Some(repo) = config.push_repo.as_deref() else {
+        let Some(push) = workspace.github_push_state(chat_id)? else {
             return Ok(());
         };
-        let contract = config.push_contract.ok_or_else(|| {
-            EngineError::Other("board-dispatched GitHub chat has no persisted push contract".into())
-        })?;
         self.push
             .get()
             .ok_or_else(|| {
@@ -923,7 +918,7 @@ impl Inner {
                     "board-dispatched GitHub chat has no credential handoff resolver".into(),
                 )
             })?
-            .verify_for_repo(repo, contract)
+            .verify_for_repo(&push.repo, push.contract)
             .map_err(|error| EngineError::Other(format!("{error:#}")))
     }
 

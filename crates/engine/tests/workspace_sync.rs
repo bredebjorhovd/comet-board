@@ -18,8 +18,8 @@ use comet_doc::{CommandBasedOn, SessionCommandEntry, SessionCommandPayload, Sess
 use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode,
+    AgentEvent, ChatConfig, DoneStatus, GithubPushContract, GithubPushState, HarnessId, Model,
+    ReasoningLevel, RunRequest, SandboxLevel, SessionStatus, SteeringMode,
 };
 use comet_rpc::methods;
 
@@ -332,6 +332,89 @@ async fn two_engines_share_a_workspace() {
         "device rename on A",
     )
     .await;
+
+    link.abort();
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn remote_config_edit_preserves_the_board_owned_push_tuple() {
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let a = assemble(dir_a.path(), "dev-a");
+    let b = assemble(dir_b.path(), "dev-b");
+    let link = bridge(&a, &b);
+    let push = GithubPushState {
+        repo: "owner/widget".into(),
+        contract: GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        },
+    };
+
+    a.workspace
+        .create_space("space-push", "dev-a", "/tmp", None, false)
+        .unwrap();
+    let mut config = ChatConfig {
+        harness: HarnessId::Mock,
+        model: Some("old-model".into()),
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        account: None,
+        push_repo: None,
+        push_contract: None,
+        git_author: None,
+        turn_limits: Default::default(),
+        mcp_servers: Vec::new(),
+    };
+    config.apply_github_push_state(&push);
+    a.workspace
+        .create_chat("chat-push", "space-push", Some(config.clone()), None)
+        .unwrap();
+    wait_for(
+        || b.workspace.github_push_state("chat-push").ok().flatten() == Some(push.clone()),
+        "board push tuple on remote engine",
+    )
+    .await;
+
+    // An older remote client replaces the entire config while changing model,
+    // and serializes neither half of the newer credential tuple.
+    config.model = Some("new-model".into());
+    config.push_repo = None;
+    config.push_contract = None;
+    let raw = b.workspace.doc();
+    let chats = raw.doc().get_map("chats");
+    let row = match chats.get("chat-push") {
+        Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row,
+        other => panic!("missing remote chat row: {other:?}"),
+    };
+    row.insert(
+        "config",
+        loro::LoroValue::from(serde_json::to_value(config).unwrap()),
+    )
+    .unwrap();
+    raw.doc().commit();
+
+    // B repairs from the atomic doc-owned shadow, then that repair and the
+    // user's model choice both converge to A.
+    for core in [&a, &b] {
+        wait_for(
+            || {
+                core.workspace
+                    .chat_config("chat-push")
+                    .is_some_and(|config| {
+                        config.model.as_deref() == Some("new-model")
+                            && config.github_push_state().ok().flatten() == Some(push.clone())
+                    })
+                    && core.workspace.github_push_state("chat-push").ok().flatten()
+                        == Some(push.clone())
+            },
+            "remote config edit and repaired push tuple to converge",
+        )
+        .await;
+    }
 
     link.abort();
     a.shutdown().await;

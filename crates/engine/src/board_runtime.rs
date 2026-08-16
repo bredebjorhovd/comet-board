@@ -86,16 +86,10 @@ impl CometRuntime {
     }
 
     fn verify_chat_push_credentials(&self, chat_id: &str) -> anyhow::Result<()> {
-        let Some(config) = self.chat_config(chat_id) else {
+        let Some(push) = self.workspace.github_push_state(chat_id)? else {
             return Ok(());
         };
-        let Some(repo) = config.push_repo.as_deref() else {
-            return Ok(());
-        };
-        let contract = config.push_contract.ok_or_else(|| {
-            anyhow::anyhow!("board-dispatched GitHub chat {chat_id} has no persisted push contract")
-        })?;
-        self.verify_push_credentials(repo, contract)
+        self.verify_push_credentials(&push.repo, push.contract)
     }
 }
 
@@ -112,8 +106,11 @@ impl Runtime for CometRuntime {
     }
 
     fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
-        if spec.push_repo.is_some() && spec.push_contract.is_none() {
-            anyhow::bail!("board-dispatched GitHub work has no persisted push contract");
+        match (spec.push_repo.as_deref(), spec.push_contract) {
+            (None, None) | (Some(_), Some(_)) => {}
+            _ => anyhow::bail!(
+                "board-dispatched GitHub work has an inconsistent repository/contract tuple"
+            ),
         }
         // The checkout first: a failure here leaves nothing behind to clean up.
         // That includes an unreachable origin — `create_worktree_on` fetches

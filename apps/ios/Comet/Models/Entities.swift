@@ -37,10 +37,20 @@ struct ChatConfig: Hashable, Codable {
     var model: String?
     var reasoning: String?
     var sandbox: String?
+    /// The board-owned credential tuple. Both halves round-trip even though
+    /// iOS does not configure them; dropping either can turn a dispatched chat
+    /// into an ambient-credential chat on its next turn (gh#440).
+    var pushRepo: String? = nil
+    var pushContract: GithubPushContract? = nil
     /// Process-local tool servers stamped onto a dispatched chat (gh#273).
     /// Optional keeps old workspace rows decodable; edits preserve the list
     /// even though the iOS picker does not configure it.
     var mcpServers: [MCPServer]? = nil
+}
+
+struct GithubPushContract: Hashable, Codable {
+    var contentsWrite: Bool
+    var workflowsWrite: Bool
 }
 
 struct MCPServer: Hashable, Codable {

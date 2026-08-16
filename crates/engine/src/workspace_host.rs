@@ -166,6 +166,9 @@ impl WorkspaceHostInner {
 
     fn reseed(&self, raw: loro::LoroDoc) {
         let replacement = Arc::new(WorkspaceDoc::from_doc(raw));
+        if let Err(error) = replacement.reconcile_github_push_states() {
+            tracing::warn!(error = %error, "workspace reseed could not reconcile GitHub push state");
+        }
         let changed_tx = self.changed_tx.clone();
         let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|value| *value = value.wrapping_add(1));
@@ -402,6 +405,7 @@ impl WorkspaceHost {
         // stamp the in-band schema version for the NEXT break to detect.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
         doc.ensure_schema_version()?;
+        doc.reconcile_github_push_states()?;
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
         let sub = doc.doc().subscribe_root(Arc::new({
@@ -718,6 +722,15 @@ impl WorkspaceHost {
         self.chat(chat_id).and_then(|c| c.config)
     }
 
+    /// The board-owned push tuple, independent of the replaceable config map.
+    /// A malformed half-state is an error so every turn can fail closed.
+    pub fn github_push_state(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<comet_proto::GithubPushState>, EngineError> {
+        Ok(self.inner.doc().github_push_state(chat_id)?)
+    }
+
     /// The whole chat row, when the workspace doc has one.
     pub fn chat(&self, chat_id: &str) -> Option<comet_proto::Chat> {
         match self.inner.doc().chat(chat_id) {
@@ -962,7 +975,8 @@ impl WorkspaceHost {
     /// when the chat doesn't exist.
     ///
     /// Board-owned fields survive the replace: the chat's
-    /// [`comet_proto::TurnLimits`] (gh#270) and GitHub push contract (gh#440).
+    /// [`comet_proto::TurnLimits`] (gh#270) and the complete GitHub push tuple
+    /// (repository plus capability contract, gh#440).
     /// A full-config write is what a composer sends to change a
     /// *model*, and one sent by a viewport that predates the field — or by any
     /// of the several that build the struct from their own picker state —
@@ -977,9 +991,20 @@ impl WorkspaceHost {
             if config.turn_limits.is_off() {
                 config.turn_limits = existing.turn_limits;
             }
-            if config.push_contract.is_none() {
-                config.push_contract = existing.push_contract;
+        }
+        if let Some(push) = self.github_push_state(chat_id)? {
+            match config.github_push_state() {
+                Ok(None) => config.apply_github_push_state(&push),
+                Ok(Some(incoming)) if incoming == push => {}
+                Ok(Some(_)) => {
+                    return Err(EngineError::Other(
+                        "a config edit cannot change the board-owned GitHub push tuple".into(),
+                    ));
+                }
+                Err(error) => return Err(EngineError::Other(error.to_string())),
             }
+        } else if let Err(error) = config.github_push_state() {
+            return Err(EngineError::Other(error.to_string()));
         }
         Ok(self.inner.doc().set_chat_config(chat_id, &config)?)
     }
@@ -1066,6 +1091,9 @@ impl WorkspaceHost {
 
 impl WorkspaceHostInner {
     fn publish(&self) {
+        if let Err(error) = self.doc().reconcile_github_push_states() {
+            tracing::warn!(error = %error, "workspace change could not reconcile GitHub push state");
+        }
         match self.doc().read_all() {
             Ok(mut state) => {
                 // The device list is the union of this user's private rows and

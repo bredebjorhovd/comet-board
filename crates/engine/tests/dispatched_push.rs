@@ -169,6 +169,24 @@ fn chat_config(push_repo: Option<&str>, git_author: Option<GitAuthor>) -> ChatCo
     }
 }
 
+/// Write the config value exactly as an older/remote CRDT client would. This
+/// deliberately bypasses WorkspaceHost's typed mutation seam so regressions in
+/// document-side reconciliation remain observable.
+fn replace_raw_config(core: &EngineCore, chat_id: &str, config: &ChatConfig) {
+    let workspace = core.workspace.doc();
+    let chats = workspace.doc().get_map("chats");
+    let row = match chats.get(chat_id) {
+        Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row,
+        other => panic!("missing chat row {chat_id}: {other:?}"),
+    };
+    row.insert(
+        "config",
+        loro::LoroValue::from(serde_json::to_value(config).unwrap()),
+    )
+    .unwrap();
+    workspace.doc().commit();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_does_not() {
     let tmp = tempfile::Builder::new()
@@ -423,16 +441,18 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     // Chats created before the durable contract existed are not allowed to
     // infer one from whatever credential happens to be configured now. That
     // would silently replace the capability promise the original brief made.
-    let mut legacy = chat_config(Some("owner/widget"), None);
-    legacy.push_contract = None;
+    let valid = chat_config(Some("owner/widget"), None);
     core.workspace
         .create_chat(
             "chat-missing-contract",
             "space-1",
-            Some(legacy),
+            Some(valid.clone()),
             Some("/tmp".into()),
         )
         .unwrap();
+    let mut inconsistent = valid;
+    inconsistent.push_contract = None;
+    replace_raw_config(&core, "chat-missing-contract", &inconsistent);
     let error = core
         .sessions
         .dispatch(
@@ -442,9 +462,12 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
             None,
         )
         .await
-        .expect_err("a dispatched GitHub chat inferred a missing push contract")
+        .expect_err("an inconsistent GitHub push tuple reached the harness")
         .to_string();
-    assert!(error.contains("no persisted push contract"), "{error}");
+    assert!(
+        error.contains("repository but no capability contract"),
+        "{error}"
+    );
     assert!(
         !recorded()
             .iter()
@@ -522,10 +545,6 @@ async fn removing_the_board_credential_refuses_a_live_steer_before_writing_its_p
         std::fs::set_permissions(&board_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
-    let registry = HarnessRegistry::new();
-    registry.register(Arc::new(HoldingHarness));
-    let core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
-        .expect("engine core assembles");
     let paths = Paths {
         config_dir: data.join("board"),
         state_dir: data.join("board/state"),
@@ -533,10 +552,15 @@ async fn removing_the_board_credential_refuses_a_live_steer_before_writing_its_p
     std::fs::create_dir_all(&paths.config_dir).unwrap();
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=ghp_secret\n").unwrap();
+
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(HoldingHarness));
+    let core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles");
     core.sessions
         .set_push_credentials(Arc::new(PushCredentials::with_board_exe(
             paths.clone(),
-            Some(board_exe),
+            Some(board_exe.clone()),
         )));
 
     core.workspace
@@ -556,11 +580,51 @@ async fn removing_the_board_credential_refuses_a_live_steer_before_writing_its_p
             Some("/tmp".into()),
         )
         .unwrap();
+
+    // Simulate a config editor that predates the push fields, then persist and
+    // restart before the next turn. The board-owned shadow must survive even
+    // if the replaceable config value was the last thing written.
+    let mut uninformed = chat_config(None, None);
+    uninformed.model = Some("changed-before-reload".into());
+    replace_raw_config(&core, "chat-live", &uninformed);
+    core.workspace.flush();
+    core.shutdown().await;
+    drop(core);
+
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(HoldingHarness));
+    let core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core reloads");
+    core.sessions
+        .set_push_credentials(Arc::new(PushCredentials::with_board_exe(
+            paths.clone(),
+            Some(board_exe),
+        )));
+    let push = core
+        .workspace
+        .github_push_state("chat-live")
+        .unwrap()
+        .expect("reloaded chat remains board-dispatched");
+    assert_eq!(push.repo, "owner/widget");
+    assert!(push.contract.workflows_write);
+    assert_eq!(
+        core.workspace
+            .chat_config("chat-live")
+            .unwrap()
+            .github_push_state()
+            .unwrap(),
+        Some(push)
+    );
     core.sessions
         .dispatch("chat-live", HarnessId::Mock, run_request("/tmp"), None)
         .await
         .expect("initial run dispatches");
 
+    // Repeat the uninformed replacement while the harness is live. Even if a
+    // steer races document reconciliation, credential validation reads the
+    // immutable tuple and cannot classify the chat as ordinary.
+    uninformed.model = Some("changed-during-run".into());
+    replace_raw_config(&core, "chat-live", &uninformed);
     std::fs::remove_file(paths.config_dir.join(".env")).unwrap();
     let error = core
         .sessions

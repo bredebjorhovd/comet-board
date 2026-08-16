@@ -319,7 +319,6 @@ async fn a_mid_session_config_change_keeps_board_owned_config() {
     // it knows about, which does not include the board's guardrails.
     let mut changed = chat_config(TurnLimits::default());
     changed.model = Some("mock-1".into());
-    changed.push_repo = Some("owner/widget".into());
     assert!(
         core.workspace
             .set_chat_config("chat-dispatched", &changed)
@@ -328,5 +327,15 @@ async fn a_mid_session_config_change_keeps_board_owned_config() {
     let stored = core.workspace.chat_config("chat-dispatched").unwrap();
     assert_eq!(stored.model.as_deref(), Some("mock-1"));
     assert_eq!(stored.turn_limits, limits);
+    assert_eq!(stored.push_repo.as_deref(), Some("owner/widget"));
     assert_eq!(stored.push_contract, Some(push_contract));
+
+    let mut retargeted = stored;
+    retargeted.push_repo = Some("attacker/other".into());
+    let error = core
+        .workspace
+        .set_chat_config("chat-dispatched", &retargeted)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cannot change the board-owned"), "{error}");
 }

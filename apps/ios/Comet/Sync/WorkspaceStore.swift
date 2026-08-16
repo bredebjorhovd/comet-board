@@ -197,6 +197,26 @@ final class WorkspaceStore {
                   let deviceId = m["deviceId"]?.stringValue else { return nil }
             var chatConfig: ChatConfig?
             if let c = m["config"]?.mapValue {
+                let configContract = c["pushContract"]?.mapValue.flatMap { value in
+                    guard let contents = value["contentsWrite"]?.boolValue,
+                          let workflows = value["workflowsWrite"]?.boolValue else { return nil }
+                    return GithubPushContract(contentsWrite: contents, workflowsWrite: workflows)
+                }
+                let shadow = m["boardPush"]?.mapValue
+                let shadowContract = shadow?["contract"]?.mapValue.flatMap { value in
+                    guard let contents = value["contentsWrite"]?.boolValue,
+                          let workflows = value["workflowsWrite"]?.boolValue else { return nil }
+                    return GithubPushContract(contentsWrite: contents, workflowsWrite: workflows)
+                }
+                var pushRepo = c["pushRepo"]?.stringValue
+                var pushContract = configContract
+                // The doc-owned shadow repairs an older remote config writer
+                // only when it omitted BOTH halves. A half-state stays visible
+                // so the host can reject it instead of guessing.
+                if pushRepo == nil && pushContract == nil {
+                    pushRepo = shadow?["repo"]?.stringValue
+                    pushContract = shadowContract
+                }
                 let mcpServers = (c["mcpServers"]?.listValue ?? []).compactMap { value -> MCPServer? in
                     guard let server = value.mapValue,
                           let name = server["name"]?.stringValue,
@@ -208,6 +228,8 @@ final class WorkspaceStore {
                                         model: c["model"]?.stringValue,
                                         reasoning: c["reasoning"]?.stringValue,
                                         sandbox: c["sandbox"]?.stringValue,
+                                        pushRepo: pushRepo,
+                                        pushContract: pushContract,
                                         mcpServers: mcpServers.isEmpty ? nil : mcpServers)
             }
             return Chat(id: id, deviceId: deviceId,
@@ -441,6 +463,12 @@ final class WorkspaceStore {
     /// Chat config is an LWW map set on the chat row; the host reads it when
     /// dispatching the next run.
     func setChatConfig(chatId: String, config chatConfig: ChatConfig) {
+        var chatConfig = chatConfig
+        if chatConfig.pushRepo == nil && chatConfig.pushContract == nil,
+           let existing = chats.first(where: { $0.id == chatId })?.config {
+            chatConfig.pushRepo = existing.pushRepo
+            chatConfig.pushContract = existing.pushContract
+        }
         updateChat(chatId) { row in
             if let value = LoroValue.fromEncodable(chatConfig) {
                 try row.insert(key: "config", v: value)
