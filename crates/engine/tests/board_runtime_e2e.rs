@@ -12,8 +12,10 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use comet_board::config::Paths;
 use comet_board::runtime::{DispatchSpec, RunEnd, Runtime};
 use comet_doc::{MessageRole, MessageStatus};
+use comet_engine::push_credentials::PushCredentials;
 use comet_engine::{CometRuntime, EngineCore, HarnessRegistry};
 use comet_harness::mock::MockHarness;
 use comet_proto::{AgentEvent, DoneStatus, HarnessId, SessionStatus};
@@ -101,6 +103,32 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         None,
     )
     .unwrap();
+
+    // A real board-enabled engine wires one resolver into both the dispatch
+    // preflight and every later run. This test assembles the core by hand, so
+    // provide the same explicit handoff rather than letting its dispatched
+    // chat inherit whatever GitHub credential happens to exist on the runner.
+    let board_exe = dir.path().join("comet-board");
+    std::fs::write(
+        &board_exe,
+        "#!/bin/sh\n[ \"$1\" = git-askpass ] || exit 2\necho x-access-token\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&board_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let paths = Paths {
+        config_dir: dir.path().join("data/board"),
+        state_dir: dir.path().join("data/board/state"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=ghp_secret\n").unwrap();
+    let push = Arc::new(PushCredentials::with_board_exe(paths, Some(board_exe)));
+    core.sessions.set_push_credentials(push.clone());
+
     core.workspace
         .create_space(
             "space-widget",
@@ -121,6 +149,10 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         core.agent_accounts.clone(),
         tokio::runtime::Handle::current(),
     ));
+    runtime.set_push_credentials(push);
+    runtime
+        .verify_push_credentials("o/widget")
+        .expect("the dispatch preflight accepts the explicit handoff");
 
     // What the box user's own instruction files say before any of this
     // (gh#272). A dispatch naming no account writes into the CLI's own config
