@@ -23,15 +23,16 @@ use comet_proto::HarnessId;
 
 /// Both variables, pointed somewhere real (so nothing fails merely for being
 /// unwritable) that this test then requires to be untouched.
-fn poison() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("comet-engine-poison-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("poison dir");
+fn poison() -> tempfile::TempDir {
+    let dir = tempfile::Builder::new()
+        .prefix("comet-engine-poison-")
+        .tempdir()
+        .expect("poison dir");
     // SAFETY: this binary holds one test, and sets these before it starts any
     // thread of its own.
     unsafe {
-        std::env::set_var(CONFIG_DIR_ENV, &dir);
-        std::env::set_var(STATE_DIR_ENV, &dir);
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        std::env::set_var(STATE_DIR_ENV, dir.path());
     }
     dir
 }
@@ -112,7 +113,7 @@ async fn a_board_loop_under_a_dispatched_agents_environment_stays_in_its_tempdir
 
     core.shutdown().await;
 
-    let stray = contents(&poisoned);
+    let stray = contents(poisoned.path());
     assert!(
         stray.is_empty(),
         "a test board wrote into the directory the environment named — on the \

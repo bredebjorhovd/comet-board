@@ -193,11 +193,11 @@ mod tests {
         Paths::under(dir).expect("board dirs")
     }
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("comet-push-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    fn scratch(name: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(&format!("comet-push-{name}-"))
+            .tempdir()
+            .unwrap()
     }
 
     /// A stand-in `comet-board` that answers `git-askpass` the way the real one
@@ -245,7 +245,7 @@ mod tests {
     fn a_device_with_no_github_credential_offers_nothing() {
         let dir = scratch("nocred");
         assert!(
-            resolver(&dir)
+            resolver(dir.path())
                 .for_repo_with("o/r", GithubAuth::None, None)
                 .is_none()
         );
@@ -254,7 +254,7 @@ mod tests {
     #[test]
     fn a_device_with_no_comet_board_binary_offers_nothing() {
         let dir = scratch("nobin");
-        let mut creds = resolver(&dir);
+        let mut creds = resolver(dir.path());
         creds.board_exe = None;
         assert!(creds.for_repo_with("o/r", app(), None).is_none());
     }
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn the_environment_points_at_the_helper_and_carries_no_token() {
         let dir = scratch("env");
-        let resolver = resolver(&dir);
+        let resolver = resolver(dir.path());
         let push = resolver
             .for_repo_with("o/r", app(), Some("chat-1"))
             .expect("credentials");
@@ -289,7 +289,7 @@ mod tests {
         );
         assert_eq!(
             env.get("COMET_BOARD_CONFIG_DIR").map(String::as_str),
-            Some(dir.join("board").display().to_string().as_str())
+            Some(dir.path().join("board").display().to_string().as_str())
         );
         assert!(
             !env.values()
@@ -307,7 +307,11 @@ mod tests {
     #[test]
     fn no_repo_means_no_credentials() {
         let dir = scratch("norepo");
-        assert!(resolver(&dir).for_repo_with("", app(), None).is_none());
+        assert!(
+            resolver(dir.path())
+                .for_repo_with("", app(), None)
+                .is_none()
+        );
     }
 
     /// gh#233. A device that was configured to hand out the board's credential
@@ -318,10 +322,10 @@ mod tests {
     #[cfg(unix)]
     fn a_credential_path_that_does_not_work_is_refused_and_recorded() {
         let dir = scratch("broken");
-        let mut creds = resolver(&dir);
+        let mut creds = resolver(dir.path());
         // Installed, resolvable, and reaching nothing — a payload that shipped
         // the engine without the CLI beside it.
-        creds.board_exe = Some(dir.join("not-installed"));
+        creds.board_exe = Some(dir.path().join("not-installed"));
         assert!(creds.for_repo_with("o/r", app(), Some("chat-1")).is_none());
 
         let record = comet_board::credential_ledger::for_chat(&creds.paths, "chat-1");
@@ -343,7 +347,7 @@ mod tests {
     #[test]
     fn the_gh_shim_is_written_executable_and_late_minting() {
         let dir = scratch("install");
-        let creds = resolver(&dir);
+        let creds = resolver(dir.path());
         let bin = creds.paths.state_dir.join(SHIM_DIR);
         let installed = git_credentials::install_gh_shim(
             &bin,

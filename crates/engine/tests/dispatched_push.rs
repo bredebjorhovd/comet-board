@@ -121,8 +121,11 @@ fn chat_config(push_repo: Option<&str>, git_author: Option<GitAuthor>) -> ChatCo
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_does_not() {
-    let dir = std::env::temp_dir().join(format!("comet-gh68-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let tmp = tempfile::Builder::new()
+        .prefix("comet-gh68-")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = tmp.path();
     let data = dir.join("data");
     std::fs::create_dir_all(&data).unwrap();
 
@@ -371,11 +374,10 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
     for chat in ["chat-dispatched", "chat-authored", "chat-plain"] {
         assert_eq!(
             run_for(chat).bin_dirs,
-            vec![dir.clone()],
+            vec![dir.to_path_buf()],
             "{chat} could not have run comet-board"
         );
     }
 
     core.sessions.shutdown().await;
-    let _ = std::fs::remove_dir_all(&dir);
 }
