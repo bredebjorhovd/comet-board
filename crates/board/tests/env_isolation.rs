@@ -18,24 +18,27 @@ use std::path::{Path, PathBuf};
 
 use comet_board::config::{CONFIG_DIR_ENV, Paths, STATE_DIR_ENV};
 
-/// The poisoned pair, set for the whole binary before any test runs.
+/// The poisoned pair, owned for one test and removed when that test ends.
 ///
 /// Test binaries are multi-threaded and `set_var` is process-wide, so this
-/// happens once, from `poison`, guarded by a `Once` — never per test.
-fn poison() -> PathBuf {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    let dir = std::env::temp_dir().join(format!("comet-board-poison-{}", std::process::id()));
-    ONCE.call_once(|| {
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("poison dir");
-        // SAFETY: single-threaded here (a `Once` before any test spawns a
-        // thread), and every test in this binary wants these set.
-        unsafe {
-            std::env::set_var(CONFIG_DIR_ENV, &dir);
-            std::env::set_var(STATE_DIR_ENV, &dir);
-        }
-    });
-    dir
+/// helper serializes the two tests that mutate it and returns the lock beside
+/// the `TempDir`, keeping both alive for the whole test.
+fn poison() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let env_lock = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = tempfile::Builder::new()
+        .prefix("comet-board-poison-")
+        .tempdir()
+        .expect("poison dir");
+    // SAFETY: the only tests in this binary that read or write these variables
+    // hold `ENV_LOCK`, and neither starts another thread.
+    unsafe {
+        std::env::set_var(CONFIG_DIR_ENV, dir.path());
+        std::env::set_var(STATE_DIR_ENV, dir.path());
+    }
+    (env_lock, dir)
 }
 
 /// Everything under `dir`, recursively — empty is the assertion.
@@ -58,7 +61,7 @@ fn contents(dir: &Path) -> Vec<PathBuf> {
 /// The exit criterion, at the level the whole suite builds its paths.
 #[test]
 fn under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given() {
-    let poisoned = poison();
+    let (_env_lock, poisoned) = poison();
     let dir = tempfile::tempdir().expect("tempdir");
     let paths = Paths::under(dir.path()).expect("board dirs");
 
@@ -77,7 +80,7 @@ fn under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given() {
             resolved.display()
         );
         assert!(
-            !resolved.starts_with(&poisoned),
+            !resolved.starts_with(poisoned.path()),
             "{} resolved into the environment's directory",
             resolved.display()
         );
@@ -87,7 +90,7 @@ fn under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given() {
     // the dirs is what `under` does on its own — neither may reach the pair.
     std::fs::write(paths.routing(), "# fixture\n").expect("write routing.toml");
     std::fs::write(paths.logfile(), "fixture\n").expect("write syncd.log");
-    let stray = contents(&poisoned);
+    let stray = contents(poisoned.path());
     assert!(
         stray.is_empty(),
         "the environment's board was written to: {stray:?}"
@@ -100,10 +103,10 @@ fn under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given() {
 /// which would leave the askpass helper on the wrong board.
 #[test]
 fn discover_is_where_the_environment_is_still_honoured() {
-    let poisoned = poison();
+    let (_env_lock, poisoned) = poison();
     let paths = Paths::discover().expect("discover");
-    assert_eq!(paths.config_dir, poisoned);
-    assert_eq!(paths.state_dir, poisoned);
+    assert_eq!(paths.config_dir.as_path(), poisoned.path());
+    assert_eq!(paths.state_dir.as_path(), poisoned.path());
 }
 
 /// The guard against the next test written the old way: outside the two files
