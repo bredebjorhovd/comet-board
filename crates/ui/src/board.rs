@@ -4261,6 +4261,7 @@ mod tests {
             workspace: Some("offhand".into()),
             runtime: Some("claude-code".into()),
             chat_id: None,
+            preparation: None,
             review_chat_id: None,
             pr_url: None,
             pr_number: None,

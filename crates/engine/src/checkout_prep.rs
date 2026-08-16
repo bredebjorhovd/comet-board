@@ -865,7 +865,7 @@ impl CheckoutPrep {
         // A retry may race a sync or another explicit retry. Only one command
         // tree may prepare a checkout; every other caller observes the same
         // persisted lifecycle instead of starting the script twice.
-        let token = req.cancel.clone().unwrap_or_else(CancellationToken::new);
+        let token = req.cancel.clone().unwrap_or_default();
         let generation = uuid::Uuid::new_v4().to_string();
         {
             let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
