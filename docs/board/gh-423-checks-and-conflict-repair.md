@@ -305,10 +305,25 @@ Submission v2 additions
   reviewer_key
   head_sha
   kind
+  snapshot                  immutable SubmissionSnapshot written with the record
   normalized_body_sha256
+  delivery_id               verdict:<task>:<attempt>:<submission_id>
   delivery_state            pending | completed | not_required
+  delivery_result           null | { chat_id, not_delivered }
+  projection_state          pending | recovery_required | indeterminate | settled
+  projection_result         null | { review_id, projection, refusal, posted_as }
   standing_review_sequence  null for Comment
   final_refresh             null | { current_head_sha, head_moved, repository_fresh }
+
+SubmissionSnapshot
+  normalized_body           exact A-scoped reviewer input
+  author_message            exact Runtime payload, including A-era remainder
+  github_review_event       exact requested event
+  github_review_body        exact marked decisive body
+  github_comment_body       exact marked COMMENT fallback body
+  unclaimed_snapshot[]      exact A-era ChangedFile values
+  receipt_base              { task_id, attempt, kind, reviewed_head_sha,
+                              chat_id, unclaimed_count, payload }
 
 StandingReview
   key                       github:<review_id> | comet:<submission_id>
@@ -385,6 +400,16 @@ three-field `verdict::fingerprint` remains legacy-only. The board-owned GitHub
 body marker carries `submissionId`, so crash recovery aliases the review id to
 the occurrence that produced it.
 
+Before the record transaction, the board renders one immutable
+`SubmissionSnapshot` from the reviewed A projection, claims/effects remainder,
+and authoring attempt. The transaction stores that snapshot with the standing
+decision before any external call. Its exact author message, both possible
+GitHub bodies, unclaimed `ChangedFile` values, and receipt base are never
+recomputed from a later `ReadAttemptReview`; mutable delivery, projection, and
+final-refresh outcomes fill the remaining live `VerdictReceipt` fields. A
+serialize/reload or head move therefore cannot mix B-era claims, chat, or prose
+into the A occurrence.
+
 Occurrence lookup precedes the current-head guard. After authenticating the
 reviewer and computing the digest, the board looks up `(task, attempt,
 submissionId)` and validates the stored digest before choosing a path:
@@ -393,12 +418,12 @@ submissionId)` and validates the stored digest before choosing a path:
   returns its compacted receipt, with no delivery, GitHub post, sequence, or
   current-head comparison;
 - an unsettled live entry resumes the already recorded occurrence. It uses the
-  stored reviewer, normalized payload, and `head_sha` — never the pull's now-
-  current head — and finishes only a `delivery_state = pending` delivery and/or
-  a projection still marked retryable. Each completed half is persisted before
-  starting the next, so a further crash cannot repeat it. The GitHub half
-  always sends `commit_id = stored head_sha`, then runs the mandatory final
-  refresh below;
+  stored snapshot, reviewer, and `head_sha` — never the pull's now-current head
+  or a recomputed Review — and finishes only a pending external half. Delivery
+  uses the durable command id and projection uses the recovery protocol below;
+  neither relies on a success flag written after an unkeyed external call. The
+  GitHub half always sends `commit_id = stored head_sha`, then runs the
+  mandatory final refresh below;
 - only a lookup miss is a new occurrence and enters the current-head and review-
   ordering preflight before anything is recorded.
 
@@ -407,13 +432,20 @@ deliver or project the A-scoped verdict once, but the final refresh exposes B
 and applies the normal head-scoped acceptance rules. A failed chat delivery or
 an unposted projection remains live and retryable; it is not compactable.
 
+Verdict delivery uses the same durable seam as repair:
+`Runtime::prompt_once(chat, delivery_id, snapshot.author_message)`. The
+submission id makes `delivery_id` unique to the occurrence. If enqueue succeeds
+and the process dies before `delivery_state = completed` is stored, retrying
+the same command id returns the existing durable command and cannot create a
+second author turn; the board then stores that result.
+
 `MAX_SUBMISSIONS = 20` remains the bound on full, retryable ledger entries, but
 submission occurrence ids are not evicted with them. Before inserting entry 21,
 the board moves the oldest fully settled entry — delivery completed or was not
 required, and its projection is on GitHub — into an exact
 `SubmissionTombstone`. The tombstone retains only the fields needed to
-reconstruct an idempotency receipt
-with delivery/projection status and suppress both side effects; it retains no
+reconstruct an idempotency receipt with delivery/projection status and suppress
+both side effects; it retains no
 comment body or payload. A settled retry found in either tier returns
 `recorded = false` and never delivers or posts again; an unsettled live retry
 also returns `recorded = false` but finishes only its missing halves as defined
@@ -547,9 +579,29 @@ The existing board-owned body marker is extended to carry the durable
 `submissionId` on every create-review request. When GitHub returns a review id —
 for a decisive review or a `COMMENT` fallback — the board writes it onto the
 Comet-owned record as an alias; if the process dies between the POST and that
-write, reconciliation recovers the same alias from the marker. A later read of
-that id updates the same logical decision. Alias recovery indexes both live
-submissions and compacted tombstones by `submissionId`, updating a tombstone's
+write, reconciliation recovers the same alias from the marker. Projection
+persists `recovery_required` *before* the first create-review call. An accepted
+or recovered projection becomes `settled` only after its alias/outcome is
+durable; a known absent but still unposted copy returns to `pending`, while an
+ambiguous outcome remains `recovery_required` or becomes `indeterminate`.
+
+An occurrence in `recovery_required` or `indeterminate` must complete the
+bounded review read before any create-review retry or credential fallback. A
+matching marker proves the earlier call succeeded: the board aliases that
+review id, derives decisive-review versus `COMMENT` projection from the returned
+review, and posts nothing. A complete, nontruncated read with no matching marker
+proves absence and permits one call using the stored event/body and
+`commit_id`; `recovery_required` remains durable across that call. A failed or
+truncated read proves neither success nor absence, so the board persists
+`indeterminate`, marks repository acceptance stale/unknown, returns a retryable
+receipt, and makes no GitHub call. A later retry repeats recovery, never a blind
+POST. An unambiguous GitHub refusal may advance the existing credential order;
+an ambiguous transport outcome must pass through this recovery read before a
+different credential is tried.
+
+A later read of that id updates the same logical decision. Alias recovery
+indexes both live submissions and compacted tombstones by `submissionId`,
+updating a tombstone's
 transport fields without making it live or repeating a side effect. A
 `COMMENTED` overlay may update its transport metadata but never replaces the
 Comet decision's kind. A verdict
@@ -1046,6 +1098,14 @@ Authority stays separated by construction:
   standing decision, author delivery, or GitHub post. It cannot prevent an
   already durable occurrence from finishing its stored-head delivery or
   projection exactly once.
+- A submission snapshot and standing decision commit before either external
+  call; resume never renders payload or receipt fields from the new head.
+- Verdict delivery uses `Runtime::prompt_once` with the occurrence delivery id,
+  so success followed by a crash before the ledger write still produces one
+  author turn.
+- An unresolved create-review outcome must be recovered by its marker before
+  any repost. Failed or truncated recovery stays indeterminate, acceptance
+  unknown, and retryable without making a GitHub call.
 - A push after verdict preflight may still leave a successful GitHub review of
   the old `commit_id`, or GitHub may refuse that post. Either outcome remains
   bound to the old-head local submission; the mandatory final refresh keeps the
@@ -1053,9 +1113,9 @@ Authority stays separated by construction:
 - A failed final verdict refresh marks repository state stale and acceptance
   unknown; it never returns cached A as a known-current head or leaves a
   mutation action enabled.
-- A mutation-path review reconciliation that cannot complete prevents local
-  sequence allocation and every verdict side effect; timestamp equality never
-  substitutes for that read.
+- A new-occurrence mutation-path review reconciliation that cannot complete
+  prevents local sequence allocation and every verdict side effect; timestamp
+  equality never substitutes for that read.
 - Same-reviewer movement racing the allocation fence persists chronology
   ambiguity and keeps acceptance unknown; an imported hash order never decides.
 - A legacy sequence high-water overflow or incomplete atomic seed keeps the
@@ -1184,13 +1244,23 @@ The implementation is complete when these seams are pinned:
    reload assert the reduced `CompactedVerdictReceipt` contract, and each
    desktop, iOS, CLI, and JSON fixture renders the compacted variant without
    filling omitted live-only fields. Retry-order fixtures record occurrence A,
-   crash before delivery, push head B, and retry the same id/payload: lookup
-   bypasses the new-occurrence head guard, delivers the stored A payload once,
-   projects with `commit_id = A` once, and final-refreshes B. A companion crash
-   after delivery but before projection proves delivery is skipped and only the
-   A-bound GitHub half resumes. Unposted/not-delivered receipts keep
-   `retryable = true` and the same client id; settled live and tombstoned
-   retries return `retryable = false` with no repeated half.
+   serialize/reload, crash before delivery, push head B, and retry the same
+   id/payload: lookup bypasses the new-occurrence head guard, and byte/field
+   snapshots prove the author message, decisive and fallback GitHub bodies,
+   unclaimed set, and every reconstructed live receipt field remain the stored
+   A values rather than B-era Review output. `Runtime::prompt_once` then
+   enqueues that message; a crash after enqueue but before the delivery-state
+   write followed by retry returns the same command id and one author turn.
+   A companion crash after delivery but before projection proves delivery is
+   skipped and only the A-bound GitHub half resumes. A POST-accepted-before-
+   store fixture leaves `recovery_required`; retry's complete bounded read
+   finds the submission marker, aliases the accepted decisive review (and, in
+   the fallback variant, the `COMMENTED` review), and performs no second POST.
+   Failed/truncated recovery persists `indeterminate` and likewise makes no
+   POST; a complete marker-absent recovery permits one stored-body attempt.
+   Unposted/not-delivered receipts keep `retryable = true` and the same client
+   id; settled live and tombstoned retries return `retryable = false` with no
+   repeated half.
 9. Every action-precedence row is table-tested, including no-check
    repositories, drafts, optional failures, stale data, and a REST transition
    from an actionable open projection to closed-unmerged. That transition
