@@ -1349,7 +1349,7 @@ mod tests {
         );
     }
 
-    // ---- the credential preflight reaches the first prompt (§gh#440) -----
+    // ---- the credential preflight reaches the first prompt (gh#440) ------
 
     #[test]
     fn a_workflow_capable_credential_says_both_writes_are_deliverable() {
