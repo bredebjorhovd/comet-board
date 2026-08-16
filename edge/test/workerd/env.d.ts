@@ -5,5 +5,6 @@ declare module "cloudflare:test" {
     TEST_LOG: DurableObjectNamespace;
     TEST_ALARM: DurableObjectNamespace<import("./fixture").TestAlarmRoom>;
     DEVICE_ROOM: DurableObjectNamespace;
+    TEST_SESSION: DurableObjectNamespace;
   }
 }

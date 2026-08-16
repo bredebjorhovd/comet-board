@@ -9,15 +9,10 @@ import { cloudflareTest } from "@cloudflare/vitest-pool-workers";
 //
 // `wrangler.configPath` points at the real wrangler.jsonc so compatibility
 // date and the loro-crdt base64 alias are read from the deployed config, not
-// duplicated here. `main` overrides the entry with test/workerd/fixture.ts:
-// the real entry (src/index.ts) imports SessionRoom and therefore loro-crdt;
-// loro's wasm does NOT work in this tier — the pool's test runner
-// evaluates modules where wasm codegen is disallowed, while a real worker
-// compiles the base64-inlined module at startup (deployed edge and
-// `wrangler dev` are fine). The fixture exports DeviceRoom directly (it only
-// imports loro-protocol) and keeps TestLogRoom for real DO SQLite; loro-on-
-// workerd coverage stays with the wrangler-dev scripts
-// (scripts/whale-check.mjs, scripts/fold-check.mjs).
+// duplicated here. `main` overrides the entry with test/workerd/fixture.ts,
+// which exposes the bare SQLite/alarm probes and the production SessionRoom
+// and DeviceRoom. That keeps Loro export/import and hibernatable-handler
+// regressions in workerd instead of only in the Node fake tier.
 export default defineConfig({
   plugins: [
     cloudflareTest({
@@ -27,7 +22,8 @@ export default defineConfig({
         durableObjects: {
           TEST_LOG: { className: "TestLogRoom", useSQLite: true },
           TEST_ALARM: { className: "TestAlarmRoom", useSQLite: true },
-          DEVICE_ROOM: { className: "DeviceRoom", useSQLite: true }
+          DEVICE_ROOM: { className: "DeviceRoom", useSQLite: true },
+          TEST_SESSION: { className: "SessionRoom", useSQLite: true }
         }
       }
     })
