@@ -134,7 +134,10 @@ through the current layer. Each ordered entry includes position, pull-request
 node id and number, head SHA, base ref and SHA, `layer_state`, and
 `layer_merged_at`. It changes when a lower head or base moves even if the
 current head does not. The fingerprint is an optimistic-lock token for the
-reviewer's merge confirmation, not a substitute for refreshing the gates.
+reviewer's merge confirmation and the board's final preflight, not a substitute
+for refreshing the gates. It is a local token: GitHub's merge endpoint accepts
+an expected current head but no expected base or lower-layer fingerprint, so the
+confirmation must not present the whole landing slice as atomically locked.
 
 ### Exactly what GitHub is asked
 
@@ -280,43 +283,84 @@ Delivered
 StandingReview
   key                       github:<review_id> | comet:<submission_fingerprint>
   sequence                  monotonic PR-local id used by stack fan-out
+  owner                     comet | github
+  submission_fingerprint    required when owner is comet
   github_review_id          null until/unless GitHub accepts it as a review
   reviewer_key              GitHub user id (login only if absent), else verified Comet identity
   kind                      approved | changes_requested | unknown
   disposition               active | dismissed
   head_sha
   submitted_at
-  source                    comet | github
+  transport                 decisive_review | comment | unposted | imported
 ```
 
-A GitHub review read adds `commit_id`, `user.id`, and `user.login` and upserts
-every decisive or dismissed review by its immutable review id *before* the
-new-message watermark is applied. The review endpoint is paged at 100 records,
-to a hard maximum of ten pages, only when the existing pull `updated_at` gate
-says feedback moved. Once that timestamp differs, the board persists
-`standing_reviews_complete = false` before the read; a crash cannot leave the
-old collection labeled current. More pages set `review_state_truncated`; that
-projection cannot derive Merge. A rewritten `DISMISSED` response marks that
-exact review dismissed while retaining its previous kind when known. Seeing a
-dismissal for the first time may leave `kind = unknown`; the tombstone still
-has the review's identity, reviewer, head, and ordering.
+A GitHub review read adds `commit_id`, `user.id`, and `user.login`. Its complete
+result replaces only records with `owner = github`; Comet-owned decisions are a
+separate durable partition and are never deleted merely because GitHub returned
+no decisive reviews. Each imported decisive or dismissed review is keyed by its
+immutable review id *before* the new-message watermark is applied. If that id
+already appears as `github_review_id` on a Comet-owned submission, the imported
+state overlays that logical record instead of creating a second decision. In
+particular, a later `DISMISSED` response dismisses the aliased decision without
+changing its Comet ownership. Board-marked `COMMENTED` reviews are read only to
+recover that alias and transport state; an ordinary GitHub comment is never
+imported as a decision.
+
+The review endpoint is paged at 100 records, to a hard maximum of ten pages,
+only when the existing pull `updated_at` gate says feedback moved. Once that
+timestamp differs, the board persists `standing_reviews_complete = false`
+before the read; a crash cannot leave the GitHub-owned partition labeled
+current. More pages set `review_state_truncated`; that projection cannot derive
+Merge. A rewritten `DISMISSED` response marks that exact review dismissed while
+retaining its previous kind when known. Seeing a dismissal for the first time
+may leave `kind = unknown`; the tombstone still has the review's identity,
+reviewer, head, and ordering.
 
 A Comet verdict request carries the `expectedHeadSha` the reviewer actually
 saw. Before recording, delivering, or posting anything, the board performs a
 targeted pull refresh and compare-and-refuses unless that value equals the
 current head. The refusal persists the refreshed projection and leaves no
 submission, standing review, chat message, or GitHub review behind. Only then
-does the verdict record that same expected SHA and the transport's verified
-reviewer identity. The `[users]` mapping resolves that identity to GitHub's
-numeric user id where possible; a normalized login is the legacy fallback, and
-the authenticated Comet subject is the fallback for an unposted verdict. When
-GitHub returns a review id, that id aliases the local submission rather than
-adding a second decision. A verdict projected only as a comment or left
-unposted remains a Comet decision, consistent with the existing rule that the
-board's verdict stands even when GitHub refuses its copy. Comments do not enter
-this collection.
+does the verdict submission record that same expected SHA and the transport's
+verified reviewer identity; Approve and Request changes also create the
+Comet-owned standing decision described below, while Comment does not. The
+`[users]` mapping resolves that identity to GitHub's numeric user id where
+possible; a normalized login is the legacy fallback, and the authenticated
+Comet subject is the fallback for an unposted verdict.
 
-Aggregation is deterministic and per reviewer:
+Every outbound create-review request carries the same optimistic lock:
+
+```json
+{ "event": "APPROVE | REQUEST_CHANGES | COMMENT", "body": "...", "commit_id": "<expectedHeadSha>" }
+```
+
+`Github::post_review` therefore accepts the expected head explicitly and
+serializes it as `commit_id`. That includes the reviewer's credential, the board
+credential, and the self-review `COMMENT` fallback; no credential retry may
+omit or replace it. A stale-commit response is terminal for that submission
+rather than a reason to retry under another credential or downgrade to an
+unlocked comment. The board refreshes the pull. The already durable local
+decision and any author delivery remain bound to the expected SHA; for a plain
+Comment only the submission and delivery exist. In either case an approval
+cannot be mistaken for approval of the new head. Other credential failures may
+continue through the existing fallback order, but every attempt uses the same
+`commit_id`.
+
+The existing board-owned body marker is extended to carry the durable submission
+fingerprint on every create-review request. When GitHub returns a review id —
+for a decisive review or a `COMMENT` fallback — the board writes it onto the
+Comet-owned record as an alias; if the process dies between the POST and that
+write, reconciliation recovers the same alias from the marker. A later read of
+that id updates the same logical decision. A `COMMENTED` overlay may update its
+transport metadata but never replaces the Comet decision's kind. A verdict
+projected only as a GitHub comment or left unposted remains a Comet-owned
+decision, consistent with the existing rule that the board's verdict stands
+even when GitHub refuses its copy. Ordinary comments do not create decisions in
+this collection; the local verdict that caused a fallback comment already did.
+
+Aggregation consumes the union of the freshly replaced GitHub-owned partition
+and the preserved Comet-owned partition after aliases have been collapsed. It
+is deterministic and per reviewer:
 
 1. order that reviewer's records by `submitted_at`, then immutable key;
 2. take the newest record, even when it is dismissed;
@@ -348,11 +392,13 @@ the schema is current, `standing_reviews_complete` is true, and
 `standing_reviews_updated_at` equals the pull's current `updated_at`. The
 required reconciliation rides the existing full-sweep clock, not a new retry
 loop. Only a successful, complete bounded read may atomically replace the
-collection, set version 1, set `standing_reviews_complete = true`, and copy the
+GitHub-owned partition, apply aliases and dismissals to matching Comet-owned
+records, set version 1, set `standing_reviews_complete = true`, and copy the
 pull's `updated_at` into `standing_reviews_updated_at`. Failure or a page beyond
 the cap persists `complete = false`, keeps Merge unavailable, and retries on a
 later full sweep. A complete response containing zero decisive reviews is
-still a completed reconciliation and persists an explicitly empty collection.
+still a completed reconciliation: it persists an explicitly empty GitHub
+partition while preserving every Comet-owned comment-only or unposted verdict.
 
 This is how repair reopens review on evidence rather than on optimism: a new
 commit invalidates acceptance, the new run replaces the attempt's observed
@@ -444,10 +490,13 @@ them an owned mutation. They are not mislabeled conflict repair.
 
 `Merge…` calls the `MergeTask` path from gh#408 after showing gh#408's exact
 `merge_confirmation`. The confirmation carries the displayed
-`expectedHeadSha` and `expectedTopologyFingerprint`. Before the existing
-`MergeTask` executor is allowed to call `merge_pull_request`, its board-loop
-handler performs an uncached preflight over the current layer and every layer
-below it:
+`expectedHeadSha`, `expectedTopologyFingerprint`, and repository `observed_at`.
+For a stack landing more than one open layer it also says, before the explicit
+confirm control: “After confirmation, Comet rechecks every landing layer.
+GitHub locks the current pull-request head during submission, but cannot lock
+lower heads or bases.” Before the existing `MergeTask` executor is allowed to
+call `merge_pull_request`, its board-loop handler performs an uncached preflight
+over the current layer and every layer below it:
 
 1. targeted REST reads refresh each layer's lifecycle, preview stack topology,
    head SHA, base ref/SHA, and `updated_at`;
@@ -462,11 +511,31 @@ below it:
    projection and refuses before the merge executor runs.
 
 Only an unchanged, freshly eligible landing slice reaches gh#408's executor in
-that same serialized board-loop turn. No other function invokes GitHub's merge
-endpoint, and GitHub still makes the final branch-protection decision. The
-current-head guard remains, but is no longer asked to stand in for lower-layer
-heads or bases. A race is a refusal and a fresh projection, never a merge whose
-Comet-local acceptance was evaluated on different topology.
+that same serialized board-loop turn. The executor passes the reviewed head to
+the provider, whose irreversible request is exactly:
+
+```json
+{ "merge_method": "merge", "sha": "<expectedHeadSha>" }
+```
+
+The `sha` field is required on every `merge-async` invocation, whether GitHub's
+default action selects a direct merge or its merge queue; no fallback may call
+the endpoint without it. `Github::merge_pr` therefore accepts the expected head
+explicitly instead of constructing a head-unlocked request. GitHub refuses a
+current-head push between preflight and the `PUT`, and the board refreshes the
+projection rather than recording a successful merge. No other function invokes
+GitHub's merge endpoint, and GitHub still makes the final branch-protection
+decision.
+
+The topology fingerprint has a deliberately narrower guarantee. It catches a
+lower-head, lower-base, or topology change visible before the request is handed
+off, but GitHub exposes no compare token for those values. An external change
+after preflight and before the `PUT` can therefore race a stacked landing while
+the current head remains unchanged. The confirmation surfaces that residual
+instead of claiming atomicity GitHub does not provide. The merge receipt stores
+`atomicity = current_head_only`, the preflight observation time, and the exact
+fingerprint, and triggers an immediate targeted refresh of every landing layer;
+the refreshed Review shows any topology movement alongside GitHub's result.
 
 ### Failed-check repair
 
@@ -643,7 +712,9 @@ The existing verdict and merge surfaces become:
   is required for Comment, Approve, and Request changes alike;
 - `MergeTask { taskId, confirmation, expectedHeadSha,
   expectedTopologyFingerprint }` — both optimistic-lock values are required
-  when invoked from Review.
+  when invoked from Review; its receipt exposes `atomicity`,
+  `preflightObservedAt`, and `topologyFingerprint` rather than implying the
+  local fingerprint was a GitHub compare-and-set token.
 
 Desktop and iOS submit the values held by the rendered Review, never a fresh
 client-side lookup. The CLI prints `head_sha` in `review` and requires
@@ -679,8 +750,15 @@ Authority stays separated by construction:
   reload.
 - A verdict expected-head mismatch is side-effect free: no standing decision,
   author delivery, or GitHub post.
-- A merge topology mismatch or refreshed lower-layer blocker never reaches
-  gh#408's merge executor.
+- A push after verdict preflight is server-refused by `commit_id`; any local
+  decision already recorded remains scoped to the old head and is not aliased
+  to a review of the new one.
+- A merge topology mismatch or refreshed lower-layer blocker observed during
+  preflight never reaches gh#408's merge executor. A lower-layer change after
+  preflight is the explicitly displayed `current_head_only` residual, not
+  falsely reported as an atomic refusal.
+- A current-head push after merge preflight is server-refused by `sha`; no
+  credential or queue fallback retries without that guard.
 - A merged layer with aggregate `pr_merged = false` cannot start any task
   retention path.
 - A log fetch or redaction failure writes no partial raw artifact and queues no
@@ -713,7 +791,12 @@ The implementation is complete when these seams are pinned:
    GraphQL answer.
 5. A reviewer renders SHA A, SHA B arrives, and delayed Approve(A) performs a
    targeted refresh, compare-and-refuses, publishes B, and records/delivers/posts
-   no verdict. Comment and Request changes run the same expected-head test.
+   no verdict. Comment and Request changes run the same expected-head test. In
+   the narrower compare-to-POST race, the initial compare passes on A and B
+   arrives before GitHub receives the request: reviewer credential, board
+   credential, and `COMMENT` fallback bodies all retain `commit_id = A`, GitHub
+   refuses the stale commit, and the local record remains scoped to A rather
+   than becoming a review of B.
 6. Review fixtures keep decisions per reviewer: A's approval cannot clear B's
    change request; B's later approval clears only B's request; dismissing B's
    exact latest review clears B without changing A; dismissing an older B
@@ -724,7 +807,13 @@ The implementation is complete when these seams are pinned:
    `review_state_truncated`, `acceptance = unknown`, and no Merge. Migration
    from an old `Delivered` with unchanged pull `updated_at` bypasses the normal
    short circuit; a complete zero-review response persists version 1,
-   `standing_reviews_complete = true`, and an explicitly empty collection.
+   `standing_reviews_complete = true`, and an explicitly empty GitHub-owned
+   partition. Separate comment-only and unposted Comet change requests survive
+   that same zero-review reconciliation. A locally posted decisive review later
+   read by its GitHub id aliases to one decision rather than two, and dismissal
+   updates that exact aliased decision. A `COMMENT` fallback aliases its review
+   id for transport bookkeeping but remains the one Comet-owned decision; a
+   crash after POST recovers the alias from its submission marker.
 8. Every action-precedence row is table-tested, including no-check
    repositories, drafts, optional failures, stale data, and a REST transition
    from an actionable open projection to closed-unmerged. That transition
@@ -747,6 +836,12 @@ The implementation is complete when these seams are pinned:
     preflight refreshes every gate, changes the topology fingerprint, refuses,
     and never calls gh#408's merge executor. A same-head check rerun and a new
     standing change request likewise fail the refreshed gate before the call.
+    A current-head push after a successful preflight but before the `PUT` is
+    refused by GitHub because the request still carries `sha = expectedHeadSha`.
+    A lower-head move in that same post-preflight window is not asserted to be
+    atomic: the fixture accepts the unchanged current head, records
+    `atomicity = current_head_only`, immediately refreshes all landing layers,
+    and exposes the changed fingerprint in Review.
 12. Log fixtures prove transfer, artifact, line, job-count, and aggregate caps;
    ANSI stripping; every redaction class; mode `0600`; atomic writes; and a
    clean `git status`.
