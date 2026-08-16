@@ -24,7 +24,8 @@ export default defineConfig({
       wrangler: { configPath: "./wrangler.jsonc" },
       miniflare: {
         durableObjects: {
-          TEST_LOG: { className: "TestLogRoom", useSQLite: true }
+          TEST_LOG: { className: "TestLogRoom", useSQLite: true },
+          TEST_ALARM: { className: "TestAlarmRoom", useSQLite: true }
         }
       }
     })

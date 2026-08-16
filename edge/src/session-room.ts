@@ -73,6 +73,7 @@ import {
   RETAIN_DAYS,
   materializeTail
 } from "./session-doc";
+import { AlarmArmer } from "./alarm";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { createMetaStore, type MetaStore } from "./meta";
 import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
@@ -292,6 +293,7 @@ export class SessionRoom implements DurableObject {
   private readonly env: Env;
   private readonly blobs: BlobStore;
   private readonly meta: MetaStore;
+  private readonly dailyAlarm: AlarmArmer;
   /** Lazily materialized doc — the log is authoritative; this is a cache. */
   private doc: LoroDoc | undefined;
   private eph: EphemeralStore | undefined;
@@ -326,6 +328,7 @@ export class SessionRoom implements DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
     this.env = env;
+    this.dailyAlarm = new AlarmArmer(ctx.storage);
     ensureUpdateLog(ctx.storage.sql);
     this.meta = createMetaStore(ctx.storage.sql);
     this.blobs = createBlobStore(ctx.storage.sql);
@@ -535,7 +538,7 @@ export class SessionRoom implements DurableObject {
       } catch {
         return json({ error: "invalid_update" }, 400);
       }
-      this.recordLoroUpdates([body]);
+      await this.recordLoroUpdates([body]);
       // Converge live peers: relay the update to connected %LOR sockets.
       const roomId = this.getMeta("chatId") ?? "";
       for (const ws of this.ctx.getWebSockets()) {
@@ -721,7 +724,7 @@ export class SessionRoom implements DurableObject {
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
     // A client is back on a room that had given up on its own maintenance
     // (gh#378) — that is the signal to try again, whatever broke last time.
-    this.reviveAlarm();
+    await this.reviveAlarm();
 
     if (message.crdt === CrdtType.Loro) {
       const doc = await this.ensureDoc();
@@ -930,7 +933,7 @@ export class SessionRoom implements DurableObject {
         }
         this.notePush(state.deviceId, false, now);
         if (imported.length > 0) {
-          this.recordLoroUpdates(imported);
+          await this.recordLoroUpdates(imported);
           this.relay(ws, crdt, roomId, imported);
         }
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
@@ -938,7 +941,7 @@ export class SessionRoom implements DurableObject {
       }
       if (state.deviceId) this.importPenalty.delete(state.deviceId);
       this.notePush(state.deviceId, true, now);
-      this.recordLoroUpdates(updates);
+      await this.recordLoroUpdates(updates);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       this.relay(ws, crdt, roomId, updates);
       return;
@@ -960,7 +963,7 @@ export class SessionRoom implements DurableObject {
 
   /** Durability bookkeeping for accepted %LOR updates: buffer for the flush
    * batch, dirty the tail/backup caches, keep the daily alarm armed. */
-  private recordLoroUpdates(updates: Uint8Array[]): void {
+  private async recordLoroUpdates(updates: Uint8Array[]): Promise<void> {
     let real = false;
     for (const update of updates) {
       if (update.length === 0) continue;
@@ -982,7 +985,7 @@ export class SessionRoom implements DurableObject {
     // (the monotonic VV gate in alarm() still has the final say).
     this.setMeta("postReset", "0");
     this.scheduleFlush();
-    this.markActivity();
+    await this.markActivity();
   }
 
   private handleFragmentHeader(
@@ -1533,12 +1536,14 @@ export class SessionRoom implements DurableObject {
    * up is revived by the next join, /tail read or write anyway, which is the
    * case that matters: a room that has stopped retrying must never be a room
    * that has stopped backing up. */
-  private reviveAlarm(): boolean {
+  private async reviveAlarm(): Promise<boolean> {
     if (!this.getMeta("alarmGaveUpAt")) return false;
+    // Arm first: if storage refuses, the give-up marker remains truthful and
+    // the initiating event fails instead of claiming this room was revived.
+    await this.armDailyAlarm();
     this.setMeta("alarmGaveUpAt", "");
     this.setMeta("alarmFailures", "0");
     console.log("alarm re-armed after give-up", `room=${this.getMeta("chatId") ?? "?"}`);
-    this.armDailyAlarm();
     return true;
   }
 
@@ -1621,22 +1626,20 @@ export class SessionRoom implements DurableObject {
 
   /** Arm the daily alarm if none is scheduled (called on every write). A write
    * is also a client returning, so it revives a room that gave up. */
-  private markActivity(): void {
-    if (this.reviveAlarm()) return; // already re-armed
-    this.armDailyAlarm();
+  private async markActivity(): Promise<void> {
+    if (await this.reviveAlarm()) return; // already re-armed
+    await this.armDailyAlarm();
   }
 
-  private armDailyAlarm(): void {
-    void this.ctx.storage.getAlarm().then((existing) => {
-      if (existing === null) void this.ctx.storage.setAlarm(Date.now() + DAY_MS);
-    });
+  private async armDailyAlarm(): Promise<void> {
+    await this.dailyAlarm.armAfter(DAY_MS);
   }
 
   private async currentTail(): Promise<unknown> {
     // An explicit read counts as a client returning too (gh#378): the L2 tail
     // is what an instant-open does before any socket exists, so on a room
     // nobody has joined yet it is the earliest evidence anyone is watching.
-    this.reviveAlarm();
+    await this.reviveAlarm();
     await this.flush();
     if (this.getMeta("tailDirty") !== "1") {
       const cached = getJsonBlob<unknown>(this.blobs, "tail");

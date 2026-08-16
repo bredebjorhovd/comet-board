@@ -7,6 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { LoroDoc } from "loro-crdt";
 import { CrdtType, MessageType, encode } from "loro-protocol";
 import { describe, expect, it, vi } from "vitest";
+import { AlarmArmer } from "./alarm";
 import { AUTH_USER_HEADER } from "./env";
 import { ALARM_FAILURE_LIMIT, SessionRoom, alarmRetryDelay } from "./session-room";
 
@@ -49,11 +50,23 @@ class FakeStorage {
    * question this test asks. */
   scheduled: number | null = null;
   syncs = 0;
+  getAlarmCalls = 0;
+  readonly setAlarmCalls: number[] = [];
+  failGetAlarm: Error | undefined;
+  failSetAlarm: Error | undefined;
+  private setAlarmBarrier: Promise<void> | undefined;
+  private setAlarmStarted: (() => void) | undefined;
 
   async getAlarm(): Promise<number | null> {
+    this.getAlarmCalls++;
+    if (this.failGetAlarm) throw this.failGetAlarm;
     return this.scheduled;
   }
   async setAlarm(at: number): Promise<void> {
+    this.setAlarmCalls.push(at);
+    this.setAlarmStarted?.();
+    if (this.failSetAlarm) throw this.failSetAlarm;
+    await this.setAlarmBarrier;
     this.scheduled = at;
   }
   async deleteAlarm(): Promise<void> {
@@ -61,6 +74,23 @@ class FakeStorage {
   }
   async sync(): Promise<void> {
     this.syncs++;
+  }
+
+  pauseSetAlarm(): { started: Promise<void>; release: () => void } {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let release!: () => void;
+    this.setAlarmBarrier = new Promise<void>((resolve) => {
+      release = () => {
+        this.setAlarmBarrier = undefined;
+        this.setAlarmStarted = undefined;
+        resolve();
+      };
+    });
+    this.setAlarmStarted = markStarted;
+    return { started, release };
   }
 }
 
@@ -127,8 +157,6 @@ interface Harness {
     backupDirty: boolean;
     alarm: { consecutiveFailures: number; gaveUp: boolean; gaveUpAt: number | null; limit: number };
   }>;
-  /** Let markActivity's getAlarm().then(...) arming land. */
-  settle: () => Promise<void>;
 }
 
 const harness = (): Harness => {
@@ -141,9 +169,6 @@ const harness = (): Harness => {
     ctx as unknown as DurableObjectState,
     { BLOBS: { put } } as unknown as ConstructorParameters<typeof SessionRoom>[1]
   );
-  const settle = async (): Promise<void> => {
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  };
   const authed = (path: string, init?: RequestInit): Request =>
     new Request(`https://room.invalid${path}`, {
       ...init,
@@ -159,7 +184,6 @@ const harness = (): Harness => {
     fire: async () => {
       ctx.storage.scheduled = null;
       await room.alarm();
-      await settle();
     },
     join: async () => {
       const ws = new FakeSocket();
@@ -176,26 +200,18 @@ const harness = (): Harness => {
         ws as unknown as WebSocket,
         frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength) as ArrayBuffer
       );
-      await settle();
       return ws;
     },
     append: async (text) => {
       const doc = new LoroDoc();
       doc.getText("t").insert(0, text);
       doc.commit();
-      const response = await room.fetch(
+      return room.fetch(
         authed("/append", { method: "POST", body: doc.export({ mode: "update" }) })
       );
-      await settle();
-      return response;
     },
-    tail: async () => {
-      const response = await room.fetch(authed("/tail"));
-      await settle();
-      return response;
-    },
-    stats: async () => (await room.fetch(authed("/stats"))).json() as never,
-    settle
+    tail: () => room.fetch(authed("/tail")),
+    stats: async () => (await room.fetch(authed("/stats"))).json() as never
   };
 };
 
@@ -207,6 +223,66 @@ const roomWithWork = async (): Promise<Harness> => {
   expect(h.ctx.storage.scheduled).not.toBeNull(); // a write arms the daily alarm
   return h;
 };
+
+describe("daily alarm arming", () => {
+  it("does not finish an accepted write until setAlarm completes", async () => {
+    const h = harness();
+    await h.join();
+    const gate = h.ctx.storage.pauseSetAlarm();
+    let response: Response | undefined;
+    const write = h.append("hello").then((value) => {
+      response = value;
+    });
+
+    await gate.started;
+    expect(response).toBeUndefined();
+    expect(h.ctx.storage.scheduled).toBeNull();
+
+    gate.release();
+    await write;
+    expect(response?.status).toBe(200);
+    expect(h.ctx.storage.scheduled).not.toBeNull();
+  });
+
+  it("preserves an existing retry alarm", async () => {
+    const h = harness();
+    await h.join();
+    const retryAt = Date.now() + alarmRetryDelay(1);
+    h.ctx.storage.scheduled = retryAt;
+
+    expect((await h.append("hello")).status).toBe(200);
+
+    expect(h.ctx.storage.scheduled).toBe(retryAt);
+    expect(h.ctx.storage.setAlarmCalls).toEqual([]);
+  });
+
+  it.each(["getAlarm", "setAlarm"] as const)("surfaces a %s failure to the writer", async (op) => {
+    const h = harness();
+    await h.join();
+    const failure = new Error(`${op} unavailable`);
+    if (op === "getAlarm") h.ctx.storage.failGetAlarm = failure;
+    else h.ctx.storage.failSetAlarm = failure;
+
+    await expect(h.append("hello")).rejects.toThrow(failure.message);
+    expect((await h.stats()).backupDirty).toBe(true);
+  });
+
+  it("coalesces concurrent arms instead of racing a later alarm into place", async () => {
+    const storage = new FakeStorage();
+    const armer = new AlarmArmer(storage as unknown as DurableObjectStorage);
+    const gate = storage.pauseSetAlarm();
+    const first = armer.armAfter(1_000, () => 10_000);
+    await gate.started;
+    const second = armer.armAfter(1_000, () => 20_000);
+
+    gate.release();
+    await Promise.all([first, second]);
+
+    expect(storage.getAlarmCalls).toBe(1);
+    expect(storage.setAlarmCalls).toEqual([11_000]);
+    expect(storage.scheduled).toBe(11_000);
+  });
+});
 
 // ── the ladder ────────────────────────────────────────────────────────────
 
@@ -391,6 +467,19 @@ describe("a room that gave up comes back", () => {
 
     expect(h.ctx.storage.scheduled).not.toBeNull();
     expect((await h.stats()).alarm.gaveUp).toBe(false);
+  });
+
+  it("keeps the give-up visible when revival cannot schedule an alarm", async () => {
+    const h = await givenUp();
+    h.ctx.storage.failSetAlarm = new Error("alarm storage unavailable");
+
+    await expect(h.append("a client is back")).rejects.toThrow("alarm storage unavailable");
+
+    expect(h.ctx.storage.scheduled).toBeNull();
+    expect((await h.stats()).alarm).toMatchObject({
+      consecutiveFailures: ALARM_FAILURE_LIMIT,
+      gaveUp: true
+    });
   });
 
   // The deliberate narrowing: reviving is for rooms that have GIVEN UP. A join
