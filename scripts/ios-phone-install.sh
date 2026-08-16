@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build, install, and launch the current checkout on a connected iPhone.
 #
-# Usage: scripts/ios-phone-install.sh <device name-or-udid> [chat-id]
+# Usage: scripts/ios-phone-install.sh <device name-or-udid> [chat-id|--sync-spec]
 #
 # The optional chat id is passed through the app's existing `-route chat:...`
 # launch argument, which makes the gh#450 stale-session check one command after
@@ -11,10 +11,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEVICE="${1:-}"
-CHAT_ID="${2:-}"
+LAUNCH_TARGET="${2:-}"
 
 if [[ -z "$DEVICE" ]]; then
-  echo "usage: $0 <device name-or-udid> [chat-id]" >&2
+  echo "usage: $0 <device name-or-udid> [chat-id|--sync-spec]" >&2
   echo "connected devices:" >&2
   xcrun devicectl list devices >&2 || true
   exit 2
@@ -46,9 +46,22 @@ echo "phone install: installing $APP_ID on $DEVICE"
 xcrun devicectl device install app --device "$DEVICE" "$APP"
 
 echo "phone install: launching $APP_ID"
-if [[ -n "$CHAT_ID" ]]; then
+if [[ "$LAUNCH_TARGET" == "--sync-spec" ]]; then
   xcrun devicectl device process launch --terminate-existing \
-    --device "$DEVICE" "$APP_ID" -route "chat:$CHAT_ID"
+    --device "$DEVICE" "$APP_ID" -sync-spec
+  # The in-app test is synchronous and finishes during launch. Give its file
+  # close a small tooling-only window, then pull the deterministic verdict from
+  # the app container; this does not contact or wake any Durable Object.
+  sleep 2
+  SPEC_LOG="$DERIVED/sync-spec.log"
+  xcrun devicectl device copy from --device "$DEVICE" \
+    --domain-type appDataContainer --domain-identifier "$APP_ID" \
+    --source Documents/sync-spec.log --destination "$SPEC_LOG"
+  cat "$SPEC_LOG"
+  grep -q '^OK ' "$SPEC_LOG"
+elif [[ -n "$LAUNCH_TARGET" ]]; then
+  xcrun devicectl device process launch --terminate-existing \
+    --device "$DEVICE" "$APP_ID" -route "chat:$LAUNCH_TARGET"
 else
   xcrun devicectl device process launch --terminate-existing \
     --device "$DEVICE" "$APP_ID"

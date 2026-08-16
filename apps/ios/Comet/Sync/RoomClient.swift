@@ -49,6 +49,16 @@ final class RoomDocument: @unchecked Sendable {
         return generation
     }
 
+    /// Hold the owner gate for the whole operation. Device-command creation
+    /// uses this instead of retaining `current()` across a reseed, so either
+    /// the command commits before the final replay or it lands directly on the
+    /// replacement — never on an orphaned old doc.
+    func withCurrent<T>(_ operation: (LoroDoc) throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation(doc)
+    }
+
     func observeLocalUpdates(_ handler: @escaping (UInt64, Data) -> Void) {
         lock.lock()
         defer { lock.unlock() }
@@ -66,9 +76,15 @@ final class RoomDocument: @unchecked Sendable {
         localUpdateHandler = nil
     }
 
-    func replace(with replacement: LoroDoc) {
+    /// Reconcile the final device-local command delta and swap the owner under
+    /// the same gate used by command creation.
+    func replaceReplayingPendingCommands(with replacement: LoroDoc,
+                                         localDeviceId: String?) -> Int? {
         lock.lock()
         defer { lock.unlock() }
+        guard let replayed = Self.replayUnresolvedLocalCommands(
+            from: doc, into: replacement, localDeviceId: localDeviceId
+        ) else { return nil }
         generation &+= 1
         let replacementGeneration = generation
         let replacementSubscription = localUpdateHandler.map { handler in
@@ -78,6 +94,43 @@ final class RoomDocument: @unchecked Sendable {
         }
         doc = replacement
         localSubscription = replacementSubscription
+        return replayed
+    }
+
+    private static func replayUnresolvedLocalCommands(from stale: LoroDoc,
+                                                       into replacement: LoroDoc,
+                                                       localDeviceId: String?) -> Int? {
+        guard let localDeviceId,
+              let staleCommands = stale.getList(id: "commands").getDeepValue().listValue else {
+            return 0
+        }
+        let replacementIds = Set(
+            (replacement.getList(id: "commands").getDeepValue().listValue ?? [])
+                .compactMap { $0.mapValue?["id"]?.stringValue }
+        )
+        let unresolved = staleCommands.compactMap { value -> [String: LoroValue]? in
+            guard let command = value.mapValue,
+                  command["issuedBy"]?.stringValue == localDeviceId,
+                  command["status"]?.stringValue == "pending",
+                  let id = command["id"]?.stringValue,
+                  !replacementIds.contains(id) else { return nil }
+            return command
+        }
+        guard !unresolved.isEmpty else { return 0 }
+
+        let target = replacement.getList(id: "commands")
+        do {
+            for command in unresolved {
+                let map = try target.pushContainer(child: LoroMap())
+                for (key, value) in command {
+                    try map.insert(key: key, v: value)
+                }
+            }
+            replacement.commit()
+            return unresolved.count
+        } catch {
+            return nil
+        }
     }
 }
 
@@ -132,6 +185,7 @@ actor RoomClient {
     private var backoff = ReconnectBackoff()
     private var lastInbound = DispatchTime.now()
     private var closed = false
+    private var protocolParked = false
     private var generation = 0
     // Room-liveness state (room.rs Session::{join_sent_at, join_is_probe,
     // last_lor_rx}): the instant of the last %LOR JoinRequest still awaiting
@@ -170,6 +224,7 @@ actor RoomClient {
 
     func start() {
         closed = false
+        protocolParked = false
         connect()
     }
 
@@ -186,7 +241,7 @@ actor RoomClient {
     }
 
     private func connect() {
-        guard !closed else { return }
+        guard !closed, !protocolParked else { return }
         generation += 1
         let gen = generation
         joinedLor = false
@@ -214,7 +269,7 @@ actor RoomClient {
     }
 
     private func openSocket(url: URL, gen: Int) {
-        guard gen == generation, !closed else { return }
+        guard gen == generation, !closed, !protocolParked else { return }
         let task = URLSession.shared.webSocketTask(with: url)
         socket = task
         task.resume()
@@ -259,13 +314,13 @@ actor RoomClient {
     }
 
     private func onSocketError(gen: Int) {
-        guard gen == generation, !closed else { return }
+        guard gen == generation, !closed, !protocolParked else { return }
         events(.disconnected)
         scheduleReconnect(gen: gen)
     }
 
     private func scheduleReconnect(gen: Int) {
-        guard gen == generation, !closed else { return }
+        guard gen == generation, !closed, !protocolParked else { return }
         socket?.cancel(with: .abnormalClosure, reason: nil)
         socket = nil
         receiveTask?.cancel()
@@ -443,8 +498,7 @@ actor RoomClient {
             } else if let decoded = try? VersionVector.decode(bytes: Data(version)) {
                 advertisedVv = decoded
             } else {
-                roomLog.error("room \(self.roomId, privacy: .public): invalid server version vector; redialing without accepting backfill")
-                onSocketError(gen: generation)
+                parkProtocol("invalid server version vector; parking room")
                 return
             }
             serverVv = advertisedVv
@@ -531,6 +585,21 @@ actor RoomClient {
         await sendJoinLoro(version: [], suppressJoinEffects: joinedLor)
     }
 
+    private func parkProtocol(_ reason: String) {
+        guard !protocolParked else { return }
+        protocolParked = true
+        generation += 1
+        receiveTask?.cancel()
+        pingTask?.cancel()
+        livenessTask?.cancel()
+        socket?.cancel(with: .policyViolation, reason: Data(reason.utf8))
+        socket = nil
+        joinedLor = false
+        joinedAt = nil
+        roomLog.fault("room \(self.roomId, privacy: .public): \(reason, privacy: .public); explicit restart required")
+        events(.disconnected)
+    }
+
     private func tryReseed(from snapshot: [UInt8]) async -> Bool {
         guard let serverVv else { return false }
         let replacement = LoroDoc()
@@ -538,7 +607,15 @@ actor RoomClient {
               status.pending == nil,
               replacement.oplogVv() == serverVv else { return false }
 
-        guard let replayed = replayUnresolvedLocalCommands(from: doc, into: replacement) else {
+        // Anything derived from the stale graph is invalid. Clear it before
+        // taking the owner gate; the final command replay and pointer swap are
+        // one atomic operation with respect to SessionStore.queueCommand.
+        pending.removeAll()
+        invalidRejoins = 0
+        guard let replayed = document.replaceReplayingPendingCommands(
+            with: replacement, localDeviceId: localDeviceId
+        ) else {
+            roomLog.error("room \(self.roomId, privacy: .public): failed to replay unresolved local commands during reseed")
             return false
         }
         let replayUpdate: [UInt8]?
@@ -550,52 +627,11 @@ actor RoomClient {
             replayUpdate = nil
         }
 
-        // Drop every retry derived from the stale graph. The semantic command
-        // replay is the only local state allowed to cross the replacement.
-        pending.removeAll()
-        invalidRejoins = 0
-        document.replace(with: replacement)
         if let replayUpdate {
             await sendLoroUpdates([replayUpdate])
         }
         roomLog.error("room \(self.roomId, privacy: .public): reseeded stale local document from validated server snapshot; replayed \(replayed) unresolved local commands")
         return true
-    }
-
-    private func replayUnresolvedLocalCommands(from stale: LoroDoc,
-                                               into replacement: LoroDoc) -> Int? {
-        guard let localDeviceId,
-              let staleCommands = stale.getList(id: "commands").getDeepValue().listValue else {
-            return 0
-        }
-        let replacementIds = Set(
-            (replacement.getList(id: "commands").getDeepValue().listValue ?? [])
-                .compactMap { $0.mapValue?["id"]?.stringValue }
-        )
-        let unresolved = staleCommands.compactMap { value -> [String: LoroValue]? in
-            guard let command = value.mapValue,
-                  command["issuedBy"]?.stringValue == localDeviceId,
-                  command["status"]?.stringValue == "pending",
-                  let id = command["id"]?.stringValue,
-                  !replacementIds.contains(id) else { return nil }
-            return command
-        }
-        guard !unresolved.isEmpty else { return 0 }
-
-        let target = replacement.getList(id: "commands")
-        do {
-            for command in unresolved {
-                let map = try target.pushContainer(child: LoroMap())
-                for (key, value) in command {
-                    try map.insert(key: key, v: value)
-                }
-            }
-            replacement.commit()
-            return unresolved.count
-        } catch {
-            roomLog.error("room \(self.roomId, privacy: .public): failed to replay unresolved local commands during reseed")
-            return nil
-        }
     }
 
     private func onFragment(batchId: BatchId, index: Int, fragment: [UInt8]) async {

@@ -86,6 +86,15 @@ scripts/ios-phone-install.sh 'Brede’s iPhone' \
   b5b3c796-2f3b-4bb2-8341-95d1d7782927
 ```
 
+Before the live-room check, run the same signed build on the phone with the
+deterministic sync spec. It races a command commit holding the old-document
+gate against reseeding, pulls the result log back from the app container, and
+requires an `OK` verdict:
+
+```sh
+scripts/ios-phone-install.sh 'Brede’s iPhone' --sync-spec
+```
+
 In Xcode's Devices and Simulators console (or Console.app with the phone
 selected), filter on subsystem `dev.cometnative.Comet` and category `sync`.
 Recovery emits `reseeded stale local document from validated server snapshot`
@@ -103,6 +112,11 @@ per-connection latch suppresses every further recovery request, including
 repeated pending imports and `versionUnknown` replies. A later socket loss uses
 the existing capped, jittered reconnect backoff and begins a new recovery
 episode; probe and liveness intervals are unchanged.
+
+An undecodable server version vector is different from a lost socket: the same
+protocol bytes will not heal on redial. That room parks on its current attempt
+and requires an explicit store/app restart; it does not enter either reconnect
+layer, issue another join, or wake the Durable Object again.
 
 An ignored file rather than settings in `Comet.xcodeproj/project.pbxproj`: put a
 team id in the tracked `.pbxproj` and it is a permanent dirty diff, one that has

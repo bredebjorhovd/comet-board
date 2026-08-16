@@ -225,6 +225,28 @@ pub struct ChatDocHandle {
     _sub: Mutex<loro::Subscription>,
 }
 
+fn replay_unresolved_device_commands(
+    stale: &SessionDoc,
+    replacement: &SessionDoc,
+    device_id: &str,
+) -> Result<usize, DocError> {
+    let existing: HashSet<String> = replacement
+        .read_commands()?
+        .into_iter()
+        .map(|command| command.id)
+        .collect();
+    let mut replayed = 0;
+    for command in stale.read_commands()?.into_iter().filter(|command| {
+        command.status == SessionCommandStatus::Pending
+            && command.issued_by == device_id
+            && !existing.contains(&command.id)
+    }) {
+        replacement.queue_command(&command)?;
+        replayed += 1;
+    }
+    Ok(replayed)
+}
+
 impl ChatDocHandle {
     pub fn chat_id(&self) -> &str {
         &self.chat_id
@@ -258,18 +280,35 @@ impl ChatDocHandle {
         self.doc()
     }
 
-    fn reseed(&self, raw: loro::LoroDoc) {
+    fn with_current<R>(&self, operation: impl FnOnce(&SessionDoc) -> R) -> R {
+        let owner = self.doc.read().unwrap_or_else(PoisonError::into_inner);
+        operation(owner.as_ref())
+    }
+
+    fn reseed(&self, raw: loro::LoroDoc) -> Result<usize, DocError> {
         let replacement = Arc::new(SessionDoc::from_doc(raw));
+        // Device command creation holds a read guard for its entire commit.
+        // Taking the write guard therefore closes the replay-to-swap gap: a
+        // command either finishes on the old owner and is copied below, or
+        // starts after the replacement is visible and writes there directly.
+        let mut owner = self.doc.write().unwrap_or_else(PoisonError::into_inner);
+        let replayed = replay_unresolved_device_commands(
+            owner.as_ref(),
+            replacement.as_ref(),
+            &self.device_id,
+        )?;
         let changed_tx = self.changed_tx.clone();
         let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
-        *self.doc.write().unwrap_or_else(PoisonError::into_inner) = replacement;
+        *owner = replacement;
+        drop(owner);
         *lock(&self._sub) = sub;
         // The server snapshot and replay commits happened before this new
         // subscription existed. Publish the ownership swap itself so mirrors
         // and disk persistence immediately read the replacement.
         self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(replayed)
     }
 
     /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
@@ -528,8 +567,11 @@ impl DocHost {
                 doc.doc().clone(),
                 Some(self.inner.config.device_id.clone()),
                 Arc::new(move |replacement| {
-                    if let Some(handle) = weak_handle.upgrade() {
-                        handle.reseed(replacement);
+                    if let Some(handle) = weak_handle.upgrade()
+                        && let Err(err) = handle.reseed(replacement)
+                    {
+                        tracing::error!(chat = %handle.chat_id, error = %err,
+                            "failed to reconcile device commands during room reseed");
                     }
                 }),
                 Arc::downgrade(&handle.room),
@@ -740,20 +782,21 @@ impl DocHost {
         let handle = self.open(chat_id)?;
         let id = new_id();
         let now = now_ms();
-        let doc = handle.doc();
-        let based_on = doc.read_entries()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
-            frontier: None,
-        });
-        doc.queue_command(&SessionCommandEntry {
-            id: id.clone(),
-            payload,
-            issued_by: self.inner.config.device_id.clone(),
-            issued_at: now,
-            based_on,
-            expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
-            status: SessionCommandStatus::Pending,
-            resolution: None,
+        handle.with_current(|doc| {
+            let based_on = doc.read_entries()?.last().map(|m| CommandBasedOn {
+                turn_id: Some(m.id.clone()),
+                frontier: None,
+            });
+            doc.queue_command(&SessionCommandEntry {
+                id: id.clone(),
+                payload,
+                issued_by: self.inner.config.device_id.clone(),
+                issued_at: now,
+                based_on,
+                expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
+                status: SessionCommandStatus::Pending,
+                resolution: None,
+            })
         })?;
         // §7 durable delivery: when another device hosts this chat, nudge its device
         // room so a cold host opens the doc and drains the queue. Fire-and-forget —
@@ -1668,7 +1711,9 @@ mod tests {
                 continuation_of: None,
             })
             .expect("write replacement");
-        handle.reseed(replacement.doc().clone());
+        handle
+            .reseed(replacement.doc().clone())
+            .expect("reseed owner");
 
         tokio::time::timeout(Duration::from_secs(1), messages.changed())
             .await
@@ -1687,6 +1732,67 @@ mod tests {
             .expect("post-reseed commit is published")
             .expect("watch stays open");
         assert_eq!(messages.borrow().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_command_queued_at_the_reseed_boundary_survives_the_owner_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        let handle = host.open("chat-reseed-command").expect("open");
+        let replacement = SessionDoc::init("chat-reseed-command").expect("replacement doc");
+        let (queue_entered_tx, queue_entered_rx) = std::sync::mpsc::channel();
+        let (release_queue_tx, release_queue_rx) = std::sync::mpsc::channel();
+        let queue_handle = handle.clone();
+        let queue = std::thread::spawn(move || {
+            queue_handle.with_current(|stale| {
+                queue_entered_tx.send(()).unwrap();
+                release_queue_rx.recv().unwrap();
+                stale
+                    .queue_command(&SessionCommandEntry {
+                        id: "boundary-command".into(),
+                        payload: SessionCommandPayload::Interrupt {},
+                        issued_by: queue_handle.device_id.clone(),
+                        issued_at: 1,
+                        based_on: None,
+                        expires_at: None,
+                        status: SessionCommandStatus::Pending,
+                        resolution: None,
+                    })
+                    .expect("queue at boundary");
+            });
+        });
+        queue_entered_rx.recv().unwrap();
+
+        // Replacement races the retained-old-owner commit but must wait on the
+        // same gate. Once the queue releases it, the final replay observes the
+        // command and swaps only after copying it.
+        let (replace_started_tx, replace_started_rx) = std::sync::mpsc::channel();
+        let (replace_done_tx, replace_done_rx) = std::sync::mpsc::channel();
+        let replace_handle = handle.clone();
+        let replace = std::thread::spawn(move || {
+            replace_started_tx.send(()).unwrap();
+            replace_handle
+                .reseed(replacement.doc().clone())
+                .expect("reseed owner with boundary command");
+            replace_done_tx.send(()).unwrap();
+        });
+        replace_started_rx.recv().unwrap();
+        assert!(
+            replace_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "reseed waits on command gate"
+        );
+        release_queue_tx.send(()).unwrap();
+        queue.join().unwrap();
+        replace.join().unwrap();
+        replace_done_rx.recv().unwrap();
+
+        assert_eq!(
+            handle.doc().read_commands().unwrap()[0].id,
+            "boundary-command",
+            "the owner swap must reconcile the final old-doc command delta"
+        );
     }
 
     #[tokio::test]

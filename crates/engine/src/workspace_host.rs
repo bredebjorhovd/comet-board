@@ -184,8 +184,9 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Why a supervised room client was abandoned — both reasons mean "build a new
-/// one", never "give up".
+/// Why a supervised room client was abandoned. Transient exits rebuild it;
+/// deterministic malformed protocol parks it until explicit restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoomExit {
     /// The client's actor task is gone (clean shutdown, or a panic / lost
     /// local-update channel that leaves a client which can never reconnect).
@@ -195,6 +196,10 @@ enum RoomExit {
     /// slowness — it is a stuck actor (gh#116), and a fresh client with fresh
     /// credentials is the way out.
     DarkTooLong,
+    /// The server produced deterministic malformed protocol bytes. Rebuilding
+    /// would wake the same DO forever, so this room parks until its owner is
+    /// explicitly restarted.
+    ProtocolParked,
 }
 
 /// Join `room_id` and hold it in `slot` for the joiner's life — the shared
@@ -258,7 +263,7 @@ pub(crate) fn spawn_room_join(
                 Some(device_id) => DocRecovery::for_device(device_id, reseed),
                 None => DocRecovery::replacing(reseed),
             };
-            match RoomClient::connect_via_recovering(url.clone(), &room_id, doc, recovery).await {
+            match RoomClient::connect_via(url.clone(), &room_id, doc, recovery).await {
                 Ok(client) => {
                     // Health handles are taken BEFORE the client moves into the
                     // slot, so supervision never has to hold the slot lock.
@@ -287,7 +292,17 @@ pub(crate) fn spawn_room_join(
                             dark_s = ROOM_DARK_REBUILD.as_secs(),
                             "room held no live connection; rebuilding the client"
                         ),
+                        RoomExit::ProtocolParked => {
+                            tracing::error!(room = %room_id,
+                                "room parked after malformed protocol; explicit restart required");
+                            return;
+                        }
                     }
+                }
+                Err(err) if err.is_permanent() => {
+                    tracing::error!(room = %room_id, error = %err,
+                        "initial room join returned malformed protocol; parking without retry");
+                    return;
                 }
                 Err(err) => {
                     // Taper the level once the backoff has reached its cap.
@@ -328,6 +343,7 @@ async fn supervise_room(
         tokio::select! {
             event = events.recv() => match event {
                 Ok(comet_sync::RoomEvent::EphemeralUpdate) => on_event(),
+                Ok(comet_sync::RoomEvent::ProtocolParked) => return RoomExit::ProtocolParked,
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return RoomExit::ActorGone,
@@ -1302,5 +1318,29 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 inner.publish();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod room_supervision_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_protocol_parks_the_supervisor_instead_of_rebuilding() {
+        let (events_tx, events_rx) = tokio::sync::broadcast::channel(4);
+        let (_health_tx, health_rx) = tokio::sync::watch::channel(true);
+        let on_event: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let supervision = tokio::spawn(async move {
+            supervise_room("malformed-room", events_rx, health_rx, true, &on_event).await
+        });
+
+        events_tx
+            .send(comet_sync::RoomEvent::ProtocolParked)
+            .unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(1), supervision)
+            .await
+            .expect("supervisor stops immediately")
+            .expect("supervisor task");
+        assert_eq!(exit, RoomExit::ProtocolParked);
     }
 }

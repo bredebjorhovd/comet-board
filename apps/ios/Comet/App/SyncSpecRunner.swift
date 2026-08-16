@@ -24,6 +24,7 @@
 // wrong in the first place.
 
 import Foundation
+import Loro
 
 @MainActor
 enum SyncSpecRunner {
@@ -73,6 +74,7 @@ enum SyncSpecRunner {
         aJoinThenDieRoomIsBounded()
         aWorkingSessionEarnsAFreshLadder()
         onlyALastingSessionCounts()
+        aCommandQueuedAgainstReseedSurvives()
 
         log(failures == 0
             ? "OK \(checks) checks, no drift"
@@ -194,5 +196,63 @@ enum SyncSpecRunner {
         // The subtraction is unsigned; an underflow would read as healthy.
         expect(ReconnectBackoff.isHealthy(joinedAt: after(1_000_000_000), now: joined), false,
                "a clock that ran backwards is not a working session")
+    }
+
+    /// gh#450 review: queueing may already hold the old document when recovery
+    /// is ready to replace it. Both operations run concurrently here, with the
+    /// queue deliberately paused inside the owner gate. Replacement must wait,
+    /// replay that final command, and only then publish the new owner.
+    private static func aCommandQueuedAgainstReseedSurvives() {
+        let document = RoomDocument()
+        let queueHasOldOwner = DispatchSemaphore(value: 0)
+        let releaseQueue = DispatchSemaphore(value: 0)
+        let queueDone = DispatchSemaphore(value: 0)
+        let replaceStarted = DispatchSemaphore(value: 0)
+        let replaceDone = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global().async {
+            document.withCurrent { stale in
+                queueHasOldOwner.signal()
+                releaseQueue.wait()
+                appendSyncSpecCommand(to: stale, id: "boundary", deviceId: "phone-spec")
+            }
+            queueDone.signal()
+        }
+        queueHasOldOwner.wait()
+
+        DispatchQueue.global().async {
+            replaceStarted.signal()
+            let replacement = LoroDoc()
+            _ = document.replaceReplayingPendingCommands(
+                with: replacement, localDeviceId: "phone-spec"
+            )
+            replaceDone.signal()
+        }
+        replaceStarted.wait()
+        expect(replaceDone.wait(timeout: .now() + .milliseconds(100)), .timedOut,
+               "replacement waits while command creation owns the gate")
+        releaseQueue.signal()
+        queueDone.wait()
+        replaceDone.wait()
+
+        let commands = document.current().getList(id: "commands").getDeepValue().listValue ?? []
+        expect(commands.count, 1, "the boundary command crosses the owner swap")
+        expect(commands.first?.mapValue?["id"]?.stringValue, "boundary",
+               "the recovered command is the one queued against the old owner")
+    }
+}
+
+private func appendSyncSpecCommand(to doc: LoroDoc, id: String, deviceId: String) {
+    do {
+        let map = try doc.getList(id: "commands").pushContainer(child: LoroMap())
+        try map.insert(key: "id", v: id)
+        try map.insert(key: "kind", v: "interrupt")
+        try map.insert(key: "payload", v: LoroValue.map(value: ["kind": .string(value: "interrupt")]))
+        try map.insert(key: "issuedBy", v: deviceId)
+        try map.insert(key: "issuedAt", v: 1)
+        try map.insert(key: "status", v: "pending")
+        doc.commit()
+    } catch {
+        preconditionFailure("could not construct boundary command: \(error)")
     }
 }

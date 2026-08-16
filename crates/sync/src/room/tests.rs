@@ -59,6 +59,8 @@ struct FakeEdge {
     advertised_vv: Mutex<Option<VersionVector>>,
     /// Deterministic window for a test to subscribe before backfill arrives.
     backfill_delay_ms: AtomicU64,
+    /// Persistently advertise undecodable VV bytes after the initial join.
+    malformed_versions: AtomicBool,
     /// Swallow this many `%EPH` JoinRequests (consume, answer nothing) — the
     /// gh#126 shape: the doc room joins fine while the presence sub-join is
     /// lost, and nothing at any layer notices.
@@ -90,6 +92,7 @@ impl FakeEdge {
             full_snapshot_requests: AtomicUsize::new(0),
             advertised_vv: Mutex::new(None),
             backfill_delay_ms: AtomicU64::new(0),
+            malformed_versions: AtomicBool::new(false),
             swallow_eph_joins: AtomicUsize::new(0),
             eph_join_requests: AtomicUsize::new(0),
             dials: AtomicUsize::new(0),
@@ -199,19 +202,23 @@ impl FakeEdge {
                 if version.is_empty() {
                     self.full_snapshot_requests.fetch_add(1, Ordering::SeqCst);
                 }
-                let advertised_vv = self
-                    .advertised_vv
-                    .lock()
-                    .unwrap()
-                    .clone()
-                    .unwrap_or_else(|| self.doc.oplog_vv());
+                let advertised_version = if self.malformed_versions.load(Ordering::SeqCst) {
+                    vec![0xff, 0x00, 0xff]
+                } else {
+                    self.advertised_vv
+                        .lock()
+                        .unwrap()
+                        .clone()
+                        .unwrap_or_else(|| self.doc.oplog_vv())
+                        .encode()
+                };
                 self.reply(
                     reply_to,
                     &ProtocolMessage::JoinResponseOk {
                         crdt: CrdtType::Loro,
                         room_id: room_id.clone(),
                         permission: Permission::Write,
-                        version: advertised_vv.encode(),
+                        version: advertised_version,
                         extra: None,
                     },
                 )
@@ -362,6 +369,19 @@ impl FakeEdge {
                 self.leaves.fetch_add(1, Ordering::SeqCst);
             }
             _ => {}
+        }
+    }
+
+    async fn broadcast(&self, message: &ProtocolMessage) {
+        let senders: Vec<_> = self
+            .conns
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|conn| conn.tx.clone())
+            .collect();
+        for sender in senders {
+            self.reply(&sender, message).await;
         }
     }
 
@@ -608,6 +628,53 @@ async fn stale_full_client_reseeds_from_shallow_server_without_losing_local_comm
     client.shutdown().await.unwrap();
 }
 
+#[test]
+fn public_connect_requires_an_explicit_replacement_owner() {
+    let future = RoomClient::connect(
+        "ws://127.0.0.1:1",
+        "room-public-contract",
+        LoroDoc::new(),
+        DocRecovery::replacing(Arc::new(|_| {})),
+    );
+    drop(future); // Signature/ownership contract only; no dial is started.
+}
+
+#[tokio::test]
+async fn disabled_recovery_never_swaps_away_from_the_supplied_document() {
+    let server = LoroDoc::new();
+    server.set_peer_id(21).unwrap();
+    let messages = server.get_list("messages");
+    for id in ["m1", "m2", "m3"] {
+        messages.insert(messages.len(), id).unwrap();
+        server.commit();
+    }
+    let stale = LoroDoc::new();
+    stale
+        .import(&server.export(ExportMode::Snapshot).unwrap())
+        .unwrap();
+    for id in ["m4", "m5"] {
+        messages.insert(messages.len(), id).unwrap();
+        server.commit();
+    }
+    let snapshot = server
+        .export(ExportMode::shallow_snapshot(&server.oplog_frontiers()))
+        .unwrap();
+    let shallow_server = LoroDoc::new();
+    shallow_server.import(&snapshot).unwrap();
+    let edge = FakeEdge::with_doc(shallow_server);
+
+    let client = RoomClient::connect_with(edge.connector(), "room-1", stale.clone())
+        .await
+        .expect("normal join");
+    wait_until(|| edge.full_snapshot_requests.load(Ordering::SeqCst) == 1).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(stale.get_list("messages").len(), 3);
+    assert_eq!(client.doc().get_list("messages").len(), 3);
+    assert_eq!(edge.join_requests.load(Ordering::SeqCst), 2);
+    client.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn repeated_pending_imports_request_only_one_recovery_snapshot_and_publish_nothing() {
     let server = LoroDoc::new();
@@ -680,6 +747,50 @@ async fn repeated_pending_imports_request_only_one_recovery_snapshot_and_publish
         );
     }
     client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn persistent_malformed_server_versions_park_after_one_dial_and_join() {
+    let edge = FakeEdge::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new())
+        .await
+        .expect("initial valid join");
+    assert_eq!(edge.dials.load(Ordering::SeqCst), 1);
+    assert_eq!(edge.join_requests.load(Ordering::SeqCst), 1);
+
+    edge.malformed_versions.store(true, Ordering::SeqCst);
+    edge.broadcast(&ProtocolMessage::JoinResponseOk {
+        crdt: CrdtType::Loro,
+        room_id: "room-1".into(),
+        permission: Permission::Write,
+        version: vec![0xff, 0x00, 0xff],
+        extra: None,
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    assert_eq!(
+        edge.dials.load(Ordering::SeqCst),
+        1,
+        "malformed protocol state cannot heal by redialing the same DO"
+    );
+    assert_eq!(
+        edge.join_requests.load(Ordering::SeqCst),
+        1,
+        "a parked client must issue no further room joins"
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_initial_version_fails_once_without_background_retry() {
+    let edge = FakeEdge::new();
+    edge.malformed_versions.store(true, Ordering::SeqCst);
+    let result = RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new()).await;
+    assert!(matches!(result, Err(SyncError::Protocol(_))));
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert_eq!(edge.dials.load(Ordering::SeqCst), 1);
+    assert_eq!(edge.join_requests.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -897,7 +1008,13 @@ async fn connect_via_surfaces_url_provider_auth_error() {
             Box::pin(async { Err(SyncError::Auth("signed out".into())) })
         }
     }
-    let result = RoomClient::connect_via(Arc::new(SignedOut), "room-1", LoroDoc::new()).await;
+    let result = RoomClient::connect_via(
+        Arc::new(SignedOut),
+        "room-1",
+        LoroDoc::new(),
+        DocRecovery::replacing(Arc::new(|_| {})),
+    )
+    .await;
     match result {
         Ok(_) => panic!("connect must fail"),
         Err(err) => assert!(matches!(err, SyncError::Auth(_)), "got: {err}"),

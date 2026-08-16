@@ -182,6 +182,15 @@ pub enum SyncError {
     Closed,
 }
 
+impl SyncError {
+    /// Protocol bytes are deterministic server state, not a transport outage:
+    /// redialing the same room cannot repair them and would wake its Durable
+    /// Object forever. Callers supervising an initial join must park too.
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::Protocol(_))
+    }
+}
+
 /// Per-dial WebSocket URL provider — consulted before EVERY connection attempt,
 /// including background reconnects, so a short-lived auth token embedded in the
 /// URL (`?token=…`) is re-read fresh rather than frozen at first connect.
@@ -215,6 +224,9 @@ pub enum RoomEvent {
     EphemeralUpdate,
     /// The server evicted us; the client will NOT reconnect.
     Evicted,
+    /// Malformed protocol state parked the client; no background redial will
+    /// occur until an owner explicitly constructs/starts another client.
+    ProtocolParked,
 }
 
 /// App-owned state that must move with a room client when a shallow server
@@ -225,34 +237,45 @@ pub enum RoomEvent {
 /// local device so unresolved commands authored by that device can be copied
 /// into the replacement before it becomes visible. Workspace/registry rooms
 /// use [`DocRecovery::replacing`] because they have no command ledger.
+///
+/// `on_reseed` is the ownership boundary, not a notification. It must move all
+/// app-owned references synchronously. If command creation can retain the old
+/// document, a device callback must also gate that creation and reconcile the
+/// final old-document command delta before publishing the replacement. The
+/// room cannot close a race in an owner it does not control.
 #[derive(Clone)]
 pub struct DocRecovery {
     local_device_id: Option<String>,
-    on_reseed: Arc<dyn Fn(LoroDoc) + Send + Sync>,
+    on_reseed: Option<Arc<dyn Fn(LoroDoc) + Send + Sync>>,
 }
 
 impl DocRecovery {
+    /// Install session-document recovery with a synchronous replacement owner.
+    /// See [`DocRecovery`] for the callback's atomicity contract.
     pub fn for_device(
         device_id: impl Into<String>,
         on_reseed: Arc<dyn Fn(LoroDoc) + Send + Sync>,
     ) -> Self {
         Self {
             local_device_id: Some(device_id.into()),
-            on_reseed,
+            on_reseed: Some(on_reseed),
         }
     }
 
+    /// Install recovery for a document without a device command ledger.
     pub fn replacing(on_reseed: Arc<dyn Fn(LoroDoc) + Send + Sync>) -> Self {
         Self {
             local_device_id: None,
-            on_reseed,
+            on_reseed: Some(on_reseed),
         }
     }
-}
 
-impl Default for DocRecovery {
-    fn default() -> Self {
-        Self::replacing(Arc::new(|_| {}))
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            local_device_id: None,
+            on_reseed: None,
+        }
     }
 }
 
@@ -420,24 +443,23 @@ impl RoomClient {
     /// a full snapshot) is imported as it arrives. A first-attempt failure
     /// (unreachable edge, `JoinError`) is returned as `Err`; only after a
     /// successful join does the client keep reconnecting in the background.
-    pub async fn connect(url: &str, room_id: &str, doc: LoroDoc) -> Result<Self, SyncError> {
-        Self::connect_via(Arc::new(StaticUrl(url.to_string())), room_id, doc).await
+    /// `recovery` is mandatory because a shallow-history repair replaces the
+    /// LoroDoc object; its callback must move every app-owned reference to the
+    /// supplied replacement. There is deliberately no no-op default.
+    pub async fn connect(
+        url: &str,
+        room_id: &str,
+        doc: LoroDoc,
+        recovery: DocRecovery,
+    ) -> Result<Self, SyncError> {
+        Self::connect_via(Arc::new(StaticUrl(url.to_string())), room_id, doc, recovery).await
     }
 
     /// Like [`Self::connect`], but the WebSocket URL is re-fetched from
     /// `provider` before every dial (initial and reconnects) — the seam for
     /// expiring bearer tokens carried as `?token=`.
+    /// Ownership recovery remains explicit for the same reason as `connect`.
     pub async fn connect_via(
-        provider: Arc<dyn UrlProvider>,
-        room_id: &str,
-        doc: LoroDoc,
-    ) -> Result<Self, SyncError> {
-        Self::connect_via_recovering(provider, room_id, doc, DocRecovery::default()).await
-    }
-
-    /// [`Self::connect_via`] with ownership repair for a doc that must be
-    /// replaced after an incomplete shallow-snapshot import.
-    pub async fn connect_via_recovering(
         provider: Arc<dyn UrlProvider>,
         room_id: &str,
         doc: LoroDoc,
@@ -453,7 +475,7 @@ impl RoomClient {
         room_id: &str,
         doc: LoroDoc,
     ) -> Result<Self, SyncError> {
-        Self::connect_with_recovery(connector, room_id, doc, DocRecovery::default()).await
+        Self::connect_with_recovery(connector, room_id, doc, DocRecovery::disabled()).await
     }
 
     pub(crate) async fn connect_with_recovery(
@@ -741,6 +763,25 @@ impl RoomActor {
                     backoff = BACKOFF_CAP;
                 }
                 SessionEnd::Lost(err) => {
+                    if err.is_permanent() {
+                        if let Some(tx) = ready.take() {
+                            let _ = tx.send(Err(err));
+                            return;
+                        }
+                        tracing::error!(room = %self.room_id, error = %err,
+                            "malformed room protocol; parking without redial");
+                        let _ = self.events.send(RoomEvent::ProtocolParked);
+                        // Keep the actor—and therefore its terminal state—alive
+                        // until shutdown. A supervisor sees ProtocolParked and
+                        // drops the client instead of mistaking actor death for
+                        // a transient failure worth rebuilding.
+                        while !*self.shutdown.borrow() {
+                            if self.shutdown.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        return;
+                    }
                     if let Some(tx) = ready.take() {
                         // Never joined: fail `connect()` fast instead of
                         // silently retrying in the background.
@@ -1411,6 +1452,12 @@ impl Session {
     /// commands authored by this device, and atomically move every room-owned
     /// reference/subscription to the replacement.
     async fn try_reseed(&mut self, snapshot: &[u8]) -> Result<bool, SyncError> {
+        let Some(on_reseed) = self.recovery.on_reseed.clone() else {
+            // The public API requires an explicit owner. Test-only disabled
+            // recovery may request one snapshot but must never swap behind a
+            // caller that still retains the supplied LoroDoc.
+            return Ok(false);
+        };
         let Some(server_vv) = self.server_vv.clone() else {
             return Ok(false);
         };
@@ -1462,7 +1509,7 @@ impl Session {
             .current_doc
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.clone();
-        (self.recovery.on_reseed)(candidate.clone());
+        on_reseed(candidate.clone());
         self.doc = candidate;
 
         if let Some(update) = replay_update.filter(|bytes| !bytes.is_empty()) {

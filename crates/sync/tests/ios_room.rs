@@ -214,7 +214,8 @@ fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_intent() {
         "a fresh replacement must reach the VV advertised by the edge"
     );
     assert!(
-        client.contains("replayUnresolvedLocalCommands(from: doc, into: replacement)"),
+        client.contains("private static func replayUnresolvedLocalCommands")
+            && client.contains("replaceReplayingPendingCommands"),
         "device-local pending commands must move before replacement"
     );
     assert!(
@@ -223,7 +224,7 @@ fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_intent() {
         "replay must be limited to this device's unresolved intent"
     );
     assert!(
-        client.contains("document.replace(with: replacement)"),
+        client.contains("document.replaceReplayingPendingCommands("),
         "the room must swap the shared owner, not only its private doc reference"
     );
     assert!(
@@ -238,12 +239,37 @@ fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_intent() {
     );
     assert!(
         store.contains("private let document = RoomDocument()")
-            && store.contains("localDeviceId: config.deviceId"),
-        "SessionStore must share the swappable document and identify its command author"
+            && store.contains("localDeviceId: config.deviceId")
+            && store.contains("document.withCurrent"),
+        "SessionStore command creation must hold the shared document gate"
+    );
+    assert!(
+        client.contains("replaceReplayingPendingCommands")
+            && client.contains("from: doc, into: replacement")
+            && client.contains("func withCurrent<T>"),
+        "RoomDocument replacement must make the final replay and owner swap atomic"
+    );
+    let sync_spec = read("apps/ios/Comet/App/SyncSpecRunner.swift");
+    assert!(
+        sync_spec.contains("aCommandQueuedAgainstReseedSurvives")
+            && sync_spec.contains("queueHasOldOwner")
+            && sync_spec.contains("replaceReplayingPendingCommands"),
+        "the phone runtime spec must exercise concurrent queue-vs-reseed ownership"
     );
     assert!(
         disk.contains("candidateStatus.pending == nil")
             && disk.contains("installedStatus.pending == nil"),
         "a pending disk import must not mutate or be accepted by the live document"
+    );
+}
+
+#[test]
+fn the_phone_parks_instead_of_redialing_malformed_server_versions() {
+    let client = room_client_swift();
+    assert!(
+        client.contains("parkProtocol")
+            && client.contains("invalid server version vector; parking room")
+            && client.contains("guard !closed, !protocolParked else { return }"),
+        "malformed room protocol must trip a finite circuit rather than reconnect"
     );
 }

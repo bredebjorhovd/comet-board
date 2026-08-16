@@ -309,24 +309,28 @@ final class SessionStore {
 
     /// schema.rs queue_command, field for field.
     private func queueCommand(kind: String, payload: [String: Any]) {
-        let commands = doc.getList(id: "commands")
-        do {
-            let map = try commands.pushContainer(child: LoroMap())
-            try map.insert(key: "id", v: UUID().uuidString.lowercased())
-            try map.insert(key: "kind", v: kind)
-            try map.insert(key: "payload", v: LoroValue.fromJSON(payload))
-            try map.insert(key: "issuedBy", v: config.deviceId)
-            try map.insert(key: "issuedAt", v: nowMs())
-            if let turnId = lastEntryId {
-                try map.insert(key: "basedOn", v: LoroValue.map(value: [
-                    "turnId": .string(value: turnId),
-                    "frontier": .null,
-                ]))
+        document.withCurrent { doc in
+            let commands = doc.getList(id: "commands")
+            do {
+                let map = try commands.pushContainer(child: LoroMap())
+                try map.insert(key: "id", v: UUID().uuidString.lowercased())
+                try map.insert(key: "kind", v: kind)
+                try map.insert(key: "payload", v: LoroValue.fromJSON(payload))
+                try map.insert(key: "issuedBy", v: config.deviceId)
+                try map.insert(key: "issuedAt", v: nowMs())
+                if let turnId = lastEntryId {
+                    try map.insert(key: "basedOn", v: LoroValue.map(value: [
+                        "turnId": .string(value: turnId),
+                        "frontier": .null,
+                    ]))
+                }
+                try map.insert(key: "expiresAt", v: nowMs() + commandDefaultTtlMs)
+                try map.insert(key: "status", v: "pending")
+                doc.commit()
+            } catch {
+                roomLog.error("session \(self.chatId, privacy: .public): failed to queue \(kind, privacy: .public) command")
             }
-            try map.insert(key: "expiresAt", v: nowMs() + commandDefaultTtlMs)
-            try map.insert(key: "status", v: "pending")
-            doc.commit()
-        } catch {}
+        }
         nudgeHost()
     }
 

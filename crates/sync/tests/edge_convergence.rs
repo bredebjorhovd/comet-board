@@ -11,10 +11,15 @@
 //! `COMET_EDGE_TOKEN` overrides the dev bearer (defaults to `sync-it-user`;
 //! both clients must share it — chat rooms are claim-on-first-join owned).
 
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use comet_doc::{MessagePart, MessageRole, SessionDoc, SessionMessageEntry};
-use comet_sync::RoomClient;
+use comet_sync::{DocRecovery, RoomClient};
+
+fn current(owner: &RwLock<loro::LoroDoc>) -> SessionDoc {
+    SessionDoc::from_doc(owner.read().unwrap_or_else(PoisonError::into_inner).clone())
+}
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -55,33 +60,53 @@ async fn two_session_docs_converge_through_a_real_room() {
 
     // Host device initializes the doc and claims the room.
     let host = SessionDoc::init(&chat_id).expect("init session doc");
-    let host_client = RoomClient::connect(&url, &chat_id, host.doc().clone())
-        .await
-        .expect("host connect");
+    let host_owner = Arc::new(RwLock::new(host.doc().clone()));
+    let host_reseed = host_owner.clone();
+    let host_client = RoomClient::connect(
+        &url,
+        &chat_id,
+        current(&host_owner).doc().clone(),
+        DocRecovery::replacing(Arc::new(move |replacement| {
+            *host_reseed.write().unwrap_or_else(PoisonError::into_inner) = replacement;
+        })),
+    )
+    .await
+    .expect("host connect");
 
     // Second device starts empty and backfills from the room.
-    let peer_doc = loro::LoroDoc::new();
-    let peer_client = RoomClient::connect(&url, &chat_id, peer_doc.clone())
-        .await
-        .expect("peer connect");
-    let peer = SessionDoc::from_doc(peer_doc);
-    wait_until(|| peer.chat_id().as_deref() == Some(chat_id.as_str())).await;
+    let peer_owner = Arc::new(RwLock::new(loro::LoroDoc::new()));
+    let peer_reseed = peer_owner.clone();
+    let peer_client = RoomClient::connect(
+        &url,
+        &chat_id,
+        current(&peer_owner).doc().clone(),
+        DocRecovery::replacing(Arc::new(move |replacement| {
+            *peer_reseed.write().unwrap_or_else(PoisonError::into_inner) = replacement;
+        })),
+    )
+    .await
+    .expect("peer connect");
+    wait_until(|| current(&peer_owner).chat_id().as_deref() == Some(chat_id.as_str())).await;
 
     // Host → peer.
-    host.push_message(&text_message("m1", "device-host", "hello from host"))
+    current(&host_owner)
+        .push_message(&text_message("m1", "device-host", "hello from host"))
         .expect("push m1");
     wait_until(|| {
-        peer.read_entries()
+        current(&peer_owner)
+            .read_entries()
             .map(|e| e.iter().any(|m| m.id == "m1"))
             .unwrap_or(false)
     })
     .await;
 
     // Peer → host.
-    peer.push_message(&text_message("m2", "device-peer", "hello from peer"))
+    current(&peer_owner)
+        .push_message(&text_message("m2", "device-peer", "hello from peer"))
         .expect("push m2");
     wait_until(|| {
-        host.read_entries()
+        current(&host_owner)
+            .read_entries()
             .map(|e| e.iter().any(|m| m.id == "m2"))
             .unwrap_or(false)
     })
@@ -90,7 +115,8 @@ async fn two_session_docs_converge_through_a_real_room() {
     // Full deep-value convergence.
     use loro::ToJson;
     wait_until(|| {
-        host.doc().get_deep_value().to_json_value() == peer.doc().get_deep_value().to_json_value()
+        current(&host_owner).doc().get_deep_value().to_json_value()
+            == current(&peer_owner).doc().get_deep_value().to_json_value()
     })
     .await;
 
