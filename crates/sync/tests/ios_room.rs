@@ -50,6 +50,14 @@ fn room_client_swift() -> String {
     read("apps/ios/Comet/Sync/RoomClient.swift")
 }
 
+fn session_store_swift() -> String {
+    read("apps/ios/Comet/Sync/SessionStore.swift")
+}
+
+fn doc_disk_swift() -> String {
+    read("apps/ios/Comet/Sync/DocDisk.swift")
+}
+
 /// `const NAME: Duration = Duration::from_secs(30);` → 30_000 ms.
 fn rust_duration_ms(source: &str, name: &str) -> u64 {
     let line = source
@@ -181,5 +189,87 @@ fn the_phone_ladder_has_one_owner() {
         offenders.is_empty(),
         "the base rung belongs to ReconnectBackoff alone (gh#405); found:\n  {}",
         offenders.join("\n  ")
+    );
+}
+
+/// gh#450 is another hand-ported room rule, but this time the false-success
+/// value comes from Loro itself: importing a shallow snapshot into an older
+/// full-history doc returns `ImportStatus.pending` instead of throwing. Keep
+/// the iOS implementation pinned to the three safety gates that make replacing
+/// a session doc sound: reject pending imports, validate a fresh candidate
+/// against the edge's advertised VV, and replay pending commands before the
+/// shared owner swaps to that candidate.
+#[test]
+fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_intent() {
+    let client = room_client_swift();
+    let store = session_store_swift();
+    let disk = doc_disk_swift();
+
+    assert!(
+        client.contains("if status.pending == nil"),
+        "RoomClient must not treat a non-throwing pending import as complete"
+    );
+    assert!(
+        client.contains("replacement.oplogVv() == serverVv"),
+        "a fresh replacement must reach the VV advertised by the edge"
+    );
+    assert!(
+        client.contains("private static func replayUnresolvedLocalCommands")
+            && client.contains("replaceReplayingPendingCommands"),
+        "device-local pending commands must move before replacement"
+    );
+    assert!(
+        client.contains("command[\"issuedBy\"]?.stringValue == localDeviceId")
+            && client.contains("command[\"status\"]?.stringValue == \"pending\""),
+        "replay must be limited to this device's unresolved intent"
+    );
+    assert!(
+        client.contains("document.replaceReplayingPendingCommands("),
+        "the room must swap the shared owner, not only its private doc reference"
+    );
+    assert!(
+        client.contains("guard !fullResyncRequested else { return }")
+            && client
+                .matches("sendJoinLoro(version: [], suppressJoinEffects: joinedLor)")
+                .count()
+                == 1
+            && client.contains("code == .versionUnknown")
+            && client.contains("await requestFullResync()"),
+        "every full-snapshot fallback must share one per-connection latch"
+    );
+    assert!(
+        store.contains("private let document = RoomDocument()")
+            && store.contains("localDeviceId: config.deviceId")
+            && store.contains("document.withCurrent"),
+        "SessionStore command creation must hold the shared document gate"
+    );
+    assert!(
+        client.contains("replaceReplayingPendingCommands")
+            && client.contains("from: doc, into: replacement")
+            && client.contains("func withCurrent<T>"),
+        "RoomDocument replacement must make the final replay and owner swap atomic"
+    );
+    let sync_spec = read("apps/ios/Comet/App/SyncSpecRunner.swift");
+    assert!(
+        sync_spec.contains("aCommandQueuedAgainstReseedSurvives")
+            && sync_spec.contains("queueHasOldOwner")
+            && sync_spec.contains("replaceReplayingPendingCommands"),
+        "the phone runtime spec must exercise concurrent queue-vs-reseed ownership"
+    );
+    assert!(
+        disk.contains("candidateStatus.pending == nil")
+            && disk.contains("installedStatus.pending == nil"),
+        "a pending disk import must not mutate or be accepted by the live document"
+    );
+}
+
+#[test]
+fn the_phone_parks_instead_of_redialing_malformed_server_versions() {
+    let client = room_client_swift();
+    assert!(
+        client.contains("parkProtocol")
+            && client.contains("invalid server version vector; parking room")
+            && client.contains("guard !closed, !protocolParked else { return }"),
+        "malformed room protocol must trip a finite circuit rather than reconnect"
     );
 }

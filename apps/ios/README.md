@@ -70,6 +70,54 @@ plutil -extract CFBundleIdentifier raw "$APP/Info.plist"
 
 `scripts/ios-stats-spec.sh` does exactly that. Copy it, do not hardcode.
 
+For a connected phone that already trusts this Mac, the repository also has a
+one-command build/install/launch path. It reads the signed bundle id from the
+built app, so the local signing override above is honored:
+
+```sh
+scripts/ios-phone-install.sh 'Brede’s iPhone'
+```
+
+To exercise the shallow-session recovery from gh#450, route directly to the
+known affected chat on launch:
+
+```sh
+scripts/ios-phone-install.sh 'Brede’s iPhone' \
+  b5b3c796-2f3b-4bb2-8341-95d1d7782927
+```
+
+Before the live-room check, run the same signed build on the phone with the
+deterministic sync spec. It races a command commit holding the old-document
+gate against reseeding, pulls the result log back from the app container, and
+requires an `OK` verdict:
+
+```sh
+scripts/ios-phone-install.sh 'Brede’s iPhone' --sync-spec
+```
+
+In Xcode's Devices and Simulators console (or Console.app with the phone
+selected), filter on subsystem `dev.cometnative.Comet` and category `sync`.
+Recovery emits `reseeded stale local document from validated server snapshot`
+with the unresolved-command replay count. The HITL pass is: the chat advances
+past its cached 75-message prefix to the server's 135-message state, a pending
+offline send/input/verdict still arrives at the host, and reopening the app
+retains the recovered transcript from disk.
+
+This recovery does not add a timer, alarm, poll, socket, or Durable Object
+wake. The stale phone makes its ordinary room join on the existing socket. A
+valid server shallow snapshot is reseeded locally with no additional request;
+if that snapshot cannot be validated, the client may send exactly one
+empty-version recovery join on that socket to request a full snapshot. A
+per-connection latch suppresses every further recovery request, including
+repeated pending imports and `versionUnknown` replies. A later socket loss uses
+the existing capped, jittered reconnect backoff and begins a new recovery
+episode; probe and liveness intervals are unchanged.
+
+An undecodable server version vector is different from a lost socket: the same
+protocol bytes will not heal on redial. That room parks on its current attempt
+and requires an explicit store/app restart; it does not enter either reconnect
+layer, issue another join, or wake the Durable Object again.
+
 An ignored file rather than settings in `Comet.xcodeproj/project.pbxproj`: put a
 team id in the tracked `.pbxproj` and it is a permanent dirty diff, one that has
 already been swept into an unrelated `git stash` and nearly lost. It cannot

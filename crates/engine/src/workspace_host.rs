@@ -21,14 +21,14 @@
 //! belief is made of, and why it is no longer a 15s heartbeat, is
 //! [`crate::presence`] (gh#145).
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 
 use chrono::Utc;
 use tokio::sync::watch;
 
 use comet_doc::{DeletedSpace, WorkspaceDoc};
 use comet_proto::{Chat, ChatConfig, Device, Session, Space};
-use comet_sync::{DocsStore, RoomClient};
+use comet_sync::{DocRecovery, DocsStore, RoomClient};
 
 use crate::doc_host::EdgeConfig;
 use crate::org_devices::{OrgDevices, OrgDevicesConfig, merge_devices};
@@ -132,7 +132,8 @@ pub struct WorkspaceHostConfig {
 struct WorkspaceHostInner {
     store: Arc<DocsStore>,
     config: WorkspaceHostConfig,
-    doc: Arc<WorkspaceDoc>,
+    doc: RwLock<Arc<WorkspaceDoc>>,
+    changed_tx: watch::Sender<u64>,
     /// The org-wide device registry (gh#66) — the only entity index that is
     /// NOT private to this user. Shares this host's change channel, snapshot
     /// debounce and presence tick.
@@ -152,7 +153,28 @@ struct WorkspaceHostInner {
     /// immediately instead of waiting out the failure backoff.
     peer_alive: Mutex<Option<PeerAliveHook>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
-    _sub: loro::Subscription,
+    _sub: Mutex<loro::Subscription>,
+}
+
+impl WorkspaceHostInner {
+    fn doc(&self) -> Arc<WorkspaceDoc> {
+        self.doc
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn reseed(&self, raw: loro::LoroDoc) {
+        let replacement = Arc::new(WorkspaceDoc::from_doc(raw));
+        let changed_tx = self.changed_tx.clone();
+        let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
+            changed_tx.send_modify(|value| *value = value.wrapping_add(1));
+        }));
+        *self.doc.write().unwrap_or_else(PoisonError::into_inner) = replacement;
+        *lock(&self._sub) = sub;
+        self.changed_tx
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -162,8 +184,9 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Why a supervised room client was abandoned — both reasons mean "build a new
-/// one", never "give up".
+/// Why a supervised room client was abandoned. Transient exits rebuild it;
+/// deterministic malformed protocol parks it until explicit restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RoomExit {
     /// The client's actor task is gone (clean shutdown, or a panic / lost
     /// local-update channel that leaves a client which can never reconnect).
@@ -173,6 +196,10 @@ enum RoomExit {
     /// slowness — it is a stuck actor (gh#116), and a fresh client with fresh
     /// credentials is the way out.
     DarkTooLong,
+    /// The server produced deterministic malformed protocol bytes. Rebuilding
+    /// would wake the same DO forever, so this room parks until its owner is
+    /// explicitly restarted.
+    ProtocolParked,
 }
 
 /// Join `room_id` and hold it in `slot` for the joiner's life — the shared
@@ -207,16 +234,36 @@ pub(crate) fn spawn_room_join(
     url: Arc<dyn comet_sync::UrlProvider>,
     room_id: String,
     doc: loro::LoroDoc,
+    local_device_id: Option<String>,
+    on_reseed: Arc<dyn Fn(loro::LoroDoc) + Send + Sync>,
     slot: Weak<Mutex<Option<RoomClient>>>,
     on_event: Arc<dyn Fn() + Send + Sync>,
 ) {
     tokio::spawn(async move {
         let mut backoff = JOIN_RETRY_BASE;
+        // Outlives any one RoomClient actor. If supervision rebuilds a client
+        // after a successful reseed, it must dial with the replacement rather
+        // than resurrecting the stale handle captured at startup.
+        let current_doc = Arc::new(RwLock::new(doc));
         loop {
             if slot.upgrade().is_none() {
                 return; // host dropped
             }
-            match RoomClient::connect_via(url.clone(), &room_id, doc.clone()).await {
+            let doc = current_doc
+                .read()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let reseed_slot = current_doc.clone();
+            let reseed_owner = on_reseed.clone();
+            let reseed = Arc::new(move |replacement: loro::LoroDoc| {
+                *reseed_slot.write().unwrap_or_else(PoisonError::into_inner) = replacement.clone();
+                reseed_owner(replacement);
+            });
+            let recovery = match local_device_id.as_deref() {
+                Some(device_id) => DocRecovery::for_device(device_id, reseed),
+                None => DocRecovery::replacing(reseed),
+            };
+            match RoomClient::connect_via(url.clone(), &room_id, doc, recovery).await {
                 Ok(client) => {
                     // Health handles are taken BEFORE the client moves into the
                     // slot, so supervision never has to hold the slot lock.
@@ -245,7 +292,17 @@ pub(crate) fn spawn_room_join(
                             dark_s = ROOM_DARK_REBUILD.as_secs(),
                             "room held no live connection; rebuilding the client"
                         ),
+                        RoomExit::ProtocolParked => {
+                            tracing::error!(room = %room_id,
+                                "room parked after malformed protocol; explicit restart required");
+                            return;
+                        }
                     }
+                }
+                Err(err) if err.is_permanent() => {
+                    tracing::error!(room = %room_id, error = %err,
+                        "initial room join returned malformed protocol; parking without retry");
+                    return;
                 }
                 Err(err) => {
                     // Taper the level once the backoff has reached its cap.
@@ -286,6 +343,7 @@ async fn supervise_room(
         tokio::select! {
             event = events.recv() => match event {
                 Ok(comet_sync::RoomEvent::EphemeralUpdate) => on_event(),
+                Ok(comet_sync::RoomEvent::ProtocolParked) => return RoomExit::ProtocolParked,
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => return RoomExit::ActorGone,
@@ -361,7 +419,7 @@ impl WorkspaceHost {
                 org_id: config.org_id.clone(),
                 edge: config.edge.clone(),
             },
-            changed_tx,
+            changed_tx.clone(),
         )?;
 
         // Boot: upsert our own device row — into BOTH the private workspace doc
@@ -405,7 +463,8 @@ impl WorkspaceHost {
             inner: Arc::new(WorkspaceHostInner {
                 store,
                 config,
-                doc,
+                doc: RwLock::new(doc),
+                changed_tx,
                 org_devices,
                 chats_tx,
                 devices_tx,
@@ -414,7 +473,7 @@ impl WorkspaceHost {
                 room: Arc::new(Mutex::new(None)),
                 presence: Mutex::new(PresenceBelief::default()),
                 peer_alive: Mutex::new(None),
-                _sub: sub,
+                _sub: Mutex::new(sub),
             }),
         };
         host.join_room();
@@ -465,10 +524,17 @@ impl WorkspaceHost {
         // skew that DID matter would be a silent outage, not an error.
         let room_id = format!("ws4/{}/{}", org_id, self.inner.config.user_id);
         let weak = Arc::downgrade(&self.inner);
+        let reseed_owner = weak.clone();
         spawn_room_join(
             url,
             room_id,
-            self.inner.doc.doc().clone(),
+            self.inner.doc().doc().clone(),
+            None,
+            Arc::new(move |replacement| {
+                if let Some(inner) = reseed_owner.upgrade() {
+                    inner.reseed(replacement);
+                }
+            }),
             Arc::downgrade(&self.inner.room),
             // Presence rides `%EPH`, never the doc — the room's answer must
             // re-publish the device watch itself (the signal that distinguishes
@@ -492,12 +558,12 @@ impl WorkspaceHost {
         &self.inner.config.device_id
     }
 
-    pub fn doc(&self) -> &WorkspaceDoc {
-        &self.inner.doc
+    pub fn doc(&self) -> Arc<WorkspaceDoc> {
+        self.inner.doc()
     }
 
     pub fn doc_arc(&self) -> Arc<WorkspaceDoc> {
-        self.inner.doc.clone()
+        self.inner.doc()
     }
 
     /// Is the workspace room joined RIGHT NOW? Holding a client is not holding
@@ -571,7 +637,7 @@ impl WorkspaceHost {
     /// §2.2 writer discipline: the chat's host is its row's `deviceId`. Unknown chats
     /// are claimable — the first run command claims them via [`Self::claim_chat`].
     pub fn is_host(&self, chat_id: &str) -> bool {
-        match self.inner.doc.chat(chat_id) {
+        match self.inner.doc().chat(chat_id) {
             Ok(Some(chat)) => chat.device_id == self.inner.config.device_id,
             Ok(None) => true,
             Err(err) => {
@@ -592,14 +658,14 @@ impl WorkspaceHost {
     /// cwd claims a space *at the worktree path*, not the repo root — acceptable
     /// for tooling-only (raw doc command) traffic.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
-        if self.inner.doc.chat(chat_id)?.is_some() {
+        if self.inner.doc().chat(chat_id)?.is_some() {
             return Ok(());
         }
         let space_id = match cwd {
             Some(cwd) => Some(self.space_for_path(cwd)?),
             None => None,
         };
-        self.inner.doc.upsert_chat(&Chat {
+        self.inner.doc().upsert_chat(&Chat {
             id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
             title: None,
@@ -624,7 +690,7 @@ impl WorkspaceHost {
         let device_id = &self.inner.config.device_id;
         if let Some(space) = self
             .inner
-            .doc
+            .doc()
             .read_spaces()?
             .into_iter()
             .find(|s| s.device_id == *device_id && s.path == path)
@@ -642,7 +708,7 @@ impl WorkspaceHost {
             branch: None,
             created_at: Utc::now(),
         };
-        self.inner.doc.upsert_space(&space)?;
+        self.inner.doc().upsert_space(&space)?;
         Ok(space.id)
     }
 
@@ -654,7 +720,7 @@ impl WorkspaceHost {
 
     /// The whole chat row, when the workspace doc has one.
     pub fn chat(&self, chat_id: &str) -> Option<comet_proto::Chat> {
-        match self.inner.doc.chat(chat_id) {
+        match self.inner.doc().chat(chat_id) {
             Ok(chat) => chat,
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");
@@ -671,7 +737,7 @@ impl WorkspaceHost {
         let preview: String = text.chars().take(120).collect();
         let result = self.claim_chat(chat_id, None).and_then(|_| {
             self.inner
-                .doc
+                .doc()
                 .set_chat_last_message(chat_id, &preview, Utc::now())
                 .map_err(EngineError::from)
         });
@@ -688,7 +754,7 @@ impl WorkspaceHost {
     pub fn set_chat_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         match self
             .inner
-            .doc
+            .doc()
             .set_chat_harness_session(chat_id, session_id, cwd)
         {
             Ok(_) => {}
@@ -702,7 +768,7 @@ impl WorkspaceHost {
     /// The empty-string tombstone passes through — callers must treat it as
     /// "explicitly no resume" (and must NOT fall back to older sources).
     pub fn chat_harness_session(&self, chat_id: &str) -> Option<(String, Option<String>)> {
-        match self.inner.doc.chat(chat_id) {
+        match self.inner.doc().chat(chat_id) {
             Ok(chat) => {
                 let chat = chat?;
                 let id = chat.harness_session_id?;
@@ -718,7 +784,7 @@ impl WorkspaceHost {
     /// Session-status row upsert (sessions engine transitions land here too, in
     /// addition to the local watch channel).
     pub fn record_session(&self, session: &Session) {
-        if let Err(err) = self.inner.doc.upsert_session(session) {
+        if let Err(err) = self.inner.doc().upsert_session(session) {
             tracing::warn!(chat = %session.chat_id, error = %err, "workspace session write failed");
         }
     }
@@ -735,13 +801,13 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
     ) -> Result<(), EngineError> {
-        if self.inner.doc.chat(chat_id)?.is_some() {
+        if self.inner.doc().chat(chat_id)?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
-        let Some(space) = self.inner.doc.space(space_id)? else {
+        let Some(space) = self.inner.doc().space(space_id)? else {
             return Err(EngineError::Other(format!("no such space: {space_id}")));
         };
-        self.inner.doc.upsert_chat(&Chat {
+        self.inner.doc().upsert_chat(&Chat {
             id: chat_id.to_string(),
             device_id: space.device_id.clone(),
             title: None,
@@ -775,14 +841,14 @@ impl WorkspaceHost {
         name: Option<String>,
         git_detected: bool,
     ) -> Result<(), EngineError> {
-        let spaces = self.inner.doc.read_spaces()?;
+        let spaces = self.inner.doc().read_spaces()?;
         if spaces
             .iter()
             .any(|s| s.id == space_id || (s.device_id == device_id && s.path == path))
         {
             return Ok(());
         }
-        self.inner.doc.upsert_space(&Space {
+        self.inner.doc().upsert_space(&Space {
             id: space_id.to_string(),
             device_id: device_id.to_string(),
             path: path.to_string(),
@@ -797,13 +863,13 @@ impl WorkspaceHost {
     }
 
     pub fn rename_space(&self, space_id: &str, name: Option<&str>) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.rename_space(space_id, name)?)
+        Ok(self.inner.doc().rename_space(space_id, name)?)
     }
 
     /// Hard-delete a space and its chats (doc cascade). The caller (rpc layer)
     /// tears down live runs / doc-host handles for the returned chat ids.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
-        Ok(self.inner.doc.delete_space(space_id)?)
+        Ok(self.inner.doc().delete_space(space_id)?)
     }
 
     /// Synced seen marker (any device; LWW + monotonic guard in the doc layer).
@@ -812,7 +878,7 @@ impl WorkspaceHost {
         chat_id: &str,
         at: chrono::DateTime<Utc>,
     ) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.set_chat_seen(chat_id, at)?)
+        Ok(self.inner.doc().set_chat_seen(chat_id, at)?)
     }
 
     /// Owner-only git stamp (SpacesSync). Refuses rows owned by another device.
@@ -823,11 +889,16 @@ impl WorkspaceHost {
         checkout_id: Option<&str>,
         branch: Option<&str>,
     ) -> Result<bool, EngineError> {
-        match self.inner.doc.space(space_id)? {
-            Some(space) if space.device_id == self.inner.config.device_id => Ok(self
-                .inner
-                .doc
-                .set_space_git(space_id, detected, checkout_id, branch, Utc::now())?),
+        match self.inner.doc().space(space_id)? {
+            Some(space) if space.device_id == self.inner.config.device_id => {
+                Ok(self.inner.doc().set_space_git(
+                    space_id,
+                    detected,
+                    checkout_id,
+                    branch,
+                    Utc::now(),
+                )?)
+            }
             Some(space) => {
                 tracing::warn!(
                     space = %space_id, owner = %space.device_id,
@@ -840,11 +911,11 @@ impl WorkspaceHost {
     }
 
     pub fn read_spaces(&self) -> Result<Vec<Space>, EngineError> {
-        Ok(self.inner.doc.read_spaces()?)
+        Ok(self.inner.doc().read_spaces()?)
     }
 
     pub fn rename_chat(&self, chat_id: &str, title: &str) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.rename_chat(chat_id, title)?)
+        Ok(self.inner.doc().rename_chat(chat_id, title)?)
     }
 
     /// Backdate a chat's activity timestamps (epoch ms). Returns false when
@@ -855,7 +926,7 @@ impl WorkspaceHost {
         last_message_at: Option<i64>,
         created_at: Option<i64>,
     ) -> Result<bool, EngineError> {
-        let Some(mut chat) = self.inner.doc.chat(chat_id)? else {
+        let Some(mut chat) = self.inner.doc().chat(chat_id)? else {
             return Ok(false);
         };
         if let Some(ms) = last_message_at {
@@ -866,7 +937,7 @@ impl WorkspaceHost {
         {
             chat.created_at = at;
         }
-        self.inner.doc.upsert_chat(&chat)?;
+        self.inner.doc().upsert_chat(&chat)?;
         Ok(true)
     }
 
@@ -874,16 +945,16 @@ impl WorkspaceHost {
     /// migration flow will drive this). Returns false when the chat doesn't
     /// exist.
     pub fn set_chat_host(&self, chat_id: &str, device_id: &str) -> Result<bool, EngineError> {
-        let Some(mut chat) = self.inner.doc.chat(chat_id)? else {
+        let Some(mut chat) = self.inner.doc().chat(chat_id)? else {
             return Ok(false);
         };
         chat.device_id = device_id.to_string();
-        self.inner.doc.upsert_chat(&chat)?;
+        self.inner.doc().upsert_chat(&chat)?;
         Ok(true)
     }
 
     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.set_chat_archived(chat_id, archived)?)
+        Ok(self.inner.doc().set_chat_archived(chat_id, archived)?)
     }
 
     /// LWW full-config replace on the chat row (comet `SetChatConfig` — the
@@ -906,19 +977,19 @@ impl WorkspaceHost {
         {
             config.turn_limits = existing.turn_limits;
         }
-        Ok(self.inner.doc.set_chat_config(chat_id, &config)?)
+        Ok(self.inner.doc().set_chat_config(chat_id, &config)?)
     }
 
     /// Tombstone: removes the chats (and session-status) row; the per-chat session
     /// doc remains untouched.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.delete_chat(chat_id)?)
+        Ok(self.inner.doc().delete_chat(chat_id)?)
     }
 
     /// LWW rename from any device, written to both device docs so the new name
     /// reaches this user's other devices AND the rest of the org.
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
-        let renamed = self.inner.doc.rename_device(device_id, name)?;
+        let renamed = self.inner.doc().rename_device(device_id, name)?;
         self.inner.org_devices.rename_device(device_id, name);
         // The org registry may hold a row the private doc never did (another
         // user's device), so either write landing counts as a rename.
@@ -928,7 +999,7 @@ impl WorkspaceHost {
     /// Every device the caller can address: this user's own rows merged with
     /// the org registry (gh#66).
     pub fn devices(&self) -> Vec<Device> {
-        let own = self.inner.doc.read_devices().unwrap_or_else(|err| {
+        let own = self.inner.doc().read_devices().unwrap_or_else(|err| {
             tracing::warn!(error = %err, "workspace device read failed");
             Vec::new()
         });
@@ -950,18 +1021,18 @@ impl WorkspaceHost {
 
     /// HEAD-watcher reconciliation: the branch checked out at the chat's cwd.
     pub fn set_chat_branch(&self, chat_id: &str, branch: &str) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.set_chat_branch(chat_id, branch)?)
+        Ok(self.inner.doc().set_chat_branch(chat_id, branch)?)
     }
 
     /// Retarget a chat onto another folder (mid-session switch to an existing
     /// worktree). Resume is cwd-scoped — the next run there starts fresh.
     pub fn set_chat_cwd(&self, chat_id: &str, cwd: &str) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.set_chat_cwd(chat_id, cwd)?)
+        Ok(self.inner.doc().set_chat_cwd(chat_id, cwd)?)
     }
 
     /// Canonical checkout identity for the chat's cwd (diff grouping key).
     pub fn set_chat_checkout(&self, chat_id: &str, checkout_id: &str) -> Result<bool, EngineError> {
-        Ok(self.inner.doc.set_chat_checkout(chat_id, checkout_id)?)
+        Ok(self.inner.doc().set_chat_checkout(chat_id, checkout_id)?)
     }
 
     // ── persistence / teardown ──────────────────────────────────────────────
@@ -977,7 +1048,7 @@ impl WorkspaceHost {
         let now = Utc::now();
         if let Err(err) = self
             .inner
-            .doc
+            .doc()
             .set_device_last_seen(&self.inner.config.device_id, now)
         {
             tracing::warn!(error = %err, "device lastSeenAt stamp failed");
@@ -991,7 +1062,7 @@ impl WorkspaceHost {
 
 impl WorkspaceHostInner {
     fn publish(&self) {
-        match self.doc.read_all() {
+        match self.doc().read_all() {
             Ok(mut state) => {
                 // The device list is the union of this user's private rows and
                 // the org registry — the org's devices are what a teammate has
@@ -1074,7 +1145,7 @@ impl WorkspaceHostInner {
     }
 
     fn save_snapshot(&self) {
-        match self.doc.export_snapshot() {
+        match self.doc().export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot(WORKSPACE_DOC_ID, &bytes) {
                     tracing::warn!(error = %err, "workspace snapshot save failed");
@@ -1137,7 +1208,7 @@ async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
         };
         let self_id = inner.config.device_id.clone();
         let targets: Vec<String> = {
-            let Ok(own) = inner.doc.read_devices() else {
+            let Ok(own) = inner.doc().read_devices() else {
                 continue;
             };
             // Every device either registry knows, plus anything the belief has
@@ -1247,5 +1318,29 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 inner.publish();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod room_supervision_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn malformed_protocol_parks_the_supervisor_instead_of_rebuilding() {
+        let (events_tx, events_rx) = tokio::sync::broadcast::channel(4);
+        let (_health_tx, health_rx) = tokio::sync::watch::channel(true);
+        let on_event: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let supervision = tokio::spawn(async move {
+            supervise_room("malformed-room", events_rx, health_rx, true, &on_event).await
+        });
+
+        events_tx
+            .send(comet_sync::RoomEvent::ProtocolParked)
+            .unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(1), supervision)
+            .await
+            .expect("supervisor stops immediately")
+            .expect("supervisor task");
+        assert_eq!(exit, RoomExit::ProtocolParked);
     }
 }

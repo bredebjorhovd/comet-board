@@ -27,10 +27,12 @@
 //! - Presence rides the `%EPH` sub-room as `loro::awareness::EphemeralStore`
 //!   payloads relayed verbatim.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use comet_doc::{SessionCommandStatus, SessionDoc};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use loro::awareness::EphemeralStore;
@@ -180,6 +182,15 @@ pub enum SyncError {
     Closed,
 }
 
+impl SyncError {
+    /// Protocol bytes are deterministic server state, not a transport outage:
+    /// redialing the same room cannot repair them and would wake its Durable
+    /// Object forever. Callers supervising an initial join must park too.
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, Self::Protocol(_))
+    }
+}
+
 /// Per-dial WebSocket URL provider — consulted before EVERY connection attempt,
 /// including background reconnects, so a short-lived auth token embedded in the
 /// URL (`?token=…`) is re-read fresh rather than frozen at first connect.
@@ -213,6 +224,59 @@ pub enum RoomEvent {
     EphemeralUpdate,
     /// The server evicted us; the client will NOT reconnect.
     Evicted,
+    /// Malformed protocol state parked the client; no background redial will
+    /// occur until an owner explicitly constructs/starts another client.
+    ProtocolParked,
+}
+
+/// App-owned state that must move with a room client when a shallow server
+/// snapshot cannot merge into its stale local document.
+///
+/// The room validates and builds the replacement, then invokes `on_reseed`
+/// before publishing [`RoomEvent::RemoteUpdate`]. Session rooms also name the
+/// local device so unresolved commands authored by that device can be copied
+/// into the replacement before it becomes visible. Workspace/registry rooms
+/// use [`DocRecovery::replacing`] because they have no command ledger.
+///
+/// `on_reseed` is the ownership boundary, not a notification. It must move all
+/// app-owned references synchronously. If command creation can retain the old
+/// document, a device callback must also gate that creation and reconcile the
+/// final old-document command delta before publishing the replacement. The
+/// room cannot close a race in an owner it does not control.
+#[derive(Clone)]
+pub struct DocRecovery {
+    local_device_id: Option<String>,
+    on_reseed: Option<Arc<dyn Fn(LoroDoc) + Send + Sync>>,
+}
+
+impl DocRecovery {
+    /// Install session-document recovery with a synchronous replacement owner.
+    /// See [`DocRecovery`] for the callback's atomicity contract.
+    pub fn for_device(
+        device_id: impl Into<String>,
+        on_reseed: Arc<dyn Fn(LoroDoc) + Send + Sync>,
+    ) -> Self {
+        Self {
+            local_device_id: Some(device_id.into()),
+            on_reseed: Some(on_reseed),
+        }
+    }
+
+    /// Install recovery for a document without a device command ledger.
+    pub fn replacing(on_reseed: Arc<dyn Fn(LoroDoc) + Send + Sync>) -> Self {
+        Self {
+            local_device_id: None,
+            on_reseed: Some(on_reseed),
+        }
+    }
+
+    #[cfg(test)]
+    fn disabled() -> Self {
+        Self {
+            local_device_id: None,
+            on_reseed: None,
+        }
+    }
 }
 
 /// A byte-frame duplex to the room: `tx` outbound, `rx` inbound. Closing
@@ -352,7 +416,7 @@ impl Drop for ConnectedFlag {
 /// client aborts the task immediately; [`RoomClient::shutdown`] leaves the
 /// room cleanly first.
 pub struct RoomClient {
-    doc: LoroDoc,
+    doc: Arc<RwLock<LoroDoc>>,
     eph: EphemeralStore,
     events: broadcast::Sender<RoomEvent>,
     connected: watch::Receiver<bool>,
@@ -361,6 +425,9 @@ pub struct RoomClient {
     task: Option<tokio::task::JoinHandle<()>>,
     /// Doc + ephemeral local-update subscriptions (drop = unsubscribe).
     _subs: Vec<loro::Subscription>,
+    /// Swapped by the actor together with `doc` during a reseed, so local
+    /// commits on the replacement keep flowing without rebuilding the client.
+    _doc_sub: Arc<Mutex<Option<loro::Subscription>>>,
 }
 
 impl RoomClient {
@@ -376,34 +443,59 @@ impl RoomClient {
     /// a full snapshot) is imported as it arrives. A first-attempt failure
     /// (unreachable edge, `JoinError`) is returned as `Err`; only after a
     /// successful join does the client keep reconnecting in the background.
-    pub async fn connect(url: &str, room_id: &str, doc: LoroDoc) -> Result<Self, SyncError> {
-        Self::connect_via(Arc::new(StaticUrl(url.to_string())), room_id, doc).await
+    /// `recovery` is mandatory because a shallow-history repair replaces the
+    /// LoroDoc object; its callback must move every app-owned reference to the
+    /// supplied replacement. There is deliberately no no-op default.
+    pub async fn connect(
+        url: &str,
+        room_id: &str,
+        doc: LoroDoc,
+        recovery: DocRecovery,
+    ) -> Result<Self, SyncError> {
+        Self::connect_via(Arc::new(StaticUrl(url.to_string())), room_id, doc, recovery).await
     }
 
     /// Like [`Self::connect`], but the WebSocket URL is re-fetched from
     /// `provider` before every dial (initial and reconnects) — the seam for
     /// expiring bearer tokens carried as `?token=`.
+    /// Ownership recovery remains explicit for the same reason as `connect`.
     pub async fn connect_via(
         provider: Arc<dyn UrlProvider>,
         room_id: &str,
         doc: LoroDoc,
+        recovery: DocRecovery,
     ) -> Result<Self, SyncError> {
         let connector = Arc::new(WsConnector { url: provider });
-        Self::connect_with(connector, room_id, doc).await
+        Self::connect_with_recovery(connector, room_id, doc, recovery).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn connect_with(
         connector: Arc<dyn Connector>,
         room_id: &str,
         doc: LoroDoc,
     ) -> Result<Self, SyncError> {
+        Self::connect_with_recovery(connector, room_id, doc, DocRecovery::disabled()).await
+    }
+
+    pub(crate) async fn connect_with_recovery(
+        connector: Arc<dyn Connector>,
+        room_id: &str,
+        doc: LoroDoc,
+        recovery: DocRecovery,
+    ) -> Result<Self, SyncError> {
         let eph = EphemeralStore::new(EPHEMERAL_TIMEOUT_MS);
 
         let (local_tx, local_rx) = mpsc::unbounded_channel();
+        let doc_generation = Arc::new(AtomicU64::new(0));
+        let initial_local_tx = local_tx.clone();
+        let initial_generation = doc_generation.load(Ordering::SeqCst);
         let sub_doc = doc.subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
-            let _ = local_tx.send(bytes.clone());
+            let _ = initial_local_tx.send((initial_generation, bytes.clone()));
             true
         }));
+        let doc_sub = Arc::new(Mutex::new(Some(sub_doc)));
+        let current_doc = Arc::new(RwLock::new(doc.clone()));
         let (eph_tx, eph_rx) = mpsc::unbounded_channel();
         let sub_eph = eph.subscribe_local_updates(Box::new(move |bytes: &Vec<u8>| {
             let _ = eph_tx.send(bytes.clone());
@@ -417,7 +509,11 @@ impl RoomClient {
         let (ready_tx, ready_rx) = oneshot::channel();
 
         let actor = RoomActor {
-            doc: doc.clone(),
+            doc: current_doc.clone(),
+            local_tx,
+            doc_generation,
+            doc_sub: doc_sub.clone(),
+            recovery,
             eph: eph.clone(),
             room_id: room_id.to_string(),
             connector,
@@ -432,14 +528,15 @@ impl RoomClient {
 
         match ready_rx.await {
             Ok(Ok(())) => Ok(Self {
-                doc,
+                doc: current_doc,
                 eph,
                 events,
                 connected: connected_rx,
                 presence: presence_rx,
                 shutdown: shutdown_tx,
                 task: Some(task),
-                _subs: vec![sub_doc, sub_eph],
+                _subs: vec![sub_eph],
+                _doc_sub: doc_sub,
             }),
             Ok(Err(err)) => {
                 task.abort();
@@ -452,9 +549,14 @@ impl RoomClient {
         }
     }
 
-    /// The synced doc handle (reference clone of the one passed to `connect`).
-    pub fn doc(&self) -> &LoroDoc {
-        &self.doc
+    /// The current synced doc handle. This is the original passed to
+    /// `connect` until shallow-history recovery atomically swaps in a validated
+    /// replacement.
+    pub fn doc(&self) -> LoroDoc {
+        self.doc
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Presence store relayed through the room's `%EPH` channel: `set` keys
@@ -534,11 +636,15 @@ impl Drop for RoomClient {
 // ── background actor ────────────────────────────────────────────────────────
 
 struct RoomActor {
-    doc: LoroDoc,
+    doc: Arc<RwLock<LoroDoc>>,
+    local_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    doc_generation: Arc<AtomicU64>,
+    doc_sub: Arc<Mutex<Option<loro::Subscription>>>,
+    recovery: DocRecovery,
     eph: EphemeralStore,
     room_id: String,
     connector: Arc<dyn Connector>,
-    local_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    local_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
     eph_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     events: broadcast::Sender<RoomEvent>,
     /// Live-connection truth for the client (and its supervisor). Held as an
@@ -657,6 +763,25 @@ impl RoomActor {
                     backoff = BACKOFF_CAP;
                 }
                 SessionEnd::Lost(err) => {
+                    if err.is_permanent() {
+                        if let Some(tx) = ready.take() {
+                            let _ = tx.send(Err(err));
+                            return;
+                        }
+                        tracing::error!(room = %self.room_id, error = %err,
+                            "malformed room protocol; parking without redial");
+                        let _ = self.events.send(RoomEvent::ProtocolParked);
+                        // Keep the actor—and therefore its terminal state—alive
+                        // until shutdown. A supervisor sees ProtocolParked and
+                        // drops the client instead of mistaking actor death for
+                        // a transient failure worth rebuilding.
+                        while !*self.shutdown.borrow() {
+                            if self.shutdown.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                        return;
+                    }
                     if let Some(tx) = ready.take() {
                         // Never joined: fail `connect()` fast instead of
                         // silently retrying in the background.
@@ -714,7 +839,16 @@ impl RoomActor {
         while self.eph_rx.try_recv().is_ok() {}
 
         let mut sess = Session {
-            doc: self.doc.clone(),
+            doc: self
+                .doc
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+            current_doc: self.doc.clone(),
+            local_tx: self.local_tx.clone(),
+            doc_generation: self.doc_generation.clone(),
+            doc_sub: self.doc_sub.clone(),
+            recovery: self.recovery.clone(),
             eph: self.eph.clone(),
             room_id: self.room_id.clone(),
             tx: pipe.tx.clone(),
@@ -729,6 +863,7 @@ impl RoomActor {
             eph_join_sent_at: None,
             invalid_rejoins: 0,
             full_resync_requested: false,
+            server_vv: None,
             join_sent_at: None,
             join_is_probe: false,
             last_lor_rx: tokio::time::Instant::now(),
@@ -825,8 +960,9 @@ impl RoomActor {
                 update = self.local_rx.recv() => match update {
                     None => break SessionEnd::Shutdown, // client dropped
                     // When not yet joined: covered by the join-time VV diff.
-                    Some(update) => {
-                        if sess.joined_lor
+                    Some((generation, update)) => {
+                        if generation == sess.doc_generation.load(Ordering::SeqCst)
+                            && sess.joined_lor
                             && let Err(err) = sess.send_loro_updates(vec![update]).await
                         {
                             break SessionEnd::Lost(err);
@@ -909,6 +1045,11 @@ struct FragmentBuffer {
 
 struct Session {
     doc: LoroDoc,
+    current_doc: Arc<RwLock<LoroDoc>>,
+    local_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    doc_generation: Arc<AtomicU64>,
+    doc_sub: Arc<Mutex<Option<loro::Subscription>>>,
+    recovery: DocRecovery,
     eph: EphemeralStore,
     room_id: String,
     tx: mpsc::Sender<Vec<u8>>,
@@ -935,13 +1076,16 @@ struct Session {
     eph_join_sent_at: Option<tokio::time::Instant>,
     invalid_rejoins: u32,
     full_resync_requested: bool,
+    /// Version advertised by the latest answered join. A fresh import is a
+    /// valid server reseed only when it exactly reaches this vector.
+    server_vv: Option<VersionVector>,
     /// Instant of the last `%LOR` JoinRequest still awaiting `JoinResponseOk`
     /// (initial join, stale-peer rejoin, or liveness probe); `None` once
     /// answered. `run_session` enforces `JOIN_RESPONSE_DEADLINE` on it.
     join_sent_at: Option<tokio::time::Instant>,
-    /// True while the outstanding join is a liveness probe on an established
-    /// session — its answer must not replay join side effects (%EPH rejoin,
-    /// Connected re-broadcast).
+    /// True while the outstanding join is a liveness/recovery probe on an
+    /// established session — its answer must not replay join side effects
+    /// (%EPH rejoin, Connected re-broadcast, or stale doc upload).
     join_is_probe: bool,
     /// Instant of the last inbound `%LOR` frame — the room-liveness clock
     /// feeding both the join deadline and the probe timer. %EPH frames are
@@ -952,6 +1096,35 @@ struct Session {
     /// (adversarial-review finding, round 2). Auto-pongs never reach this
     /// layer at all (pump forwards only binary frames).
     last_lor_rx: tokio::time::Instant,
+}
+
+fn replay_unresolved_commands(
+    stale: &LoroDoc,
+    replacement: &LoroDoc,
+    device_id: &str,
+) -> Result<usize, SyncError> {
+    let stale_commands = SessionDoc::from_doc(stale.clone())
+        .read_commands()
+        .map_err(|err| SyncError::Loro(err.to_string()))?;
+    let replacement_doc = SessionDoc::from_doc(replacement.clone());
+    let existing: HashSet<String> = replacement_doc
+        .read_commands()
+        .map_err(|err| SyncError::Loro(err.to_string()))?
+        .into_iter()
+        .map(|command| command.id)
+        .collect();
+    let mut replayed = 0;
+    for command in stale_commands.into_iter().filter(|command| {
+        command.status == SessionCommandStatus::Pending
+            && command.issued_by == device_id
+            && !existing.contains(&command.id)
+    }) {
+        replacement_doc
+            .queue_command(&command)
+            .map_err(|err| SyncError::Loro(err.to_string()))?;
+        replayed += 1;
+    }
+    Ok(replayed)
 }
 
 impl Session {
@@ -1047,7 +1220,7 @@ impl Session {
                     if code == JoinErrorCode::VersionUnknown {
                         // Server can't diff from our VV — fall back to a full
                         // snapshot backfill.
-                        self.send_join_loro(Vec::new()).await?;
+                        self.request_full_resync().await?;
                         return Ok(None);
                     }
                     return Ok(Some(SessionEnd::Evicted(format!("{code:?}: {message}"))));
@@ -1137,9 +1310,28 @@ impl Session {
             CrdtType::Loro => {
                 self.join_sent_at = None; // join answered — disarm the deadline
                 let was_probe = std::mem::take(&mut self.join_is_probe);
+                let server_vv = if version.is_empty() {
+                    VersionVector::default()
+                } else {
+                    VersionVector::decode(&version).map_err(|err| {
+                        SyncError::Protocol(format!("invalid server version vector: {err}"))
+                    })?
+                };
+                self.server_vv = Some(server_vv.clone());
                 self.joined_lor = true;
                 self.joined_at.get_or_insert_with(tokio::time::Instant::now);
                 self.connected.set(true);
+                if was_probe {
+                    // A probe or recovery answer on an established session
+                    // proves only that the room is alive and advertises the
+                    // snapshot VV. Do not publish the stale graph again or
+                    // replay ordinary join side effects. If presence never
+                    // joined, retain the existing one-shot repair.
+                    if !self.joined_eph {
+                        self.send_join_eph().await?;
+                    }
+                    return Ok(());
+                }
                 // Resubmit-from-VV: push everything the server lacks. This
                 // covers both fresh docs (first upload) and updates that went
                 // unacked across a reconnect or stale-peer resync. Gated on
@@ -1151,11 +1343,6 @@ impl Session {
                 // — a fleet of idle rooms that could never actually go idle
                 // (adversarial-review finding).
                 if !self.doc.oplog_vv().is_empty() && self.invalid_rejoins < MAX_INVALID_REJOINS {
-                    let server_vv = if version.is_empty() {
-                        VersionVector::default()
-                    } else {
-                        VersionVector::decode(&version).unwrap_or_default()
-                    };
                     if !server_vv.includes_vv(&self.doc.oplog_vv()) {
                         let missing = self
                             .doc
@@ -1165,20 +1352,6 @@ impl Session {
                             self.send_loro_updates(vec![missing]).await?;
                         }
                     }
-                }
-                if was_probe {
-                    // A probe answer on an established session proves the
-                    // room is alive — that is ALL it is for. Re-running the
-                    // join side effects below every probe would re-join %EPH
-                    // (re-uploading full presence) and re-broadcast Connected
-                    // (consumers treat it as "resync underway") on a timer.
-                    // The one exception: a presence sub-room that never came
-                    // up — re-asking for it is exactly what the probe's
-                    // "still alive" answer makes safe (gh#126).
-                    if !self.joined_eph {
-                        self.send_join_eph().await?;
-                    }
-                    return Ok(());
                 }
                 // Join presence once the doc room is up.
                 self.send_join_eph().await?;
@@ -1208,24 +1381,35 @@ impl Session {
         match crdt {
             CrdtType::Loro => {
                 let mut imported = false;
+                let mut incomplete = false;
                 for update in updates {
                     if update.is_empty() {
                         continue;
                     }
                     match self.doc.import(&update) {
-                        Ok(_) => imported = true,
-                        Err(err) => {
-                            tracing::warn!(room = %self.room_id, error = %err, "remote update import failed");
-                            if !self.full_resync_requested {
-                                // Ask for a full snapshot backfill once; import
-                                // of a snapshot merges, so this heals gaps.
-                                self.full_resync_requested = true;
-                                self.send_join_loro(Vec::new()).await?;
+                        Ok(status) if status.pending.is_none() => imported = true,
+                        Ok(status) => {
+                            incomplete = true;
+                            tracing::warn!(
+                                room = %self.room_id,
+                                pending = ?status.pending,
+                                "remote update import is incomplete; attempting server snapshot reseed"
+                            );
+                            if self.try_reseed(&update).await? {
+                                imported = true;
+                                incomplete = false;
+                            } else {
+                                self.request_full_resync().await?;
                             }
+                        }
+                        Err(err) => {
+                            incomplete = true;
+                            tracing::warn!(room = %self.room_id, error = %err, "remote update import failed");
+                            self.request_full_resync().await?;
                         }
                     }
                 }
-                if imported {
+                if imported && !incomplete {
                     let _ = self.events.send(RoomEvent::RemoteUpdate);
                 }
             }
@@ -1251,6 +1435,92 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    async fn request_full_resync(&mut self) -> Result<(), SyncError> {
+        if !self.full_resync_requested {
+            self.full_resync_requested = true;
+            let suppress_join_effects = self.joined_lor;
+            self.send_join_loro(Vec::new()).await?;
+            self.join_is_probe = suppress_join_effects;
+        }
+        Ok(())
+    }
+
+    /// Import `snapshot` into a fresh doc, validate it against the version the
+    /// server advertised immediately before the backfill, replay unresolved
+    /// commands authored by this device, and atomically move every room-owned
+    /// reference/subscription to the replacement.
+    async fn try_reseed(&mut self, snapshot: &[u8]) -> Result<bool, SyncError> {
+        let Some(on_reseed) = self.recovery.on_reseed.clone() else {
+            // The public API requires an explicit owner. Test-only disabled
+            // recovery may request one snapshot but must never swap behind a
+            // caller that still retains the supplied LoroDoc.
+            return Ok(false);
+        };
+        let Some(server_vv) = self.server_vv.clone() else {
+            return Ok(false);
+        };
+        let candidate = LoroDoc::new();
+        let status = match candidate.import(snapshot) {
+            Ok(status) if status.pending.is_none() => status,
+            Ok(_) | Err(_) => return Ok(false),
+        };
+        debug_assert!(status.pending.is_none());
+        if candidate.oplog_vv() != server_vv {
+            return Ok(false);
+        }
+
+        let replayed = if let Some(device_id) = self.recovery.local_device_id.as_deref() {
+            replay_unresolved_commands(&self.doc, &candidate, device_id)?
+        } else {
+            0
+        };
+
+        // Replay happened before subscribing, so explicitly derive the only
+        // local delta the server can lack. This also avoids publishing the
+        // server snapshot back to the server.
+        let replay_update = if replayed > 0 {
+            Some(
+                candidate
+                    .export(ExportMode::updates(&server_vv))
+                    .map_err(|err| SyncError::Loro(err.to_string()))?,
+            )
+        } else {
+            None
+        };
+
+        // Anything derived from the stale graph is now invalid: discard sent
+        // batches and make queued subscription callbacks self-identify as the
+        // old generation. Only the semantic command replay crosses the cut.
+        self.pending.clear();
+        self.invalid_rejoins = 0;
+        let generation = self.doc_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let local_tx = self.local_tx.clone();
+        let subscription = candidate.subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
+            let _ = local_tx.send((generation, bytes.clone()));
+            true
+        }));
+        *self
+            .doc_sub
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(subscription);
+        *self
+            .current_doc
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.clone();
+        on_reseed(candidate.clone());
+        self.doc = candidate;
+
+        if let Some(update) = replay_update.filter(|bytes| !bytes.is_empty()) {
+            self.send_loro_updates(vec![update]).await?;
+        }
+        tracing::warn!(
+            room = %self.room_id,
+            replayed_commands = replayed,
+            "reseeded stale local document from validated server snapshot"
+        );
+        Ok(true)
     }
 
     async fn on_fragment(
@@ -1304,7 +1574,12 @@ impl Session {
                 }
             }
             UpdateStatusCode::InvalidUpdate | UpdateStatusCode::PermissionDenied => {
-                self.pending.remove(&ref_id);
+                // A successful reseed clears every batch derived from the old
+                // graph. Its delayed rejection is historical, not a reason to
+                // rejoin or resubmit the replacement.
+                if self.pending.remove(&ref_id).is_none() {
+                    return Ok(());
+                }
                 if crdt == CrdtType::Loro {
                     if self.invalid_rejoins >= MAX_INVALID_REJOINS {
                         tracing::error!(

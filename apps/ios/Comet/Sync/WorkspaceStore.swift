@@ -27,9 +27,9 @@ final class WorkspaceStore {
     private(set) var presence: Set<String> = []
     private(set) var connected = false
 
-    let doc = LoroDoc()
+    private let document = RoomDocument()
+    var doc: LoroDoc { document.current() }
     private var room: RoomClient?
-    private var subscriptions: [Subscription] = []
     private let config: AppConfig
 
     init(config: AppConfig) {
@@ -57,8 +57,8 @@ final class WorkspaceStore {
         if DocDisk.loadWorkspace(into: doc, orgId: config.orgId, userId: config.userId) {
             project()
         }
-        saver = DocSaver(docId: diskId, doc: doc)
-        let client = RoomClient(roomId: roomId, doc: doc) { [config] in
+        saver = DocSaver(docId: diskId, document: document)
+        let client = RoomClient(roomId: roomId, document: document) { [config] in
             await config.workspaceSocketURL()
         } events: { [weak self] event in
             Task { @MainActor [weak self] in self?.handle(event) }
@@ -67,14 +67,12 @@ final class WorkspaceStore {
 
         // Local commits → room. The subscription fires synchronously inside
         // commit; hop to the actor to send.
-        let localSub = doc.subscribeLocalUpdate { [weak client, weak self] update in
+        document.observeLocalUpdates { [weak client, weak self] generation, update in
             guard let client else { return }
             let bytes = [UInt8](update)
-            Task { await client.sendLocalUpdate(bytes) }
+            Task { await client.sendLocalUpdate(bytes, generation: generation) }
             Task { @MainActor [weak self] in self?.saver?.poke() }
         }
-        subscriptions.append(localSub)
-
         Task { await client.start() }
         project()
     }
@@ -85,7 +83,7 @@ final class WorkspaceStore {
     }
 
     func stop() {
-        subscriptions.removeAll()
+        document.stopObservingLocalUpdates()
         saver?.flush()
         if let room {
             Task { await room.stop() }

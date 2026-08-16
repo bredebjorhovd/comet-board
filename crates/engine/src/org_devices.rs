@@ -26,7 +26,7 @@
 //! traffic at all: presence on this room is derived by the edge from the socket
 //! set, and this host only reads the answers.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use chrono::{DateTime, Utc};
 use tokio::sync::watch;
@@ -57,7 +57,8 @@ pub struct OrgDevicesConfig {
 struct OrgDevicesInner {
     store: Arc<DocsStore>,
     config: OrgDevicesConfig,
-    doc: Arc<WorkspaceDoc>,
+    doc: RwLock<Arc<WorkspaceDoc>>,
+    changed_tx: watch::Sender<u64>,
     room: Arc<Mutex<Option<RoomClient>>>,
     /// Called on every ephemeral update on the org room — the room's answer
     /// about who it can see, which the workspace host folds into its belief and
@@ -67,7 +68,28 @@ struct OrgDevicesInner {
     /// Doc subscription (drop = unsubscribe) — bumps the workspace host's
     /// change watch, so a remote device row lands in `WatchDevices` the same
     /// way a local one does.
-    _sub: loro::Subscription,
+    _sub: Mutex<loro::Subscription>,
+}
+
+impl OrgDevicesInner {
+    fn doc(&self) -> Arc<WorkspaceDoc> {
+        self.doc
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn reseed(&self, raw: loro::LoroDoc) {
+        let replacement = Arc::new(WorkspaceDoc::from_doc(raw));
+        let changed_tx = self.changed_tx.clone();
+        let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
+            changed_tx.send_modify(|value| *value = value.wrapping_add(1));
+        }));
+        *self.doc.write().unwrap_or_else(PoisonError::into_inner) = replacement;
+        *lock(&self._sub) = sub;
+        self.changed_tx
+            .send_modify(|value| *value = value.wrapping_add(1));
+    }
 }
 
 #[derive(Clone)]
@@ -96,18 +118,20 @@ impl OrgDevices {
         };
         let doc = Arc::new(doc);
         doc.ensure_schema_version()?;
+        let root_changed_tx = changed_tx.clone();
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
-            changed_tx.send_modify(|v| *v = v.wrapping_add(1));
+            root_changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
 
         let host = Self {
             inner: Arc::new(OrgDevicesInner {
                 store,
                 config,
-                doc,
+                doc: RwLock::new(doc),
+                changed_tx,
                 room: Arc::new(Mutex::new(None)),
                 on_presence: Mutex::new(None),
-                _sub: sub,
+                _sub: Mutex::new(sub),
             }),
         };
         host.join_room();
@@ -136,10 +160,17 @@ impl OrgDevices {
         // a room of one.
         let room_id = format!("orgdev1/{org_id}");
         let weak = Arc::downgrade(&self.inner);
+        let reseed_owner = weak.clone();
         spawn_room_join(
             url,
             room_id,
-            self.inner.doc.doc().clone(),
+            self.inner.doc().doc().clone(),
+            None,
+            Arc::new(move |replacement| {
+                if let Some(inner) = reseed_owner.upgrade() {
+                    inner.reseed(replacement);
+                }
+            }),
             Arc::downgrade(&self.inner.room),
             Arc::new(move || {
                 let hook = weak
@@ -171,14 +202,14 @@ impl OrgDevices {
 
     /// The underlying doc — what the room syncs (and what tests bridge).
     pub fn doc_arc(&self) -> Arc<WorkspaceDoc> {
-        self.inner.doc.clone()
+        self.inner.doc()
     }
 
     /// Every device row the org has published (this device's included).
     /// Best-effort: an unreadable doc logs and reads as empty rather than
     /// failing the device list it feeds.
     pub fn read_devices(&self) -> Vec<Device> {
-        match self.inner.doc.read_devices() {
+        match self.inner.doc().read_devices() {
             Ok(devices) => devices,
             Err(err) => {
                 tracing::warn!(error = %err, "org devices read failed");
@@ -189,7 +220,7 @@ impl OrgDevices {
 
     /// Publish THIS device's row (writer discipline: never another's).
     pub fn upsert_device(&self, device: &Device) {
-        if let Err(err) = self.inner.doc.upsert_device(device) {
+        if let Err(err) = self.inner.doc().upsert_device(device) {
             tracing::warn!(error = %err, "org device row write failed");
         }
     }
@@ -201,7 +232,7 @@ impl OrgDevices {
 
     /// LWW rename from any device (mirrors the workspace doc's rule).
     pub fn rename_device(&self, device_id: &str, name: &str) {
-        if let Err(err) = self.inner.doc.rename_device(device_id, name) {
+        if let Err(err) = self.inner.doc().rename_device(device_id, name) {
             tracing::warn!(device = %device_id, error = %err, "org device rename failed");
         }
     }
@@ -209,7 +240,7 @@ impl OrgDevices {
     /// Boot/shutdown `lastSeenAt` stamp — liveness in between is an overlay
     /// over the live presence belief, never a row write.
     pub fn set_device_last_seen(&self, device_id: &str, at: DateTime<Utc>) {
-        if let Err(err) = self.inner.doc.set_device_last_seen(device_id, at) {
+        if let Err(err) = self.inner.doc().set_device_last_seen(device_id, at) {
             tracing::warn!(device = %device_id, error = %err, "org device lastSeenAt stamp failed");
         }
     }
@@ -227,7 +258,7 @@ impl OrgDevices {
     }
 
     pub fn save_snapshot(&self) {
-        match self.inner.doc.export_snapshot() {
+        match self.inner.doc().export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.inner.store.save_snapshot(ORG_DEVICES_DOC_ID, &bytes) {
                     tracing::warn!(error = %err, "org devices snapshot save failed");

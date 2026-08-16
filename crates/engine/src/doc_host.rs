@@ -28,7 +28,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::watch;
@@ -205,7 +205,8 @@ pub struct DocHost {
 pub struct ChatDocHandle {
     chat_id: String,
     device_id: String,
-    doc: Arc<SessionDoc>,
+    doc: RwLock<Arc<SessionDoc>>,
+    changed_tx: watch::Sender<u64>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
     /// The session room, supervised by [`crate::workspace_host::spawn_room_join`].
     /// An `Arc` because the supervisor holds a `Weak` to it: dropping the handle
@@ -221,7 +222,29 @@ pub struct ChatDocHandle {
     /// Last known snapshot blob size — the release byte budget's input.
     snapshot_bytes: AtomicUsize,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
-    _sub: loro::Subscription,
+    _sub: Mutex<loro::Subscription>,
+}
+
+fn replay_unresolved_device_commands(
+    stale: &SessionDoc,
+    replacement: &SessionDoc,
+    device_id: &str,
+) -> Result<usize, DocError> {
+    let existing: HashSet<String> = replacement
+        .read_commands()?
+        .into_iter()
+        .map(|command| command.id)
+        .collect();
+    let mut replayed = 0;
+    for command in stale.read_commands()?.into_iter().filter(|command| {
+        command.status == SessionCommandStatus::Pending
+            && command.issued_by == device_id
+            && !existing.contains(&command.id)
+    }) {
+        replacement.queue_command(&command)?;
+        replayed += 1;
+    }
+    Ok(replayed)
 }
 
 impl ChatDocHandle {
@@ -246,12 +269,46 @@ impl ChatDocHandle {
         self.messages_tx.receiver_count() > 0
     }
 
-    pub fn doc(&self) -> &SessionDoc {
-        &self.doc
+    pub fn doc(&self) -> Arc<SessionDoc> {
+        self.doc
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn doc_arc(&self) -> Arc<SessionDoc> {
-        self.doc.clone()
+        self.doc()
+    }
+
+    fn with_current<R>(&self, operation: impl FnOnce(&SessionDoc) -> R) -> R {
+        let owner = self.doc.read().unwrap_or_else(PoisonError::into_inner);
+        operation(owner.as_ref())
+    }
+
+    fn reseed(&self, raw: loro::LoroDoc) -> Result<usize, DocError> {
+        let replacement = Arc::new(SessionDoc::from_doc(raw));
+        // Device command creation holds a read guard for its entire commit.
+        // Taking the write guard therefore closes the replay-to-swap gap: a
+        // command either finishes on the old owner and is copied below, or
+        // starts after the replacement is visible and writes there directly.
+        let mut owner = self.doc.write().unwrap_or_else(PoisonError::into_inner);
+        let replayed = replay_unresolved_device_commands(
+            owner.as_ref(),
+            replacement.as_ref(),
+            &self.device_id,
+        )?;
+        let changed_tx = self.changed_tx.clone();
+        let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
+            changed_tx.send_modify(|v| *v = v.wrapping_add(1));
+        }));
+        *owner = replacement;
+        drop(owner);
+        *lock(&self._sub) = sub;
+        // The server snapshot and replay commits happened before this new
+        // subscription existed. Publish the ownership swap itself so mirrors
+        // and disk persistence immediately read the replacement.
+        self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
+        Ok(replayed)
     }
 
     /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
@@ -287,10 +344,11 @@ impl ChatDocHandle {
         text: &str,
         created_at: i64,
     ) -> Result<(), DocError> {
-        if self.doc.read_entries()?.iter().any(|e| e.id == message_id) {
+        let doc = self.doc();
+        if doc.read_entries()?.iter().any(|e| e.id == message_id) {
             return Ok(());
         }
-        self.doc.push_message(&SessionMessageEntry {
+        doc.push_message(&SessionMessageEntry {
             id: message_id.to_string(),
             role: MessageRole::User,
             parts: vec![MessagePart::Text {
@@ -311,16 +369,15 @@ impl ChatDocHandle {
     /// them for the resume-freshness check.
     pub fn mark_abandoned_streams(&self, note: &str) -> Result<Vec<(String, i64)>, DocError> {
         let mut stamped = Vec::new();
-        for entry in self.doc.read_entries()? {
+        let doc = self.doc();
+        for entry in doc.read_entries()? {
             if entry.role == MessageRole::Assistant
                 && entry.status == Some(MessageStatus::Streaming)
                 && entry.device_id == self.device_id
-                && self
-                    .doc
-                    .set_message_status(&entry.id, MessageStatus::Aborted)?
+                && doc.set_message_status(&entry.id, MessageStatus::Aborted)?
             {
                 let part_id = format!("{}-recovery", entry.id);
-                if let Err(err) = self.doc.append_error_part(&entry.id, &part_id, note) {
+                if let Err(err) = doc.append_error_part(&entry.id, &part_id, note) {
                     tracing::warn!(chat = %self.chat_id, error = %err, "recovery note append failed");
                 }
                 stamped.push((entry.id.clone(), entry.created_at));
@@ -334,7 +391,7 @@ impl ChatDocHandle {
 
     fn publish_messages(&self) {
         self.mirror_dirty.store(false, Ordering::Release);
-        match self.doc.read_entries() {
+        match self.doc().read_entries() {
             Ok(entries) => {
                 let joined = join_continuation_entries(entries);
                 // send_replace: update the watch even with no subscribers yet, so a
@@ -459,8 +516,9 @@ impl DocHost {
         let doc = Arc::new(doc);
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
+        let root_changed_tx = changed_tx.clone();
         let sub = doc.doc().subscribe_root(Arc::new(move |_diff| {
-            changed_tx.send_modify(|v| *v = v.wrapping_add(1));
+            root_changed_tx.send_modify(|v| *v = v.wrapping_add(1));
         }));
         // The mirror starts dirty and empty: many opens (command queueing,
         // drains, nudges) never watch the transcript, and the first
@@ -470,13 +528,14 @@ impl DocHost {
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
             device_id: self.inner.config.device_id.clone(),
-            doc: doc.clone(),
+            doc: RwLock::new(doc.clone()),
+            changed_tx: changed_tx.clone(),
             messages_tx,
             room: Arc::new(Mutex::new(None)),
             last_used: AtomicI64::new(now_ms()),
             mirror_dirty: AtomicBool::new(true),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
-            _sub: sub,
+            _sub: Mutex::new(sub),
         });
         {
             let mut handles = lock(&self.inner.handles);
@@ -498,6 +557,7 @@ impl DocHost {
         // same roomless handle forever. The supervisor retries the first join
         // and rebuilds a client that stops reconnecting.
         if let Some(edge) = &self.inner.config.edge {
+            let weak_handle = Arc::downgrade(&handle);
             crate::workspace_host::spawn_room_join(
                 edge.room_url_as(
                     format!("/session/{chat_id}/ws"),
@@ -505,6 +565,15 @@ impl DocHost {
                 ),
                 chat_id.to_string(),
                 doc.doc().clone(),
+                Some(self.inner.config.device_id.clone()),
+                Arc::new(move |replacement| {
+                    if let Some(handle) = weak_handle.upgrade()
+                        && let Err(err) = handle.reseed(replacement)
+                    {
+                        tracing::error!(chat = %handle.chat_id, error = %err,
+                            "failed to reconcile device commands during room reseed");
+                    }
+                }),
                 Arc::downgrade(&handle.room),
                 Arc::new(|| {}),
             );
@@ -713,19 +782,21 @@ impl DocHost {
         let handle = self.open(chat_id)?;
         let id = new_id();
         let now = now_ms();
-        let based_on = handle.doc.read_entries()?.last().map(|m| CommandBasedOn {
-            turn_id: Some(m.id.clone()),
-            frontier: None,
-        });
-        handle.doc.queue_command(&SessionCommandEntry {
-            id: id.clone(),
-            payload,
-            issued_by: self.inner.config.device_id.clone(),
-            issued_at: now,
-            based_on,
-            expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
-            status: SessionCommandStatus::Pending,
-            resolution: None,
+        handle.with_current(|doc| {
+            let based_on = doc.read_entries()?.last().map(|m| CommandBasedOn {
+                turn_id: Some(m.id.clone()),
+                frontier: None,
+            });
+            doc.queue_command(&SessionCommandEntry {
+                id: id.clone(),
+                payload,
+                issued_by: self.inner.config.device_id.clone(),
+                issued_at: now,
+                based_on,
+                expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
+                status: SessionCommandStatus::Pending,
+                resolution: None,
+            })
         })?;
         // §7 durable delivery: when another device hosts this chat, nudge its device
         // room so a cold host opens the doc and drains the queue. Fire-and-forget —
@@ -742,7 +813,7 @@ impl DocHost {
     fn host_device(&self, chat_id: &str) -> Option<String> {
         let stamped = lock(&self.inner.handles)
             .get(chat_id)
-            .and_then(|handle| handle.doc.host_device_id());
+            .and_then(|handle| handle.doc().host_device_id());
         if stamped.is_some() {
             return stamped;
         }
@@ -864,7 +935,7 @@ impl DocHost {
     /// Asked of the handle the caller already holds, never of the cache: the
     /// drain's answer must not depend on the chat still being cached (gh#395).
     fn is_host(&self, handle: &ChatDocHandle) -> bool {
-        if let Some(host) = handle.doc.host_device_id() {
+        if let Some(host) = handle.doc().host_device_id() {
             return host == self.inner.config.device_id;
         }
         self.workspace()
@@ -882,7 +953,10 @@ impl DocHost {
         if !hosted_here {
             return;
         }
-        if let Err(err) = handle.doc.set_host_device_id(&self.inner.config.device_id) {
+        if let Err(err) = handle
+            .doc()
+            .set_host_device_id(&self.inner.config.device_id)
+        {
             tracing::warn!(chat = %handle.chat_id, error = %err, "host stamp failed");
         }
     }
@@ -907,7 +981,8 @@ impl DocHost {
         // Entries this pass decided to leave alone (processed dedupe hits).
         let mut skipped: HashSet<String> = HashSet::new();
         loop {
-            let commands = match handle.doc.read_commands() {
+            let doc = handle.doc();
+            let commands = match doc.read_commands() {
                 Ok(commands) => commands,
                 Err(err) => {
                     tracing::warn!(chat = %handle.chat_id, error = %err, "command read failed");
@@ -926,7 +1001,7 @@ impl DocHost {
             else {
                 return;
             };
-            let messages = handle.doc.read_entries().unwrap_or_default();
+            let messages = doc.read_entries().unwrap_or_default();
             let current_turn_id = messages.last().map(|m| m.id.clone());
             let turn_is_past = |turn_id: &str| messages.iter().any(|m| m.id == turn_id);
             let disposition = evaluate_command(
@@ -975,7 +1050,7 @@ impl DocHost {
         resolution: Option<&str>,
     ) {
         if let Err(err) = handle
-            .doc
+            .doc()
             .set_command_status(command_id, status, resolution)
         {
             tracing::warn!(
@@ -1084,7 +1159,7 @@ impl DocHost {
                 // and must still reject, and a still-streaming entry's
                 // question belongs to the live run (a just-consumed resolver
                 // racing a second answer must not spawn a duplicate turn).
-                let questions = handle.doc.read_entries().ok().and_then(|entries| {
+                let questions = handle.doc().read_entries().ok().and_then(|entries| {
                     entries
                         .iter()
                         .rev()
@@ -1126,7 +1201,7 @@ impl DocHost {
                 request.prompt = respond_input_prompt(&questions, answers);
                 request.resume = None; // dispatch re-derives the harness session
                 request.attachments = Vec::new();
-                if let Err(err) = handle.doc.resolve_input(request_id) {
+                if let Err(err) = handle.doc().resolve_input(request_id) {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
@@ -1180,7 +1255,7 @@ impl DocHost {
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
-        if let Some(bytes) = self.save_doc(&handle.chat_id, &handle.doc) {
+        if let Some(bytes) = self.save_doc(&handle.chat_id, &handle.doc()) {
             handle.snapshot_bytes.store(bytes, Ordering::Relaxed);
         }
     }
@@ -1608,6 +1683,116 @@ mod tests {
         let seen = rx.borrow().clone();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].id, "m1");
+    }
+
+    #[tokio::test]
+    async fn a_reseed_moves_the_handle_and_its_watch_to_the_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        let handle = host.open("chat-reseed").expect("open");
+        handle
+            .write_user_message("old", "stale prefix", 1)
+            .expect("write old");
+        let mut messages = handle.watch_messages();
+        messages.borrow_and_update();
+
+        let replacement = SessionDoc::init("chat-reseed").expect("replacement doc");
+        replacement
+            .push_message(&SessionMessageEntry {
+                id: "server".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "server-text".into(),
+                    text: "complete server transcript".into(),
+                }],
+                device_id: "server-device".into(),
+                created_at: 2,
+                status: None,
+                continuation_of: None,
+            })
+            .expect("write replacement");
+        handle
+            .reseed(replacement.doc().clone())
+            .expect("reseed owner");
+
+        tokio::time::timeout(Duration::from_secs(1), messages.changed())
+            .await
+            .expect("replacement is published")
+            .expect("watch stays open");
+        assert_eq!(handle.doc().read_entries().unwrap()[0].id, "server");
+        assert_eq!(messages.borrow_and_update()[0].id, "server");
+
+        // The reseed also rebinds the root subscription: later writes through
+        // the stable handle still wake transcript consumers.
+        handle
+            .write_user_message("after", "written after reseed", 3)
+            .expect("write through replacement");
+        tokio::time::timeout(Duration::from_secs(1), messages.changed())
+            .await
+            .expect("post-reseed commit is published")
+            .expect("watch stays open");
+        assert_eq!(messages.borrow().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_command_queued_at_the_reseed_boundary_survives_the_owner_swap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        let handle = host.open("chat-reseed-command").expect("open");
+        let replacement = SessionDoc::init("chat-reseed-command").expect("replacement doc");
+        let (queue_entered_tx, queue_entered_rx) = std::sync::mpsc::channel();
+        let (release_queue_tx, release_queue_rx) = std::sync::mpsc::channel();
+        let queue_handle = handle.clone();
+        let queue = std::thread::spawn(move || {
+            queue_handle.with_current(|stale| {
+                queue_entered_tx.send(()).unwrap();
+                release_queue_rx.recv().unwrap();
+                stale
+                    .queue_command(&SessionCommandEntry {
+                        id: "boundary-command".into(),
+                        payload: SessionCommandPayload::Interrupt {},
+                        issued_by: queue_handle.device_id.clone(),
+                        issued_at: 1,
+                        based_on: None,
+                        expires_at: None,
+                        status: SessionCommandStatus::Pending,
+                        resolution: None,
+                    })
+                    .expect("queue at boundary");
+            });
+        });
+        queue_entered_rx.recv().unwrap();
+
+        // Replacement races the retained-old-owner commit but must wait on the
+        // same gate. Once the queue releases it, the final replay observes the
+        // command and swaps only after copying it.
+        let (replace_started_tx, replace_started_rx) = std::sync::mpsc::channel();
+        let (replace_done_tx, replace_done_rx) = std::sync::mpsc::channel();
+        let replace_handle = handle.clone();
+        let replace = std::thread::spawn(move || {
+            replace_started_tx.send(()).unwrap();
+            replace_handle
+                .reseed(replacement.doc().clone())
+                .expect("reseed owner with boundary command");
+            replace_done_tx.send(()).unwrap();
+        });
+        replace_started_rx.recv().unwrap();
+        assert!(
+            replace_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "reseed waits on command gate"
+        );
+        release_queue_tx.send(()).unwrap();
+        queue.join().unwrap();
+        replace.join().unwrap();
+        replace_done_rx.recv().unwrap();
+
+        assert_eq!(
+            handle.doc().read_commands().unwrap()[0].id,
+            "boundary-command",
+            "the owner swap must reconcile the final old-doc command delta"
+        );
     }
 
     #[tokio::test]

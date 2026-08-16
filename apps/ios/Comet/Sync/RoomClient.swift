@@ -22,6 +22,118 @@ enum RoomEvent {
 /// down). Visible in Console.app / `log stream` under this subsystem.
 let roomLog = Logger(subsystem: "dev.cometnative.Comet", category: "sync")
 
+/// One swappable document reference shared by the room, its store, local
+/// update forwarding, and disk persistence. A shallow snapshot cannot repair a
+/// stale LoroDoc in place, so recovery must change the object every consumer
+/// reads rather than only changing RoomClient's private pointer.
+final class RoomDocument: @unchecked Sendable {
+    private let lock = NSLock()
+    private var doc: LoroDoc
+    private var generation: UInt64 = 0
+    private var localUpdateHandler: ((UInt64, Data) -> Void)?
+    private var localSubscription: Subscription?
+
+    init(_ doc: LoroDoc = LoroDoc()) {
+        self.doc = doc
+    }
+
+    func current() -> LoroDoc {
+        lock.lock()
+        defer { lock.unlock() }
+        return doc
+    }
+
+    func currentGeneration() -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
+    }
+
+    /// Hold the owner gate for the whole operation. Device-command creation
+    /// uses this instead of retaining `current()` across a reseed, so either
+    /// the command commits before the final replay or it lands directly on the
+    /// replacement — never on an orphaned old doc.
+    func withCurrent<T>(_ operation: (LoroDoc) throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation(doc)
+    }
+
+    func observeLocalUpdates(_ handler: @escaping (UInt64, Data) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        localUpdateHandler = handler
+        let observedGeneration = generation
+        localSubscription = doc.subscribeLocalUpdate { update in
+            handler(observedGeneration, update)
+        }
+    }
+
+    func stopObservingLocalUpdates() {
+        lock.lock()
+        defer { lock.unlock() }
+        localSubscription = nil
+        localUpdateHandler = nil
+    }
+
+    /// Reconcile the final device-local command delta and swap the owner under
+    /// the same gate used by command creation.
+    func replaceReplayingPendingCommands(with replacement: LoroDoc,
+                                         localDeviceId: String?) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let replayed = Self.replayUnresolvedLocalCommands(
+            from: doc, into: replacement, localDeviceId: localDeviceId
+        ) else { return nil }
+        generation &+= 1
+        let replacementGeneration = generation
+        let replacementSubscription = localUpdateHandler.map { handler in
+            replacement.subscribeLocalUpdate { update in
+                handler(replacementGeneration, update)
+            }
+        }
+        doc = replacement
+        localSubscription = replacementSubscription
+        return replayed
+    }
+
+    private static func replayUnresolvedLocalCommands(from stale: LoroDoc,
+                                                       into replacement: LoroDoc,
+                                                       localDeviceId: String?) -> Int? {
+        guard let localDeviceId,
+              let staleCommands = stale.getList(id: "commands").getDeepValue().listValue else {
+            return 0
+        }
+        let replacementIds = Set(
+            (replacement.getList(id: "commands").getDeepValue().listValue ?? [])
+                .compactMap { $0.mapValue?["id"]?.stringValue }
+        )
+        let unresolved = staleCommands.compactMap { value -> [String: LoroValue]? in
+            guard let command = value.mapValue,
+                  command["issuedBy"]?.stringValue == localDeviceId,
+                  command["status"]?.stringValue == "pending",
+                  let id = command["id"]?.stringValue,
+                  !replacementIds.contains(id) else { return nil }
+            return command
+        }
+        guard !unresolved.isEmpty else { return 0 }
+
+        let target = replacement.getList(id: "commands")
+        do {
+            for command in unresolved {
+                let map = try target.pushContainer(child: LoroMap())
+                for (key, value) in command {
+                    try map.insert(key: key, v: value)
+                }
+            }
+            replacement.commit()
+            return unresolved.count
+        } catch {
+            return nil
+        }
+    }
+}
+
 actor RoomClient {
     // Constants mirrored from room.rs.
     static let fragmentBytes = 200_000
@@ -47,7 +159,9 @@ actor RoomClient {
     static let livenessTickNs: UInt64 = 5_000_000_000
 
     let roomId: String
-    let doc: LoroDoc
+    let document: RoomDocument
+    private let localDeviceId: String?
+    private var doc: LoroDoc { document.current() }
     let eph: EphemeralStore
     private let urlProvider: @Sendable () async -> URL?
     private let events: @Sendable (RoomEvent) -> Void
@@ -67,14 +181,17 @@ actor RoomClient {
     private var joinedAt: DispatchTime?
     private var invalidRejoins = 0
     private var fullResyncRequested = false
+    private var serverVv: VersionVector?
     private var backoff = ReconnectBackoff()
     private var lastInbound = DispatchTime.now()
     private var closed = false
+    private var protocolParked = false
     private var generation = 0
     // Room-liveness state (room.rs Session::{join_sent_at, join_is_probe,
     // last_lor_rx}): the instant of the last %LOR JoinRequest still awaiting
-    // JoinResponseOk, whether that join is a liveness probe on an established
-    // session (its answer must not replay join side effects), and the last
+    // JoinResponseOk, whether that join is a liveness/recovery probe on an
+    // established session (its answer must not replay join side effects), and
+    // the last
     // inbound %LOR frame — the clock feeding both the deadline and the probe.
     private var joinSentAt: DispatchTime?
     private var joinIsProbe = false
@@ -90,12 +207,14 @@ actor RoomClient {
     }
 
     init(roomId: String,
-         doc: LoroDoc,
+         document: RoomDocument,
+         localDeviceId: String? = nil,
          ephTimeoutMs: Int64 = 30_000,
          urlProvider: @escaping @Sendable () async -> URL?,
          events: @escaping @Sendable (RoomEvent) -> Void) {
         self.roomId = roomId
-        self.doc = doc
+        self.document = document
+        self.localDeviceId = localDeviceId
         self.eph = EphemeralStore(timeout: ephTimeoutMs)
         self.urlProvider = urlProvider
         self.events = events
@@ -105,6 +224,7 @@ actor RoomClient {
 
     func start() {
         closed = false
+        protocolParked = false
         connect()
     }
 
@@ -121,12 +241,13 @@ actor RoomClient {
     }
 
     private func connect() {
-        guard !closed else { return }
+        guard !closed, !protocolParked else { return }
         generation += 1
         let gen = generation
         joinedLor = false
         joinedAt = nil
         fullResyncRequested = false
+        serverVv = nil
         fragments.removeAll()
         joinSentAt = nil
         joinIsProbe = false
@@ -148,7 +269,7 @@ actor RoomClient {
     }
 
     private func openSocket(url: URL, gen: Int) {
-        guard gen == generation, !closed else { return }
+        guard gen == generation, !closed, !protocolParked else { return }
         let task = URLSession.shared.webSocketTask(with: url)
         socket = task
         task.resume()
@@ -193,13 +314,13 @@ actor RoomClient {
     }
 
     private func onSocketError(gen: Int) {
-        guard gen == generation, !closed else { return }
+        guard gen == generation, !closed, !protocolParked else { return }
         events(.disconnected)
         scheduleReconnect(gen: gen)
     }
 
     private func scheduleReconnect(gen: Int) {
-        guard gen == generation, !closed else { return }
+        guard gen == generation, !closed, !protocolParked else { return }
         socket?.cancel(with: .abnormalClosure, reason: nil)
         socket = nil
         receiveTask?.cancel()
@@ -315,7 +436,7 @@ actor RoomClient {
             if crdt == .loro {
                 if code == .versionUnknown {
                     // Server can't diff from our VV — full snapshot backfill.
-                    await sendJoinLoro(version: [])
+                    await requestFullResync()
                 } else {
                     // AuthFailed / AppError: back off and retry (token refresh
                     // may fix it on the next dial).
@@ -324,7 +445,7 @@ actor RoomClient {
             }
 
         case .docUpdate(let crdt, _, let updates, _):
-            applyRemote(crdt: crdt, updates: updates)
+            await applyRemote(crdt: crdt, updates: updates)
 
         case .docUpdateFragmentHeader(let crdt, _, let batchId, let count, let total):
             guard count > 0, count <= RoomClient.maxFragmentCount,
@@ -333,7 +454,7 @@ actor RoomClient {
                                                 received: 0, totalSize: Int(total))
 
         case .docUpdateFragment(_, _, let batchId, let index, let fragment):
-            onFragment(batchId: batchId, index: Int(index), fragment: fragment)
+            await onFragment(batchId: batchId, index: Int(index), fragment: fragment)
 
         case .ack(let crdt, _, let refId, let status):
             await onAck(crdt: crdt, refId: refId, status: status)
@@ -371,6 +492,16 @@ actor RoomClient {
             joinSentAt = nil  // join answered — disarm the deadline
             let wasProbe = joinIsProbe
             joinIsProbe = false
+            let advertisedVv: VersionVector
+            if version.isEmpty {
+                advertisedVv = VersionVector()
+            } else if let decoded = try? VersionVector.decode(bytes: Data(version)) {
+                advertisedVv = decoded
+            } else {
+                parkProtocol("invalid server version vector; parking room")
+                return
+            }
+            serverVv = advertisedVv
             joinedLor = true
             // Note what the join answer is worth and NOT more: it starts the
             // clock the reset is judged on, it is not the reset. This line used
@@ -380,29 +511,24 @@ actor RoomClient {
             // only: a probe answer or a rejoin mid-session must not restart the
             // session's lifetime.
             if joinedAt == nil { joinedAt = .now() }
+            if wasProbe {
+                // A probe or recovery answer on an established session proves
+                // only that the room is alive and advertises the snapshot VV.
+                // Do not re-upload the stale graph, re-join presence, or emit
+                // another connected event; recovery replays only commands
+                // after the replacement validates.
+                return
+            }
             // Resubmit-from-VV: push everything the server lacks. Gated on
             // the VERSION VECTORS, not the export bytes: the export returns a
             // non-empty envelope even when there is nothing to say, so a
             // byte-length gate made every liveness probe upload a no-op
             // DocUpdate that dirtied the room's caches (room.rs finding).
             if !doc.oplogVv().isEmpty(), invalidRejoins < RoomClient.maxInvalidRejoins {
-                let serverVv: VersionVector
-                if version.isEmpty {
-                    serverVv = VersionVector()
-                } else {
-                    serverVv = (try? VersionVector.decode(bytes: Data(version))) ?? VersionVector()
-                }
-                if !serverVv.includesVv(other: doc.oplogVv()),
-                   let missing = try? doc.export(mode: .updates(from: serverVv)), !missing.isEmpty {
+                if !advertisedVv.includesVv(other: doc.oplogVv()),
+                   let missing = try? doc.export(mode: .updates(from: advertisedVv)), !missing.isEmpty {
                     await sendLoroUpdates([[UInt8](missing)])
                 }
-            }
-            if wasProbe {
-                // A probe answer on an established session proves the room is
-                // alive — that is ALL it is for. Re-running the side effects
-                // below would re-join %EPH (re-uploading full presence) and
-                // re-broadcast .connected on a timer.
-                return
             }
             roomLog.info("room \(self.roomId, privacy: .public): joined")
             // Join presence once the doc room is up.
@@ -417,20 +543,33 @@ actor RoomClient {
         }
     }
 
-    private func applyRemote(crdt: CrdtType, updates: [[UInt8]]) {
+    private func applyRemote(crdt: CrdtType, updates: [[UInt8]]) async {
         switch crdt {
         case .loro:
             var imported = false
+            var incomplete = false
             for update in updates where !update.isEmpty {
-                if let _ = try? doc.importWith(bytes: Data(update), origin: "remote") {
-                    imported = true
-                } else if !fullResyncRequested {
-                    fullResyncRequested = true
+                do {
+                    let status = try doc.importWith(bytes: Data(update), origin: "remote")
+                    if status.pending == nil {
+                        imported = true
+                    } else {
+                        incomplete = true
+                        roomLog.error("room \(self.roomId, privacy: .public): remote import incomplete (\(status.pending?.count ?? 0) pending peer ranges); attempting snapshot reseed")
+                        if await tryReseed(from: update) {
+                            imported = true
+                            incomplete = false
+                        } else {
+                            await requestFullResync()
+                        }
+                    }
+                } catch {
+                    incomplete = true
                     roomLog.error("room \(self.roomId, privacy: .public): remote update failed to import; requesting full snapshot resync")
-                    Task { await self.sendJoinLoro(version: []) }
+                    await requestFullResync()
                 }
             }
-            if imported { events(.remoteUpdate) }
+            if imported && !incomplete { events(.remoteUpdate) }
         case .loroEphemeral:
             var applied = false
             for update in updates where !update.isEmpty {
@@ -440,7 +579,62 @@ actor RoomClient {
         }
     }
 
-    private func onFragment(batchId: BatchId, index: Int, fragment: [UInt8]) {
+    private func requestFullResync() async {
+        guard !fullResyncRequested else { return }
+        fullResyncRequested = true
+        await sendJoinLoro(version: [], suppressJoinEffects: joinedLor)
+    }
+
+    private func parkProtocol(_ reason: String) {
+        guard !protocolParked else { return }
+        protocolParked = true
+        generation += 1
+        receiveTask?.cancel()
+        pingTask?.cancel()
+        livenessTask?.cancel()
+        socket?.cancel(with: .policyViolation, reason: Data(reason.utf8))
+        socket = nil
+        joinedLor = false
+        joinedAt = nil
+        roomLog.fault("room \(self.roomId, privacy: .public): \(reason, privacy: .public); explicit restart required")
+        events(.disconnected)
+    }
+
+    private func tryReseed(from snapshot: [UInt8]) async -> Bool {
+        guard let serverVv else { return false }
+        let replacement = LoroDoc()
+        guard let status = try? replacement.importWith(bytes: Data(snapshot), origin: "remote-reseed"),
+              status.pending == nil,
+              replacement.oplogVv() == serverVv else { return false }
+
+        // Anything derived from the stale graph is invalid. Clear it before
+        // taking the owner gate; the final command replay and pointer swap are
+        // one atomic operation with respect to SessionStore.queueCommand.
+        pending.removeAll()
+        invalidRejoins = 0
+        guard let replayed = document.replaceReplayingPendingCommands(
+            with: replacement, localDeviceId: localDeviceId
+        ) else {
+            roomLog.error("room \(self.roomId, privacy: .public): failed to replay unresolved local commands during reseed")
+            return false
+        }
+        let replayUpdate: [UInt8]?
+        if replayed > 0,
+           let update = try? replacement.export(mode: .updates(from: serverVv)),
+           !update.isEmpty {
+            replayUpdate = [UInt8](update)
+        } else {
+            replayUpdate = nil
+        }
+
+        if let replayUpdate {
+            await sendLoroUpdates([replayUpdate])
+        }
+        roomLog.error("room \(self.roomId, privacy: .public): reseeded stale local document from validated server snapshot; replayed \(replayed) unresolved local commands")
+        return true
+    }
+
+    private func onFragment(batchId: BatchId, index: Int, fragment: [UInt8]) async {
         guard var buffer = fragments[batchId] else { return }
         guard index < buffer.parts.count else {
             fragments.removeValue(forKey: batchId)
@@ -456,7 +650,7 @@ actor RoomClient {
         var total: [UInt8] = []
         total.reserveCapacity(buffer.totalSize)
         for part in buffer.parts { total.append(contentsOf: part ?? []) }
-        applyRemote(crdt: buffer.crdt, updates: [total])
+        await applyRemote(crdt: buffer.crdt, updates: [total])
     }
 
     private func onAck(crdt: CrdtType, refId: BatchId, status: UpdateStatusCode) async {
@@ -469,8 +663,11 @@ actor RoomClient {
                 await sendLoroUpdates(batch)
             }
         case .invalidUpdate, .permissionDenied:
+            guard pending.removeValue(forKey: refId) != nil else {
+                // A delayed rejection for a pre-reseed batch is historical.
+                return
+            }
             roomLog.error("room \(self.roomId, privacy: .public): update rejected (\(String(describing: status), privacy: .public)); rejoining (\(self.invalidRejoins)/\(RoomClient.maxInvalidRejoins))")
-            pending.removeValue(forKey: refId)
             if crdt == .loro, invalidRejoins < RoomClient.maxInvalidRejoins {
                 invalidRejoins += 1
                 await sendJoinLoro(version: localVersionBytes())
@@ -484,7 +681,12 @@ actor RoomClient {
     // MARK: Outbound
 
     /// Called by the doc store on local commit (subscribeLocalUpdate bytes).
-    func sendLocalUpdate(_ update: [UInt8]) async {
+    func sendLocalUpdate(_ update: [UInt8], generation: UInt64) async {
+        guard generation == document.currentGeneration() else {
+            // The shared owner was reseeded after this callback queued its
+            // task. Replaying the old graph would immediately strand it again.
+            return
+        }
         guard joinedLor else {
             // Not lost — the commit is durable in the doc and the next
             // successful join resubmits from VV. But it IS invisible to the
@@ -502,13 +704,13 @@ actor RoomClient {
         await send(.docUpdate(crdt: .loroEphemeral, roomId: roomId, updates: [update], batchId: .random()))
     }
 
-    private func sendJoinLoro(version: [UInt8]) async {
+    private func sendJoinLoro(version: [UInt8], suppressJoinEffects: Bool = false) async {
         // Arm the answer deadline BEFORE the frame leaves: an unanswered join
         // used to hang the session forever (room.rs, 2026-07-30). Joins
         // default to non-probe; the probe branch in livenessTick flags itself
         // after this returns.
         joinSentAt = .now()
-        joinIsProbe = false
+        joinIsProbe = suppressJoinEffects
         await send(.joinRequest(crdt: .loro, roomId: roomId, auth: [], version: version))
     }
 
