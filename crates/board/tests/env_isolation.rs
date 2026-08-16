@@ -14,31 +14,52 @@
 //! running; `no_other_resolution_reads_the_environment` below is the one that
 //! catches the *next* test, by refusing the resolution rather than the symptom.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use comet_board::config::{CONFIG_DIR_ENV, Paths, STATE_DIR_ENV};
 
-/// The poisoned pair, owned for one test and removed when that test ends.
-///
-/// Test binaries are multi-threaded and `set_var` is process-wide, so this
-/// helper serializes the two tests that mutate it and returns the lock beside
-/// the `TempDir`, keeping both alive for the whole test.
-fn poison() -> (std::sync::MutexGuard<'static, ()>, tempfile::TempDir) {
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let env_lock = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let dir = tempfile::Builder::new()
+const ISOLATED_CASE_ENV: &str = "COMET_BOARD_ENV_ISOLATION_CASE";
+const ISOLATED_CASE_COMPLETE: &str = ".isolated-case-complete";
+
+/// Run one assertion in a child test process whose environment is poisoned
+/// before it starts. The parent owns the poison directory and never mutates
+/// its own process-wide environment.
+fn under_poisoned_environment(test_name: &str, check: impl FnOnce(&Path)) {
+    if std::env::var_os(ISOLATED_CASE_ENV).as_deref() == Some(OsStr::new(test_name)) {
+        let config = std::env::var_os(CONFIG_DIR_ENV).expect("child config dir");
+        let state = std::env::var_os(STATE_DIR_ENV).expect("child state dir");
+        assert_eq!(config, state, "poisoned directories differ");
+        let poisoned = Path::new(&config);
+        check(poisoned);
+        std::fs::write(poisoned.join(ISOLATED_CASE_COMPLETE), "complete\n")
+            .expect("record isolated test completion");
+        return;
+    }
+
+    let poisoned = tempfile::Builder::new()
         .prefix("comet-board-poison-")
         .tempdir()
         .expect("poison dir");
-    // SAFETY: the only tests in this binary that read or write these variables
-    // hold `ENV_LOCK`, and neither starts another thread.
-    unsafe {
-        std::env::set_var(CONFIG_DIR_ENV, dir.path());
-        std::env::set_var(STATE_DIR_ENV, dir.path());
-    }
-    (env_lock, dir)
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .args(["--exact", test_name, "--nocapture"])
+        .env(ISOLATED_CASE_ENV, test_name)
+        .env(CONFIG_DIR_ENV, poisoned.path())
+        .env(STATE_DIR_ENV, poisoned.path())
+        .output()
+        .expect("run isolated test");
+
+    assert!(
+        output.status.success(),
+        "isolated test {test_name} failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    assert!(
+        poisoned.path().join(ISOLATED_CASE_COMPLETE).is_file(),
+        "isolated test {test_name} did not run"
+    );
 }
 
 /// Everything under `dir`, recursively — empty is the assertion.
@@ -58,42 +79,61 @@ fn contents(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// The environment-sensitive assertions run outside this test process, so
+/// calling them cannot disturb unrelated libtest threads.
+#[test]
+fn poisoned_environment_checks_leave_the_test_process_unchanged() {
+    let config_before = std::env::var_os(CONFIG_DIR_ENV);
+    let state_before = std::env::var_os(STATE_DIR_ENV);
+
+    under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given();
+    discover_is_where_the_environment_is_still_honoured();
+
+    assert_eq!(std::env::var_os(CONFIG_DIR_ENV), config_before);
+    assert_eq!(std::env::var_os(STATE_DIR_ENV), state_before);
+}
+
 /// The exit criterion, at the level the whole suite builds its paths.
 #[test]
 fn under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given() {
-    let (_env_lock, poisoned) = poison();
-    let dir = tempfile::tempdir().expect("tempdir");
-    let paths = Paths::under(dir.path()).expect("board dirs");
+    under_poisoned_environment(
+        "under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given",
+        |poisoned| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let paths = Paths::under(dir.path()).expect("board dirs");
 
-    for resolved in [
-        paths.config_dir.clone(),
-        paths.state_dir.clone(),
-        paths.db(),
-        paths.routing(),
-        paths.env_file(),
-        paths.pidfile(),
-        paths.logfile(),
-    ] {
-        assert!(
-            resolved.starts_with(dir.path()),
-            "{} resolved outside the directory the caller named",
-            resolved.display()
-        );
-        assert!(
-            !resolved.starts_with(poisoned.path()),
-            "{} resolved into the environment's directory",
-            resolved.display()
-        );
-    }
+            for resolved in [
+                paths.config_dir.clone(),
+                paths.state_dir.clone(),
+                paths.db(),
+                paths.routing(),
+                paths.env_file(),
+                paths.pidfile(),
+                paths.logfile(),
+            ] {
+                assert!(
+                    resolved.starts_with(dir.path()),
+                    "{} resolved outside the directory the caller named",
+                    resolved.display()
+                );
+                assert!(
+                    !resolved.starts_with(poisoned),
+                    "{} resolved into the environment's directory",
+                    resolved.display()
+                );
+            }
 
-    // Writing through the accessors is what a test actually does, and creating
-    // the dirs is what `under` does on its own — neither may reach the pair.
-    std::fs::write(paths.routing(), "# fixture\n").expect("write routing.toml");
-    std::fs::write(paths.logfile(), "fixture\n").expect("write syncd.log");
-    let stray = contents(poisoned.path());
-    assert!(
-        stray.is_empty(),
-        "the environment's board was written to: {stray:?}"
+            // Writing through the accessors is what a test actually does, and
+            // creating the dirs is what `under` does on its own — neither may
+            // reach the poisoned pair.
+            std::fs::write(paths.routing(), "# fixture\n").expect("write routing.toml");
+            std::fs::write(paths.logfile(), "fixture\n").expect("write syncd.log");
+            let stray = contents(poisoned);
+            assert!(
+                stray.is_empty(),
+                "the environment's board was written to: {stray:?}"
+            );
+        },
     );
 }
 
@@ -103,10 +143,14 @@ fn under_a_poisoned_environment_paths_stay_in_the_directory_they_were_given() {
 /// which would leave the askpass helper on the wrong board.
 #[test]
 fn discover_is_where_the_environment_is_still_honoured() {
-    let (_env_lock, poisoned) = poison();
-    let paths = Paths::discover().expect("discover");
-    assert_eq!(paths.config_dir.as_path(), poisoned.path());
-    assert_eq!(paths.state_dir.as_path(), poisoned.path());
+    under_poisoned_environment(
+        "discover_is_where_the_environment_is_still_honoured",
+        |poisoned| {
+            let paths = Paths::discover().expect("discover");
+            assert_eq!(paths.config_dir.as_path(), poisoned);
+            assert_eq!(paths.state_dir.as_path(), poisoned);
+        },
+    );
 }
 
 /// The guard against the next test written the old way: outside the two files
