@@ -51,9 +51,21 @@ export const decodeDeviceFrame = (
   bytes: Uint8Array
 ): { header: DeviceFrameHeader; payload: Uint8Array } => {
   const reader = new BytesReader(bytes);
-  const header = JSON.parse(reader.readVarString()) as DeviceFrameHeader;
+  const header = JSON.parse(reader.readVarString()) as unknown;
+  if (!isDeviceFrameHeader(header)) {
+    throw new TypeError("device frame header is not a valid object");
+  }
   const payload = reader.readBytes(reader.remaining);
   return { header, payload };
+};
+
+const isDeviceFrameHeader = (value: unknown): value is DeviceFrameHeader => {
+  if (!isRecord(value) || typeof value.s !== "string" || typeof value.k !== "string") {
+    return false;
+  }
+  return [value.to, value.from, value.u, value.o].every(
+    (field) => field === undefined || typeof field === "string"
+  );
 };
 
 interface SocketState {
@@ -65,6 +77,24 @@ interface SocketState {
   /** Accept time — the liveness floor until the socket's first auto-pong. */
   joinedAt?: number;
 }
+
+interface SocketIdentity {
+  role: "host" | "client";
+  connId?: string;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const isSocketState = (value: unknown): value is SocketState =>
+  isRecord(value) &&
+  typeof value.userId === "string" &&
+  value.userId.length > 0 &&
+  (value.orgId === undefined || typeof value.orgId === "string") &&
+  (value.role === "host" || value.role === "client") &&
+  typeof value.connId === "string" &&
+  (value.joinedAt === undefined ||
+    (typeof value.joinedAt === "number" && Number.isFinite(value.joinedAt)));
 
 /** The header the relay puts on a client→host frame: the client's own `s`/`k`,
  * and everything else built here (gh#161).
@@ -157,6 +187,9 @@ export class DeviceRoom implements DurableObject {
   private readonly ctx: DurableObjectState;
   private readonly blobs: BlobStore;
   private readonly meta: MetaStore;
+  /** Error is commonly followed by close for the same socket. Both callbacks
+   * are allowed to arrive, but their relay-level teardown is one event. */
+  private readonly terminatedSockets = new WeakSet<WebSocket>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -186,20 +219,25 @@ export class DeviceRoom implements DurableObject {
    * still lists it during `webSocketClose`, and counting it as live would
    * suppress the very `host_closed` that close is supposed to announce. */
   private liveHost(exclude?: WebSocket): WebSocket | undefined {
-    return pickLiveHost(
-      this.ctx.getWebSockets(HOST_TAG).map((ws) => ({
-        ws,
-        // Auto-pongs are stamped even while hibernating; `joinedAt` covers the
-        // window before a fresh socket's first ping. Sockets attached by an
-        // older deploy have neither and read as ancient — correct: they are.
-        lastSeenAt: Math.max(
-          this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0,
-          (ws.deserializeAttachment() as SocketState | null)?.joinedAt ?? 0
-        )
-      })),
-      Date.now(),
-      exclude
-    );
+    const hosts: Array<{ ws: WebSocket; lastSeenAt: number }> = [];
+    for (const ws of this.ctx.getWebSockets(HOST_TAG)) {
+      // In close/error callbacks workerd still lists the departing socket. Do
+      // not ask runtime APIs about it merely to discard it in pickLiveHost.
+      if (ws === exclude) continue;
+      const state = this.socketState(ws, "live_host");
+      if (!state || state.role !== "host") continue;
+      let autoResponseAt = 0;
+      try {
+        autoResponseAt = this.ctx.getWebSocketAutoResponseTimestamp(ws)?.getTime() ?? 0;
+      } catch (error) {
+        this.logRejectedEvent("live_host", "auto_response_timestamp_failed", error);
+      }
+      // Auto-pongs are stamped even while hibernating; `joinedAt` covers the
+      // window before a fresh socket's first ping. Sockets attached by an
+      // older deploy have neither and read as ancient — correct: they are.
+      hosts.push({ ws, lastSeenAt: Math.max(autoResponseAt, state.joinedAt ?? 0) });
+    }
+    return pickLiveHost(hosts, Date.now());
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -336,12 +374,17 @@ export class DeviceRoom implements DurableObject {
 
   webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): void {
     if (typeof message === "string") return; // ping/pong auto-response
-    const state = ws.deserializeAttachment() as SocketState;
+    const state = this.socketState(ws, "message");
+    if (!state) {
+      this.closeSocket(ws, 1011, "Socket state error", "message");
+      return;
+    }
     let frame: { header: DeviceFrameHeader; payload: Uint8Array };
     try {
       frame = decodeDeviceFrame(new Uint8Array(message));
-    } catch {
-      ws.close(1002, "Frame error");
+    } catch (error) {
+      this.logRejectedEvent("message", "invalid_frame", error);
+      this.closeSocket(ws, 1002, "Frame error", "message");
       return;
     }
     if (state.role === "client") {
@@ -367,16 +410,33 @@ export class DeviceRoom implements DurableObject {
   }
 
   webSocketClose(ws: WebSocket): void {
-    const state = ws.deserializeAttachment() as SocketState | null;
-    if (!state) return;
-    if (state.role === "client") {
+    this.handleSocketTermination(ws, "close");
+  }
+
+  webSocketError(ws: WebSocket, error?: unknown): void {
+    this.logRejectedEvent("error", "socket_error", error);
+    this.handleSocketTermination(ws, "error");
+  }
+
+  private handleSocketTermination(ws: WebSocket, event: "close" | "error"): void {
+    if (this.terminatedSockets.has(ws)) return;
+    this.terminatedSockets.add(ws);
+
+    const identity = this.socketIdentity(ws, event);
+    const state = this.socketState(ws, event, identity);
+    const role = state?.role ?? identity?.role;
+    if (role === "client") {
       // Tell the host so it can tear down any per-client streams (ptys etc.).
       const host = this.liveHost();
       if (host) {
-        this.deliver(host, { s: "", k: RELAY_KIND, from: state.connId }, encodeRelayError("client_closed"));
+        const connId = state?.connId ?? identity?.connId;
+        if (connId) {
+          this.deliver(host, { s: "", k: RELAY_KIND, from: connId }, encodeRelayError("client_closed"));
+        }
       }
       return;
     }
+    if (role !== "host") return;
     // A host socket went away. Only tear the clients' links down when NO live
     // host is left: a superseded predecessor closing (or a corpse the runtime
     // finally reaps) must not knock clients off the successor that already
@@ -384,14 +444,81 @@ export class DeviceRoom implements DurableObject {
     if (this.liveHost(ws)) return;
     // Host went away: notify every client.
     for (const client of this.ctx.getWebSockets()) {
-      const cs = client.deserializeAttachment() as SocketState | null;
+      if (client === ws) continue;
+      const cs = this.socketState(client, event);
       if (cs?.role !== "client") continue;
       this.deliver(client, { s: "", k: RELAY_KIND }, encodeRelayError("host_closed"));
     }
   }
 
-  webSocketError(ws: WebSocket): void {
-    this.webSocketClose(ws);
+  private socketIdentity(
+    ws: WebSocket,
+    event: "message" | "close" | "error" | "live_host"
+  ): SocketIdentity | undefined {
+    let tags: string[];
+    try {
+      tags = this.ctx.getTags(ws);
+    } catch (error) {
+      this.logRejectedEvent(event, "socket_tags_unavailable", error);
+      return undefined;
+    }
+    if (tags.includes(HOST_TAG)) return { role: "host" };
+    const tag = tags.find((candidate) => candidate.startsWith("client:"));
+    if (tag) return { role: "client", connId: tag.slice("client:".length) };
+    this.logRejectedEvent(event, "socket_tags_invalid");
+    return undefined;
+  }
+
+  private socketState(
+    ws: WebSocket,
+    event: "message" | "close" | "error" | "live_host",
+    knownIdentity?: SocketIdentity
+  ): SocketState | undefined {
+    // Attachments outlive the object instance and may outlive a deployment;
+    // the runtime contract is `any | null`, not this revision's interface.
+    let value: unknown;
+    try {
+      value = ws.deserializeAttachment();
+    } catch (error) {
+      this.logRejectedEvent(event, "attachment_deserialize_failed", error);
+      return undefined;
+    }
+    const identity = knownIdentity ?? this.socketIdentity(ws, event);
+    if (
+      !isSocketState(value) ||
+      !identity ||
+      value.role !== identity.role ||
+      (value.role === "client" && value.connId !== identity.connId)
+    ) {
+      this.logRejectedEvent(event, "invalid_socket_state");
+      return undefined;
+    }
+    return value;
+  }
+
+  private closeSocket(
+    ws: WebSocket,
+    code: number,
+    reason: string,
+    event: "message" | "close" | "error"
+  ): void {
+    try {
+      ws.close(code, reason);
+    } catch (error) {
+      this.logRejectedEvent(event, "socket_close_failed", error);
+    }
+  }
+
+  /** Permanent diagnostics for rejected hibernation inputs. Values are fixed
+   * classifications only: never socket attachments, ids, or frame contents. */
+  private logRejectedEvent(event: string, reason: string, error?: unknown): void {
+    const cause = error instanceof Error ? error.name : error === undefined ? "none" : typeof error;
+    console.warn(
+      "DeviceRoom WebSocket event rejected",
+      `event=${event}`,
+      `reason=${reason}`,
+      `cause=${cause}`
+    );
   }
 
   private deliver(ws: WebSocket, header: DeviceFrameHeader, payload: Uint8Array): void {
