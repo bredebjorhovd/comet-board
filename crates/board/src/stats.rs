@@ -24,7 +24,8 @@ pub use comet_proto::TokenUsage;
 pub use comet_proto::view::rates::human_usd;
 pub use comet_proto::view::stats::{
     AgentSpend, BREAKDOWN_ROWS, BoardStats as Stats, Breakdown, BreakdownRow, DayBucket, Dimension,
-    Friction, HOURS, Landing, Ranking, StatsMergeBasis, TokenDay, human_tokens, rank_breakdown,
+    Friction, HOURS, Landing, Ranking, StatsAccountIdentity, StatsMergeBasis, TokenDay,
+    human_tokens, rank_breakdown,
 };
 
 /// Whose subscription a dispatch that named no slot spent (gh#101).
@@ -534,6 +535,19 @@ fn gather_with(
     let merge_basis = StatsMergeBasis {
         duration_minutes: durations.clone(),
         breakdown: full_breakdown,
+        account_identities: by_account
+            .keys()
+            .map(|label| {
+                let identity = if label == THE_BOX {
+                    StatsAccountIdentity::BoardLocal
+                } else {
+                    StatsAccountIdentity::Shared {
+                        account_id: label.clone(),
+                    }
+                };
+                (label.clone(), identity)
+            })
+            .collect(),
     };
 
     let stats = Stats {

@@ -47,10 +47,19 @@ These inputs exist only for this request and are retained by neither side.
 
 Pricing keeps the single-board honesty rules. Known list-price estimates add;
 usage a board could not price (an unknown model or absent rates) remains
-explicitly unpriced; account usage and attempt attribution add by account. An
-identical plan declaration for the same account is one subscription and is not
-charged once per board. Conflicting plan declarations are omitted from the
-aggregate comparison while the individual board answers retain them for audit.
+explicitly unpriced. Each snapshot also identifies configured payer ids as
+shared and unnamed/default logins as board-local. Shared ids merge across
+boards; board-local labels are qualified with `board_id` before account
+attempts, tokens, breakdown rows, spend and plan declarations are combined.
+Thus an identical plan for one known shared account is one subscription, while
+two boxes' default subscriptions remain distinct. Conflicting declarations for
+one shared id are omitted from the aggregate comparison while individual board
+answers retain them for audit.
+
+An explicitly disabled board answers `noBoard`. If the engine intended to host
+a board but could not start its service or read `board.db`, it retains that
+failure and the probe answers `unreadable`; the aggregate is therefore
+incomplete rather than silently treating the host as zero activity.
 
 ### Ownership, freshness, and cost
 

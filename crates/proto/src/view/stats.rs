@@ -1187,6 +1187,17 @@ pub struct StatsMergeBasis {
     pub duration_minutes: Vec<i64>,
     /// The same five cuts as [`BoardStats::breakdown`], before its display cap.
     pub breakdown: Vec<Breakdown>,
+    /// The durable identity behind each display account label. Configured
+    /// payer ids may be shared by boards; an unnamed login belongs only to
+    /// the board that reported it and is qualified by `board_id` when merged.
+    pub account_identities: BTreeMap<String, StatsAccountIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "scope")]
+pub enum StatsAccountIdentity {
+    Shared { account_id: String },
+    BoardLocal,
 }
 
 /// A device as the aggregate contract names it.
@@ -1635,6 +1646,15 @@ struct BreakdownMerge {
     unpriced_tokens: u64,
 }
 
+fn aggregate_account_label(snapshot: &BoardStatsSnapshot, label: &str) -> String {
+    match snapshot.merge_basis.account_identities.get(label) {
+        Some(StatsAccountIdentity::Shared { account_id }) => account_id.clone(),
+        Some(StatsAccountIdentity::BoardLocal) | None => {
+            format!("{label} ({})", snapshot.board_id)
+        }
+    }
+}
+
 fn merge_breakdown(snapshots: &[BoardStatsSnapshot]) -> Vec<Breakdown> {
     let mut cuts: BTreeMap<(Dimension, String), BreakdownMerge> = BTreeMap::new();
     for snapshot in snapshots {
@@ -1645,7 +1665,12 @@ fn merge_breakdown(snapshots: &[BoardStatsSnapshot]) -> Vec<Breakdown> {
         };
         for cut in source {
             for row in &cut.rows {
-                let merged = cuts.entry((cut.dimension, row.label.clone())).or_default();
+                let label = if cut.dimension == Dimension::Account {
+                    aggregate_account_label(snapshot, &row.label)
+                } else {
+                    row.label.clone()
+                };
+                let merged = cuts.entry((cut.dimension, label)).or_default();
                 merged.dispatches += row.dispatches;
                 merged.usage.add(row.usage);
                 match row.cost {
@@ -1789,7 +1814,9 @@ fn merge_spend(snapshots: &[BoardStatsSnapshot]) -> Option<BoardSpend> {
                         .add(row.usage);
                 }
                 for row in &spend.accounts {
-                    add_account_row(&mut accounts, row.clone());
+                    let mut row = row.clone();
+                    row.label = aggregate_account_label(snapshot, &row.label);
+                    add_account_row(&mut accounts, row);
                 }
             }
             None => {
@@ -1808,7 +1835,7 @@ fn merge_spend(snapshots: &[BoardStatsSnapshot]) -> Option<BoardSpend> {
                     add_account_row(
                         &mut accounts,
                         AccountSpend {
-                            label: label.clone(),
+                            label: aggregate_account_label(snapshot, label),
                             attempts: *attempts,
                             usage,
                             list_price: Usd::ZERO,
@@ -1924,10 +1951,21 @@ fn merge_board_stats(since_days: Option<i64>, snapshots: &[BoardStatsSnapshot]) 
         add_counts(&mut merged.by_workspace, &stats.by_workspace);
         add_counts(&mut merged.by_runtime, &stats.by_runtime);
         add_counts(&mut merged.by_source, &stats.by_source);
-        add_counts(&mut merged.by_account, &stats.by_account);
+        for (label, count) in &stats.by_account {
+            *merged
+                .by_account
+                .entry(aggregate_account_label(snapshot, label))
+                .or_default() += count;
+        }
         add_tokens(&mut merged.tokens_by_model, &stats.tokens_by_model);
         add_tokens(&mut merged.tokens_by_runtime, &stats.tokens_by_runtime);
-        add_tokens(&mut merged.tokens_by_account, &stats.tokens_by_account);
+        for (label, usage) in &stats.tokens_by_account {
+            merged
+                .tokens_by_account
+                .entry(aggregate_account_label(snapshot, label))
+                .or_default()
+                .add(*usage);
+        }
         durations.extend(snapshot.merge_basis.duration_minutes.iter().copied());
     }
 
@@ -3035,6 +3073,18 @@ mod tests {
         stats: BoardStats,
         durations: &[i64],
     ) -> BoardStatsSnapshot {
+        let account_identities = stats
+            .by_account
+            .keys()
+            .map(|label| {
+                (
+                    label.clone(),
+                    StatsAccountIdentity::Shared {
+                        account_id: label.clone(),
+                    },
+                )
+            })
+            .collect();
         BoardStatsSnapshot {
             board_id: board_id.to_string(),
             host,
@@ -3042,8 +3092,151 @@ mod tests {
             merge_basis: StatsMergeBasis {
                 duration_minutes: durations.to_vec(),
                 breakdown: Vec::new(),
+                account_identities,
             },
         }
+    }
+
+    #[test]
+    fn aggregate_accounts_keep_local_logins_apart_and_merge_shared_payers() {
+        fn account_stats(default_tokens: u64, shared_tokens: u64) -> BoardStats {
+            let mut stats = BoardStats::empty(Some(7));
+            stats.attempts = 2;
+            stats.by_account = BTreeMap::from([
+                ("the box's own login".into(), 1),
+                ("shared@example.com".into(), 1),
+            ]);
+            stats.tokens_by_account = BTreeMap::from([
+                ("the box's own login".into(), usage(default_tokens, 0, 0, 0)),
+                ("shared@example.com".into(), usage(shared_tokens, 0, 0, 0)),
+            ]);
+            stats.spend = Some(BoardSpend {
+                rates: RateTable::empty("2026-08-16"),
+                list_price: Usd::ZERO,
+                by_model: Vec::new(),
+                unpriced: Vec::new(),
+                unpriced_tokens: default_tokens + shared_tokens,
+                accounts: stats
+                    .by_account
+                    .iter()
+                    .map(|(label, attempts)| AccountSpend {
+                        label: label.clone(),
+                        attempts: *attempts,
+                        usage: stats.tokens_by_account[label],
+                        list_price: Usd::ZERO,
+                        unpriced_tokens: stats.tokens_by_account[label].total(),
+                        plan: None,
+                        plan_in_window: None,
+                    })
+                    .collect(),
+            });
+            stats
+        }
+
+        fn identified_snapshot(board_id: &str, stats: BoardStats) -> BoardStatsSnapshot {
+            let account_rows = stats
+                .by_account
+                .iter()
+                .map(|(label, dispatches)| BreakdownRow {
+                    label: label.clone(),
+                    dispatches: *dispatches,
+                    usage: stats.tokens_by_account[label],
+                    cost: None,
+                    unpriced_tokens: stats.tokens_by_account[label].total(),
+                })
+                .collect();
+            BoardStatsSnapshot {
+                board_id: board_id.into(),
+                host: stats_device(board_id, board_id),
+                stats,
+                merge_basis: StatsMergeBasis {
+                    breakdown: vec![Breakdown {
+                        dimension: Dimension::Account,
+                        rows: account_rows,
+                        ranking: Ranking::Tokens,
+                        peak: 0,
+                    }],
+                    account_identities: BTreeMap::from([
+                        (
+                            "the box's own login".into(),
+                            StatsAccountIdentity::BoardLocal,
+                        ),
+                        (
+                            "shared@example.com".into(),
+                            StatsAccountIdentity::Shared {
+                                account_id: "shared@example.com".into(),
+                            },
+                        ),
+                    ]),
+                    ..Default::default()
+                },
+            }
+        }
+
+        let aggregate = aggregate_board_stats(
+            Some(7),
+            vec![
+                StatsProbe {
+                    candidate: stats_device("a", "A"),
+                    result: StatsProbeResult::Answered(identified_snapshot(
+                        "board-a",
+                        account_stats(10, 20),
+                    )),
+                },
+                StatsProbe {
+                    candidate: stats_device("b", "B"),
+                    result: StatsProbeResult::Answered(identified_snapshot(
+                        "board-b",
+                        account_stats(30, 40),
+                    )),
+                },
+            ],
+        );
+
+        assert_eq!(aggregate.stats.by_account["shared@example.com"], 2);
+        assert_eq!(
+            aggregate.stats.by_account["the box's own login (board-a)"],
+            1
+        );
+        assert_eq!(
+            aggregate.stats.by_account["the box's own login (board-b)"],
+            1
+        );
+        assert_eq!(
+            aggregate.stats.tokens_by_account["shared@example.com"].total(),
+            60
+        );
+        assert_eq!(
+            aggregate
+                .stats
+                .cut(Dimension::Account)
+                .expect("account breakdown")
+                .rows
+                .iter()
+                .map(|row| row.label.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "shared@example.com",
+                "the box's own login (board-b)",
+                "the box's own login (board-a)"
+            ]
+        );
+        let labels = aggregate
+            .stats
+            .spend
+            .expect("spend")
+            .accounts
+            .into_iter()
+            .map(|row| row.label)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            labels,
+            vec![
+                "shared@example.com",
+                "the box's own login (board-a)",
+                "the box's own login (board-b)"
+            ]
+        );
     }
 
     #[test]
@@ -4185,6 +4378,7 @@ mod spec {
                         merge_basis: StatsMergeBasis {
                             duration_minutes: vec![18, 74],
                             breakdown: Vec::new(),
+                            ..Default::default()
                         },
                     }),
                 },
@@ -4218,6 +4412,7 @@ mod spec {
                         merge_basis: StatsMergeBasis {
                             duration_minutes: vec![5],
                             breakdown: Vec::new(),
+                            ..Default::default()
                         },
                     }),
                 },

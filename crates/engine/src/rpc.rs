@@ -73,8 +73,8 @@ use tokio::sync::watch;
 
 use comet_doc::SessionCommandPayload;
 use comet_proto::view::stats::{
-    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe, StatsProbeResult,
-    aggregate_board_stats,
+    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsHostStatus, StatsProbe,
+    StatsProbeResult, aggregate_board_stats,
 };
 use comet_proto::{ChatConfig, HarnessId};
 use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
@@ -540,6 +540,7 @@ pub struct EngineRpc {
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<comet_update::Updater>,
     board: Option<std::sync::Arc<crate::board::BoardService>>,
+    board_startup_error: Option<String>,
     /// Live edge-connection census (gh#116). A closure rather than the pieces,
     /// because the host-relay socket is owned by the core, not by anything this
     /// struct holds — and the answer must be recomputed per call, never cached.
@@ -576,6 +577,7 @@ impl EngineRpc {
             links: None,
             updater: None,
             board: None,
+            board_startup_error: None,
             edge_health: None,
         }
     }
@@ -601,6 +603,11 @@ impl EngineRpc {
     /// Attach the board service (WatchBoard / DispatchTask / CancelTask).
     pub fn with_board(mut self, board: std::sync::Arc<crate::board::BoardService>) -> Self {
         self.board = Some(board);
+        self
+    }
+
+    pub fn with_board_startup_error(mut self, error: String) -> Self {
+        self.board_startup_error = Some(error);
         self
     }
 
@@ -738,13 +745,17 @@ impl EngineRpc {
     /// to be able to tell this device's honest "not me" from a call that never
     /// arrived. Same message, tagged so the answer survives the relay.
     fn board(&self) -> Result<&crate::board::BoardService, RpcError> {
-        self.board.as_deref().ok_or_else(|| {
-            RpcError::Refused(
-                "board unavailable (COMET_BOARD=0, or the service failed to start — \
-                 see the engine log)"
-                    .into(),
-            )
-        })
+        if let Some(board) = self.board.as_deref() {
+            return Ok(board);
+        }
+        match &self.board_startup_error {
+            Some(error) => Err(RpcError::Failed(format!(
+                "board service failed to start: {error}"
+            ))),
+            None => Err(RpcError::Refused(
+                "board disabled or absent (COMET_BOARD=0)".into(),
+            )),
+        }
     }
 
     /// Forward a device-addressed call over the target device's relay. On transport
@@ -2659,6 +2670,23 @@ mod tests {
             EngineRpc::stats_probe_error(RpcError::UnknownMethod("old engine".into())),
             StatsProbeResult::Unreadable(_)
         ));
+
+        let failed_start = EngineRpc::stats_probe_error(RpcError::Failed(
+            "board service failed to start: opening board.db: permission denied".into(),
+        ));
+        assert!(matches!(failed_start, StatsProbeResult::Unreadable(_)));
+        let aggregate = comet_proto::view::stats::aggregate_board_stats(
+            Some(7),
+            vec![StatsProbe {
+                candidate: StatsDevice {
+                    device_id: "broken".into(),
+                    label: "Broken board host".into(),
+                },
+                result: failed_start,
+            }],
+        );
+        assert!(!aggregate.complete);
+        assert_eq!(aggregate.hosts[0].status, StatsHostStatus::Unreadable);
     }
 
     /// gh#97: onboarding is three device-local effects behind one verb — a
