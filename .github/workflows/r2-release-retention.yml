@@ -1,0 +1,77 @@
+name: R2 release retention
+
+# The schedule is audit-only until an operator explicitly sets the repository
+# variable R2_RELEASE_RETENTION_POLICY=keep-current-plus-4. That activation is
+# intentionally separate from merging the reviewed policy. A manual run also
+# defaults to audit and requires the same phrase before it can apply.
+on:
+  schedule:
+    - cron: "23 04 * * 1"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Audit only, or apply the reviewed retention policy
+        type: choice
+        options: [audit, apply]
+        default: audit
+        required: true
+      confirm_policy:
+        description: For apply, enter keep-current-plus-4
+        type: string
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  retention:
+    runs-on: ubuntu-latest
+    # Shared with release.yml's publish job: an audit or cleanup cannot overlap
+    # the artifact -> manifest -> pointer publication transaction.
+    concurrency:
+      group: r2-release-mutation
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      GITHUB_TOKEN: ${{ github.token }}
+      SCHEDULED_POLICY: ${{ vars.R2_RELEASE_RETENTION_POLICY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cloudflare account (from edge/wrangler.jsonc)
+        run: |
+          acct=$(sed -n 's/.*"account_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+            edge/wrangler.jsonc | head -1)
+          [ -n "$acct" ] || { echo "no account_id in edge/wrangler.jsonc"; exit 1; }
+          echo "CLOUDFLARE_ACCOUNT_ID=$acct" >> "$GITHUB_ENV"
+      - name: choose audit or apply
+        id: mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_MODE: ${{ inputs.mode }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirm_policy }}
+        run: |
+          mode=audit
+          confirmation=
+          if [ "$EVENT_NAME" = schedule ] && [ "$SCHEDULED_POLICY" = keep-current-plus-4 ]; then
+            mode=apply
+            confirmation="$SCHEDULED_POLICY"
+          elif [ "$EVENT_NAME" = workflow_dispatch ] && [ "$REQUESTED_MODE" = apply ]; then
+            mode=apply
+            confirmation="$REQUESTED_CONFIRMATION"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "confirmation=$confirmation" >> "$GITHUB_OUTPUT"
+      - name: retention ${{ steps.mode.outputs.mode }}
+        env:
+          MODE: ${{ steps.mode.outputs.mode }}
+          CONFIRMATION: ${{ steps.mode.outputs.confirmation }}
+        run: |
+          args=()
+          if [ "$MODE" = apply ]; then
+            args=(--apply --confirm-policy "$CONFIRMATION")
+          fi
+          node scripts/release-retention.mjs "${args[@]}" | tee retention-report.txt
+          cat retention-report.txt >> "$GITHUB_STEP_SUMMARY"
