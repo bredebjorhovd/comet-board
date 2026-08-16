@@ -281,6 +281,7 @@ Delivered
   standing_reviews_complete         defaults to false
   standing_reviews_updated_at       pull updated_at reconciled completely
   next_standing_review_sequence     next PR-local value, seeded above legacy watermarks
+  chronology_ambiguous_reviewers[] verified reviewer keys; nonempty fails closed
   legacy_review_blocker             null | LegacyReviewBlocker
   standing_reviews[]
   submission_tombstones[]
@@ -325,6 +326,19 @@ SubmissionTombstone
   projection
   posted_as
   compacted_at
+
+CompactedVerdictReceipt
+  receipt_kind              compacted
+  task_id
+  attempt
+  kind
+  reviewed_head_sha
+  review_id
+  delivery_state
+  projection
+  posted_as
+  compacted_at
+  recorded                  false
 ```
 
 The legacy token is SHA-256 over a canonical length-prefixed encoding of the
@@ -345,11 +359,11 @@ as the `comet:` key of a decisive standing review. The old three-field
 fingerprint remains readable only as legacy state; it is never used to dedupe a
 new request.
 
-Thus the same reviewer retrying the same verdict on the same head gets the first
-receipt, while that reviewer acting on a new head and a second verified reviewer
-acting on the same head create distinct submissions. The board-owned body
-marker carries this v2 identity so a GitHub review id recovered after a crash
-can alias only the submission that produced it.
+Thus the same reviewer retrying the same verdict on the same head finds the same
+submission, while that reviewer acting on a new head and a second verified
+reviewer acting on the same head create distinct submissions. The board-owned
+body marker carries this v2 identity so a GitHub review id recovered after a
+crash can alias only the submission that produced it.
 
 `MAX_SUBMISSIONS = 20` remains the bound on full, retryable ledger entries, but
 v2 identities are not evicted with them. Before inserting entry 21, the board
@@ -360,6 +374,15 @@ with delivery/projection status and suppress both side effects; it retains no
 comment body or payload. A retry found in either tier returns `recorded = false`
 and never delivers or posts again. This applies uniformly to Comments, which
 have no `StandingReview`, and to decisive verdicts.
+
+A live hit returns the existing full `VerdictReceipt`. A tombstone hit returns
+the tagged `CompactedVerdictReceipt` above, augmented with the retry preflight's
+nullable current-head/freshness fields. It deliberately omits `refusal`,
+`not_delivered`, `chat_id`, `unclaimed`, and `payload`; clients render “Already
+submitted; detailed receipt compacted at <time>” plus retained delivery and
+projection status, never pretend this is the first receipt. Desktop, iOS, CLI
+text, and JSON exhaustively switch on `receipt_kind`; absent live-only fields
+are not synthesized.
 
 `MAX_SUBMISSION_TOMBSTONES = 256` bounds that second tier per pull request.
 Unsettled live entries are never compacted because a retry may still have
@@ -403,6 +426,20 @@ reconciliation persists `acceptance = unknown` and refuses with no submission,
 standing review, chat message, or GitHub review. Thus a GitHub review that
 already moved `updated_at` is ingested and sequenced before the later Comet
 verdict even when the Comet request reaches the board first.
+
+Immediately before the record transaction, a second targeted pull read fences
+the allocation window. If `updated_at` moved since reconciliation, the board
+reconciles that timestamp before allocating; failure or truncation refuses
+without effects. The transaction stores the fenced timestamp beside the new
+sequence. Immediately after commit and before delivery, one more targeted read
+detects movement that raced the fence itself. A newly discovered decisive
+review by the same reviewer makes that reviewer's chronology ambiguous rather
+than receiving a falsely newer sequence: the board persists the review and
+reviewer key in `chronology_ambiguous_reviewers`, sets `acceptance = unknown`,
+retains any conservative change-request blocker, and disables Merge. A later
+decisive verdict from that reviewer clears the latch only after its own fence
+observes one stable, completely reconciled timestamp. Different reviewers stay
+independently ordered. No retry loop is added.
 
 Only after that ordered preflight does the verdict submission record the same
 expected SHA and the transport's verified reviewer identity; Approve and
@@ -525,12 +562,16 @@ legacy high-water mark as the checked maximum of:
 - and, when resuming an interrupted migration, every already stored standing
   sequence and `next_standing_review_sequence - 1`.
 
-It atomically seeds `next_standing_review_sequence` to high-water plus one, then
-allocates imported GitHub reviews and later Comet decisions from that counter.
-Checked overflow leaves the schema incomplete and Merge unavailable. The
-existing per-dependent `fanned_out` map is retained unchanged: an old watermark
-still suppresses the old notice, while every new change request is necessarily
-greater and therefore reaches each existing dependent once. Reconciliation and
+The complete migration read also contributes every returned GitHub review id to
+the high-water mark. It gives reconstructed legacy GitHub reviews their own
+positive review id as `sequence`, including an active
+`changes_requested_id`; it does not renumber review 900 to 901. It then
+atomically seeds `next_standing_review_sequence` above the final high-water and
+allocates later Comet decisions from that counter. Checked overflow leaves the
+schema incomplete and Merge unavailable. The existing per-dependent
+`fanned_out` map is retained unchanged: watermark 900 still suppresses the
+already-delivered notice for reconstructed active review 900, while every new
+change request is greater and reaches each dependent once. Reconciliation and
 aliasing never lower or reseed the counter.
 
 On load, an absent/older `standing_reviews_schema_version` or false
@@ -630,12 +671,16 @@ outranks a conflict or failed check on the current head; repairing or reviewing
 that disposable head would only create work the ordered upstack replay moves
 underneath.
 
-For an open, reviewable row, inspect the current layer and every *visible* open
-layer below it, bottom first. The lowest visible blocker owns the action. If it
-is a lower layer, the action is `Open PR #N`; Comet never sends the current
-layer's author a generic “the stack is red” prompt. The lower layer's own
-Review screen offers the repair that belongs to its checkout. A blocker above
-the current layer is shown on the map but does not block this layer by itself.
+For an open, reviewable row, inspect the lifecycle of the current layer and
+*every* visible layer below it, bottom first, before filtering for open-layer
+gates. A merged lower layer is satisfied. A lower layer with `state = CLOSED`
+and null `merged_at` owns `Open closed PR #N` and prevents every current-layer
+mutation, even when the current layer is clean. Among remaining open lower
+layers, the lowest visible blocker owns the action. If it is a lower layer, the
+action is `Open PR #N`; Comet never sends the current layer's author a generic
+“the stack is red” prompt. The lower layer's own Review screen offers the repair
+that belongs to its checkout. A blocker above the current layer is shown on the
+map but does not block this layer by itself.
 
 For the visible layer that owns the blocker, precedence is:
 
@@ -660,7 +705,9 @@ blocker. Standalone or `stack_gate = complete` may derive `Merge…` only when t
 current layer and every open layer below is accepted, non-draft, fresh,
 untruncated, checks-complete, and known mergeable. Equal visible and GitHub
 counts are necessary but not sufficient; the exact `1..=size` position check
-defined above prevents duplicates from masquerading as completeness.
+defined above prevents duplicates from masquerading as completeness. Every
+non-open lower layer must be merged; a closed-unmerged lower layer can never be
+discarded from the landing gate.
 
 `BEHIND`, `BLOCKED`, and unrecognised `mergeStateStatus` values get their own
 honest blocker text and an `Open on GitHub` action until a later design gives
@@ -889,9 +936,10 @@ The existing verdict and merge surfaces become:
 - `SubmitVerdict { taskId, attempt, kind, comment, expectedHeadSha,
   replacesLegacyDecision }` — the head is required for Comment, Approve, and
   Request changes alike; the optional legacy token is accepted only for a
-  decisive verdict against the still-current blocker. Its receipt adds
-  `reviewedHeadSha`, nullable `currentHeadSha`, nullable `headMoved`, and
-  `repositoryFresh`;
+  decisive verdict against the still-current blocker. It returns the tagged
+  union `live: VerdictReceipt | compacted: CompactedVerdictReceipt`; both
+  variants carry `reviewedHeadSha`, nullable `currentHeadSha`, nullable
+  `headMoved`, and `repositoryFresh`;
 - `MergeTask { taskId, confirmation, expectedHeadSha,
   expectedTopologyFingerprint }` — both optimistic-lock values are required
   when invoked from Review; its receipt exposes `atomicity`,
@@ -943,6 +991,8 @@ Authority stays separated by construction:
   mutation action enabled.
 - A changed `updated_at` or incomplete review marker that cannot be completely
   reconciled prevents local sequence allocation and every verdict side effect.
+- Same-reviewer movement racing the allocation fence persists chronology
+  ambiguity and keeps acceptance unknown; an imported hash order never decides.
 - A legacy sequence high-water overflow or incomplete atomic seed keeps the
   schema incomplete; per-edge fan-out watermarks are never compared with a
   reset counter.
@@ -950,6 +1000,8 @@ Authority stays separated by construction:
   buys space by making an older delivery or GitHub post repeatable.
 - An absent or changed legacy-replacement token leaves the unresolved blocker
   and all verdict state untouched.
+- A closed-unmerged lower layer is a lifecycle blocker, not an absent open gate;
+  neither cached eligibility nor a clean current layer can derive Merge over it.
 - A merge topology mismatch or refreshed lower-layer blocker observed during
   preflight never reaches gh#408's merge executor. A lower-layer change after
   preflight is the explicitly displayed `current_head_only` residual, not
@@ -1013,7 +1065,11 @@ The implementation is complete when these seams are pinned:
    verdict preflight reconciles and assigns the approval sequence N before
    allocating N+1 to the local request, which remains the blocker. A failed or
    truncated version of that preflight allocates no sequence and performs no
-   delivery or post.
+   delivery or post. In the exact post-preflight/pre-allocation race, the second
+   targeted read sees the moved timestamp, imports the older approval first,
+   and then gives the local request the greater sequence. Movement racing that
+   fence sets the same-reviewer ambiguity latch and cannot derive Merge until a
+   stable explicit replacement.
 7. A pagination fixture with more than the review cap yields
    `review_state_truncated`, `acceptance = unknown`, and no Merge. Migration
    fixtures deserialize the exact pre-upgrade `Delivered` JSON rather than
@@ -1028,7 +1084,9 @@ The implementation is complete when these seams are pinned:
    and `fanned_out[child] = 900`; after migration clears that blocker, a new
    local Request changes receives a sequence above 900. The existing child gets
    the new generic notice once, its edge watermark advances to the new sequence,
-   and a second fan-out pass is silent.
+   and a second fan-out pass is silent. A companion serialized fixture keeps
+   review 900 active: reconstruction assigns sequence 900, preserves the child's
+   watermark 900, and sends no duplicate generic notice.
 8. V2 submission-identity fixtures prove an empty Approve retried by the same
    reviewer on the same head dedupes, the same reviewer on a new head is
    distinct, and two verified reviewers approving the same head are distinct.
@@ -1044,7 +1102,10 @@ The implementation is complete when these seams are pinned:
    submissions, survives a serialize/reload as an exact tombstone, and a retry
    performs neither chat delivery nor GitHub POST. The same assertion covers a
    decisive verdict; a full live-plus-tombstone ledger refuses a new identity
-   instead of evicting the oldest one.
+   instead of evicting the oldest one. Field-by-field snapshots before and after
+   reload assert the reduced `CompactedVerdictReceipt` contract, and each
+   desktop, iOS, CLI, and JSON fixture renders the compacted variant without
+   filling omitted live-only fields.
 9. Every action-precedence row is table-tested, including no-check
    repositories, drafts, optional failures, stale data, and a REST transition
    from an actionable open projection to closed-unmerged. That transition
@@ -1056,7 +1117,9 @@ The implementation is complete when these seams are pinned:
    verdict controls and mutations are disabled and the sole action opens #N.
    A partial fixture with GitHub size three and only two unique visible layers
    asserts `stack_gate = partial`, `Open stack on GitHub`, and no Merge even
-   when every visible gate passes. Each blocker fixture names its owning layer.
+   when every visible gate passes. A complete stack with a closed-unmerged lower
+   layer and clean current layer yields `Open closed PR #N` for the lower layer
+   and no Merge. Each blocker fixture names its owning layer.
 11. A complete bottom-merged/upper-open stack keeps aggregate `pr_open = true`
     and `pr_merged = false`, stays in Review, offers the lowest open upper PR,
     and invokes none of `finish_on_merge`, chat archive, or worktree collection.
