@@ -149,6 +149,11 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, macos]
     runs-on: ubuntu-latest
+    # The retention workflow uses the same group. The bucket's publication
+    # transaction and a cleanup therefore cannot observe one another halfway.
+    concurrency:
+      group: r2-release-mutation
+      cancel-in-progress: false
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface
       # the token through job env and gate on that instead. The token is the
@@ -241,6 +246,9 @@ jobs:
           body_path: release-body.md
           generate_release_notes: true
           prerelease: true
+      - name: mark the R2 publication in progress
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: node scripts/release-retention.mjs publication-start "$VERSION"
       - name: upload to R2 (edge.comet.offhand.dev/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
@@ -303,6 +311,14 @@ jobs:
           [ "$served" = "$VERSION" ] \
             || { echo "::error::$base/latest.txt serves '$served' after the upload, expected '$VERSION'"; exit 1; }
           echo "the edge now hands out $served"
+
+      # A failure before here deliberately leaves the marker behind. Retention
+      # then blocks rather than treating the partial root-key set as an old
+      # release. A rerun overwrites the marker and clears it only after the
+      # public pointer has been read back successfully.
+      - name: mark the R2 publication complete
+        if: env.CLOUDFLARE_API_TOKEN != ''
+        run: node scripts/release-retention.mjs publication-finish "$VERSION"
 
       # Only now is the release a release. Without a token there is no R2 half
       # to verify and the GitHub release is the whole of it, so this runs
