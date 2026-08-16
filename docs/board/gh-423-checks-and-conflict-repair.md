@@ -195,27 +195,33 @@ repository before posting `/graphql`; a cross-repository query cannot rely on
 the current REST client's path-to-repository inference.
 
 The refresh candidate set comes from persisted identity, not only from that
-list: every task or visible stack layer still stored as open contributes its
-`pr_node_id` to the repository queue even when the first page omitted it. A
-GraphQL query is due for that identity when any of these is true:
+list. Every nonmerged pull-request identity belonging to a live or Review task,
+including a layer currently projected `closed_unmerged`, contributes its
+`pr_node_id` to the repository queue even when the first page omitted it.
+Merged identities leave this lifecycle queue; closed-unmerged identities leave
+only when existing issue/task termination or archive retention removes their
+Review ownership. A GraphQL query is due for a retained identity when any of
+these is true:
 
 - it has no projection;
 - the REST list observed a different head or base;
 - its last projection contains a pending context;
 - its `observed_at` is at least the existing 120-second `FULL_SWEEP_SECS`
-  cadence old.
+  cadence old, whether its last observation was open or closed-unmerged.
 
 At most 200 node identities per repository are refreshed in one board cycle:
 four serial batches of 50. At least one batch is reserved for the oldest
 overdue persisted identities; new/missing projections, list-observed head/base
 changes, and pending checks may consume the other three before unused capacity
 returns to the overdue queue. Within successful GitHub cycles, continuous
-pending work therefore cannot starve lifecycle proof. Overdue identities sort
-by `pr_repository_next_probe_at` then node id, and advance that timestamp only
-after a successful response. This gives `N` persisted open identities a
+pending work therefore cannot starve lifecycle proof. Overdue open and
+closed-unmerged identities share one ordering by
+`pr_repository_next_probe_at` then node id, and advance that timestamp only
+after a successful response. This gives `N` retained nonmerged identities a
 worst-case lifecycle observation bound of the 120-second full-sweep interval
 plus `ceil(N / 50)` ordinary board cycles; in the quiescent case all four
-batches serve the overdue queue.
+batches serve the overdue queue. A closed-unmerged identity gets no pending-
+check priority, so its only ongoing cost is this bounded cold sweep.
 
 A legacy persisted pull request with no node id spends one targeted
 `GET /repos/{owner}/{repo}/pulls/{number}` from a separate cap of ten legacy
@@ -226,21 +232,25 @@ unknown and action-ineligible, never assumed closed. Neither path adds a per-PR
 timer or an unbounded page loop.
 
 A list item or targeted response with `state = closed` immediately replaces
-that layer's projection and removes it from future open-identity refreshes.
-Non-null `merged_at` produces a terminal merged layer; null `merged_at`
-produces terminal `closed_unmerged`, sets that layer's action to
-`Open closed PR`, disables its verdict controls, and explains that the branch
-was closed without landing. Both layer transitions clear every cached mutation
-for that pull request; historical checks may remain visible with their
-observation time, but cannot derive Repair, Mark ready, or Merge. A GraphQL
-response racing a list item is accepted only if `state`, `mergedAt`, head, and
-base still match the newest lifecycle observation.
+that layer's projection. Non-null `merged_at` produces a terminal merged layer
+and removes its identity from lifecycle refresh. Null `merged_at` produces the
+reversible `closed_unmerged` state, keeps the identity in the cold queue, sets
+that layer's action to `Open closed PR`, disables its verdict controls, and
+explains that the branch was closed without landing. Both transitions clear
+every cached mutation for that pull request; historical checks may remain
+visible with their observation time, but cannot derive Repair, Mark ready, or
+Merge. A later targeted response with `state = open` reopens the same identity,
+replaces the closed projection with the newly observed head/base/check gates,
+and re-enables controls only through the ordinary fresh-open derivation. A
+GraphQL response racing a list item is accepted only if `state`, `mergedAt`,
+head, and base still match the newest lifecycle observation.
 
-Layer terminal is not task terminal. A merged bottom with an upper layer still
-open leaves aggregate `task.pr_open = true` and `task.pr_merged = false`; Review
-stays live. Complete topology opens the lowest remaining open layer; partial
-topology opens the stack on GitHub. Only the existing aggregate
-`task.pr_merged` can hand the task to `done` and retention.
+A merged layer is terminal without necessarily making its task terminal. A
+merged bottom with an upper layer still open leaves aggregate
+`task.pr_open = true` and `task.pr_merged = false`; Review stays live. Complete
+topology opens the lowest remaining open layer; partial topology opens the
+stack on GitHub. Only the existing aggregate `task.pr_merged` can hand the task
+to `done` and retention.
 
 Thus a running build updates on the ordinary board clock, while a stable,
 unchanged pull request costs only its slot in a batched response every existing
@@ -298,6 +308,7 @@ Submission v2 additions
   normalized_body_sha256
   delivery_state            pending | completed | not_required
   standing_review_sequence  null for Comment
+  final_refresh             null | { current_head_sha, head_moved, repository_fresh }
 
 StandingReview
   key                       github:<review_id> | comet:<submission_id>
@@ -329,6 +340,7 @@ SubmissionTombstone
   delivery_state            completed | not_required
   projection
   posted_as
+  final_refresh
   compacted_at
 
 CompactedVerdictReceipt
@@ -341,6 +353,10 @@ CompactedVerdictReceipt
   delivery_state
   projection
   posted_as
+  current_head_sha
+  head_moved
+  repository_fresh
+  retryable                 false
   compacted_at
   recorded                  false
 ```
@@ -358,44 +374,69 @@ body are identical; automation may supply `--idempotency-key` and must likewise
 use a new value for a new intentional action. The server scopes the key to task
 and attempt.
 
-The core separately resolves the verified `reviewer_key`, checks
-`expectedHeadSha`, normalizes CRLF/CR to LF and trims boundary Unicode
-whitespace, then SHA-256 hashes a canonical length-prefixed encoding of
-`(reviewer_key, expectedHeadSha, kind, normalized_body)` as `payload_digest`.
+The core separately resolves the verified `reviewer_key`, validates
+`expectedHeadSha` as submitted payload, normalizes CRLF/CR to LF and trims
+boundary Unicode whitespace, then SHA-256 hashes a canonical length-prefixed
+encoding of `(reviewer_key, expectedHeadSha, kind, normalized_body)` as
+`payload_digest`.
 Reusing a `submissionId` with the same digest is a retry; reusing it with any
 different validated payload is a conflict and has no effects. The old
 three-field `verdict::fingerprint` remains legacy-only. The board-owned GitHub
 body marker carries `submissionId`, so crash recovery aliases the review id to
 the occurrence that produced it.
 
+Occurrence lookup precedes the current-head guard. After authenticating the
+reviewer and computing the digest, the board looks up `(task, attempt,
+submissionId)` and validates the stored digest before choosing a path:
+
+- a settled live entry returns its existing full receipt, and a tombstone
+  returns its compacted receipt, with no delivery, GitHub post, sequence, or
+  current-head comparison;
+- an unsettled live entry resumes the already recorded occurrence. It uses the
+  stored reviewer, normalized payload, and `head_sha` — never the pull's now-
+  current head — and finishes only a `delivery_state = pending` delivery and/or
+  a projection still marked retryable. Each completed half is persisted before
+  starting the next, so a further crash cannot repeat it. The GitHub half
+  always sends `commit_id = stored head_sha`, then runs the mandatory final
+  refresh below;
+- only a lookup miss is a new occurrence and enters the current-head and review-
+  ordering preflight before anything is recorded.
+
+Thus a push from A to B cannot strand a durable A occurrence. Resuming it may
+deliver or project the A-scoped verdict once, but the final refresh exposes B
+and applies the normal head-scoped acceptance rules. A failed chat delivery or
+an unposted projection remains live and retryable; it is not compactable.
+
 `MAX_SUBMISSIONS = 20` remains the bound on full, retryable ledger entries, but
 submission occurrence ids are not evicted with them. Before inserting entry 21,
 the board moves the oldest fully settled entry — delivery completed or was not
 required, and its projection is on GitHub — into an exact
-`SubmissionTombstone`. The
-tombstone retains only the fields needed to reconstruct an idempotency receipt
+`SubmissionTombstone`. The tombstone retains only the fields needed to
+reconstruct an idempotency receipt
 with delivery/projection status and suppress both side effects; it retains no
-comment body or payload. A retry found in either tier returns `recorded = false`
-and never delivers or posts again. This applies uniformly to Comments, which
-have no `StandingReview`, and to decisive verdicts.
+comment body or payload. A settled retry found in either tier returns
+`recorded = false` and never delivers or posts again; an unsettled live retry
+also returns `recorded = false` but finishes only its missing halves as defined
+above. This applies uniformly to Comments, which have no `StandingReview`, and
+to decisive verdicts.
 
-A live hit returns the existing full `VerdictReceipt`. A tombstone hit returns
-the tagged `CompactedVerdictReceipt` above, augmented with the retry preflight's
-nullable current-head/freshness fields. It deliberately omits `refusal`,
-`not_delivered`, `chat_id`, `unclaimed`, and `payload`; clients render “Already
-submitted; detailed receipt compacted at <time>” plus retained delivery and
-projection status, never pretend this is the first receipt. Desktop, iOS, CLI
-text, and JSON exhaustively switch on `receipt_kind`; absent live-only fields
-are not synthesized.
+A settled live hit returns its stored full `VerdictReceipt`. A tombstone hit
+returns the tagged `CompactedVerdictReceipt` above with the final-refresh fields
+persisted at compaction; neither performs a fresh head guard. It deliberately
+omits `refusal`, `not_delivered`, `chat_id`, `unclaimed`, and `payload`; clients
+render “Already submitted; detailed receipt compacted at <time>” plus retained
+delivery and projection status, never pretend this is the first receipt.
+Desktop, iOS, CLI text, and JSON exhaustively switch on `receipt_kind`; absent
+live-only fields are not synthesized.
 
 `MAX_SUBMISSION_TOMBSTONES = 256` bounds that second tier per pull request.
 Unsettled live entries are never compacted because a retry may still have
 delivery or projection work to finish. If the 20 live slots contain no settled
 entry, or the exact tombstone tier is full, a new distinct submission refuses
 before recording, delivery, or posting instead of evicting an idempotency key.
-Retries of either tier remain available. Pull-request terminal cleanup removes
-both tiers with the existing `Delivered` retention; this adds no independent
-sweep or clock.
+Retries of either tier remain available. Merged-layer cleanup or existing
+archive/issue-terminal retention removes both tiers; merely observing
+closed-unmerged does not. This adds no independent sweep or clock.
 
 A GitHub review read adds `commit_id`, `user.id`, and `user.login`. Its complete
 result replaces only records with `owner = github`; Comet-owned decisions are a
@@ -420,10 +461,11 @@ retaining its previous kind when known. Seeing a dismissal for the first time
 may leave `kind = unknown`; the tombstone still has the review's identity,
 reviewer, head, and ordering.
 
-A Comet verdict request carries the `expectedHeadSha` the reviewer actually
-saw. Before recording, delivering, or posting anything, the board performs a
-targeted pull refresh and compare-and-refuses unless that value equals the
-current head. Unlike background polling, every verdict preflight then performs
+A new Comet verdict occurrence carries the `expectedHeadSha` the reviewer
+actually saw. After occurrence lookup misses and before recording, delivering,
+or posting anything, the board performs a targeted pull refresh and compare-
+and-refuses unless that value equals the current head. Unlike background
+polling, every new-occurrence verdict preflight then performs
 a complete bounded review reconciliation regardless of `updated_at` equality;
 GitHub's second-resolution timestamp is not a review-event fence. A failed or
 truncated reconciliation persists `acceptance = unknown` and refuses with no
@@ -476,7 +518,8 @@ for a plain Comment only the submission and delivery exist. Other credential
 failures may continue through the existing fallback order, but every attempt
 uses the same `commit_id`.
 
-After that projection path reaches *any* final outcome — posted, posted as
+After first execution or resumption reaches *any* final workflow outcome —
+delivered-only because projection was already complete, posted, posted as
 Comment, refused, transport failure, or exhausted credential fallback — the
 board performs a targeted pull refresh and rederives the repository projection.
 This is unconditional, not a success-only cleanup. If the refresh finds B, an
@@ -484,7 +527,8 @@ approval of A does not count for B and B stays `needs_review`; a change request
 remains standing under the cross-push rule, and a Comment contributes no
 decision. The board never automatically reposts on B. The final pull refresh
 always runs complete bounded review reconciliation before calling repository
-state fresh, regardless of `updated_at` equality.
+state fresh, regardless of `updated_at` equality, and persists its result as
+the occurrence's `final_refresh` before returning the receipt.
 
 If the pull refresh fails, the last projection remains visible but gains
 `stale_reason`, `acceptance = unknown`, and no Repair, Ready, or Merge action
@@ -951,7 +995,8 @@ The existing verdict and merge surfaces become:
   decisive verdict against the still-current blocker. It returns the tagged
   union `live: VerdictReceipt | compacted: CompactedVerdictReceipt`; both
   variants carry `reviewedHeadSha`, nullable `currentHeadSha`, nullable
-  `headMoved`, and `repositoryFresh`;
+  `headMoved`, `repositoryFresh`, and `retryable`; a compacted or otherwise
+  settled receipt is never retryable;
 - `MergeTask { taskId, confirmation, expectedHeadSha,
   expectedTopologyFingerprint }` — both optimistic-lock values are required
   when invoked from Review; its receipt exposes `atomicity`,
@@ -961,9 +1006,11 @@ The existing verdict and merge surfaces become:
 Desktop and iOS submit the values held by the rendered Review, never a fresh
 client-side lookup. The CLI prints `head_sha` in `review` and requires
 `verdict --expected-head-sha <sha>`; automation reading JSON passes that same
-field. Each client creates and retains `submissionId` for one occurrence and its
-transport retries, then discards it after the definitive receipt; a new user
-action gets a new id. Replacing a legacy blocker additionally requires
+field. Each client creates and retains `submissionId` for one occurrence and
+its transport retries. It discards the id only when `retryable = false`; an
+unposted or not-delivered receipt keeps the same id on the rendered manual
+Retry action, while a separate new verdict action gets a new id. Replacing a
+legacy blocker additionally requires
 `--replace-legacy-decision <token>`; no CLI or client infers consent from an
 ordinary Approve. This makes a human's reviewed head and any migration override
 explicit on every path rather than letting a surface silently bless whichever
@@ -972,7 +1019,8 @@ state happens to be current when Enter arrives.
 `ReadAttemptReview` gains the projection and derived action. Verdict, repair,
 ready, and merge preflights execute on the board loop, the sole `board.db`
 writer, and publish refreshed rows before returning a refusal. No failed
-expected-head comparison records a verdict or queues a delivery.
+expected-head comparison for a new occurrence records a verdict or queues a
+delivery; a durable occurrence resumes before that comparison as specified.
 
 The CLI mirrors the remote-capable operations as `repair --checks`, `repair
 --conflict`, and `ready`; it does not gain another merge verb. JSON exposes the
@@ -991,11 +1039,13 @@ Authority stays separated by construction:
 
 - A partial/stale projection is visible and action-ineligible, not clean.
 - Absence from the 100-item pull list changes no persisted lifecycle; only a
-  targeted identity response can close an omitted pull request.
+  targeted identity response can close or reopen an omitted pull request.
 - A changed head/base/check set refuses the stale action and asks the screen to
   reload.
-- A verdict expected-head mismatch is side-effect free: no standing decision,
-  author delivery, or GitHub post.
+- A new verdict occurrence's expected-head mismatch is side-effect free: no
+  standing decision, author delivery, or GitHub post. It cannot prevent an
+  already durable occurrence from finishing its stored-head delivery or
+  projection exactly once.
 - A push after verdict preflight may still leave a successful GitHub review of
   the old `commit_id`, or GitHub may refuse that post. Either outcome remains
   bound to the old-head local submission; the mandatory final refresh keeps the
@@ -1048,11 +1098,16 @@ The implementation is complete when these seams are pinned:
    take two serial batches rather than 100 per-PR requests. With 201 overdue
    identities, four batches refresh 200 in the first cycle and the remaining
    identity is selected next cycle rather than starved; continuous pending
-   traffic still leaves the reserved oldest-overdue batch intact.
+   traffic still leaves the reserved oldest-overdue batch intact. The same
+   bound includes retained closed-unmerged identities without giving them
+   pending-check priority.
 3. A repository fixture returns 100 newer pull requests on the list while an
    older persisted-open PR is omitted and closes. Its targeted node refresh
-   observes `CLOSED` beyond the first page, removes stale Repair/Merge, and does
-   not require list pagination.
+   observes `CLOSED` beyond the first page, removes stale Repair/Merge, and
+   retains the identity in the cold queue. The same omitted PR then reopens;
+   a later bounded targeted refresh observes `OPEN`, replaces the closed
+   projection, and restores only the actions its fresh gates permit without
+   requiring list pagination.
 4. A REST head change invalidates projection and approval before the next
    GraphQL answer.
 5. A reviewer renders SHA A, SHA B arrives, and delayed Approve(A) performs a
@@ -1128,12 +1183,20 @@ The implementation is complete when these seams are pinned:
    instead of evicting the oldest one. Field-by-field snapshots before and after
    reload assert the reduced `CompactedVerdictReceipt` contract, and each
    desktop, iOS, CLI, and JSON fixture renders the compacted variant without
-   filling omitted live-only fields.
+   filling omitted live-only fields. Retry-order fixtures record occurrence A,
+   crash before delivery, push head B, and retry the same id/payload: lookup
+   bypasses the new-occurrence head guard, delivers the stored A payload once,
+   projects with `commit_id = A` once, and final-refreshes B. A companion crash
+   after delivery but before projection proves delivery is skipped and only the
+   A-bound GitHub half resumes. Unposted/not-delivered receipts keep
+   `retryable = true` and the same client id; settled live and tombstoned
+   retries return `retryable = false` with no repeated half.
 9. Every action-precedence row is table-tested, including no-check
    repositories, drafts, optional failures, stale data, and a REST transition
    from an actionable open projection to closed-unmerged. That transition
    yields only `Open closed PR`, disables verdict controls, and proves stale
-   Repair and Merge actions cannot survive it.
+   Repair and Merge actions cannot survive it; reopening is covered by the
+   cold-lifecycle fixture above rather than treating closure as terminal.
 10. Stack fixtures cover parent conflict/current clean, parent failure/current
    passing, current conflict, current failure, an unknown lower layer, and a
    failure above the current layer. A `changes_below = #N` fixture asserts all
