@@ -323,14 +323,17 @@
         "complete": false,
         "hosts": [
           {
-            "currentVersion": "0.7.1",
             "device": {
               "deviceId": "tokenmaxxer",
               "label": "Tokenmaxxer9000"
             },
-            "error": "unknown method: BoardStatsSnapshot",
-            "requiredVersion": "0.8.0",
-            "status": "upgradeRequired"
+            "status": "upgradeRequired",
+            "upgrade": {
+              "canApply": true,
+              "currentVersion": "0.7.1",
+              "error": "unknown method: BoardStatsSnapshot",
+              "requiredVersion": "0.8.0"
+            }
           }
         ],
         "sinceDays": 7,

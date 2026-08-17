@@ -427,6 +427,7 @@ pub struct StatsPage {
     error: Option<SharedString>,
     task: Option<Task<()>>,
     updating: Option<String>,
+    update_task: Option<Task<()>>,
 }
 
 impl StatsPage {
@@ -451,6 +452,7 @@ impl StatsPage {
             error: None,
             task: None,
             updating: None,
+            update_task: None,
         };
         page.reload(cx);
         page
@@ -487,36 +489,35 @@ impl StatsPage {
                 page.swept = true;
                 match result {
                     Ok(aggregate) => {
-                        let answers = aggregate
-                            .boards
-                            .iter()
-                            .map(|board| {
-                                let target = (Some(board.host.device_id.as_str())
-                                    != local.as_deref())
-                                .then(|| board.host.device_id.clone());
-                                (target, board.stats.clone())
-                            })
-                            .collect::<Vec<_>>();
+                        let empty_note = aggregate
+                            .completeness_note()
+                            .unwrap_or_else(|| "No device on this account hosts a board".into());
+                        page.apply_aggregate(aggregate, local.as_deref());
+                        let answers = &page.answers;
                         page.error = if answers.is_empty() {
-                            Some(
-                                aggregate
-                                    .completeness_note()
-                                    .unwrap_or_else(|| {
-                                        "No device on this account hosts a board".into()
-                                    })
-                                    .into(),
-                            )
+                            Some(empty_note.into())
                         } else {
                             None
                         };
-                        page.answers = answers;
-                        page.aggregate = Some(aggregate);
                     }
                     Err(error) => page.error = Some(error.into()),
                 }
                 cx.notify();
             });
         }));
+    }
+
+    fn apply_aggregate(&mut self, aggregate: AggregateBoardStats, local: Option<&str>) {
+        self.answers = aggregate
+            .boards
+            .iter()
+            .map(|board| {
+                let target = (Some(board.host.device_id.as_str()) != local)
+                    .then(|| board.host.device_id.clone());
+                (target, board.stats.clone())
+            })
+            .collect();
+        self.aggregate = Some(aggregate);
     }
 
     /// This device's id, as the sweep and the pin both spell it.
@@ -600,37 +601,43 @@ impl StatsPage {
         self.error = None;
         let since_days = self.since_days;
         let timer = cx.background_executor().clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let _ = engine
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let apply = engine
                 .client()
                 .call(
                     methods::APPLY_UPDATE,
                     serde_json::json!({ "targetDeviceId": device_id }),
                 )
                 .await;
+            if let Err(error) = apply
+                && !apply_failure_may_be_restart(&error)
+            {
+                let _ = this.update(cx, |page, cx| {
+                    page.updating = None;
+                    page.error = Some(format!("Update refused: {error}").into());
+                    cx.notify();
+                });
+                return;
+            }
             let mut outcome = Err("The device did not return after its update".to_string());
-            for _ in 0..30 {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
                 timer.timer(Duration::from_secs(1)).await;
-                let value = engine
-                    .client()
-                    .call(
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let value = tokio::time::timeout(
+                    remaining,
+                    engine.client().call(
                         methods::AGGREGATE_BOARD_STATS,
                         serde_json::json!({ "sinceDays": since_days }),
-                    )
-                    .await;
-                let Ok(value) = value else { continue };
+                    ),
+                )
+                .await;
+                let Ok(Ok(value)) = value else { continue };
                 let Ok(aggregate) = serde_json::from_value::<AggregateBoardStats>(value) else {
                     continue;
                 };
-                let waiting = aggregate.hosts.iter().any(|host| {
-                    host.device.device_id == device_id
-                        && matches!(
-                            host.status,
-                            comet_proto::view::stats::StatsHostStatus::UpgradeRequired
-                                | comet_proto::view::stats::StatsHostStatus::Unreachable
-                        )
-                });
-                if !waiting {
+                let converged = update_recovery_converged(&aggregate, &device_id);
+                if converged {
                     outcome = Ok(aggregate);
                     break;
                 }
@@ -640,17 +647,7 @@ impl StatsPage {
                 match outcome {
                     Ok(aggregate) => {
                         let local = page.local_device(cx);
-                        page.answers = aggregate
-                            .boards
-                            .iter()
-                            .map(|board| {
-                                let target = (Some(board.host.device_id.as_str())
-                                    != local.as_deref())
-                                .then(|| board.host.device_id.clone());
-                                (target, board.stats.clone())
-                            })
-                            .collect();
-                        page.aggregate = Some(aggregate);
+                        page.apply_aggregate(aggregate, local.as_deref());
                     }
                     Err(message) => page.error = Some(message.into()),
                 }
@@ -2241,6 +2238,30 @@ impl StatsPage {
     }
 }
 
+fn update_recovery_converged(aggregate: &AggregateBoardStats, device_id: &str) -> bool {
+    aggregate.hosts.iter().any(|host| {
+        host.device.device_id == device_id
+            && matches!(
+                host.status,
+                comet_proto::view::stats::StatsHostStatus::Answered
+                    | comet_proto::view::stats::StatsHostStatus::Duplicate
+            )
+    })
+}
+
+fn apply_failure_may_be_restart(error: &comet_rpc::RpcError) -> bool {
+    match error {
+        comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_) => true,
+        comet_rpc::RpcError::Failed(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("connection closed")
+                || message.contains("transport:")
+                || message.contains("offline")
+        }
+        _ => false,
+    }
+}
+
 /// The scroll container every settings page wraps its column in — and the one
 /// this page shipped without, which on the longest page in the app meant
 /// everything below the fold was simply unreachable (operator, 2026-08-08).
@@ -2339,6 +2360,10 @@ impl Render for StatsPage {
             let upgrade = self.aggregate.as_ref().and_then(|aggregate| {
                 aggregate.hosts.iter().find(|host| {
                     host.status == comet_proto::view::stats::StatsHostStatus::UpgradeRequired
+                        && host
+                            .upgrade
+                            .as_ref()
+                            .is_some_and(|upgrade| upgrade.can_apply)
                 })
             });
             let mut strip = widgets::warning_strip(&theme, note);
@@ -2458,6 +2483,50 @@ impl Render for StatsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recovery(status: comet_proto::view::stats::StatsHostStatus) -> AggregateBoardStats {
+        AggregateBoardStats {
+            since_days: Some(7),
+            stats: BoardStats::empty(Some(7)),
+            boards: vec![],
+            hosts: vec![comet_proto::view::stats::StatsHost {
+                device: comet_proto::view::stats::StatsDevice {
+                    device_id: "peer".into(),
+                    label: "Peer".into(),
+                },
+                status,
+                board_id: None,
+                error: None,
+                upgrade: None,
+            }],
+            complete: false,
+        }
+    }
+
+    #[test]
+    fn update_recovery_waits_for_an_exact_new_protocol_answer() {
+        use comet_proto::view::stats::StatsHostStatus::*;
+        for transient in [NoBoard, Unreachable, Unreadable, UpgradeRequired] {
+            assert!(!update_recovery_converged(&recovery(transient), "peer"));
+        }
+        assert!(!update_recovery_converged(&recovery(Answered), "other"));
+        assert!(update_recovery_converged(&recovery(Answered), "peer"));
+        assert!(update_recovery_converged(&recovery(Duplicate), "peer"));
+    }
+
+    #[test]
+    fn apply_refusal_is_immediate_but_a_lost_restart_reply_recovers() {
+        assert!(!apply_failure_may_be_restart(
+            &comet_rpc::RpcError::Refused("not update-managed".into())
+        ));
+        assert!(!apply_failure_may_be_restart(&comet_rpc::RpcError::Failed(
+            "this install is not update-managed".into()
+        )));
+        assert!(apply_failure_may_be_restart(&comet_rpc::RpcError::Closed));
+        assert!(apply_failure_may_be_restart(&comet_rpc::RpcError::Failed(
+            "connection closed".into()
+        )));
+    }
 
     #[test]
     fn an_all_unpriced_spend_still_has_desktop_agent_rows() {

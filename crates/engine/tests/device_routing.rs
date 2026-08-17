@@ -21,6 +21,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -42,8 +43,8 @@ use comet_proto::{
     SteeringMode,
 };
 use comet_rpc::{
-    DeviceFrameHeader, LinkCache, LinkCacheConfig, StaticToken, decode_device_frame,
-    encode_device_frame, methods,
+    Caller, DeviceFrameHeader, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig, RpcError,
+    RpcReply, RpcService, StaticToken, decode_device_frame, encode_device_frame, methods,
 };
 
 // ---------------------------------------------------------------------------
@@ -331,6 +332,72 @@ fn links(relay_url: &str, user: &str, org: &str) -> Arc<LinkCache> {
     LinkCache::new(config)
 }
 
+/// A real relay-hosted N-1 protocol seam: no BoardStatsSnapshot until its
+/// update mutation tears the relay-shaped answer down and returns upgraded.
+struct LegacyStatsPeer {
+    phase: Arc<AtomicU8>,
+}
+
+#[async_trait]
+impl RpcService for LegacyStatsPeer {
+    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        self.handle_as(method, params, &Caller::LOCAL).await
+    }
+
+    async fn handle_as(
+        &self,
+        method: &str,
+        _params: serde_json::Value,
+        _caller: &Caller,
+    ) -> Result<RpcReply, RpcError> {
+        match method {
+            methods::LIST_HARNESSES => RpcReply::value(&serde_json::json!([])),
+            methods::BOARD_STATS_SNAPSHOT if self.phase.load(Ordering::SeqCst) == 0 => {
+                Err(RpcError::UnknownMethod(method.into()))
+            }
+            methods::BOARD_STATS_SNAPSHOT if self.phase.load(Ordering::SeqCst) == 1 => {
+                Err(RpcError::Transport("relay restarting".into()))
+            }
+            methods::BOARD_STATS_SNAPSHOT => {
+                let mut stats = comet_proto::view::stats::BoardStats::empty(Some(7));
+                stats.attempts = 89;
+                RpcReply::value(&comet_proto::view::stats::BoardStatsSnapshot {
+                    board_id: "legacy-board".into(),
+                    host: comet_proto::view::stats::StatsDevice {
+                        device_id: "legacy-peer".into(),
+                        label: "Tokenmaxxer9000".into(),
+                    },
+                    stats,
+                    merge_basis: Default::default(),
+                })
+            }
+            methods::UPDATE_STATUS => Ok(RpcReply::Stream(
+                futures::stream::once(async {
+                    serde_json::to_value(comet_update::UpdateStatus {
+                        current_version: "0.7.1".into(),
+                        latest_version: Some("0.8.0".into()),
+                        update_available: true,
+                        checked_at: Some(1),
+                        error: None,
+                    })
+                    .unwrap()
+                })
+                .boxed(),
+            )),
+            methods::APPLY_UPDATE => {
+                self.phase.store(1, Ordering::SeqCst);
+                let phase = self.phase.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    phase.store(2, Ordering::SeqCst);
+                });
+                Err(RpcError::Closed)
+            }
+            _ => Err(RpcError::UnknownMethod(method.into())),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -505,6 +572,145 @@ async fn target_device_id_routes_over_the_relay() {
 
     core_a.shutdown().await;
     core_b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let phase = Arc::new(AtomicU8::new(0));
+    let mut host_config = HostRelayConfig::new(
+        relay_url.clone(),
+        "legacy-peer",
+        Arc::new(StaticToken(bearer(OWNER, ORG))),
+    );
+    host_config.retry = Duration::from_millis(20);
+    let _legacy_host = HostRelay::spawn(
+        host_config,
+        Arc::new(LegacyStatsPeer {
+            phase: phase.clone(),
+        }),
+        Arc::new(|_| {}),
+    );
+
+    let core = assemble(&dirs.path().join("collector"), "collector");
+    core.set_board(Arc::new(board_service(
+        &core,
+        board_paths(&dirs.path().join("board")),
+    )));
+    core.set_links(links(&relay_url, OWNER, ORG));
+    core.workspace
+        .org_devices()
+        .upsert_device(&comet_proto::Device {
+            id: "legacy-peer".into(),
+            name: "Tokenmaxxer9000".into(),
+            platform: "linux".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: Some("0.7.1".into()),
+        });
+    let local = comet_rpc::memory_client(core.rpc_service());
+    let refusal = local
+        .call(
+            methods::APPLY_UPDATE,
+            serde_json::json!({ "targetDeviceId": "legacy-peer" }),
+        )
+        .await
+        .expect_err("localhost cannot mint an operator update");
+    assert!(refusal.to_string().contains("operator surface"));
+    let teammate_refusal = match core
+        .rpc_service()
+        .handle_as(
+            methods::APPLY_UPDATE,
+            serde_json::json!({}),
+            &Caller::relayed(Some(TEAMMATE.into()), Some(ORG.into())),
+        )
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("an org member is not the device owner"),
+    };
+    assert!(
+        teammate_refusal
+            .to_string()
+            .contains("verified device owner")
+    );
+    let operator = comet_rpc::operator_memory_client(core.rpc_service());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let before: comet_proto::view::stats::AggregateBoardStats = loop {
+        match operator
+            .call(
+                methods::AGGREGATE_BOARD_STATS,
+                serde_json::json!({ "sinceDays": 7 }),
+            )
+            .await
+            .and_then(|value| {
+                serde_json::from_value::<comet_proto::view::stats::AggregateBoardStats>(value)
+                    .map_err(|error| RpcError::Failed(error.to_string()))
+            }) {
+            Ok(aggregate)
+                if aggregate.hosts.iter().any(|host| {
+                    host.device.device_id == "legacy-peer"
+                        && host.status == comet_proto::view::stats::StatsHostStatus::UpgradeRequired
+                }) =>
+            {
+                break aggregate;
+            }
+            result => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no N-1 answer: {result:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
+    let upgrade = before
+        .hosts
+        .iter()
+        .find(|host| host.device.device_id == "legacy-peer")
+        .and_then(|host| host.upgrade.as_ref())
+        .expect("upgrade details");
+    assert_eq!(upgrade.current_version, "0.7.1");
+    assert!(upgrade.can_apply);
+    assert!(upgrade.error.contains("BoardStatsSnapshot"));
+
+    let lost = operator
+        .call(
+            methods::APPLY_UPDATE,
+            serde_json::json!({ "targetDeviceId": "legacy-peer" }),
+        )
+        .await
+        .expect_err("restart loses the mutation reply");
+    assert!(lost.to_string().contains("connection closed"));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let aggregate: comet_proto::view::stats::AggregateBoardStats = serde_json::from_value(
+            operator
+                .call(
+                    methods::AGGREGATE_BOARD_STATS,
+                    serde_json::json!({ "sinceDays": 7 }),
+                )
+                .await
+                .expect("collector remains available"),
+        )
+        .expect("aggregate shape");
+        let returned = aggregate.hosts.iter().any(|host| {
+            host.device.device_id == "legacy-peer"
+                && host.status == comet_proto::view::stats::StatsHostStatus::Answered
+        });
+        if returned {
+            assert!(aggregate.stats.attempts >= 89);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "peer never returned"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// M5: terminals are device-addressable — OpenTerminal/WriteTerminal forward as

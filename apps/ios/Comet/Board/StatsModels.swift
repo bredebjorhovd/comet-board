@@ -568,9 +568,15 @@ struct StatsHost: Decodable, Hashable, Identifiable {
     var status: StatsHostStatus
     var boardId: String?
     var error: String?
-    var currentVersion: String?
-    var requiredVersion: String?
+    var upgrade: StatsUpgradeDetails?
     var id: String { device.deviceId }
+}
+
+struct StatsUpgradeDetails: Decodable, Hashable {
+    var currentVersion: String
+    var requiredVersion: String
+    var error: String
+    var canApply: Bool
 }
 
 struct AggregateBoardStatsSource: Decodable, Hashable, Identifiable {
@@ -593,8 +599,8 @@ struct AggregateBoardStats: Decodable, Hashable {
         let missing = hosts.compactMap { host -> String? in
             guard host.status.compromisesAggregate else { return nil }
             if host.status == .upgradeRequired {
-                return "\(host.device.label) is on v\(host.currentVersion ?? "unknown"); "
-                    + "v\(host.requiredVersion ?? "unknown") is required for all-board stats"
+                return "\(host.device.label) is on v\(host.upgrade?.currentVersion ?? "unknown"); "
+                    + "v\(host.upgrade?.requiredVersion ?? "unknown") is required for all-board stats"
             }
             return host.status == .unreadable
                 ? "\(host.device.label) was unreadable"

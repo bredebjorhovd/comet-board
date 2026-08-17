@@ -1280,12 +1280,22 @@ pub struct StatsHost {
     /// hosting no board is a complete answer, not a failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Auditable protocol-skew facts. These remain absent for ordinary
-    /// transport/schema failures and for hosts that contributed normally.
+    /// Present exactly for an `upgradeRequired` host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_version: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub required_version: Option<String>,
+    pub upgrade: Option<StatsUpgradeDetails>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StatsUpgradeDetails {
+    pub current_version: String,
+    pub required_version: String,
+    /// The rejected snapshot call, retained separately from the diagnosis.
+    pub error: String,
+    /// True only when the compatible UpdateStatus frame names the required
+    /// release as available and the registered host is managed-host shaped.
+    #[serde(default)]
+    pub can_apply: bool,
 }
 
 /// The one aggregate contract shared by CLI JSON, desktop and iOS.
@@ -1315,8 +1325,14 @@ impl AggregateBoardStats {
                 StatsHostStatus::UpgradeRequired => format!(
                     "{} is on v{}; v{} is required for all-board stats",
                     host.device.label,
-                    host.current_version.as_deref().unwrap_or("unknown"),
-                    host.required_version.as_deref().unwrap_or("unknown")
+                    host.upgrade
+                        .as_ref()
+                        .map(|u| u.current_version.as_str())
+                        .unwrap_or("unknown"),
+                    host.upgrade
+                        .as_ref()
+                        .map(|u| u.required_version.as_str())
+                        .unwrap_or("unknown")
                 ),
                 StatsHostStatus::Unreadable => format!("{} was unreadable", host.device.label),
                 _ => format!("{} did not answer", host.device.label),
@@ -1350,6 +1366,7 @@ pub enum StatsProbeResult {
         current_version: String,
         required_version: String,
         error: String,
+        can_apply: bool,
     },
 }
 
@@ -1513,8 +1530,7 @@ pub fn aggregate_board_stats(
                     status: StatsHostStatus::Unreadable,
                     board_id: None,
                     error: Some("the board answered without a stable board id".into()),
-                    current_version: None,
-                    required_version: None,
+                    upgrade: None,
                 });
             }
             StatsProbeResult::Answered(snapshot) => {
@@ -1532,8 +1548,7 @@ pub fn aggregate_board_stats(
                     },
                     board_id: Some(board_id),
                     error: None,
-                    current_version: None,
-                    required_version: None,
+                    upgrade: None,
                 });
             }
             StatsProbeResult::NoBoard => hosts.push(StatsHost {
@@ -1541,36 +1556,38 @@ pub fn aggregate_board_stats(
                 status: StatsHostStatus::NoBoard,
                 board_id: None,
                 error: None,
-                current_version: None,
-                required_version: None,
+                upgrade: None,
             }),
             StatsProbeResult::Unreachable(error) => hosts.push(StatsHost {
                 device: candidate,
                 status: StatsHostStatus::Unreachable,
                 board_id: None,
                 error: Some(error),
-                current_version: None,
-                required_version: None,
+                upgrade: None,
             }),
             StatsProbeResult::Unreadable(error) => hosts.push(StatsHost {
                 device: candidate,
                 status: StatsHostStatus::Unreadable,
                 board_id: None,
                 error: Some(error),
-                current_version: None,
-                required_version: None,
+                upgrade: None,
             }),
             StatsProbeResult::UpgradeRequired {
                 current_version,
                 required_version,
                 error,
+                can_apply,
             } => hosts.push(StatsHost {
                 device: candidate,
                 status: StatsHostStatus::UpgradeRequired,
                 board_id: None,
-                error: Some(error),
-                current_version: Some(current_version),
-                required_version: Some(required_version),
+                error: None,
+                upgrade: Some(StatsUpgradeDetails {
+                    current_version,
+                    required_version,
+                    error,
+                    can_apply,
+                }),
             }),
         }
     }
@@ -3484,6 +3501,7 @@ mod tests {
                     current_version: "0.7.1".into(),
                     required_version: "0.8.0".into(),
                     error: "unknown method: BoardStatsSnapshot".into(),
+                    can_apply: true,
                 },
             }],
         );
@@ -3494,15 +3512,10 @@ mod tests {
             "legacy totals cannot be safely identified"
         );
         assert_eq!(aggregate.hosts[0].status, StatsHostStatus::UpgradeRequired);
-        assert_eq!(aggregate.hosts[0].current_version.as_deref(), Some("0.7.1"));
-        assert_eq!(
-            aggregate.hosts[0].required_version.as_deref(),
-            Some("0.8.0")
-        );
-        assert_eq!(
-            aggregate.hosts[0].error.as_deref(),
-            Some("unknown method: BoardStatsSnapshot")
-        );
+        let upgrade = aggregate.hosts[0].upgrade.as_ref().unwrap();
+        assert_eq!(upgrade.current_version, "0.7.1");
+        assert_eq!(upgrade.required_version, "0.8.0");
+        assert_eq!(upgrade.error, "unknown method: BoardStatsSnapshot");
         assert!(
             aggregate
                 .completeness_note()
@@ -3512,7 +3525,7 @@ mod tests {
         let json = serde_json::to_value(&aggregate).unwrap();
         assert_eq!(json["hosts"][0]["status"], "upgradeRequired");
         assert_eq!(
-            json["hosts"][0]["error"],
+            json["hosts"][0]["upgrade"]["error"],
             "unknown method: BoardStatsSnapshot"
         );
     }
@@ -4530,6 +4543,7 @@ mod spec {
                     current_version: "0.7.1".into(),
                     required_version: "0.8.0".into(),
                     error: "unknown method: BoardStatsSnapshot".into(),
+                    can_apply: true,
                 },
             }],
         );

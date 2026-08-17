@@ -103,6 +103,25 @@ use comet_board::dispatch::{DispatchOrigin, DispatchOverrides, VerifiedCaller};
 /// not answered in five seconds is one this write proceeds without.
 const PEER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The compatibility promise is deliberately one released minor line, not
+/// "anything that rejects the method". Patch releases within N-1 remain
+/// compatible; same/newer/malformed versions are protocol failures.
+fn supported_n_minus_one(peer: &str, collector: &str) -> bool {
+    fn line(version: &str) -> Option<(u64, u64)> {
+        let mut parts = version.trim_start_matches('v').split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        parts.next()?.split('-').next()?.parse::<u64>().ok()?;
+        Some((major, minor))
+    }
+    matches!((line(peer), line(collector)), (Some((pm, pn)), Some((cm, cn))) if pm == cm && pn.checked_add(1) == Some(cn))
+}
+
+fn unknown_stats_snapshot(error: &RpcError) -> bool {
+    matches!(error, RpcError::UnknownMethod(method) if method == methods::BOARD_STATS_SNAPSHOT)
+        || matches!(error, RpcError::Failed(message) if message == "unknown method: BoardStatsSnapshot")
+}
+
 /// Ceiling on what one `SearchContextFiles` call may ask for (gh#424). The
 /// picker wants seven rows; this is the bound on a client asking for the disk.
 const MAX_CONTEXT_RESULTS: usize = 100;
@@ -1099,7 +1118,10 @@ impl EngineRpc {
     /// Read the first frame of the N-1-compatible update stream. This is only
     /// used after an old peer explicitly rejects BoardStatsSnapshot, so a
     /// normal aggregate still performs exactly one request per candidate.
-    async fn peer_version(&self, target: &str) -> Result<String, RpcError> {
+    async fn peer_update_status(
+        &self,
+        target: &str,
+    ) -> Result<comet_update::UpdateStatus, RpcError> {
         let reply = self
             .forward(target, methods::UPDATE_STATUS, serde_json::json!({}))
             .await?;
@@ -1110,8 +1132,15 @@ impl EngineRpc {
         };
         let value = stream.next().await.ok_or_else(|| RpcError::Closed)?;
         serde_json::from_value::<comet_update::UpdateStatus>(value)
-            .map(|status| status.current_version)
             .map_err(|error| RpcError::Failed(format!("could not decode UpdateStatus: {error}")))
+    }
+
+    fn managed_stats_host(&self, target: &str) -> bool {
+        self.workspace
+            .devices()
+            .into_iter()
+            .find(|device| device.id == target)
+            .is_some_and(|device| device.platform == "linux")
     }
 
     /// Ask one candidate under the same per-device budget as the existing
@@ -1139,19 +1168,32 @@ impl EngineRpc {
                 "timed out after {}s",
                 PEER_SWEEP_BUDGET.as_secs()
             )),
-            Ok(Err(error @ RpcError::UnknownMethod(_))) if candidate.device_id != local => {
+            Ok(Err(error)) if candidate.device_id != local && unknown_stats_snapshot(&error) => {
                 let underlying = error.to_string();
                 match tokio::time::timeout(
                     PEER_SWEEP_BUDGET,
-                    self.peer_version(&candidate.device_id),
+                    self.peer_update_status(&candidate.device_id),
                 )
                 .await
                 {
-                    Ok(Ok(current_version)) => StatsProbeResult::UpgradeRequired {
-                        current_version,
-                        required_version: env!("CARGO_PKG_VERSION").to_string(),
-                        error: underlying,
-                    },
+                    Ok(Ok(status)) => {
+                        let required = env!("CARGO_PKG_VERSION");
+                        if supported_n_minus_one(&status.current_version, required) {
+                            StatsProbeResult::UpgradeRequired {
+                                can_apply: self.managed_stats_host(&candidate.device_id)
+                                    && status.update_available
+                                    && status.latest_version.as_deref() == Some(required),
+                                current_version: status.current_version,
+                                required_version: required.to_string(),
+                                error: underlying,
+                            }
+                        } else {
+                            StatsProbeResult::Unreadable(format!(
+                                "{underlying}; incompatible peer version {} (collector is v{required})",
+                                status.current_version
+                            ))
+                        }
+                    }
                     Ok(Err(version_error)) => StatsProbeResult::Unreadable(format!(
                         "{underlying}; UpdateStatus failed: {version_error}"
                     )),
@@ -2159,6 +2201,14 @@ impl RpcService for EngineRpc {
         params: serde_json::Value,
         caller: &Caller,
     ) -> Result<RpcReply, RpcError> {
+        if method == methods::APPLY_UPDATE
+            && params.get("targetDeviceId").is_some()
+            && !caller.is_operator()
+        {
+            return Err(RpcError::Refused(
+                "updating another device requires the embedded operator surface".into(),
+            ));
+        }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         //
@@ -2281,6 +2331,15 @@ impl RpcService for EngineRpc {
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
+                let verified_owner = caller.user().is_some_and(|user| {
+                    self.auth.as_ref().and_then(Auth::user_id).as_deref() == Some(user)
+                });
+                if !caller.is_operator() && !verified_owner {
+                    return Err(RpcError::Refused(
+                        "applying an update requires the embedded operator or verified device owner"
+                            .into(),
+                    ));
+                }
                 let version = self
                     .updater()?
                     .apply()
@@ -3082,6 +3141,16 @@ mod tests {
             aggregate.hosts[0].status,
             comet_proto::view::stats::StatsHostStatus::Unreadable
         );
+    }
+
+    #[test]
+    fn snapshot_compatibility_is_only_the_previous_minor_line() {
+        assert!(supported_n_minus_one("0.7.1", "0.8.0"));
+        assert!(supported_n_minus_one("v0.7.9", "0.8.0"));
+        assert!(!supported_n_minus_one("0.8.0", "0.8.0"));
+        assert!(!supported_n_minus_one("0.9.0", "0.8.0"));
+        assert!(!supported_n_minus_one("garbage", "0.8.0"));
+        assert!(!supported_n_minus_one("1.7.1", "0.8.0"));
     }
 
     /// gh#97: onboarding is three device-local effects behind one verb — a
