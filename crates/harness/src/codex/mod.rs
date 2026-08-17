@@ -28,7 +28,7 @@ mod catalog;
 mod normalize;
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -462,25 +462,38 @@ impl Harness for CodexHarness {
         } else {
             Vec::new()
         };
+        let push_environment = CodexPushEnvironment::new(&controls, &exe)?;
         let mut cmd = Command::new(&exe);
         // Global `-c` overrides must precede the app-server subcommand. Each
         // value is one complete inline table, so a route cannot inherit stale
         // args from a same-named server in the reused CODEX_HOME (gh#273).
+        if let Some(config) = push_environment.as_ref().map(CodexPushEnvironment::config) {
+            cmd.arg("-c").arg(config);
+            // The policy environment is assembled before Codex launches the
+            // model tool's shell. A login shell could then source an account
+            // profile which replaces askpass, its ledger attribution, or the
+            // board-first PATH. This top-level CLI override is deliberately
+            // paired with the credential projection: ordinary chats retain
+            // their configured login-shell behavior.
+            cmd.arg("-c").arg("allow_login_shell=false");
+        }
         for config in mcp_config_overrides(&controls.mcp_servers) {
             cmd.arg("-c").arg(config);
         }
         cmd.arg("app-server");
         crate::prepend_exe_dir_to_path(&mut cmd, &exe);
-        if let Some(chat_id) = &controls.chat_id {
+        if push_environment.is_none()
+            && let Some(chat_id) = &controls.chat_id
+        {
             cmd.env("COMET_BOARD_CHAT_ID", chat_id);
         }
         if let Some(account) = &controls.account {
             account.apply(&mut cmd, HarnessId::Codex);
         }
-        // Before the push credentials, whose `gh` shim has to stay in front.
-        crate::prepend_dirs_to_path(&mut cmd, &controls.bin_dirs);
-        if let Some(push) = &controls.push {
-            push.apply(&mut cmd);
+        if let Some(environment) = &push_environment {
+            environment.apply(&mut cmd);
+        } else {
+            crate::prepend_dirs_to_path(&mut cmd, &controls.bin_dirs);
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
@@ -553,6 +566,97 @@ fn mcp_config_overrides(servers: &[comet_proto::McpServer]) -> Vec<String> {
             format!("mcp_servers.{name}={{ command = {command}, args = {args} }}")
         })
         .collect()
+}
+
+/// One projection of the board-owned environment across both Codex boundaries.
+///
+/// Stamping these values on `codex app-server` is not enough: Codex rebuilds
+/// the environment for every shell command according to the account's
+/// `shell_environment_policy`. A restrictive policy can therefore leave the
+/// app server holding `GIT_ASKPASS` while the `git push` it launches inherits
+/// an ambient Keychain credential instead. Codex recursively merges table
+/// overlays, so `inherit` and `set` alone do not replace a lower allowlist.
+/// Naming the current `filters` form displaces legacy `exclude`/`include_only`,
+/// and the catch-all include prevents lower keyed includes from narrowing the
+/// final allowlist. Lower exclusions run before `set`, so the board projection
+/// restores its own keys afterwards. `inherit = "core"` keeps the catch-all
+/// bounded to Codex's small core plus these non-secret values.
+///
+/// `PATH` is part of the contract because it puts the board's `gh` wrapper in
+/// front of the real CLI. `COMET_BOARD_CHAT_ID` is part of it because a mint
+/// without that attribution cannot attest which attempt performed the push.
+/// Ordinary, non-dispatched Codex chats keep their own policy untouched.
+#[derive(Debug)]
+struct CodexPushEnvironment {
+    values: Vec<(String, String)>,
+}
+
+impl CodexPushEnvironment {
+    fn new(controls: &RunControls, exe: &Path) -> Result<Option<Self>, HarnessError> {
+        let Some(push) = controls.push.as_ref() else {
+            return Ok(None);
+        };
+        let mut values = push.env.clone();
+        if let Some(chat) = &controls.chat_id {
+            values.push(("COMET_BOARD_CHAT_ID".into(), chat.clone()));
+        }
+        #[cfg(unix)]
+        values.extend([
+            // `-c` only disables login profiles. Bash still sources BASH_ENV,
+            // POSIX shells may source ENV, and zsh always reads
+            // $ZDOTDIR/.zshenv. Override recursively merged account values;
+            // /dev/null cannot contain a zsh startup file.
+            ("BASH_ENV".into(), String::new()),
+            ("ENV".into(), String::new()),
+            ("ZDOTDIR".into(), "/dev/null".into()),
+        ]);
+
+        let mut paths = Vec::new();
+        if let Some(dir) = &push.bin_dir {
+            paths.push(dir.clone());
+        }
+        paths.extend(controls.bin_dirs.iter().cloned());
+        if let Some(dir) = exe.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            paths.push(dir.to_path_buf());
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        let path = std::env::join_paths(paths).map_err(|error| {
+            HarnessError::Protocol(format!(
+                "cannot represent the required Codex push PATH: {error}"
+            ))
+        })?;
+        let path = path.into_string().map_err(|_| {
+            HarnessError::Protocol("cannot represent the required Codex push PATH as UTF-8".into())
+        })?;
+        values.push(("PATH".into(), path));
+        Ok(Some(Self { values }))
+    }
+
+    fn apply(&self, cmd: &mut Command) {
+        for (key, value) in &self.values {
+            cmd.env(key, value);
+        }
+    }
+
+    fn config(&self) -> String {
+        let entries = self
+            .values
+            .iter()
+            .map(|(key, value)| {
+                let key = serde_json::to_string(key).expect("a string serializes");
+                let value = serde_json::to_string(value).expect("a string serializes");
+                format!("{key} = {value}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "shell_environment_policy={{ inherit = \"core\", \
+             ignore_default_excludes = false, set = {{ {entries} }}, \
+             filters = {{ \"*\" = \"include\" }} }}"
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1711,6 +1815,145 @@ mod tests {
             [r#"mcp_servers."comet-board"={ command = "comet-board", args = ["mcp"] }"#]
         );
         assert!(mcp_config_overrides(&[]).is_empty());
+    }
+
+    #[test]
+    fn dispatched_push_environment_crosses_codex_shell_policy() {
+        let (_steer_tx, steering) = tokio::sync::mpsc::channel(1);
+        let controls = RunControls {
+            request_input: Box::new(|_| {
+                let (_tx, rx) = tokio::sync::oneshot::channel();
+                rx
+            }),
+            steering,
+            interrupt: crate::CancellationToken::new(),
+            chat_id: Some("chat-464".into()),
+            account: None,
+            push: Some(crate::PushCredentials {
+                env: vec![
+                    ("GIT_ASKPASS".into(), "/board/bin/askpass".into()),
+                    ("GIT_CONFIG_COUNT".into(), "1".into()),
+                    ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+                    ("GIT_CONFIG_VALUE_0".into(), String::new()),
+                    ("COMET_BOARD_ASKPASS_REPO".into(), "owner/repo".into()),
+                ],
+                bin_dir: Some(PathBuf::from("/board/bin")),
+            }),
+            bin_dirs: vec![PathBuf::from("/engine/bin")],
+            mcp_servers: Vec::new(),
+        };
+
+        let projection = CodexPushEnvironment::new(&controls, Path::new("/codex/bin/codex"))
+            .expect("push PATH is representable")
+            .expect("a dispatched push forces its environment");
+        let config = projection.config();
+        assert!(
+            config.starts_with("shell_environment_policy={ inherit = \"core\""),
+            "{config}"
+        );
+        assert!(!config.contains("include_only"), "{config}");
+        assert!(
+            config.contains(r#"filters = { "*" = "include" }"#),
+            "{config}"
+        );
+        assert!(
+            config.contains(r#""GIT_ASKPASS" = "/board/bin/askpass""#),
+            "{config}"
+        );
+        assert!(
+            config.contains(r#""GIT_CONFIG_KEY_0" = "credential.helper""#),
+            "{config}"
+        );
+        assert!(
+            config.contains(r#""COMET_BOARD_CHAT_ID" = "chat-464""#),
+            "{config}"
+        );
+        #[cfg(unix)]
+        {
+            assert!(config.contains(r#""BASH_ENV" = """#), "{config}");
+            assert!(config.contains(r#""ENV" = """#), "{config}");
+            assert!(config.contains(r#""ZDOTDIR" = "/dev/null""#), "{config}");
+        }
+        let path = config.find(r#""PATH" = "/board/bin:/engine/bin:/codex/bin:"#);
+        assert!(
+            path.is_some(),
+            "the gh wrapper must lead the forced PATH: {config}"
+        );
+
+        let mut ordinary = controls;
+        ordinary.push = None;
+        assert!(
+            CodexPushEnvironment::new(&ordinary, Path::new("codex"))
+                .expect("ordinary runs do not construct a PATH")
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatched_push_refuses_an_unrepresentable_wrapper_path() {
+        let (_steer_tx, steering) = tokio::sync::mpsc::channel(1);
+        let controls = RunControls {
+            request_input: Box::new(|_| {
+                let (_tx, rx) = tokio::sync::oneshot::channel();
+                rx
+            }),
+            steering,
+            interrupt: crate::CancellationToken::new(),
+            chat_id: Some("chat-464".into()),
+            account: None,
+            push: Some(crate::PushCredentials {
+                env: vec![("GIT_ASKPASS".into(), "/board/bin/askpass".into())],
+                // ':' is legal in a Unix filename but cannot be encoded in PATH.
+                bin_dir: Some(PathBuf::from("/board:bin")),
+            }),
+            bin_dirs: Vec::new(),
+            mcp_servers: Vec::new(),
+        };
+
+        let error = CodexPushEnvironment::new(&controls, Path::new("codex"))
+            .expect_err("a missing board wrapper must fail the dispatch");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot represent the required Codex push PATH"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatched_push_refuses_a_non_utf8_wrapper_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (_steer_tx, steering) = tokio::sync::mpsc::channel(1);
+        let controls = RunControls {
+            request_input: Box::new(|_| {
+                let (_tx, rx) = tokio::sync::oneshot::channel();
+                rx
+            }),
+            steering,
+            interrupt: crate::CancellationToken::new(),
+            chat_id: Some("chat-464".into()),
+            account: None,
+            push: Some(crate::PushCredentials {
+                env: vec![("GIT_ASKPASS".into(), "/board/bin/askpass".into())],
+                bin_dir: Some(PathBuf::from(std::ffi::OsString::from_vec(
+                    b"/board/\xff/bin".to_vec(),
+                ))),
+            }),
+            bin_dirs: Vec::new(),
+            mcp_servers: Vec::new(),
+        };
+
+        let error = CodexPushEnvironment::new(&controls, Path::new("codex"))
+            .expect_err("a rewritten board wrapper path must fail the dispatch");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot represent the required Codex push PATH as UTF-8"),
+            "{error}"
+        );
     }
 
     #[test]

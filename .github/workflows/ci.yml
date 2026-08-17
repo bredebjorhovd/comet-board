@@ -62,12 +62,20 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
             bubblewrap \
+            zsh \
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
             libvulkan-dev pkg-config cmake
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # This is a security boundary, not an optional developer integration:
+      # keep the real recursive-config and model-shell behavior in CI.
+      - name: pinned Codex CLI for push-policy regression
+        run: npm install --global @openai/codex@0.147.0
       - uses: Swatinem/rust-cache@v2
       # Noble confines unprofiled user namespaces through AppArmor by default.
       # Grant only the distro bwrap executable the namespace permission it
@@ -89,6 +97,8 @@ jobs:
           -- --exact --nocapture
       # No --all-targets here: it would silently drop doctests.
       - name: cargo test --workspace
+        env:
+          COMET_REQUIRE_REAL_CODEX: 1
         run: cargo test --workspace
 
   clippy:
