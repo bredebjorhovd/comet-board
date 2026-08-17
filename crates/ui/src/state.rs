@@ -310,6 +310,47 @@ impl EngineHandle {
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_service(
+        service: Arc<dyn RpcService>,
+    ) -> (Self, Arc<tokio::runtime::Runtime>) {
+        struct TestEngine {
+            client: RpcClient,
+            _runtime: Arc<tokio::runtime::Runtime>,
+        }
+
+        #[async_trait]
+        impl EngineBackend for TestEngine {
+            fn client(&self) -> &RpcClient {
+                &self.client
+            }
+
+            fn mode(&self) -> EngineMode {
+                EngineMode::InProcess
+            }
+
+            async fn shutdown(&self) {}
+        }
+
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test RPC runtime"),
+        );
+        let client = {
+            let _entered = runtime.enter();
+            comet_rpc::operator_memory_client(service)
+        };
+        let handle = Self {
+            inner: Arc::new(TestEngine {
+                client,
+                _runtime: runtime.clone(),
+            }),
+        };
+        (handle, runtime)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -818,6 +859,11 @@ impl AppState {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
         }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_test_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        self.attach_engine(handle, cx);
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:

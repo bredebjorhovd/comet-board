@@ -12,7 +12,7 @@
 //! dock. Double-clicking a handle resets that pane to its default width.
 
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use gpui::{
@@ -564,6 +564,10 @@ pub struct Shell {
     mutate_task: Option<Task<()>>,
     /// One New Session invocation at a time; also absorbs key-repeat events.
     new_session_task: Option<Task<()>>,
+    /// GPUI resolves a key binding before element capture sees `is_held`.
+    /// Debounce the resolved action itself so a fast RPC cannot let a held
+    /// physical shortcut become a second invocation.
+    last_new_session_action: Option<Instant>,
     /// Durable until the exact row returns through WATCH_CHATS.
     new_session_intent: Option<NewSessionIntent>,
     new_session_intent_attempted: bool,
@@ -818,6 +822,7 @@ impl Shell {
             org: None,
             mutate_task: None,
             new_session_task: None,
+            last_new_session_action: None,
             new_session_intent: commands::load_intent(&data_dir),
             new_session_intent_attempted: false,
             new_session_intent_confirmed: false,
@@ -1688,6 +1693,39 @@ impl Shell {
 
     // ---- sidebar mutations ----
 
+    fn handle_new_session_chooser_key(&mut self, key: &str, cx: &mut Context<Self>) -> bool {
+        let Some(selected) = self.new_session_chooser else {
+            return false;
+        };
+        let count = self.state.read(cx).spaces.len();
+        match key {
+            "up" if count > 0 => {
+                self.new_session_chooser = Some(commands::step_chooser(selected, count, -1));
+                cx.notify();
+            }
+            "down" if count > 0 => {
+                self.new_session_chooser = Some(commands::step_chooser(selected, count, 1));
+                cx.notify();
+            }
+            "enter" if count > 0 => {
+                let space = self.state.read(cx).spaces[selected.min(count - 1)]
+                    .id
+                    .clone();
+                self.new_session(Some(space), cx);
+            }
+            "enter" => {
+                self.new_session_chooser = None;
+                self.open_add_space(cx);
+            }
+            "escape" => {
+                self.new_session_chooser = None;
+                cx.notify();
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// Fire a Mutate op; failures surface in the sidebar notice strip.
     fn mutate(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -1714,6 +1752,16 @@ impl Shell {
             self.new_session_task.is_some(),
         ) {
             return;
+        }
+        if requested_space.is_none() {
+            let now = Instant::now();
+            if self
+                .last_new_session_action
+                .is_some_and(|last| now.duration_since(last) < Duration::from_millis(250))
+            {
+                return;
+            }
+            self.last_new_session_action = Some(now);
         }
         if self.new_session_intent.is_some() {
             // Resolve the durable idempotency key before any replacement. A
@@ -4643,40 +4691,8 @@ impl Render for Shell {
                     cx.stop_propagation();
                     return;
                 }
-                if let Some(selected) = this.new_session_chooser {
-                    let count = this.state.read(cx).spaces.len();
-                    match event.keystroke.key.as_str() {
-                        "up" if count > 0 => {
-                            this.new_session_chooser =
-                                Some(commands::step_chooser(selected, count, -1));
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                        "down" if count > 0 => {
-                            this.new_session_chooser =
-                                Some(commands::step_chooser(selected, count, 1));
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                        "enter" if count > 0 => {
-                            let space = this.state.read(cx).spaces[selected.min(count - 1)]
-                                .id
-                                .clone();
-                            cx.stop_propagation();
-                            this.new_session(Some(space), cx);
-                        }
-                        "enter" => {
-                            this.new_session_chooser = None;
-                            cx.stop_propagation();
-                            this.open_add_space(cx);
-                        }
-                        "escape" => {
-                            this.new_session_chooser = None;
-                            cx.stop_propagation();
-                            cx.notify();
-                        }
-                        _ => {}
-                    }
+                if this.handle_new_session_chooser_key(&event.keystroke.key, cx) {
+                    cx.stop_propagation();
                 }
             }))
             // `esc` leaves a review (gh#311). The board panel says "esc close"
@@ -5217,3 +5233,6 @@ mod tests {
         assert_eq!(broken.review_session_width, REVIEW_SESSION_DEFAULT);
     }
 }
+
+#[cfg(test)]
+mod interaction_tests;

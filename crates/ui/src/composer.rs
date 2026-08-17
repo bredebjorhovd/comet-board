@@ -2203,6 +2203,15 @@ impl Composer {
         composer
     }
 
+    #[cfg(test)]
+    pub(crate) fn send_for_interaction_test(
+        &mut self,
+        text: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(text.into(), false, cx);
+    }
+
     /// Capture-knob passthrough (`COMET_OPEN_DIALOG=model`): open the
     /// combined harness/model menu.
     pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
