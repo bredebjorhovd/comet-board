@@ -1135,12 +1135,53 @@ impl EngineRpc {
             .map_err(|error| RpcError::Failed(format!("could not decode UpdateStatus: {error}")))
     }
 
-    fn managed_stats_host(&self, target: &str) -> bool {
-        self.workspace
-            .devices()
-            .into_iter()
-            .find(|device| device.id == target)
-            .is_some_and(|device| device.platform == "linux")
+    async fn peer_has_board(
+        &self,
+        target: &str,
+        since_days: Option<i64>,
+    ) -> Result<bool, RpcError> {
+        match self
+            .forward(
+                target,
+                methods::BOARD_STATS,
+                serde_json::json!({ "sinceDays": since_days }),
+            )
+            .await
+        {
+            Ok(RpcReply::Value(value)) => {
+                serde_json::from_value::<comet_proto::view::stats::BoardStats>(value)
+                    .map(|_| true)
+                    .map_err(|error| {
+                        RpcError::Failed(format!("could not decode legacy BoardStats: {error}"))
+                    })
+            }
+            Ok(RpcReply::Stream(_)) => Err(RpcError::Failed(
+                "legacy BoardStats answered with a stream".into(),
+            )),
+            Err(RpcError::Refused(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// N-1-safe, read-only proof of the symlink-managed install layout.
+    /// `/proc/self/exe/../../current` resolves to `~/.comet-native/app/current`
+    /// for installer-managed Linux services and does not exist for source
+    /// builds. ListFolders was already relay-forwardable in v0.7.
+    async fn peer_update_managed(&self, target: &str) -> bool {
+        let answer = self
+            .forward(
+                target,
+                methods::LIST_FOLDERS,
+                serde_json::json!({ "path": "/proc/self/exe/../../current" }),
+            )
+            .await;
+        let Ok(RpcReply::Value(value)) = answer else {
+            return false;
+        };
+        value
+            .get("entries")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == "comet"))
     }
 
     /// Ask one candidate under the same per-device budget as the existing
@@ -1172,6 +1213,35 @@ impl EngineRpc {
                 let underlying = error.to_string();
                 match tokio::time::timeout(
                     PEER_SWEEP_BUDGET,
+                    self.peer_has_board(&candidate.device_id, since_days),
+                )
+                .await
+                {
+                    Ok(Ok(false)) => {
+                        return StatsProbe {
+                            candidate,
+                            result: StatsProbeResult::NoBoard,
+                        };
+                    }
+                    Ok(Ok(true)) => {}
+                    Ok(Err(error)) => {
+                        return StatsProbe {
+                            candidate,
+                            result: Self::stats_probe_error(error),
+                        };
+                    }
+                    Err(_) => {
+                        return StatsProbe {
+                            candidate,
+                            result: StatsProbeResult::Unreachable(format!(
+                                "legacy BoardStats timed out after {}s",
+                                PEER_SWEEP_BUDGET.as_secs()
+                            )),
+                        };
+                    }
+                }
+                match tokio::time::timeout(
+                    PEER_SWEEP_BUDGET,
                     self.peer_update_status(&candidate.device_id),
                 )
                 .await
@@ -1179,10 +1249,14 @@ impl EngineRpc {
                     Ok(Ok(status)) => {
                         let required = env!("CARGO_PKG_VERSION");
                         if supported_n_minus_one(&status.current_version, required) {
+                            let can_apply = tokio::time::timeout(
+                                PEER_SWEEP_BUDGET,
+                                self.peer_update_managed(&candidate.device_id),
+                            )
+                            .await
+                            .unwrap_or(false);
                             StatsProbeResult::UpgradeRequired {
-                                can_apply: self.managed_stats_host(&candidate.device_id)
-                                    && status.update_available
-                                    && status.latest_version.as_deref() == Some(required),
+                                can_apply,
                                 current_version: status.current_version,
                                 required_version: required.to_string(),
                                 error: underlying,

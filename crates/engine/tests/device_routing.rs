@@ -21,7 +21,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{
     ErrorResponse as WsErrorResponse, Request as WsRequest, Response as WsResponse,
@@ -336,6 +336,9 @@ fn links(relay_url: &str, user: &str, org: &str) -> Arc<LinkCache> {
 /// update mutation tears the relay-shaped answer down and returns upgraded.
 struct LegacyStatsPeer {
     phase: Arc<AtomicU8>,
+    has_board: Arc<AtomicBool>,
+    update_managed: Arc<AtomicBool>,
+    restart: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 #[async_trait]
@@ -371,12 +374,29 @@ impl RpcService for LegacyStatsPeer {
                     merge_basis: Default::default(),
                 })
             }
+            methods::BOARD_STATS if !self.has_board.load(Ordering::SeqCst) => {
+                Err(RpcError::Refused("board not configured".into()))
+            }
+            methods::BOARD_STATS => {
+                let mut stats = comet_proto::view::stats::BoardStats::empty(Some(7));
+                stats.attempts = 89;
+                RpcReply::value(&stats)
+            }
+            methods::LIST_FOLDERS if self.update_managed.load(Ordering::SeqCst) => {
+                RpcReply::value(&serde_json::json!({
+                    "path": "/home/test/.comet-native/app/current",
+                    "entries": [{ "name": "comet", "isDir": false, "isRepo": false }]
+                }))
+            }
+            methods::LIST_FOLDERS => Err(RpcError::Failed("could not read that folder".into())),
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(
                 futures::stream::once(async {
                     serde_json::to_value(comet_update::UpdateStatus {
                         current_version: "0.7.1".into(),
-                        latest_version: Some("0.8.0".into()),
-                        update_available: true,
+                        // The incident's six-hour cache predates v0.8. ApplyUpdate
+                        // refreshes the manifest, so this is deliberately stale.
+                        latest_version: Some("0.7.1".into()),
+                        update_available: false,
                         checked_at: Some(1),
                         error: None,
                     })
@@ -386,12 +406,10 @@ impl RpcService for LegacyStatsPeer {
             )),
             methods::APPLY_UPDATE => {
                 self.phase.store(1, Ordering::SeqCst);
-                let phase = self.phase.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(150)).await;
-                    phase.store(2, Ordering::SeqCst);
-                });
-                Err(RpcError::Closed)
+                if let Some(restart) = self.restart.lock().unwrap().take() {
+                    let _ = restart.send(());
+                }
+                futures::future::pending::<Result<RpcReply, RpcError>>().await
             }
             _ => Err(RpcError::UnknownMethod(method.into())),
         }
@@ -579,19 +597,25 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     let (relay_url, _relay) = fake_device_room().await;
     let dirs = tempfile::tempdir().expect("tempdir");
     let phase = Arc::new(AtomicU8::new(0));
-    let mut host_config = HostRelayConfig::new(
-        relay_url.clone(),
-        "legacy-peer",
-        Arc::new(StaticToken(bearer(OWNER, ORG))),
-    );
-    host_config.retry = Duration::from_millis(20);
-    let _legacy_host = HostRelay::spawn(
-        host_config,
-        Arc::new(LegacyStatsPeer {
-            phase: phase.clone(),
-        }),
-        Arc::new(|_| {}),
-    );
+    let has_board = Arc::new(AtomicBool::new(false));
+    let update_managed = Arc::new(AtomicBool::new(false));
+    let (restart_tx, restart_rx) = oneshot::channel();
+    let legacy_peer = Arc::new(LegacyStatsPeer {
+        phase: phase.clone(),
+        has_board: has_board.clone(),
+        update_managed: update_managed.clone(),
+        restart: Mutex::new(Some(restart_tx)),
+    });
+    let host_config = || {
+        let mut config = HostRelayConfig::new(
+            relay_url.clone(),
+            "legacy-peer",
+            Arc::new(StaticToken(bearer(OWNER, ORG))),
+        );
+        config.retry = Duration::from_millis(20);
+        config
+    };
+    let legacy_host = HostRelay::spawn(host_config(), legacy_peer.clone(), Arc::new(|_| {}));
 
     let core = assemble(&dirs.path().join("collector"), "collector");
     core.set_board(Arc::new(board_service(
@@ -637,6 +661,69 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     );
     let operator = comet_rpc::operator_memory_client(core.rpc_service());
 
+    // The compatible legacy method distinguishes a reachable engine whose
+    // board is disabled from a board that merely needs the new snapshot RPC.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let aggregate = operator
+            .call(
+                methods::AGGREGATE_BOARD_STATS,
+                serde_json::json!({ "sinceDays": 7 }),
+            )
+            .await;
+        let no_board = aggregate
+            .ok()
+            .and_then(|value| {
+                serde_json::from_value::<comet_proto::view::stats::AggregateBoardStats>(value).ok()
+            })
+            .is_some_and(|aggregate| {
+                aggregate.hosts.iter().any(|host| {
+                    host.device.device_id == "legacy-peer"
+                        && host.status == comet_proto::view::stats::StatsHostStatus::NoBoard
+                        && host.upgrade.is_none()
+                })
+            });
+        if no_board {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "legacy disabled board was not classified as noBoard"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    has_board.store(true, Ordering::SeqCst);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let aggregate: Option<comet_proto::view::stats::AggregateBoardStats> = operator
+            .call(
+                methods::AGGREGATE_BOARD_STATS,
+                serde_json::json!({ "sinceDays": 7 }),
+            )
+            .await
+            .ok()
+            .and_then(|value| serde_json::from_value(value).ok());
+        let unmanaged = aggregate.is_some_and(|aggregate| {
+            aggregate.hosts.iter().any(|host| {
+                host.device.device_id == "legacy-peer"
+                    && host
+                        .upgrade
+                        .as_ref()
+                        .is_some_and(|upgrade| !upgrade.can_apply)
+            })
+        });
+        if unmanaged {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "source-shaped Linux peer incorrectly offered an update"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    update_managed.store(true, Ordering::SeqCst);
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let before: comet_proto::view::stats::AggregateBoardStats = loop {
         match operator
@@ -676,14 +763,30 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     assert!(upgrade.can_apply);
     assert!(upgrade.error.contains("BoardStatsSnapshot"));
 
-    let lost = operator
-        .call(
-            methods::APPLY_UPDATE,
-            serde_json::json!({ "targetDeviceId": "legacy-peer" }),
-        )
-        .await
-        .expect_err("restart loses the mutation reply");
-    assert!(lost.to_string().contains("connection closed"));
+    let update_service = core.rpc_service();
+    let mut apply = tokio::spawn(async move {
+        update_service
+            .handle_as(
+                methods::APPLY_UPDATE,
+                serde_json::json!({ "targetDeviceId": "legacy-peer" }),
+                &Caller::OPERATOR,
+            )
+            .await
+    });
+    restart_rx.await.expect("legacy peer began its restart");
+    drop(legacy_host);
+    phase.store(2, Ordering::SeqCst);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _restarted_host = HostRelay::spawn(host_config(), legacy_peer, Arc::new(|_| {}));
+    match tokio::time::timeout(Duration::from_secs(1), &mut apply).await {
+        Ok(Ok(Err(error))) => assert!(
+            error.to_string().contains("connection closed"),
+            "unexpected lost-reply error: {error}"
+        ),
+        Err(_) => apply.abort(),
+        Ok(Ok(Ok(_))) => panic!("restart must lose the mutation reply"),
+        Ok(Err(error)) => panic!("apply task failed: {error}"),
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {

@@ -426,6 +426,9 @@ pub struct StatsPage {
     swept: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
+    /// Monotonic fence for aggregate reads. A slower request for an old
+    /// window must never repaint beneath the newly selected window label.
+    reload_generation: u64,
     updating: Option<String>,
     update_task: Option<Task<()>>,
 }
@@ -451,6 +454,7 @@ impl StatsPage {
             swept: false,
             error: None,
             task: None,
+            reload_generation: 0,
             updating: None,
             update_task: None,
         };
@@ -469,6 +473,8 @@ impl StatsPage {
         };
         let local = self.state.read(cx).local_device_id.clone();
         let since_days = self.since_days;
+        self.reload_generation = self.reload_generation.wrapping_add(1);
+        let generation = self.reload_generation;
         self.error = None;
         self.swept = false;
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -486,6 +492,9 @@ impl StatsPage {
                         .map_err(|error| format!("Unreadable aggregate stats: {error}"))
                 });
             let _ = this.update(cx, |page, cx| {
+                if page.reload_generation != generation {
+                    return;
+                }
                 page.swept = true;
                 match result {
                     Ok(aggregate) => {
@@ -645,10 +654,16 @@ impl StatsPage {
             let _ = this.update(cx, |page, cx| {
                 page.updating = None;
                 match outcome {
-                    Ok(aggregate) => {
+                    Ok(aggregate)
+                        if recovery_matches_selected_window(since_days, page.since_days) =>
+                    {
                         let local = page.local_device(cx);
                         page.apply_aggregate(aggregate, local.as_deref());
                     }
+                    // A normal reload for the newly selected window owns the
+                    // screen. The recovery probe used its captured window only
+                    // to prove this exact peer had returned.
+                    Ok(_) => {}
                     Err(message) => page.error = Some(message.into()),
                 }
                 cx.notify();
@@ -2249,6 +2264,13 @@ fn update_recovery_converged(aggregate: &AggregateBoardStats, device_id: &str) -
     })
 }
 
+fn recovery_matches_selected_window(
+    recovery_window: Option<i64>,
+    selected_window: Option<i64>,
+) -> bool {
+    recovery_window == selected_window
+}
+
 fn apply_failure_may_be_restart(error: &comet_rpc::RpcError) -> bool {
     match error {
         comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_) => true,
@@ -2512,6 +2534,13 @@ mod tests {
         assert!(!update_recovery_converged(&recovery(Answered), "other"));
         assert!(update_recovery_converged(&recovery(Answered), "peer"));
         assert!(update_recovery_converged(&recovery(Duplicate), "peer"));
+    }
+
+    #[test]
+    fn old_window_recovery_cannot_overwrite_a_new_window_reload() {
+        assert!(recovery_matches_selected_window(Some(7), Some(7)));
+        assert!(!recovery_matches_selected_window(Some(7), Some(30)));
+        assert!(!recovery_matches_selected_window(Some(7), None));
     }
 
     #[test]

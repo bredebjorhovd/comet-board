@@ -1293,7 +1293,9 @@ pub struct StatsUpgradeDetails {
     /// The rejected snapshot call, retained separately from the diagnosis.
     pub error: String,
     /// True only when the compatible UpdateStatus frame names the required
-    /// release as available and the registered host is managed-host shaped.
+    /// The peer proved an installer-managed layout through a compatible,
+    /// read-only capability probe. This deliberately does not depend on its
+    /// possibly stale release-check cache.
     #[serde(default)]
     pub can_apply: bool,
 }
