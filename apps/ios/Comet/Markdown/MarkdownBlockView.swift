@@ -152,6 +152,9 @@ struct MarkdownBlockView: View {
     let block: MDBlock
     /// Identity for async highlight caching (row id).
     var cacheKey: String = ""
+    /// The settled message's complete copy payload. Nested blocks receive it
+    /// so their existing long-press controls do not shadow whole-message Copy.
+    var messageCopyText: String? = nil
 
     var body: some View {
         switch block {
@@ -172,13 +175,16 @@ struct MarkdownBlockView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
         case .codeBlock(let language, let code):
-            CodeBlockView(language: language, code: code, cacheKey: cacheKey)
+            CodeBlockView(language: language, code: code, cacheKey: cacheKey,
+                          messageCopyText: messageCopyText)
 
         case .blockquote(let children):
-            BlockquoteView(children: children, cacheKey: cacheKey)
+            BlockquoteView(children: children, cacheKey: cacheKey,
+                           messageCopyText: messageCopyText)
 
         case .list(let orderedStart, let items):
-            ListBlockView(orderedStart: orderedStart, items: items, cacheKey: cacheKey)
+            ListBlockView(orderedStart: orderedStart, items: items, cacheKey: cacheKey,
+                          messageCopyText: messageCopyText)
 
         case .table(let header, let rows, let align):
             TableBlockView(header: header, rows: rows, align: align)
@@ -197,6 +203,7 @@ struct CodeBlockView: View {
     let language: String?
     let code: String
     var cacheKey: String = ""
+    var messageCopyText: String? = nil
 
     @State private var spans: [[TokenSpan]] = []
 
@@ -236,6 +243,13 @@ struct CodeBlockView: View {
                 .strokeBorder(Theme.border, lineWidth: 1)
         )
         .contextMenu {
+            if let messageCopyText {
+                Button {
+                    UIPasteboard.general.string = messageCopyText
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+            }
             Button {
                 UIPasteboard.general.string = code
             } label: {
@@ -291,11 +305,13 @@ private extension AttributedString {
 struct BlockquoteView: View {
     let children: [MDBlock]
     var cacheKey: String = ""
+    var messageCopyText: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(children.enumerated()), id: \.offset) { ix, child in
-                MarkdownBlockView(block: child, cacheKey: "\(cacheKey)/q\(ix)")
+                MarkdownBlockView(block: child, cacheKey: "\(cacheKey)/q\(ix)",
+                                  messageCopyText: messageCopyText)
                     .foregroundStyle(Theme.textMuted)
             }
         }
@@ -320,6 +336,7 @@ struct ListBlockView: View {
     let orderedStart: Int?
     let items: [MDListItem]
     var cacheKey: String = ""
+    var messageCopyText: String? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -329,7 +346,9 @@ struct ListBlockView: View {
                         .frame(minWidth: 18, alignment: .trailing)
                     VStack(alignment: .leading, spacing: 4) {
                         ForEach(Array(item.children.enumerated()), id: \.offset) { cix, child in
-                            MarkdownBlockView(block: child, cacheKey: "\(cacheKey)/l\(ix).\(cix)")
+                            MarkdownBlockView(block: child,
+                                              cacheKey: "\(cacheKey)/l\(ix).\(cix)",
+                                              messageCopyText: messageCopyText)
                         }
                     }
                 }

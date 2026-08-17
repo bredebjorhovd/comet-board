@@ -37,6 +37,10 @@ struct TranscriptRow: Identifiable {
     var kind: RowKind
     var entryId: String
     var timestamp: Int64?
+    /// Complete rendered text for this message once it has settled. Every text
+    /// row in an assistant message carries the same payload, so a context menu
+    /// can copy the whole message even when most of its lazy rows are offscreen.
+    var messageCopyText: String? = nil
     /// "{entryId}#{partId}" for markdown rows, nil otherwise — two adjacent
     /// rows sharing it are blocks of the same part (the tighter gap).
     var partKey: String?
@@ -51,6 +55,7 @@ struct TranscriptRow: Identifiable {
 struct CompletedParse {
     var source: String
     var blocks: [TopBlock]
+    var copyText: String
 }
 
 enum TranscriptRowBuilder {
@@ -77,6 +82,7 @@ enum TranscriptRowBuilder {
                                       kind: .user(text: pending.text),
                                       entryId: pending.messageId,
                                       timestamp: nil,
+                                      messageCopyText: nil,
                                       partKey: nil))
         }
         // Drop memos for parts that no longer exist. The count guard keeps the
@@ -120,10 +126,15 @@ enum TranscriptRowBuilder {
             rows.append(TranscriptRow(id: entry.id, version: fnv1a(text),
                                       turnStart: true, kind: .user(text: text),
                                       entryId: entry.id, timestamp: entry.createdAt,
+                                      // User entries are atomic; only the
+                                      // separate optimistic echo is unsettled.
+                                      messageCopyText: text,
                                       partKey: nil))
             return
         }
 
+        let messageRowStart = rows.count
+        var messageTextParts: [String] = []
         var first = true
         var pendingTools: [ToolItem] = []
         var groupIx = 0
@@ -176,6 +187,9 @@ enum TranscriptRowBuilder {
                 let isLiveTail = streaming && ix == lastPartIx
                 let blocks = parse(text: text, key: key, streaming: isLiveTail,
                                    parsers: &parsers, completed: &completed)
+                if settled, let copyText = completed[key]?.copyText, !copyText.isEmpty {
+                    messageTextParts.append(copyText)
+                }
                 for (blockIx, top) in blocks.enumerated() {
                     var version = (top.fingerprint << 1) | (isLiveTail && blockIx == blocks.count - 1 ? 1 : 0)
                     if settled, ix == lastPartIx, blockIx == blocks.count - 1 {
@@ -188,6 +202,7 @@ enum TranscriptRowBuilder {
                         entryId: entry.id,
                         timestamp: settled && ix == lastPartIx && blockIx == blocks.count - 1
                             ? entry.createdAt : nil,
+                        messageCopyText: nil,
                         partKey: key))
                     first = false
                 }
@@ -212,6 +227,12 @@ enum TranscriptRowBuilder {
             }
         }
         flushTools(lastIx: lastPartIx)
+        if settled, !messageTextParts.isEmpty {
+            let copyText = messageTextParts.joined(separator: "\n\n")
+            for rowIx in messageRowStart..<rows.count where rows[rowIx].partKey != nil {
+                rows[rowIx].messageCopyText = copyText
+            }
+        }
     }
 
     private static func parse(text: String, key: String, streaming: Bool,
@@ -235,7 +256,11 @@ enum TranscriptRowBuilder {
         let blocks = handoff?.source == text
             ? (handoff?.blocks ?? MarkdownParser.parse(text))
             : MarkdownParser.parse(text)
-        completed[key] = CompletedParse(source: text, blocks: blocks)
+        completed[key] = CompletedParse(
+            source: text,
+            blocks: blocks,
+            copyText: TranscriptMessageText.render(blocks.map(\.block))
+        )
         return blocks
     }
 

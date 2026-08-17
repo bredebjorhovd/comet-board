@@ -94,6 +94,10 @@ final class AppModel {
             SyncSpecRunner.run()
             return
         }
+        if args.contains("-transcript-copy-spec") {
+            TranscriptCopySpecRunner.run()
+            return
+        }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return

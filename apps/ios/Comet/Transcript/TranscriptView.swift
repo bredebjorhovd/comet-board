@@ -204,10 +204,10 @@ struct TranscriptView: View {
 
     @ViewBuilder
     private func rowView(_ row: TranscriptRow) -> some View {
-        Group {
+        let content = Group {
             switch row.kind {
             case .user(let text):
-                UserBubble(text: text, pending: row.timestamp == nil)
+                UserBubble(text: text, pending: row.messageCopyText == nil)
 
             case .markdown(let block, let streaming):
                 MarkdownRowView(row: row, block: block, streaming: streaming, veils: veils)
@@ -231,8 +231,23 @@ struct TranscriptView: View {
                 ErrorChipView(message: message)
             }
         }
-        .padding(.top, row.topGap)
-        .padding(.horizontal, 16)
+        if let copyText = row.messageCopyText {
+            content
+                .textSelection(.enabled)
+                .contextMenu {
+                    Button {
+                        UIPasteboard.general.string = copyText
+                    } label: {
+                        Label("Copy", systemImage: "doc.on.doc")
+                    }
+                }
+                .padding(.top, row.topGap)
+                .padding(.horizontal, 16)
+        } else {
+            content
+                .padding(.top, row.topGap)
+                .padding(.horizontal, 16)
+        }
     }
 }
 
@@ -294,13 +309,6 @@ struct UserBubble: View {
                 .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
                 .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
                 .opacity(pending ? 0.65 : 1)
-                .contextMenu {
-                    Button {
-                        UIPasteboard.general.string = text
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
-                    }
-                }
         }
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
@@ -321,7 +329,8 @@ struct MarkdownRowView: View {
             }
             .onDisappear { veils.drop(row.id) }
         } else {
-            MarkdownBlockView(block: block, cacheKey: row.id)
+            MarkdownBlockView(block: block, cacheKey: row.id,
+                              messageCopyText: row.messageCopyText)
         }
     }
 
@@ -352,7 +361,8 @@ struct MarkdownRowView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
         default:
-            MarkdownBlockView(block: block, cacheKey: row.id)
+            MarkdownBlockView(block: block, cacheKey: row.id,
+                              messageCopyText: row.messageCopyText)
         }
     }
 }
