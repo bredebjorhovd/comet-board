@@ -126,7 +126,10 @@ fn mock_script() -> Vec<AgentEvent> {
 #[cfg(target_os = "linux")]
 fn authenticated_git_http(origin: PathBuf) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/repo.git", listener.local_addr().unwrap());
+    let url = format!(
+        "http://x-access-token@{}/repo.git",
+        listener.local_addr().unwrap()
+    );
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
@@ -134,6 +137,7 @@ fn authenticated_git_http(origin: PathBuf) -> String {
             let mut request = String::new();
             reader.read_line(&mut request).unwrap();
             let mut content_length = 0usize;
+            let mut content_type = String::new();
             let mut authenticated = false;
             loop {
                 let mut line = String::new();
@@ -144,6 +148,9 @@ fn authenticated_git_http(origin: PathBuf) -> String {
                 let lower = line.to_ascii_lowercase();
                 if let Some(value) = lower.strip_prefix("content-length:") {
                     content_length = value.trim().parse().unwrap();
+                }
+                if let Some(value) = lower.strip_prefix("content-type:") {
+                    content_type = value.trim().to_string();
                 }
                 if let Some(value) = lower.strip_prefix("authorization: basic ") {
                     authenticated = value.trim() == "eC1hY2Nlc3MtdG9rZW46Ym9hcmQtdG9rZW4=";
@@ -172,7 +179,7 @@ fn authenticated_git_http(origin: PathBuf) -> String {
                 )
                 .env("QUERY_STRING", query)
                 .env("REQUEST_METHOD", request.split_whitespace().next().unwrap())
-                .env("CONTENT_TYPE", "application/x-git-receive-pack-request")
+                .env("CONTENT_TYPE", content_type)
                 .env("CONTENT_LENGTH", content_length.to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
@@ -202,12 +209,7 @@ fn authenticated_git_http(origin: PathBuf) -> String {
                     write!(stream, "{header}\r\n").unwrap();
                 }
             }
-            write!(
-                stream,
-                "Content-Length: {}\r\nConnection: close\r\n\r\n",
-                response_body.len()
-            )
-            .unwrap();
+            write!(stream, "Connection: close\r\n\r\n").unwrap();
             stream.write_all(response_body).unwrap();
         }
     });
