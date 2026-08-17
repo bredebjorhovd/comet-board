@@ -235,11 +235,7 @@ struct TranscriptView: View {
             content
                 .textSelection(.enabled)
                 .contextMenu {
-                    Button {
-                        UIPasteboard.general.string = copyText
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
-                    }
+                    CopyMessageButton(text: copyText)
                 }
                 .padding(.top, row.topGap)
                 .padding(.horizontal, 16)
@@ -247,6 +243,21 @@ struct TranscriptView: View {
             content
                 .padding(.top, row.topGap)
                 .padding(.horizontal, 16)
+        }
+    }
+}
+
+/// One action shared by the row menu and nested code-block menu. Code blocks
+/// keep their narrower "Copy code" action, but whole-message Copy cannot drift
+/// in label, icon, or pasteboard behavior between the two attachment sites.
+struct CopyMessageButton: View {
+    let text: String
+
+    var body: some View {
+        Button {
+            UIPasteboard.general.string = text
+        } label: {
+            Label("Copy", systemImage: "doc.on.doc")
         }
     }
 }

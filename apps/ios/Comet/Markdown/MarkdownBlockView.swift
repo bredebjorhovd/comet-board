@@ -244,11 +244,7 @@ struct CodeBlockView: View {
         )
         .contextMenu {
             if let messageCopyText {
-                Button {
-                    UIPasteboard.general.string = messageCopyText
-                } label: {
-                    Label("Copy", systemImage: "doc.on.doc")
-                }
+                CopyMessageButton(text: messageCopyText)
             }
             Button {
                 UIPasteboard.general.string = code

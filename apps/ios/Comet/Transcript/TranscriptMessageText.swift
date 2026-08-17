@@ -31,11 +31,28 @@ enum TranscriptMessageText {
                 } else {
                     marker = "•"
                 }
-                let body = item.children.compactMap { render($0, depth: depth + 1) }
-                    .joined(separator: "\n\n")
+                let children: [(text: String, isList: Bool)] = item.children.compactMap { child in
+                    guard let text = render(child, depth: depth + 1) else { return nil }
+                    if case .list = child { return (text, true) }
+                    return (text, false)
+                }
+                guard let first = children.first?.text else {
+                    return "\(String(repeating: "  ", count: depth))\(marker)"
+                }
                 let continuation = String(repeating: "  ", count: depth + 1)
-                let indented = body.replacingOccurrences(of: "\n", with: "\n\(continuation)")
-                return "\(String(repeating: "  ", count: depth))\(marker) \(indented)"
+                let firstIndented = first.replacingOccurrences(of: "\n", with: "\n\(continuation)")
+                var line = "\(String(repeating: "  ", count: depth))\(marker) \(firstIndented)"
+                for child in children.dropFirst() {
+                    if child.isList {
+                        line += "\n\(child.text)"
+                    } else {
+                        let text = child.text.replacingOccurrences(
+                            of: "\n", with: "\n\(continuation)"
+                        )
+                        line += "\n\(continuation)\(text)"
+                    }
+                }
+                return line
             }.joined(separator: "\n")
         case .table(let header, let rows, _):
             return ([header] + rows).map { row in

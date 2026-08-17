@@ -54,8 +54,16 @@ final class AppModel {
 
     func restore() {
         if demo != nil { return }
-        DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
+        // The transcript-copy spec is pure formatting in an ordinary app
+        // container. Recognize it before any production persistence upkeep so
+        // installing the runner over a simulator's normal app cannot prune the
+        // operator's cached session documents.
+        if args.contains("-transcript-copy-spec") {
+            TranscriptCopySpecRunner.run()
+            return
+        }
+        DocDisk.prune(keep: 80)
         // Debug-rig config overrides (cfprefsd caching defeats external
         // defaults writes; the app applying them itself always sticks).
         func override(_ flag: String, _ apply: (String) -> Void) {
@@ -92,10 +100,6 @@ final class AppModel {
         // against an edge that is failing every request.
         if args.contains("-sync-spec") {
             SyncSpecRunner.run()
-            return
-        }
-        if args.contains("-transcript-copy-spec") {
-            TranscriptCopySpecRunner.run()
             return
         }
         if args.contains("-e2e") {
