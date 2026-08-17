@@ -9,7 +9,8 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use comet_harness::{
-    CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
+    CancellationToken, CodexHarness, Harness, HarnessError, PushCredentials, RunControls,
+    SteerMessage,
 };
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
@@ -330,6 +331,47 @@ async fn spawned_codex_receives_the_route_mcp_config() {
             "app-server"
         ]
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (wrapper, argv_file) = common::recording_wrapper(&fixture_path(), &dir);
+    let harness = CodexHarness::new().with_executable(wrapper);
+    let (mut controls, _steer, _token) = controls("Yes");
+    controls.chat_id = Some("chat-464".into());
+    controls.push = Some(PushCredentials {
+        env: vec![
+            ("GIT_ASKPASS".into(), "/board/bin/comet-askpass".into()),
+            ("COMET_BOARD_ASKPASS_REPO".into(), "owner/repo".into()),
+        ],
+        bin_dir: Some(PathBuf::from("/board/bin")),
+    });
+
+    run_to_end(&harness, request("scenario:happy"), controls).await;
+
+    let argv = std::fs::read_to_string(argv_file).expect("spawned Codex argv");
+    let argv: Vec<&str> = argv.lines().collect();
+    assert_eq!(argv.first(), Some(&"-c"), "{argv:?}");
+    let policy = argv.get(1).expect("credential policy override");
+    assert!(
+        policy.starts_with("shell_environment_policy.set={ "),
+        "{policy}"
+    );
+    assert!(
+        policy.contains(r#""GIT_ASKPASS" = "/board/bin/comet-askpass""#),
+        "{policy}"
+    );
+    assert!(
+        policy.contains(r#""COMET_BOARD_CHAT_ID" = "chat-464""#),
+        "{policy}"
+    );
+    assert!(
+        policy.contains(r#""PATH" = "/board/bin:"#),
+        "the gh shim must lead Codex's tool PATH: {policy}"
+    );
+    assert_eq!(argv.last(), Some(&"app-server"), "{argv:?}");
 }
 
 #[tokio::test]

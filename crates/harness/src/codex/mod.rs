@@ -28,7 +28,7 @@ mod catalog;
 mod normalize;
 
 use std::collections::{HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -466,6 +466,9 @@ impl Harness for CodexHarness {
         // Global `-c` overrides must precede the app-server subcommand. Each
         // value is one complete inline table, so a route cannot inherit stale
         // args from a same-named server in the reused CODEX_HOME (gh#273).
+        if let Some(config) = push_environment_override(&controls, &exe) {
+            cmd.arg("-c").arg(config);
+        }
         for config in mcp_config_overrides(&controls.mcp_servers) {
             cmd.arg("-c").arg(config);
         }
@@ -553,6 +556,55 @@ fn mcp_config_overrides(servers: &[comet_proto::McpServer]) -> Vec<String> {
             format!("mcp_servers.{name}={{ command = {command}, args = {args} }}")
         })
         .collect()
+}
+
+/// Keep the board's credential handoff intact across Codex's second
+/// environment boundary.
+///
+/// Stamping these values on `codex app-server` is not enough: Codex rebuilds
+/// the environment for every shell command according to the account's
+/// `shell_environment_policy`. A restrictive policy can therefore leave the
+/// app server holding `GIT_ASKPASS` while the `git push` it launches inherits
+/// an ambient Keychain credential instead. `shell_environment_policy.set` is
+/// applied after that filtering and is the supported way for the launcher to
+/// force its non-secret handoff values into tool subprocesses.
+///
+/// `PATH` is part of the contract because it puts the board's `gh` wrapper in
+/// front of the real CLI. `COMET_BOARD_CHAT_ID` is part of it because a mint
+/// without that attribution cannot attest which attempt performed the push.
+/// Ordinary, non-dispatched Codex chats keep their own policy untouched.
+fn push_environment_override(controls: &RunControls, exe: &Path) -> Option<String> {
+    let push = controls.push.as_ref()?;
+    let mut values = push.env.clone();
+    if let Some(chat) = &controls.chat_id {
+        values.push(("COMET_BOARD_CHAT_ID".into(), chat.clone()));
+    }
+
+    let mut paths = Vec::new();
+    if let Some(dir) = &push.bin_dir {
+        paths.push(dir.clone());
+    }
+    paths.extend(controls.bin_dirs.iter().cloned());
+    if let Some(dir) = exe.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        paths.push(dir.to_path_buf());
+    }
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    if let Ok(path) = std::env::join_paths(paths) {
+        values.push(("PATH".into(), path.to_string_lossy().into_owned()));
+    }
+
+    let entries = values
+        .iter()
+        .map(|(key, value)| {
+            let key = serde_json::to_string(key).expect("a string serializes");
+            let value = serde_json::to_string(value).expect("a string serializes");
+            format!("{key} = {value}")
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!("shell_environment_policy.set={{ {entries} }}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1711,6 +1763,61 @@ mod tests {
             [r#"mcp_servers."comet-board"={ command = "comet-board", args = ["mcp"] }"#]
         );
         assert!(mcp_config_overrides(&[]).is_empty());
+    }
+
+    #[test]
+    fn dispatched_push_environment_crosses_codex_shell_policy() {
+        let (_steer_tx, steering) = tokio::sync::mpsc::channel(1);
+        let controls = RunControls {
+            request_input: Box::new(|_| {
+                let (_tx, rx) = tokio::sync::oneshot::channel();
+                rx
+            }),
+            steering,
+            interrupt: crate::CancellationToken::new(),
+            chat_id: Some("chat-464".into()),
+            account: None,
+            push: Some(crate::PushCredentials {
+                env: vec![
+                    ("GIT_ASKPASS".into(), "/board/bin/askpass".into()),
+                    ("GIT_CONFIG_COUNT".into(), "1".into()),
+                    ("GIT_CONFIG_KEY_0".into(), "credential.helper".into()),
+                    ("GIT_CONFIG_VALUE_0".into(), String::new()),
+                    ("COMET_BOARD_ASKPASS_REPO".into(), "owner/repo".into()),
+                ],
+                bin_dir: Some(PathBuf::from("/board/bin")),
+            }),
+            bin_dirs: vec![PathBuf::from("/engine/bin")],
+            mcp_servers: Vec::new(),
+        };
+
+        let config = push_environment_override(&controls, Path::new("/codex/bin/codex"))
+            .expect("a dispatched push forces its environment");
+        assert!(
+            config.starts_with("shell_environment_policy.set={ "),
+            "{config}"
+        );
+        assert!(
+            config.contains(r#""GIT_ASKPASS" = "/board/bin/askpass""#),
+            "{config}"
+        );
+        assert!(
+            config.contains(r#""GIT_CONFIG_KEY_0" = "credential.helper""#),
+            "{config}"
+        );
+        assert!(
+            config.contains(r#""COMET_BOARD_CHAT_ID" = "chat-464""#),
+            "{config}"
+        );
+        let path = config.find(r#""PATH" = "/board/bin:/engine/bin:/codex/bin:"#);
+        assert!(
+            path.is_some(),
+            "the gh wrapper must lead the forced PATH: {config}"
+        );
+
+        let mut ordinary = controls;
+        ordinary.push = None;
+        assert!(push_environment_override(&ordinary, Path::new("codex")).is_none());
     }
 
     #[test]
