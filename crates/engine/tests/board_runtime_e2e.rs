@@ -20,6 +20,8 @@ use std::process::Stdio;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use comet_board::config::Paths;
@@ -124,12 +126,14 @@ fn mock_script() -> Vec<AgentEvent> {
 }
 
 #[cfg(target_os = "linux")]
-fn authenticated_git_http(origin: PathBuf) -> String {
+fn authenticated_git_http(origin: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!(
         "http://x-access-token@{}/repo.git",
         listener.local_addr().unwrap()
     );
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&trace);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let mut stream = stream.unwrap();
@@ -138,13 +142,16 @@ fn authenticated_git_http(origin: PathBuf) -> String {
             reader.read_line(&mut request).unwrap();
             let mut content_length = 0usize;
             let mut content_type = String::new();
+            let mut transfer_encoding = String::new();
             let mut authenticated = false;
+            let mut request_headers = Vec::new();
             loop {
                 let mut line = String::new();
                 reader.read_line(&mut line).unwrap();
                 if line == "\r\n" || line.is_empty() {
                     break;
                 }
+                request_headers.push(line.trim_end().to_string());
                 let lower = line.to_ascii_lowercase();
                 if let Some(value) = lower.strip_prefix("content-length:") {
                     content_length = value.trim().parse().unwrap();
@@ -152,12 +159,20 @@ fn authenticated_git_http(origin: PathBuf) -> String {
                 if let Some(value) = lower.strip_prefix("content-type:") {
                     content_type = value.trim().to_string();
                 }
+                if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+                    transfer_encoding = value.trim().to_string();
+                }
                 if let Some(value) = lower.strip_prefix("authorization: basic ") {
                     authenticated = value.trim() == "eC1hY2Nlc3MtdG9rZW46Ym9hcmQtdG9rZW4=";
                 }
             }
             let mut body = vec![0; content_length];
             reader.read_exact(&mut body).unwrap();
+            recorded.lock().unwrap().push(format!(
+                "request={:?} headers={request_headers:?} authenticated={authenticated} content_length={content_length} transfer_encoding={transfer_encoding:?} body_read={}",
+                request.trim_end(),
+                body.len()
+            ));
             if !authenticated {
                 write!(stream, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=board\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
                 continue;
@@ -183,6 +198,7 @@ fn authenticated_git_http(origin: PathBuf) -> String {
                 .env("CONTENT_LENGTH", content_length.to_string())
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
             child.stdin.as_mut().unwrap().write_all(&body).unwrap();
@@ -202,6 +218,13 @@ fn authenticated_git_http(origin: PathBuf) -> String {
                 .unwrap();
             let headers = String::from_utf8_lossy(&output.stdout[..split]);
             let response_body = &output.stdout[split..];
+            recorded.lock().unwrap().push(format!(
+                "backend_status={} backend_stderr={:?} cgi_headers={:?} response_body={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                headers,
+                response_body.len()
+            ));
             write!(stream, "HTTP/1.1 200 OK\r\n").unwrap();
             for header in headers.lines() {
                 let header = header.trim_end_matches('\r');
@@ -213,7 +236,7 @@ fn authenticated_git_http(origin: PathBuf) -> String {
             stream.write_all(response_body).unwrap();
         }
     });
-    url
+    (url, trace)
 }
 
 #[cfg(target_os = "linux")]
@@ -764,7 +787,7 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let push_url = authenticated_git_http(receive.clone());
+    let (push_url, receiver_trace) = authenticated_git_http(receive.clone());
     let (model, model_requests) = serve_push_model(format!(
         "unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT {} {} GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push '{}' HEAD:refs/heads/board-test",
         concat!("COMET_BOARD_", "CONFIG_DIR"),
@@ -918,11 +941,12 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
     };
     assert!(
         pushed,
-        "model-issued remote ref missing; model requests={}; sessions={:?}; run_end={:?}; ledger={:?}",
+        "model-issued remote ref missing; model requests={}; sessions={:?}; run_end={:?}; ledger={:?}; receiver={:?}",
         model_requests.load(Ordering::SeqCst),
         core.sessions.watch_sessions().borrow().clone(),
         runtime.last_run_end(&dispatched.chat_id),
         credential_ledger::for_chat(&paths, &dispatched.chat_id),
+        receiver_trace.lock().unwrap(),
     );
     wait_for(
         || {
