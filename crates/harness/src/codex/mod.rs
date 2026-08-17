@@ -567,11 +567,13 @@ fn mcp_config_overrides(servers: &[comet_proto::McpServer]) -> Vec<String> {
 /// the environment for every shell command according to the account's
 /// `shell_environment_policy`. A restrictive policy can therefore leave the
 /// app server holding `GIT_ASKPASS` while the `git push` it launches inherits
-/// an ambient Keychain credential instead. A complete policy replaces any
-/// account/project allowlist rather than trying to merge through it: official
-/// Codex ordering applies the final include allowlist *after* `set`, so adding
-/// values alone is not a guarantee. The replacement inherits Codex's small
-/// `core` environment and adds only this non-secret projection.
+/// an ambient Keychain credential instead. Codex recursively merges table
+/// overlays, so `inherit` and `set` alone do not replace a lower allowlist.
+/// Naming the current `filters` form displaces legacy `exclude`/`include_only`,
+/// and the catch-all include prevents lower keyed includes from narrowing the
+/// final allowlist. Lower exclusions run before `set`, so the board projection
+/// restores its own keys afterwards. `inherit = "core"` keeps the catch-all
+/// bounded to Codex's small core plus these non-secret values.
 ///
 /// `PATH` is part of the contract because it puts the board's `gh` wrapper in
 /// front of the real CLI. `COMET_BOARD_CHAT_ID` is part of it because a mint
@@ -625,7 +627,8 @@ impl CodexPushEnvironment {
             .join(", ");
         format!(
             "shell_environment_policy={{ inherit = \"core\", \
-             ignore_default_excludes = false, set = {{ {entries} }} }}"
+             ignore_default_excludes = false, set = {{ {entries} }}, \
+             filters = {{ \"*\" = \"include\" }} }}"
         )
     }
 }
@@ -1822,7 +1825,10 @@ mod tests {
             "{config}"
         );
         assert!(!config.contains("include_only"), "{config}");
-        assert!(!config.contains("filters"), "{config}");
+        assert!(
+            config.contains(r#"filters = { "*" = "include" }"#),
+            "{config}"
+        );
         assert!(
             config.contains(r#""GIT_ASKPASS" = "/board/bin/askpass""#),
             "{config}"

@@ -1,5 +1,7 @@
-//! CodexHarness integration tests against the fake app server in
-//! `tests/fixtures/fake-codex.sh` (no real `codex` binary involved).
+//! CodexHarness integration tests, primarily against the fake app server in
+//! `tests/fixtures/fake-codex.sh`. The push-policy regression uses a real
+//! installed Codex app server because its recursive config merge is the
+//! boundary under test; it skips on builders without that optional CLI.
 
 use std::path::PathBuf;
 #[cfg(unix)]
@@ -370,7 +372,10 @@ async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
         "{policy}"
     );
     assert!(!policy.contains("include_only"), "{policy}");
-    assert!(!policy.contains("filters"), "{policy}");
+    assert!(
+        policy.contains(r#"filters = { "*" = "include" }"#),
+        "{policy}"
+    );
     assert!(
         policy.contains(r#""GIT_ASKPASS" = "/board/bin/comet-askpass""#),
         "{policy}"
@@ -386,9 +391,10 @@ async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
     assert_eq!(argv.last(), Some(&"app-server"), "{argv:?}");
 }
 
-/// The #464 boundary in one process tree: the harness launches a Codex-shaped
-/// app server, that server applies the restrictive shell policy to a real
-/// `git push`, and git must choose askpass over an available ambient helper.
+/// The #464 boundary in one process tree: the harness emits its override, a
+/// real Codex app server merges it over a restrictive account config and runs
+/// a real `git push`, and git must choose askpass over an available ambient
+/// helper.
 /// The stand-in board writes the same ledger event as `git-askpass`, so the
 /// final assertion is the settlement input rather than a marker invented by
 /// the test.
@@ -399,6 +405,14 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
         Ok(output) if output.status.success() => PathBuf::from("git"),
         _ => return,
     };
+    if !std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+    {
+        eprintln!("no real Codex CLI on this box — skipping subprocess-policy regression");
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let paths = Paths {
@@ -474,30 +488,12 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
         }
     });
 
-    // This is the Codex subprocess boundary, not an argv recorder. It starts
-    // from an empty environment (stricter than any account policy), extracts
-    // the complete replacement policy's `set` values, and runs a real push.
-    let policy_codex = dir.path().join("policy-codex");
-    let fixture = fixture_path();
-    std::fs::write(
-        &policy_codex,
-        format!(
-            r#"#!/bin/sh
-policy="$2"
-get() {{ printf '%s' "$policy" | sed -n "s/.*\"$1\" = \"\([^\"]*\)\".*/\1/p"; }}
-env -i HOME='{}' PATH="$(get PATH)" GIT_ASKPASS="$(get GIT_ASKPASS)" GIT_TERMINAL_PROMPT="$(get GIT_TERMINAL_PROMPT)" GIT_CONFIG_COUNT="$(get GIT_CONFIG_COUNT)" GIT_CONFIG_KEY_0="$(get GIT_CONFIG_KEY_0)" GIT_CONFIG_VALUE_0="$(get GIT_CONFIG_VALUE_0)" COMET_BOARD_ASKPASS_REPO="$(get COMET_BOARD_ASKPASS_REPO)" COMET_BOARD_CHAT_ID="$(get COMET_BOARD_CHAT_ID)" '{}' push "$(get COMET_TEST_PUSH_URL)" HEAD:refs/heads/board-test >/dev/null 2>&1
-exec '{}' "$3"
-"#,
-            home.display(),
-            git.display(),
-            fixture.display(),
-        ),
-    )
-    .expect("policy Codex");
-    std::fs::set_permissions(&policy_codex, std::fs::Permissions::from_mode(0o755))
-        .expect("chmod policy Codex");
-
-    let harness = CodexHarness::new().with_executable(policy_codex);
+    // Capture the exact overlay the harness will pass, then give it to the
+    // real Codex app server over an adversarial lower account policy. This is
+    // Codex's own recursive config merge and `command/exec` environment, not a
+    // local model of either one.
+    let (wrapper, argv_file) = common::recording_wrapper(&fixture_path(), &dir);
+    let harness = CodexHarness::new().with_executable(wrapper);
     let (mut controls, _steer, _token) = controls("Yes");
     controls.chat_id = Some("chat-464".into());
     credential_ledger::handed(&paths, "owner/repo", Some("chat-464"));
@@ -505,6 +501,77 @@ exec '{}' "$3"
     env.push(("COMET_TEST_PUSH_URL".into(), url));
     controls.push = Some(PushCredentials { env, bin_dir: None });
     run_to_end(&harness, request("scenario:happy"), controls).await;
+    let argv = std::fs::read_to_string(argv_file).expect("Codex argv");
+    let argv: Vec<&str> = argv.lines().collect();
+    let policy = argv.get(1).expect("policy overlay");
+
+    let codex_home = dir.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home).expect("Codex home");
+    std::fs::write(
+        codex_home.join("config.toml"),
+        "[shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n",
+    )
+    .expect("restrictive lower config");
+    let mut child = tokio::process::Command::new("codex")
+        .args(["-c", policy, "app-server"])
+        .env("CODEX_HOME", &codex_home)
+        .env("HOME", &home)
+        .current_dir(dir.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .expect("real Codex app server");
+    let mut stdin = child.stdin.take().expect("Codex stdin");
+    let stdout = child.stdout.take().expect("Codex stdout");
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let mut stdout = tokio::io::BufReader::new(stdout).lines();
+    stdin
+        .write_all(
+            b"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"comet-test\",\"version\":\"1\"},\"capabilities\":{\"experimentalApi\":true}}}\n",
+        )
+        .await
+        .expect("initialize");
+    let initialized = stdout.next_line().await.expect("initialize read").expect("initialize reply");
+    assert!(initialized.contains("\"id\":1"), "{initialized}");
+    stdin
+        .write_all(b"{\"method\":\"initialized\"}\n")
+        .await
+        .expect("initialized");
+    let command = serde_json::json!({
+        "id": 2,
+        "method": "command/exec",
+        "params": {
+            "command": [git, "push", "", "HEAD:refs/heads/board-test"],
+            "cwd": std::env::current_dir().expect("test checkout"),
+            "sandboxPolicy": { "type": "dangerFullAccess" },
+            "timeoutMs": 10_000
+        }
+    });
+    // The URL lives in the forced policy, not this test process. Read it back
+    // from the known local listener rather than passing an env override that
+    // would bypass the policy under test.
+    let mut command = command;
+    command["params"]["command"][2] = serde_json::Value::String(
+        policy
+            .split(r#""COMET_TEST_PUSH_URL" = ""#)
+            .nth(1)
+            .and_then(|tail| tail.split('"').next())
+            .expect("URL in forced set")
+            .to_string(),
+    );
+    stdin
+        .write_all(format!("{command}\n").as_bytes())
+        .await
+        .expect("command/exec");
+    let command_reply = loop {
+        let line = stdout.next_line().await.expect("command read").expect("command reply");
+        if line.contains("\"id\":2") {
+            break line;
+        }
+    };
+    child.kill().await.ok();
 
     let offered = seen.lock().unwrap().join("\n");
     let board = base64::Engine::encode(
@@ -515,7 +582,10 @@ exec '{}' "$3"
         &base64::engine::general_purpose::STANDARD,
         "x-access-token:ambient-token",
     );
-    assert!(offered.contains(&board), "board credential was not offered: {offered}");
+    assert!(
+        offered.contains(&board),
+        "board credential was not offered: {offered}; Codex said: {command_reply}"
+    );
     assert!(!offered.contains(&ambient), "ambient credential escaped: {offered}");
     let record = credential_ledger::for_chat(&paths, "chat-464");
     assert!(record.handed, "the attempt did not record its handoff");
