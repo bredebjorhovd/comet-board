@@ -2637,13 +2637,20 @@ mod tests {
         });
         let old_generation = 3;
         let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
         page.update(cx, |page, cx| {
             page.task = Some(cx.spawn(async move |this, cx| {
                 let partial = partial_rx.await.expect("release partial reload");
                 let _ = this.update(cx, |page, cx| {
-                    page.commit_aggregate(old_generation, Ok(partial), None, cx);
+                    let accepted =
+                        page.commit_aggregate(old_generation, Ok(partial), None, cx);
+                    let _ = commit_tx.send(accepted);
                 });
             }));
+            // Keep the in-flight callback alive even after recovery removes the
+            // page's cancellation handle, so this regression exercises the
+            // generation fence rather than merely task cancellation.
+            page.task.take().unwrap().detach();
         });
 
         let mut complete = recovery(StatsHostStatus::Answered);
@@ -2663,10 +2670,9 @@ mod tests {
         });
 
         let partial = recovery(StatsHostStatus::UpgradeRequired);
-        // The cancelled task may drop its receiver before this send. Either
-        // way, drive the executor to prove its callback cannot repaint.
-        let _ = partial_tx.send(partial);
+        partial_tx.send(partial).unwrap();
         cx.run_until_parked();
+        assert!(!commit_rx.await.expect("stale callback reports its commit"));
         page.read_with(cx, |page, _| {
             assert_eq!(page.aggregate.as_ref().unwrap().stats.attempts, 89);
             assert!(page.reload_generation > old_generation);

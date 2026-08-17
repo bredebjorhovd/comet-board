@@ -191,7 +191,7 @@ pub fn detect_install() -> InstallKind {
 /// The directory an installer-managed service exposes through its `current`
 /// symlink. Kept beside install detection so compatibility probes and the
 /// updater derive the layout from one production definition.
-pub fn managed_install_probe_path(home: &Path) -> PathBuf {
+fn managed_install_probe_path(home: &Path) -> PathBuf {
     home.join(".comet-native").join("app").join("current")
 }
 
