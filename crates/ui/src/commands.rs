@@ -33,25 +33,43 @@ pub struct NewSessionIntent {
     pub space_id: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "camelCase")]
+enum PersistedIntent {
+    Pending { intent: NewSessionIntent },
+    Cancelled,
+}
+
 fn intent_path(data_dir: &Path) -> PathBuf {
     data_dir.join(INTENT_FILE)
 }
 
 pub fn load_intent(data_dir: &Path) -> Option<NewSessionIntent> {
     let bytes = std::fs::read(intent_path(data_dir)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    match serde_json::from_slice(&bytes).ok()? {
+        PersistedIntent::Pending { intent } => Some(intent),
+        PersistedIntent::Cancelled => None,
+    }
 }
 
 pub fn save_intent(data_dir: &Path, intent: &NewSessionIntent) -> std::io::Result<()> {
     std::fs::create_dir_all(data_dir)?;
     let path = intent_path(data_dir);
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_vec(intent)?)?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_vec(&PersistedIntent::Pending {
+            intent: intent.clone(),
+        })?,
+    )?;
     std::fs::rename(tmp, path)
 }
 
-pub fn clear_intent(data_dir: &Path) {
-    let _ = std::fs::remove_file(intent_path(data_dir));
+pub fn clear_intent(data_dir: &Path) -> std::io::Result<()> {
+    let path = intent_path(data_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec(&PersistedIntent::Cancelled)?)?;
+    std::fs::rename(tmp, path)
 }
 
 pub fn suppress_repeated_shortcut(key: &str, command: bool, is_held: bool) -> bool {
@@ -144,7 +162,7 @@ mod tests {
         };
         save_intent(dir.path(), &intent).unwrap();
         assert_eq!(load_intent(dir.path()), Some(intent.clone()));
-        clear_intent(dir.path());
+        clear_intent(dir.path()).unwrap();
         assert_eq!(load_intent(dir.path()), None);
     }
 

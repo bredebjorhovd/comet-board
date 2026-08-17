@@ -965,6 +965,49 @@ impl WorkspaceHost {
         Ok(())
     }
 
+    /// Finalize an empty UI-created draft exactly once before its first Run.
+    /// The row update is one workspace-doc write under the owner gate, so the
+    /// doc host can never observe cwd without config (or vice versa).
+    pub fn finalize_chat_draft(
+        &self,
+        chat_id: &str,
+        space_id: &str,
+        cwd: String,
+        branch: Option<String>,
+        config: ChatConfig,
+    ) -> Result<(), EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        let mut chat =
+            self.inner.doc().chat(chat_id)?.ok_or_else(|| {
+                EngineError::Other(format!("draft chat {chat_id} does not exist"))
+            })?;
+        if chat.space_id.as_deref() != Some(space_id) {
+            return Err(EngineError::Other(format!(
+                "draft chat {chat_id} belongs to another space"
+            )));
+        }
+        if chat.config.is_some()
+            || chat.last_message_at.is_some()
+            || chat.harness_session_id.is_some()
+        {
+            let already_final = chat.cwd.as_deref() == Some(cwd.as_str())
+                && chat.branch == branch
+                && chat.config.as_ref() == Some(&config);
+            return if already_final {
+                Ok(())
+            } else {
+                Err(EngineError::Other(format!(
+                    "chat {chat_id} is no longer an empty draft"
+                )))
+            };
+        }
+        chat.cwd = Some(cwd);
+        chat.branch = branch;
+        chat.config = Some(config);
+        self.inner.doc().upsert_chat(&chat)?;
+        Ok(())
+    }
+
     /// Publish one exact host-owned chat while holding the workspace document
     /// owner gate across upsert, verification, and durable snapshot.
     pub(crate) fn publish_host_owned_chat(&self, chat: &Chat) -> Result<(), EngineError> {
@@ -1577,6 +1620,78 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
 #[cfg(test)]
 mod room_supervision_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn empty_draft_finalization_atomically_sets_first_run_cwd_branch_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(
+            store,
+            WorkspaceHostConfig {
+                device_id: "host-1".into(),
+                device_name: "Host".into(),
+                platform: "test".into(),
+                org_id: "org".into(),
+                user_id: "user".into(),
+                edge: None,
+            },
+        )
+        .unwrap();
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "draft", "deviceId": "host-1", "title": null, "archived": false,
+            "cwd": "/base", "branch": null, "checkoutId": null, "config": null,
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-08-17T00:00:00Z", "harnessSessionId": null,
+            "harnessSessionCwd": null, "spaceId": "space-1", "lastSeenAt": null,
+            "forkedFrom": null
+        }))
+        .unwrap();
+        host.doc().upsert_chat(&chat).unwrap();
+        let config: ChatConfig = serde_json::from_value(serde_json::json!({
+            "harness": "codex", "model": "gpt-5.6", "reasoning": "high",
+            "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+            "pushRepo": null, "pushContract": null, "gitAuthor": null,
+            "turnLimits": {}, "mcpServers": []
+        }))
+        .unwrap();
+        host.finalize_chat_draft(
+            "draft",
+            "space-1",
+            "/worktree".into(),
+            Some("feature".into()),
+            config.clone(),
+        )
+        .unwrap();
+        let finalized = host.doc().chat("draft").unwrap().unwrap();
+        assert_eq!(finalized.cwd.as_deref(), Some("/worktree"));
+        assert_eq!(finalized.branch.as_deref(), Some("feature"));
+        assert_eq!(finalized.config, Some(config));
+        host.finalize_chat_draft(
+            "draft",
+            "space-1",
+            "/worktree".into(),
+            Some("feature".into()),
+            finalized.config.unwrap(),
+        )
+        .unwrap();
+        assert!(
+            host.finalize_chat_draft(
+                "draft",
+                "space-1",
+                "/other".into(),
+                None,
+                serde_json::from_value(serde_json::json!({
+                    "harness": "codex", "model": null, "reasoning": null,
+                    "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+                    "pushRepo": null, "pushContract": null, "gitAuthor": null,
+                    "turnLimits": {}, "mcpServers": []
+                }))
+                .unwrap(),
+            )
+            .is_err(),
+            "a finalized draft cannot be reconfigured"
+        );
+    }
 
     #[test]
     fn a_live_reseed_preserves_the_exact_host_owned_fork_row() {

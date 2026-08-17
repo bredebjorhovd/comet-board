@@ -533,6 +533,15 @@ enum MutateParams {
         #[serde(default)]
         cwd: Option<String>,
     },
+    #[serde(rename_all = "camelCase")]
+    FinalizeChatDraft {
+        chat_id: String,
+        space_id: String,
+        cwd: String,
+        #[serde(default)]
+        branch: Option<String>,
+        config: ChatConfig,
+    },
     /// Create a space (device + folder pair). Idempotent by id; a live
     /// duplicate `(deviceId, path)` no-ops. `gitDetected` is seeded from the
     /// picker's FolderEntry — the owning device's SpacesSync re-verifies.
@@ -1791,6 +1800,16 @@ impl EngineRpc {
                 }
                 Ok(())
             }
+            MutateParams::FinalizeChatDraft {
+                chat_id,
+                space_id,
+                cwd,
+                branch,
+                config,
+            } => self
+                .workspace
+                .finalize_chat_draft(&chat_id, &space_id, cwd, branch, config)
+                .map_err(failed),
             MutateParams::CreateSpace {
                 space_id,
                 device_id,

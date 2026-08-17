@@ -725,7 +725,9 @@ impl AppState {
     /// a Session row and are never drafts.
     pub fn selected_chat_is_configurable(&self) -> bool {
         self.selected_chat_row().is_some_and(|chat| {
-            chat.last_message_at.is_none() && self.session_for(&chat.id).is_none()
+            chat.last_message_at.is_none()
+                && chat.config.is_none()
+                && self.session_for(&chat.id).is_none()
         })
     }
 
@@ -1584,6 +1586,20 @@ mod tests {
         state.chats = vec![chat("draft", 1, None)];
         state.selected_chat = Some("draft".into());
         assert!(state.selected_chat_is_configurable());
+        state.chats[0].config = Some(
+            serde_json::from_value(serde_json::json!({
+                "harness": "codex", "model": null, "reasoning": null,
+                "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+                "pushRepo": null, "pushContract": null, "gitAuthor": null,
+                "turnLimits": {}, "mcpServers": []
+            }))
+            .unwrap(),
+        );
+        assert!(
+            !state.selected_chat_is_configurable(),
+            "a finalized draft must reuse its durable cwd/config on retry"
+        );
+        state.chats[0].config = None;
         state.chats[0].last_message_at = Some(Utc::now());
         assert!(!state.selected_chat_is_configurable());
     }

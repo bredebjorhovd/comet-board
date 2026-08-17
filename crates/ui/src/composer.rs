@@ -3404,7 +3404,9 @@ impl Composer {
         // (the chat then appears from the doc host once the doc materializes).
         let draft_key = self.current_key.clone();
         let configurable = self.state.read(cx).selected_chat_is_configurable();
-        let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
+        let selected_chat = self.state.read(cx).selected_chat.clone();
+        let materialized_draft = selected_chat.is_some() && configurable;
+        let (chat_id, is_new) = match selected_chat {
             Some(id) => (id, configurable),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
@@ -3585,10 +3587,15 @@ impl Composer {
                 // the doc host would materialize the chat on first command
                 // anyway, so failures are non-fatal).
                 if is_new && let Some(space_id) = &space_id {
+                    let config = resolved.chat_config().ok_or_else(|| {
+                        "Send failed: choose an available harness before starting the session."
+                            .to_string()
+                    })?;
                     let mut mutate = serde_json::json!({
-                        "op": "createChat",
+                        "op": if materialized_draft { "finalizeChatDraft" } else { "createChat" },
                         "chatId": chat_id,
                         "spaceId": space_id,
+                        "config": config,
                     });
                     if let Some(object) = mutate.as_object_mut() {
                         if let Some(worktree_cwd) = &worktree_cwd {
@@ -3603,14 +3610,20 @@ impl Composer {
                                 serde_json::Value::String(branch.clone()),
                             );
                         }
-                        if let Some(config) = resolved.chat_config()
-                            && let Ok(config) = serde_json::to_value(&config)
-                        {
-                            object.insert("config".into(), config);
-                        }
                     }
                     if let Err(err) = engine.client().call(methods::MUTATE, mutate).await {
-                        tracing::debug!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                        // A freshly cut worktree belongs to this transaction.
+                        // Roll it back only after a definitive engine refusal;
+                        // transport loss is ambiguous and may have committed.
+                        if !matches!(err, comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_))
+                            && matches!(plan, crate::pickers::CheckoutPlan::NewWorktree { .. })
+                            && let (Some(repo_path), Some(path)) = (&space_path, &worktree_cwd)
+                        {
+                            let _ = engine.client().call(methods::DELETE_WORKTREE, serde_json::json!({
+                                "repoPath": repo_path, "worktreePath": path,
+                            })).await;
+                        }
+                        return Err(format!("Send failed while finalizing the session: {err}"));
                     }
                 }
 

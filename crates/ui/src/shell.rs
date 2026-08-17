@@ -1694,9 +1694,15 @@ impl Shell {
             return;
         }
         if self.new_session_intent.is_some() {
-            self.new_session_intent_attempted = false;
-            self.submit_new_session_intent(cx);
-            return;
+            if requested_space.is_some() {
+                if self.discard_new_session_intent().is_err() {
+                    return;
+                }
+            } else {
+                self.new_session_intent_attempted = false;
+                self.submit_new_session_intent(cx);
+                return;
+            }
         }
         let space_id = requested_space.or_else(|| {
             commands::current_space(
@@ -1752,9 +1758,18 @@ impl Shell {
                     // Keep the stable intent. A retry (or a recreated Shell)
                     // reuses its UUID, so commit-before-response-loss cannot
                     // strand a second empty session.
-                    shell.sidebar_notice = Some(format!(
-                        "Couldn't confirm New Session: {err}. Check the workspace device and retry; Comet will reuse the same session."
-                    ).into());
+                    let ambiguous = matches!(err, comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_));
+                    if ambiguous {
+                        shell.new_session_chooser = Some(0);
+                        shell.sidebar_notice = Some(format!(
+                            "Couldn't confirm New Session: {err}. Retry reuses it; choosing a workspace discards it and starts over."
+                        ).into());
+                    } else if shell.discard_new_session_intent().is_ok() {
+                        shell.new_session_chooser = Some(0);
+                        shell.sidebar_notice = Some(format!(
+                            "New Session was refused: {err}. Choose another workspace or press Escape to cancel."
+                        ).into());
+                    }
                 }
                 shell.reconcile_new_session(cx);
                 cx.notify();
@@ -1774,7 +1789,12 @@ impl Shell {
         if !arrived {
             return;
         }
-        commands::clear_intent(&self.data_dir);
+        if let Err(err) = commands::clear_intent(&self.data_dir) {
+            self.sidebar_notice = Some(format!(
+                "Session was created, but its recovery record could not be cleared ({err}). Fix disk access and retry."
+            ).into());
+            return;
+        }
         self.new_session_intent = None;
         self.new_session_intent_attempted = false;
         self.new_session_task = None;
@@ -1786,6 +1806,18 @@ impl Shell {
         self.state
             .update(cx, |state, cx| state.select_chat(Some(intent.chat_id), cx));
         self.focus_composer_next_render = true;
+    }
+
+    fn discard_new_session_intent(&mut self) -> Result<(), ()> {
+        if let Err(err) = commands::clear_intent(&self.data_dir) {
+            self.sidebar_notice = Some(format!(
+                "Could not discard the failed New Session recovery record ({err}). Fix disk access and retry."
+            ).into());
+            return Err(());
+        }
+        self.new_session_intent = None;
+        self.new_session_intent_attempted = false;
+        Ok(())
     }
 
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
