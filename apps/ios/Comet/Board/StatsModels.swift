@@ -551,7 +551,7 @@ struct StatsDevice: Decodable, Hashable, Identifiable {
 }
 
 enum StatsHostStatus: String, Decodable, Hashable {
-    case answered, duplicate, noBoard, unreachable, unreadable, unknown
+    case answered, duplicate, noBoard, unreachable, unreadable, upgradeRequired, unknown
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
@@ -559,7 +559,7 @@ enum StatsHostStatus: String, Decodable, Hashable {
     }
 
     var compromisesAggregate: Bool {
-        self == .unreachable || self == .unreadable || self == .unknown
+        self == .unreachable || self == .unreadable || self == .upgradeRequired || self == .unknown
     }
 }
 
@@ -568,6 +568,8 @@ struct StatsHost: Decodable, Hashable, Identifiable {
     var status: StatsHostStatus
     var boardId: String?
     var error: String?
+    var currentVersion: String?
+    var requiredVersion: String?
     var id: String { device.deviceId }
 }
 
@@ -590,6 +592,10 @@ struct AggregateBoardStats: Decodable, Hashable {
     var completenessNote: String? {
         let missing = hosts.compactMap { host -> String? in
             guard host.status.compromisesAggregate else { return nil }
+            if host.status == .upgradeRequired {
+                return "\(host.device.label) is on v\(host.currentVersion ?? "unknown"); "
+                    + "v\(host.requiredVersion ?? "unknown") is required for all-board stats"
+            }
             return host.status == .unreadable
                 ? "\(host.device.label) was unreadable"
                 : "\(host.device.label) did not answer"

@@ -1252,11 +1252,17 @@ pub enum StatsHostStatus {
     Unreachable,
     /// A host answered, but not with a snapshot this collector could read.
     Unreadable,
+    /// The host is reachable, but its engine predates the snapshot protocol.
+    /// It contributed no totals until the operator deliberately updates it.
+    UpgradeRequired,
 }
 
 impl StatsHostStatus {
     pub fn compromises_aggregate(self) -> bool {
-        matches!(self, Self::Unreachable | Self::Unreadable)
+        matches!(
+            self,
+            Self::Unreachable | Self::Unreadable | Self::UpgradeRequired
+        )
     }
 }
 
@@ -1274,6 +1280,12 @@ pub struct StatsHost {
     /// hosting no board is a complete answer, not a failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Auditable protocol-skew facts. These remain absent for ordinary
+    /// transport/schema failures and for hosts that contributed normally.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_version: Option<String>,
 }
 
 /// The one aggregate contract shared by CLI JSON, desktop and iOS.
@@ -1300,6 +1312,12 @@ impl AggregateBoardStats {
             .iter()
             .filter(|host| host.status.compromises_aggregate())
             .map(|host| match host.status {
+                StatsHostStatus::UpgradeRequired => format!(
+                    "{} is on v{}; v{} is required for all-board stats",
+                    host.device.label,
+                    host.current_version.as_deref().unwrap_or("unknown"),
+                    host.required_version.as_deref().unwrap_or("unknown")
+                ),
                 StatsHostStatus::Unreadable => format!("{} was unreadable", host.device.label),
                 _ => format!("{} did not answer", host.device.label),
             })
@@ -1328,6 +1346,11 @@ pub enum StatsProbeResult {
     NoBoard,
     Unreachable(String),
     Unreadable(String),
+    UpgradeRequired {
+        current_version: String,
+        required_version: String,
+        error: String,
+    },
 }
 
 /// The context half of the page: not what the window's work cost, but how
@@ -1490,6 +1513,8 @@ pub fn aggregate_board_stats(
                     status: StatsHostStatus::Unreadable,
                     board_id: None,
                     error: Some("the board answered without a stable board id".into()),
+                    current_version: None,
+                    required_version: None,
                 });
             }
             StatsProbeResult::Answered(snapshot) => {
@@ -1507,6 +1532,8 @@ pub fn aggregate_board_stats(
                     },
                     board_id: Some(board_id),
                     error: None,
+                    current_version: None,
+                    required_version: None,
                 });
             }
             StatsProbeResult::NoBoard => hosts.push(StatsHost {
@@ -1514,18 +1541,36 @@ pub fn aggregate_board_stats(
                 status: StatsHostStatus::NoBoard,
                 board_id: None,
                 error: None,
+                current_version: None,
+                required_version: None,
             }),
             StatsProbeResult::Unreachable(error) => hosts.push(StatsHost {
                 device: candidate,
                 status: StatsHostStatus::Unreachable,
                 board_id: None,
                 error: Some(error),
+                current_version: None,
+                required_version: None,
             }),
             StatsProbeResult::Unreadable(error) => hosts.push(StatsHost {
                 device: candidate,
                 status: StatsHostStatus::Unreadable,
                 board_id: None,
                 error: Some(error),
+                current_version: None,
+                required_version: None,
+            }),
+            StatsProbeResult::UpgradeRequired {
+                current_version,
+                required_version,
+                error,
+            } => hosts.push(StatsHost {
+                device: candidate,
+                status: StatsHostStatus::UpgradeRequired,
+                board_id: None,
+                error: Some(error),
+                current_version: Some(current_version),
+                required_version: Some(required_version),
             }),
         }
     }
@@ -3192,7 +3237,6 @@ mod tests {
                 },
             ],
         );
-
         assert_eq!(aggregate.stats.by_account["shared@example.com"], 2);
         assert_eq!(
             aggregate.stats.by_account["the box's own login (board-a)"],
@@ -3425,6 +3469,52 @@ mod tests {
         let decoded: AggregateBoardStats = serde_json::from_str(&json).expect("decodes");
         assert_eq!(decoded, aggregate);
         assert_eq!(serde_json::to_string(&again).expect("serializes"), json);
+    }
+
+    #[test]
+    fn mixed_version_host_is_actionable_and_auditable_without_legacy_totals() {
+        let aggregate = aggregate_board_stats(
+            Some(7),
+            vec![StatsProbe {
+                candidate: StatsDevice {
+                    device_id: "tokenmaxxer".into(),
+                    label: "Tokenmaxxer9000".into(),
+                },
+                result: StatsProbeResult::UpgradeRequired {
+                    current_version: "0.7.1".into(),
+                    required_version: "0.8.0".into(),
+                    error: "unknown method: BoardStatsSnapshot".into(),
+                },
+            }],
+        );
+
+        assert!(!aggregate.complete);
+        assert!(
+            aggregate.boards.is_empty(),
+            "legacy totals cannot be safely identified"
+        );
+        assert_eq!(aggregate.hosts[0].status, StatsHostStatus::UpgradeRequired);
+        assert_eq!(aggregate.hosts[0].current_version.as_deref(), Some("0.7.1"));
+        assert_eq!(
+            aggregate.hosts[0].required_version.as_deref(),
+            Some("0.8.0")
+        );
+        assert_eq!(
+            aggregate.hosts[0].error.as_deref(),
+            Some("unknown method: BoardStatsSnapshot")
+        );
+        assert!(
+            aggregate
+                .completeness_note()
+                .unwrap()
+                .contains("Tokenmaxxer9000 is on v0.7.1; v0.8.0 is required")
+        );
+        let json = serde_json::to_value(&aggregate).unwrap();
+        assert_eq!(json["hosts"][0]["status"], "upgradeRequired");
+        assert_eq!(
+            json["hosts"][0]["error"],
+            "unknown method: BoardStatsSnapshot"
+        );
     }
 
     #[test]
@@ -4425,6 +4515,44 @@ mod spec {
                 },
             ],
         );
+        // The mixed-version rollout fixture has two frames: the v0.7-shaped
+        // peer lacks BoardStatsSnapshot but still answers UpdateStatus, then
+        // the same peer returns with a stable board id after ApplyUpdate and
+        // its relay restart. Legacy BoardStats is intentionally not merged.
+        let mixed_version = aggregate_board_stats(
+            Some(7),
+            vec![StatsProbe {
+                candidate: StatsDevice {
+                    device_id: "tokenmaxxer".into(),
+                    label: "Tokenmaxxer9000".into(),
+                },
+                result: StatsProbeResult::UpgradeRequired {
+                    current_version: "0.7.1".into(),
+                    required_version: "0.8.0".into(),
+                    error: "unknown method: BoardStatsSnapshot".into(),
+                },
+            }],
+        );
+        let mut updated_stats = BoardStats::empty(Some(7));
+        updated_stats.attempts = 89;
+        let after_update = aggregate_board_stats(
+            Some(7),
+            vec![StatsProbe {
+                candidate: StatsDevice {
+                    device_id: "tokenmaxxer".into(),
+                    label: "Tokenmaxxer9000".into(),
+                },
+                result: StatsProbeResult::Answered(BoardStatsSnapshot {
+                    board_id: "tokenmaxxer-board".into(),
+                    host: StatsDevice {
+                        device_id: "tokenmaxxer".into(),
+                        label: "Tokenmaxxer9000".into(),
+                    },
+                    stats: updated_stats,
+                    merge_basis: StatsMergeBasis::default(),
+                }),
+            }],
+        );
 
         // Scalar rules, one case per input. Built before the object below
         // because `json!` reads a `[` as an array literal, not as a Rust one.
@@ -4524,6 +4652,8 @@ mod spec {
             ],
             "aggregateStats": [
                 aggregate_case("two boards, an alias, and an unreachable host", &aggregate),
+                aggregate_case("v0.7 peer requires an update without unsafe legacy totals", &mixed_version),
+                aggregate_case("updated peer returns after relay restart", &after_update),
             ],
         })
     }

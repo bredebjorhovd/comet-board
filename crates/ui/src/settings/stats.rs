@@ -118,6 +118,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
 use serde::{Deserialize, Serialize};
@@ -425,6 +426,7 @@ pub struct StatsPage {
     swept: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
+    updating: Option<String>,
 }
 
 impl StatsPage {
@@ -448,6 +450,7 @@ impl StatsPage {
             swept: false,
             error: None,
             task: None,
+            updating: None,
         };
         page.reload(cx);
         page
@@ -581,6 +584,79 @@ impl StatsPage {
             }
         }
         cx.notify();
+    }
+
+    /// Apply an old peer's managed update, then ride through the relay restart.
+    /// A lost ApplyUpdate reply is expected: convergence is the peer answering
+    /// the aggregate protocol, not the mutation socket surviving its restart.
+    fn update_stats_host(&mut self, device_id: String, cx: &mut Context<Self>) {
+        if self.updating.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.updating = Some(device_id.clone());
+        self.error = None;
+        let since_days = self.since_days;
+        let timer = cx.background_executor().clone();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let _ = engine
+                .client()
+                .call(
+                    methods::APPLY_UPDATE,
+                    serde_json::json!({ "targetDeviceId": device_id }),
+                )
+                .await;
+            let mut outcome = Err("The device did not return after its update".to_string());
+            for _ in 0..30 {
+                timer.timer(Duration::from_secs(1)).await;
+                let value = engine
+                    .client()
+                    .call(
+                        methods::AGGREGATE_BOARD_STATS,
+                        serde_json::json!({ "sinceDays": since_days }),
+                    )
+                    .await;
+                let Ok(value) = value else { continue };
+                let Ok(aggregate) = serde_json::from_value::<AggregateBoardStats>(value) else {
+                    continue;
+                };
+                let waiting = aggregate.hosts.iter().any(|host| {
+                    host.device.device_id == device_id
+                        && matches!(
+                            host.status,
+                            comet_proto::view::stats::StatsHostStatus::UpgradeRequired
+                                | comet_proto::view::stats::StatsHostStatus::Unreachable
+                        )
+                });
+                if !waiting {
+                    outcome = Ok(aggregate);
+                    break;
+                }
+            }
+            let _ = this.update(cx, |page, cx| {
+                page.updating = None;
+                match outcome {
+                    Ok(aggregate) => {
+                        let local = page.local_device(cx);
+                        page.answers = aggregate
+                            .boards
+                            .iter()
+                            .map(|board| {
+                                let target = (Some(board.host.device_id.as_str())
+                                    != local.as_deref())
+                                .then(|| board.host.device_id.clone());
+                                (target, board.stats.clone())
+                            })
+                            .collect();
+                        page.aggregate = Some(aggregate);
+                    }
+                    Err(message) => page.error = Some(message.into()),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn set_window(&mut self, since_days: Option<i64>, cx: &mut Context<Self>) {
@@ -2260,7 +2336,27 @@ impl Render for StatsPage {
                 .as_ref()
                 .and_then(AggregateBoardStats::completeness_note)
         {
-            column = column.child(widgets::warning_strip(&theme, note));
+            let upgrade = self.aggregate.as_ref().and_then(|aggregate| {
+                aggregate.hosts.iter().find(|host| {
+                    host.status == comet_proto::view::stats::StatsHostStatus::UpgradeRequired
+                })
+            });
+            let mut strip = widgets::warning_strip(&theme, note);
+            if let Some(host) = upgrade {
+                let device_id = host.device.device_id.clone();
+                let busy = self.updating.as_deref() == Some(device_id.as_str());
+                strip = strip.child(
+                    widgets::ghost_action(&theme)
+                        .id("update-stats-host")
+                        .ml_auto()
+                        .when(busy, |el| el.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_stats_host(device_id.clone(), cx)
+                        }))
+                        .child(if busy { "Updating…" } else { "Update" }),
+                );
+            }
+            column = column.child(strip);
         }
 
         // A pin whose board has stopped answering: the page falls back to the

@@ -316,6 +316,315 @@
         "tokenTotal": 120
       },
       "name": "two boards, an alias, and an unreachable host"
+    },
+    {
+      "aggregate": {
+        "boards": [],
+        "complete": false,
+        "hosts": [
+          {
+            "currentVersion": "0.7.1",
+            "device": {
+              "deviceId": "tokenmaxxer",
+              "label": "Tokenmaxxer9000"
+            },
+            "error": "unknown method: BoardStatsSnapshot",
+            "requiredVersion": "0.8.0",
+            "status": "upgradeRequired"
+          }
+        ],
+        "sinceDays": 7,
+        "stats": {
+          "agentDispatched": 0,
+          "agentUsage": [],
+          "attempts": 0,
+          "attemptsWithAgentUsage": 0,
+          "attemptsWithTokens": 0,
+          "breakdown": [],
+          "byAccount": {},
+          "byRuntime": {},
+          "bySource": {},
+          "byWorkspace": {},
+          "completionRate": null,
+          "context": {
+            "attemptsReported": 0,
+            "nearCompaction": 0,
+            "peakPercent": null
+          },
+          "daily": [],
+          "dailyTokens": [],
+          "dispatched": false,
+          "friction": {
+            "blockedEntries": 0,
+            "earlySettles": 0,
+            "overruns": 0,
+            "retriedTasks": 0
+          },
+          "hourOfDay": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "hoursByWorkspace": {},
+          "landing": {
+            "closedUnmerged": 0,
+            "inFlight": 0,
+            "merged": 0,
+            "noPr": 0,
+            "open": 0
+          },
+          "live": 0,
+          "longestMinutes": null,
+          "medianMinutes": null,
+          "outcomes": {},
+          "p90Minutes": null,
+          "pricingBasis": "listPriceApiEstimate",
+          "sinceDays": 7,
+          "spend": null,
+          "tasksTouched": 0,
+          "tokenCoverage": null,
+          "tokens": {
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "inputTokens": 0,
+            "outputTokens": 0
+          },
+          "tokensByAccount": {},
+          "tokensByModel": {},
+          "tokensByRuntime": {},
+          "totalMinutes": 0
+        }
+      },
+      "expect": {
+        "attempts": 0,
+        "boardCount": 0,
+        "complete": false,
+        "completenessNote": "Partial aggregate — Tokenmaxxer9000 is on v0.7.1; v0.8.0 is required for all-board stats. The totals include only the boards that answered.",
+        "hostStatuses": [
+          "upgradeRequired"
+        ],
+        "tokenTotal": 0
+      },
+      "name": "v0.7 peer requires an update without unsafe legacy totals"
+    },
+    {
+      "aggregate": {
+        "boards": [
+          {
+            "boardId": "tokenmaxxer-board",
+            "host": {
+              "deviceId": "tokenmaxxer",
+              "label": "Tokenmaxxer9000"
+            },
+            "stats": {
+              "agentDispatched": 0,
+              "agentUsage": [],
+              "attempts": 89,
+              "attemptsWithAgentUsage": 0,
+              "attemptsWithTokens": 0,
+              "breakdown": [],
+              "byAccount": {},
+              "byRuntime": {},
+              "bySource": {},
+              "byWorkspace": {},
+              "completionRate": null,
+              "context": {
+                "attemptsReported": 0,
+                "nearCompaction": 0,
+                "peakPercent": null
+              },
+              "daily": [],
+              "dailyTokens": [],
+              "dispatched": false,
+              "friction": {
+                "blockedEntries": 0,
+                "earlySettles": 0,
+                "overruns": 0,
+                "retriedTasks": 0
+              },
+              "hourOfDay": [
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0
+              ],
+              "hoursByWorkspace": {},
+              "landing": {
+                "closedUnmerged": 0,
+                "inFlight": 0,
+                "merged": 0,
+                "noPr": 0,
+                "open": 0
+              },
+              "live": 0,
+              "longestMinutes": null,
+              "medianMinutes": null,
+              "outcomes": {},
+              "p90Minutes": null,
+              "pricingBasis": "listPriceApiEstimate",
+              "sinceDays": 7,
+              "spend": null,
+              "tasksTouched": 0,
+              "tokenCoverage": null,
+              "tokens": {
+                "cacheCreationTokens": 0,
+                "cacheReadTokens": 0,
+                "inputTokens": 0,
+                "outputTokens": 0
+              },
+              "tokensByAccount": {},
+              "tokensByModel": {},
+              "tokensByRuntime": {},
+              "totalMinutes": 0
+            }
+          }
+        ],
+        "complete": true,
+        "hosts": [
+          {
+            "boardId": "tokenmaxxer-board",
+            "device": {
+              "deviceId": "tokenmaxxer",
+              "label": "Tokenmaxxer9000"
+            },
+            "status": "answered"
+          }
+        ],
+        "sinceDays": 7,
+        "stats": {
+          "agentDispatched": 0,
+          "agentUsage": [],
+          "attempts": 89,
+          "attemptsWithAgentUsage": 0,
+          "attemptsWithTokens": 0,
+          "breakdown": [],
+          "byAccount": {},
+          "byRuntime": {},
+          "bySource": {},
+          "byWorkspace": {},
+          "completionRate": null,
+          "context": {
+            "attemptsReported": 0,
+            "nearCompaction": 0,
+            "peakPercent": null
+          },
+          "daily": [],
+          "dailyTokens": [],
+          "dispatched": false,
+          "friction": {
+            "blockedEntries": 0,
+            "earlySettles": 0,
+            "overruns": 0,
+            "retriedTasks": 0
+          },
+          "hourOfDay": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "hoursByWorkspace": {},
+          "landing": {
+            "closedUnmerged": 0,
+            "inFlight": 0,
+            "merged": 0,
+            "noPr": 0,
+            "open": 0
+          },
+          "live": 0,
+          "longestMinutes": null,
+          "medianMinutes": null,
+          "outcomes": {},
+          "p90Minutes": null,
+          "pricingBasis": "listPriceApiEstimate",
+          "sinceDays": 7,
+          "spend": null,
+          "tasksTouched": 0,
+          "tokenCoverage": 0.0,
+          "tokens": {
+            "cacheCreationTokens": 0,
+            "cacheReadTokens": 0,
+            "inputTokens": 0,
+            "outputTokens": 0
+          },
+          "tokensByAccount": {},
+          "tokensByModel": {},
+          "tokensByRuntime": {},
+          "totalMinutes": 0
+        }
+      },
+      "expect": {
+        "attempts": 89,
+        "boardCount": 1,
+        "complete": true,
+        "completenessNote": null,
+        "hostStatuses": [
+          "answered"
+        ],
+        "tokenTotal": 0
+      },
+      "name": "updated peer returns after relay restart"
     }
   ],
   "barFraction": [

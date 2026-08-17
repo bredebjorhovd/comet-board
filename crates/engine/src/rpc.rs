@@ -1096,6 +1096,24 @@ impl EngineRpc {
         }
     }
 
+    /// Read the first frame of the N-1-compatible update stream. This is only
+    /// used after an old peer explicitly rejects BoardStatsSnapshot, so a
+    /// normal aggregate still performs exactly one request per candidate.
+    async fn peer_version(&self, target: &str) -> Result<String, RpcError> {
+        let reply = self
+            .forward(target, methods::UPDATE_STATUS, serde_json::json!({}))
+            .await?;
+        let RpcReply::Stream(mut stream) = reply else {
+            return Err(RpcError::Failed(
+                "UpdateStatus answered without a stream".into(),
+            ));
+        };
+        let value = stream.next().await.ok_or_else(|| RpcError::Closed)?;
+        serde_json::from_value::<comet_update::UpdateStatus>(value)
+            .map(|status| status.current_version)
+            .map_err(|error| RpcError::Failed(format!("could not decode UpdateStatus: {error}")))
+    }
+
     /// Ask one candidate under the same per-device budget as the existing
     /// board census. All candidates run concurrently, so one dark laptop costs
     /// five seconds of wall time, not five seconds multiplied by the fleet.
@@ -1121,6 +1139,28 @@ impl EngineRpc {
                 "timed out after {}s",
                 PEER_SWEEP_BUDGET.as_secs()
             )),
+            Ok(Err(error @ RpcError::UnknownMethod(_))) if candidate.device_id != local => {
+                let underlying = error.to_string();
+                match tokio::time::timeout(
+                    PEER_SWEEP_BUDGET,
+                    self.peer_version(&candidate.device_id),
+                )
+                .await
+                {
+                    Ok(Ok(current_version)) => StatsProbeResult::UpgradeRequired {
+                        current_version,
+                        required_version: env!("CARGO_PKG_VERSION").to_string(),
+                        error: underlying,
+                    },
+                    Ok(Err(version_error)) => StatsProbeResult::Unreadable(format!(
+                        "{underlying}; UpdateStatus failed: {version_error}"
+                    )),
+                    Err(_) => StatsProbeResult::Unreadable(format!(
+                        "{underlying}; UpdateStatus timed out after {}s",
+                        PEER_SWEEP_BUDGET.as_secs()
+                    )),
+                }
+            }
             Ok(Err(error)) => Self::stats_probe_error(error),
             Ok(Ok(RpcReply::Stream(_))) => {
                 StatsProbeResult::Unreadable("stats snapshot answered with a stream".into())
