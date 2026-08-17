@@ -2339,7 +2339,7 @@ async fn run_step(
     let _ = std::fs::create_dir_all(&isolated_xdg_cache);
     let _ = std::fs::create_dir_all(&isolated_xdg_data);
 
-    let mut cmd = match crate::checkout_prep_sandbox::command(command, worktree, &runtime_root) {
+    let sandboxed = match crate::checkout_prep_sandbox::command(command, worktree, &runtime_root) {
         Ok(command) => command,
         Err(detail) => {
             return StepOutcome {
@@ -2348,6 +2348,8 @@ async fn run_step(
             };
         }
     };
+    let establishes_process_group = sandboxed.establishes_process_group;
+    let mut cmd = sandboxed.command;
     cmd.current_dir(worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2394,7 +2396,11 @@ async fn run_step(
         cmd.env("RUSTUP_HOME", rustup);
     }
     #[cfg(unix)]
-    cmd.process_group(0);
+    if !establishes_process_group {
+        cmd.process_group(0);
+    }
+
+    let sandbox_argv = format!("{:?}", cmd.as_std());
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -2414,6 +2420,7 @@ async fn run_step(
     // for "what went wrong", and errors that arrived in a separate file from
     // the command that caused them answer that badly.
     let mut sink = LogSink::create(log_path, command);
+    sink.write(format!("[comet] sandbox argv: {sandbox_argv}\n").as_bytes());
     let pump = async {
         let mut out_buf = [0u8; 8192];
         let mut err_buf = [0u8; 8192];

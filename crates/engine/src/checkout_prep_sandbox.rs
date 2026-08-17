@@ -10,17 +10,26 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+pub(crate) struct SandboxedCommand {
+    pub(crate) command: tokio::process::Command,
+    /// The adapter creates a process group whose id is the spawned child's pid.
+    pub(crate) establishes_process_group: bool,
+}
+
 /// Build (but do not spawn) the confined command.
 pub(crate) fn command(
     script: &str,
     worktree: &Path,
     runtime_root: &Path,
-) -> Result<tokio::process::Command, String> {
+) -> Result<SandboxedCommand, String> {
     #[cfg(debug_assertions)]
     if test_process() && std::env::var_os("COMET_TEST_ASSUME_OUTER_SANDBOX").is_some() {
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg(script);
-        return Ok(command);
+        return Ok(SandboxedCommand {
+            command,
+            establishes_process_group: false,
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -121,7 +130,7 @@ fn macos_command(
     script: &str,
     worktree: &Path,
     runtime_root: &Path,
-) -> Result<tokio::process::Command, String> {
+) -> Result<SandboxedCommand, String> {
     let mut reads = read_roots();
     reads.push(worktree.to_path_buf());
     reads.push(runtime_root.to_path_buf());
@@ -156,7 +165,10 @@ fn macos_command(
         .arg("/bin/sh")
         .arg("-c")
         .arg(script);
-    Ok(command)
+    Ok(SandboxedCommand {
+        command,
+        establishes_process_group: false,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -171,7 +183,7 @@ fn linux_command(
     script: &str,
     worktree: &Path,
     runtime_root: &Path,
-) -> Result<tokio::process::Command, String> {
+) -> Result<SandboxedCommand, String> {
     let bwrap = find_program("bwrap").ok_or_else(|| {
         "repository setup/archive requires bubblewrap (`bwrap`) on Linux; install it before retrying"
             .to_string()
@@ -211,7 +223,12 @@ fn linux_command(
         .arg("/bin/sh")
         .arg("-c")
         .arg(script);
-    Ok(command)
+    Ok(SandboxedCommand {
+        command,
+        // --new-session calls setsid(2). Making bwrap a process-group leader
+        // before it starts would make that call fail with EPERM.
+        establishes_process_group: true,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -277,5 +294,20 @@ mod tests {
         ));
         assert!(allowed_path_root(Path::new("/usr/local/bin"), Some(home)));
         assert!(!allowed_path_root(Path::new("relative/bin"), Some(home)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_starts_a_real_confined_session() {
+        let source = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let mut sandboxed = linux_command("test ! -e .git", source.path(), runtime.path()).unwrap();
+        let argv = format!("{:?}", sandboxed.command.as_std());
+        let output = sandboxed.command.output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "bubblewrap smoke failed\nargv: {argv}\nstderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }

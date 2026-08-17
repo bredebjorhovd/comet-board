@@ -69,6 +69,11 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: bubblewrap checkout-prep smoke
+        run: >-
+          cargo test -p comet-engine --lib
+          checkout_prep_sandbox::tests::bubblewrap_starts_a_real_confined_session
+          -- --exact --nocapture
       # No --all-targets here: it would silently drop doctests.
       - name: cargo test --workspace
         run: cargo test --workspace
