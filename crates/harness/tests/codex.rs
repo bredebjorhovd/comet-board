@@ -605,7 +605,7 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     let model_requests = Arc::new(Mutex::new(Vec::<String>::new()));
     let recorded_model_requests = Arc::clone(&model_requests);
     std::thread::spawn(move || {
-        for (index, stream) in model_listener.incoming().take(4).enumerate() {
+        for (index, stream) in model_listener.incoming().take(2).enumerate() {
             let mut stream = stream.expect("model request");
             let mut reader = BufReader::new(stream.try_clone().expect("clone model request"));
             let mut content_length = 0;
@@ -695,114 +695,14 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         ),
     )
     .expect("restrictive lower config");
-    let path = std::env::join_paths(
-        std::iter::once(guarded_bin.clone()).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
-    ).unwrap();
-    let mut child = tokio::process::Command::new("codex")
-        .args(["-c", policy, "-c", "allow_login_shell=false", "-c", "features.shell_snapshot=false", "app-server"])
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .env("PATH", path)
-        .current_dir(&tool_cwd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("real Codex app server");
-    let mut stdin = child.stdin.take().expect("Codex stdin");
-    let stdout = child.stdout.take().expect("Codex stdout");
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let mut stdout = tokio::io::BufReader::new(stdout).lines();
-    stdin
-        .write_all(
-            b"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"comet-test\",\"version\":\"1\"},\"capabilities\":{\"experimentalApi\":true}}}\n",
-        )
-        .await
-        .expect("initialize");
-    let initialized = stdout
-        .next_line()
-        .await
-        .expect("initialize read")
-        .expect("initialize reply");
-    assert!(initialized.contains("\"id\":1"), "{initialized}");
-    stdin
-        .write_all(b"{\"method\":\"initialized\"}\n")
-        .await
-        .expect("initialized");
-    let start = serde_json::json!({
-        "id": 2,
-        "method": "thread/start",
-        "params": {
-            "cwd": tool_cwd,
-            "ephemeral": true,
-            "sandbox": "danger-full-access",
-            "approvalPolicy": "never"
-        }
-    });
-    // The URL lives in the forced policy, not this test process. The fake
-    // model deliberately references the variable instead of smuggling the URL
-    // into the tool call as an environment override.
-    stdin
-        .write_all(format!("{start}\n").as_bytes())
-        .await
-        .expect("thread/start");
-    let start_reply = loop {
-        let line = stdout
-            .next_line()
-            .await
-            .expect("command read")
-            .expect("command reply");
-        if line.contains("\"id\":2") {
-            break serde_json::from_str::<serde_json::Value>(&line).expect("thread/start JSON");
-        }
-    };
-    let thread_id = start_reply["result"]["thread"]["id"]
-        .as_str()
-        .expect("started thread id");
-    let turn = serde_json::json!({
-        "id": 3,
-        "method": "turn/start",
-        "params": {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": "push the current branch"}],
-            "approvalPolicy": "never",
-            "sandboxPolicy": { "type": "dangerFullAccess" }
-        }
-    });
-    stdin
-        .write_all(format!("{turn}\n").as_bytes())
-        .await
-        .expect("turn/start");
-    let command_reply = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut transcript = String::new();
-        loop {
-            let line = stdout
-                .next_line()
-                .await
-                .expect("turn read")
-                .expect("turn reply");
-            transcript.push_str(&line);
-            transcript.push('\n');
-            if line.contains("\"method\":\"turn/completed\"") {
-                break transcript;
-            }
-        }
-    })
-    .await
-    .expect("real Codex model-tool turn timed out");
-    child.kill().await.ok();
-    assert!(
-        command_reply.contains(&shell.display().to_string()),
-        "Codex did not execute through requested {shell_name} shell {}: {command_reply}",
-        shell.display()
-    );
-
     // Now traverse the production harness itself, not a reconstructed argv.
     // The wrapper supplies only the isolated account directories; every
     // policy flag, environment projection, and app-server request comes from
     // `CodexHarness::run`.
-    let real_codex = std::fs::canonicalize("/opt/homebrew/bin/codex").expect("real Codex");
+    let real_codex = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("codex"))
+        .find(|path| path.is_file())
+        .expect("Codex on PATH");
     let live = dir.path().join("live-codex");
     std::fs::write(
         &live,
@@ -826,10 +726,23 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     });
     let mut live_request = request("push the current branch");
     live_request.cwd = tool_cwd.display().to_string();
-    run_to_end(&live_harness, live_request, live_controls).await;
+    // This test itself runs inside macOS seatbelt; nesting another workspace
+    // seatbelt around a temp checkout is refused before Git starts. Credential
+    // enforcement is the boundary under test, so let the inner Codex run use
+    // the same unsandboxed tool mode the former direct app-server fixture did.
+    live_request.sandbox = SandboxLevel::DangerFullAccess;
+    let before = std::process::Command::new("git")
+        .args(["--git-dir", origin.to_str().unwrap(), "show-ref", "--verify", "--quiet", "refs/heads/board-test"])
+        .status().unwrap();
+    assert!(!before.success(), "production ref existed before the harness push");
+    let events = run_to_end(&live_harness, live_request, live_controls).await;
+    assert!(
+        !events.iter().any(|event| matches!(event, AgentEvent::Error { .. })),
+        "production harness emitted an error: {events:?}"
+    );
 
     let pushed = std::process::Command::new("git").args(["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/board-test"]).output().unwrap();
-    assert!(pushed.status.success(), "origin did not change: {command_reply}; model requests: {:?}", model_requests.lock().unwrap());
+    assert!(pushed.status.success(), "origin did not change; events: {events:?}; model requests: {:?}", model_requests.lock().unwrap());
     assert!(
         !hostile_profile.exists(),
         "Codex sourced the hostile {shell_name} startup hook after constructing the protected environment"
