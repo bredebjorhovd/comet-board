@@ -611,16 +611,15 @@ impl StatsPage {
         let since_days = self.since_days;
         let timer = cx.background_executor().clone();
         self.update_task = Some(cx.spawn(async move |this, cx| {
-            let apply = engine
-                .client()
-                .call(
+            let apply = await_update_mutation(
+                engine.client().call(
                     methods::APPLY_UPDATE,
                     serde_json::json!({ "targetDeviceId": device_id }),
-                )
-                .await;
-            if let Err(error) = apply
-                && !apply_failure_may_be_restart(&error)
-            {
+                ),
+                Duration::from_secs(5),
+            )
+            .await;
+            if let Err(error) = apply {
                 let _ = this.update(cx, |page, cx| {
                     page.updating = None;
                     page.error = Some(format!("Update refused: {error}").into());
@@ -655,15 +654,15 @@ impl StatsPage {
                 page.updating = None;
                 match outcome {
                     Ok(aggregate)
-                        if recovery_matches_selected_window(since_days, page.since_days) =>
+                        if recovery_paint(since_days, page.since_days) == RecoveryPaint::Apply =>
                     {
                         let local = page.local_device(cx);
                         page.apply_aggregate(aggregate, local.as_deref());
                     }
-                    // A normal reload for the newly selected window owns the
-                    // screen. The recovery probe used its captured window only
-                    // to prove this exact peer had returned.
-                    Ok(_) => {}
+                    // The reload started by the window switch may have landed
+                    // while the peer was still away. Now that recovery proved
+                    // it returned, ask the selected window again.
+                    Ok(_) => page.reload(cx),
                     Err(message) => page.error = Some(message.into()),
                 }
                 cx.notify();
@@ -2264,11 +2263,29 @@ fn update_recovery_converged(aggregate: &AggregateBoardStats, device_id: &str) -
     })
 }
 
-fn recovery_matches_selected_window(
-    recovery_window: Option<i64>,
-    selected_window: Option<i64>,
-) -> bool {
-    recovery_window == selected_window
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryPaint {
+    Apply,
+    Reload,
+}
+
+fn recovery_paint(recovery_window: Option<i64>, selected_window: Option<i64>) -> RecoveryPaint {
+    if recovery_window == selected_window {
+        RecoveryPaint::Apply
+    } else {
+        RecoveryPaint::Reload
+    }
+}
+
+async fn await_update_mutation<F>(future: F, wait: Duration) -> Result<(), comet_rpc::RpcError>
+where
+    F: std::future::Future<Output = Result<serde_json::Value, comet_rpc::RpcError>>,
+{
+    match tokio::time::timeout(wait, future).await {
+        Ok(Ok(_)) | Err(_) => Ok(()),
+        Ok(Err(error)) if apply_failure_may_be_restart(&error) => Ok(()),
+        Ok(Err(error)) => Err(error),
+    }
 }
 
 fn apply_failure_may_be_restart(error: &comet_rpc::RpcError) -> bool {
@@ -2537,10 +2554,28 @@ mod tests {
     }
 
     #[test]
-    fn old_window_recovery_cannot_overwrite_a_new_window_reload() {
-        assert!(recovery_matches_selected_window(Some(7), Some(7)));
-        assert!(!recovery_matches_selected_window(Some(7), Some(30)));
-        assert!(!recovery_matches_selected_window(Some(7), None));
+    fn old_window_recovery_reloads_the_selected_window_after_reconnect() {
+        assert_eq!(recovery_paint(Some(7), Some(7)), RecoveryPaint::Apply);
+        assert_eq!(recovery_paint(Some(7), Some(30)), RecoveryPaint::Reload);
+        assert_eq!(recovery_paint(Some(7), None), RecoveryPaint::Reload);
+    }
+
+    #[tokio::test]
+    async fn a_pending_update_mutation_advances_to_recovery() {
+        let pending = futures::future::pending::<Result<serde_json::Value, comet_rpc::RpcError>>();
+        assert!(
+            await_update_mutation(pending, Duration::from_millis(1))
+                .await
+                .is_ok()
+        );
+        assert!(
+            await_update_mutation(
+                async { Err(comet_rpc::RpcError::Refused("not managed".into())) },
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]

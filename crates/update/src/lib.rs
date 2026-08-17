@@ -96,17 +96,21 @@ pub fn mac_app_artifact(version: &str) -> String {
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
 /// Unparseable versions never count as newer — a garbage `latest.txt` must not
 /// trigger an update loop.
+pub fn release_version_parts(version: &str) -> Option<Vec<u64>> {
+    let nums: Vec<u64> = version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect::<Option<_>>()?;
+    (!nums.is_empty()).then_some(nums)
+}
+
 pub fn version_newer(latest: &str, current: &str) -> bool {
-    fn parts(v: &str) -> Option<Vec<u64>> {
-        let nums: Vec<u64> = v
-            .trim()
-            .trim_start_matches('v')
-            .split('.')
-            .map(|p| p.parse().ok())
-            .collect::<Option<_>>()?;
-        (!nums.is_empty()).then_some(nums)
-    }
-    match (parts(latest), parts(current)) {
+    match (
+        release_version_parts(latest),
+        release_version_parts(current),
+    ) {
         (Some(l), Some(c)) => l > c,
         _ => false,
     }
@@ -184,10 +188,20 @@ pub fn detect_install() -> InstallKind {
     detect_install_from(&exe, home.as_deref())
 }
 
+/// The directory an installer-managed service exposes through its `current`
+/// symlink. Kept beside install detection so compatibility probes and the
+/// updater derive the layout from one production definition.
+pub fn managed_install_probe_path(home: &Path) -> PathBuf {
+    home.join(".comet-native").join("app").join("current")
+}
+
 fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".comet-native").join("app");
+        let app_root = managed_install_probe_path(home)
+            .parent()
+            .expect("managed probe path has an app parent")
+            .to_path_buf();
         if exe.starts_with(&app_root) {
             return InstallKind::Managed { app_root };
         }
@@ -667,6 +681,10 @@ mod tests {
 
     #[test]
     fn install_kind_detection() {
+        assert_eq!(
+            managed_install_probe_path(Path::new("/home/u")),
+            PathBuf::from("/home/u/.comet-native/app/current")
+        );
         assert_eq!(
             detect_install_from(
                 Path::new("/home/u/.comet-native/app/0.1.1/comet"),

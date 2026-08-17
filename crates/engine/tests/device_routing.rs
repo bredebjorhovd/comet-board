@@ -36,7 +36,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 
 use comet_doc::{QueueOp, SessionCommandPayload};
-use comet_engine::{EngineCore, HarnessRegistry};
+use comet_engine::{EngineCore, HarnessRegistry, Repos};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
@@ -338,6 +338,8 @@ struct LegacyStatsPeer {
     phase: Arc<AtomicU8>,
     has_board: Arc<AtomicBool>,
     update_managed: Arc<AtomicBool>,
+    managed_home: std::path::PathBuf,
+    repos: Repos,
     restart: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -350,7 +352,7 @@ impl RpcService for LegacyStatsPeer {
     async fn handle_as(
         &self,
         method: &str,
-        _params: serde_json::Value,
+        params: serde_json::Value,
         _caller: &Caller,
     ) -> Result<RpcReply, RpcError> {
         match method {
@@ -382,11 +384,25 @@ impl RpcService for LegacyStatsPeer {
                 stats.attempts = 89;
                 RpcReply::value(&stats)
             }
-            methods::LIST_FOLDERS if self.update_managed.load(Ordering::SeqCst) => {
+            methods::LIST_FOLDERS if params.get("path").is_none() => {
                 RpcReply::value(&serde_json::json!({
-                    "path": "/home/test/.comet-native/app/current",
-                    "entries": [{ "name": "comet", "isDir": false, "isRepo": false }]
+                    "path": self.managed_home,
+                    "entries": [],
+                    "truncated": false
                 }))
+            }
+            methods::LIST_FOLDERS if self.update_managed.load(Ordering::SeqCst) => {
+                let path = params
+                    .get("path")
+                    .and_then(|path| path.as_str())
+                    .map(str::to_owned);
+                RpcReply::value(
+                    &self
+                        .repos
+                        .list_folders(path)
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?,
+                )
             }
             methods::LIST_FOLDERS => Err(RpcError::Failed("could not read that folder".into())),
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(
@@ -599,11 +615,23 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     let phase = Arc::new(AtomicU8::new(0));
     let has_board = Arc::new(AtomicBool::new(false));
     let update_managed = Arc::new(AtomicBool::new(false));
+    let managed_home = dirs.path().join("legacy-home");
+    let managed_version = managed_home.join(".comet-native/app/0.7.1");
+    std::fs::create_dir_all(&managed_version).expect("managed version directory");
+    std::fs::write(managed_version.join("comet"), b"fixture").expect("managed executable");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        &managed_version,
+        managed_home.join(".comet-native/app/current"),
+    )
+    .expect("managed current symlink");
     let (restart_tx, restart_rx) = oneshot::channel();
     let legacy_peer = Arc::new(LegacyStatsPeer {
         phase: phase.clone(),
         has_board: has_board.clone(),
         update_managed: update_managed.clone(),
+        managed_home,
+        repos: Repos::new(&dirs.path().join("legacy-repos"), "legacy-peer"),
         restart: Mutex::new(Some(restart_tx)),
     });
     let host_config = || {

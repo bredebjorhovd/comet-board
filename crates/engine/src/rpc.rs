@@ -108,11 +108,8 @@ const PEER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5)
 /// compatible; same/newer/malformed versions are protocol failures.
 fn supported_n_minus_one(peer: &str, collector: &str) -> bool {
     fn line(version: &str) -> Option<(u64, u64)> {
-        let mut parts = version.trim_start_matches('v').split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        parts.next()?.split('-').next()?.parse::<u64>().ok()?;
-        Some((major, minor))
+        let parts = comet_update::release_version_parts(version)?;
+        (parts.len() == 3).then(|| (parts[0], parts[1]))
     }
     matches!((line(peer), line(collector)), (Some((pm, pn)), Some((cm, cn))) if pm == cm && pn.checked_add(1) == Some(cn))
 }
@@ -1164,15 +1161,25 @@ impl EngineRpc {
     }
 
     /// N-1-safe, read-only proof of the symlink-managed install layout.
-    /// `/proc/self/exe/../../current` resolves to `~/.comet-native/app/current`
-    /// for installer-managed Linux services and does not exist for source
-    /// builds. ListFolders was already relay-forwardable in v0.7.
+    /// ListFolders without a path reports the peer's real home directory; the
+    /// shared updater helper derives its actual `app/current` path. Both calls
+    /// were already relay-forwardable in v0.7.
     async fn peer_update_managed(&self, target: &str) -> bool {
+        let home = self
+            .forward(target, methods::LIST_FOLDERS, serde_json::json!({}))
+            .await;
+        let Ok(RpcReply::Value(home)) = home else {
+            return false;
+        };
+        let Some(home) = home.get("path").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        let path = comet_update::managed_install_probe_path(std::path::Path::new(home));
         let answer = self
             .forward(
                 target,
                 methods::LIST_FOLDERS,
-                serde_json::json!({ "path": "/proc/self/exe/../../current" }),
+                serde_json::json!({ "path": path }),
             )
             .await;
         let Ok(RpcReply::Value(value)) = answer else {
@@ -3224,6 +3231,7 @@ mod tests {
         assert!(!supported_n_minus_one("0.8.0", "0.8.0"));
         assert!(!supported_n_minus_one("0.9.0", "0.8.0"));
         assert!(!supported_n_minus_one("garbage", "0.8.0"));
+        assert!(!supported_n_minus_one("0.7.1.9", "0.8.0"));
         assert!(!supported_n_minus_one("1.7.1", "0.8.0"));
     }
 
