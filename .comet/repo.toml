@@ -14,10 +14,8 @@ version = 1
 run = "cargo run -p comet"
 
 # Bounded cleanup of reproducible output before the board reclaims a finished
-# checkout. Everything this repo generates is under target/, which the board's
-# own sweep (gh#186) already knows by name — cargo clean just gets there
-# politely first. Like every repository command, the exact committed tree must
-# be approved by the worktree host before this executes.
+# checkout. Everything this repo generates is under target/. Archive is an
+# engine-owned declarative cleanup contract: no repository command or mutable
+# script executes after an agent has worked in the checkout.
 [archive]
-run = "cargo clean"
-timeout = "5m"
+paths = ["target"]
