@@ -19,9 +19,9 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicUsize, Ordering};
-#[cfg(target_os = "linux")]
 use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use comet_board::config::Paths;
@@ -126,6 +126,22 @@ fn mock_script() -> Vec<AgentEvent> {
 }
 
 #[cfg(target_os = "linux")]
+fn has_board_basic_auth(line: &str) -> bool {
+    let Some((name, value)) = line.split_once(':') else {
+        return false;
+    };
+    if !name.trim().eq_ignore_ascii_case("authorization") {
+        return false;
+    }
+    let mut value = value.split_whitespace();
+    value
+        .next()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+        && value.next() == Some("eC1hY2Nlc3MtdG9rZW46Ym9hcmQtdG9rZW4=")
+        && value.next().is_none()
+}
+
+#[cfg(target_os = "linux")]
 fn authenticated_git_http(origin: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!(
@@ -162,8 +178,8 @@ fn authenticated_git_http(origin: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) 
                 if let Some(value) = lower.strip_prefix("transfer-encoding:") {
                     transfer_encoding = value.trim().to_string();
                 }
-                if let Some(value) = lower.strip_prefix("authorization: basic ") {
-                    authenticated = value.trim() == "eC1hY2Nlc3MtdG9rZW46Ym9hcmQtdG9rZW4=";
+                if has_board_basic_auth(&line) {
+                    authenticated = true;
                 }
             }
             let mut body = vec![0; content_length];
@@ -237,6 +253,17 @@ fn authenticated_git_http(origin: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) 
         }
     });
     (url, trace)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn smart_http_auth_preserves_case_sensitive_basic_payload() {
+    assert!(has_board_basic_auth(
+        "aUtHoRiZaTiOn: bAsIc eC1hY2Nlc3MtdG9rZW46Ym9hcmQtdG9rZW4=\r\n"
+    ));
+    assert!(!has_board_basic_auth(
+        "Authorization: Basic eC1hY2Nlc3MtdG9rZW46YW1iaWVudC10b2tlbg==\r\n"
+    ));
 }
 
 #[cfg(target_os = "linux")]
