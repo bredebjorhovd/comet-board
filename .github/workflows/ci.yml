@@ -69,6 +69,13 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Noble confines unprofiled user namespaces through AppArmor by default.
+      # Checkout preparation deliberately needs one to construct its bwrap
+      # filesystem sandbox; this hosted VM is discarded after the job.
+      - name: allow the checkout-prep user namespace
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: bubblewrap checkout-prep smoke
         run: >-
           cargo test -p comet-engine --lib
