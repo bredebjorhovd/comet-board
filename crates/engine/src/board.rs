@@ -195,7 +195,9 @@ impl BoardService {
         Self::spawn_at_with_capabilities(paths, sessions, runtime, spaces, handle, None)
     }
 
-    fn spawn_at_with_capabilities(
+    /// As [`BoardService::spawn_at`], with the GitHub capability probe result
+    /// supplied by an embedding or an end-to-end assembly.
+    pub fn spawn_at_with_capabilities(
         paths: Paths,
         mut sessions: watch::Receiver<Vec<Session>>,
         runtime: Arc<dyn Runtime + Send + Sync>,

@@ -585,7 +585,7 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         // inside that real model-tool command so one CI host exercises both
         // noninteractive startup mechanisms with the policy-built env.
         "cmd": format!(
-            "{} -c 'git push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test'",
+            "{} -c 'unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT COMET_BOARD_CONFIG_DIR COMET_BOARD_STATE_DIR GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test'",
             shell.display()
         ),
         "workdir": tool_cwd.clone(),
@@ -658,10 +658,22 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     credential_ledger::handed(&paths, "owner/repo", Some("chat-464"));
     let mut env = git_credentials::push_env(&askpass, "owner/repo");
     env.push(("COMET_TEST_PUSH_URL".into(), url.clone()));
-    let real_git = git_credentials::resolve_git(None).expect("real git");
+    let system_git = git_credentials::resolve_git(None).expect("real git");
+    let git_guard_ran = dir.path().join("git-guard-ran");
+    let recorded_git = dir.path().join("recorded-real-git");
+    std::fs::write(
+        &recorded_git,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nexec '{}' \"$@\"\n",
+            git_guard_ran.display(),
+            system_git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&recorded_git, std::fs::Permissions::from_mode(0o755)).unwrap();
     let guarded_bin = git_credentials::install_git_shim(
         &dir.path().join("guarded-bin"),
-        &real_git,
+        &recorded_git,
         &askpass,
         "owner/repo",
         &paths,
@@ -743,6 +755,7 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
 
     let pushed = std::process::Command::new("git").args(["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/board-test"]).output().unwrap();
     assert!(pushed.status.success(), "origin did not change; events: {events:?}; model requests: {:?}", model_requests.lock().unwrap());
+    assert!(git_guard_ran.exists(), "the model push bypassed the guarded Git boundary");
     assert!(
         !hostile_profile.exists(),
         "Codex sourced the hostile {shell_name} startup hook after constructing the protected environment"
