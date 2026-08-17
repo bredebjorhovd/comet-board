@@ -165,6 +165,7 @@ fn queue_as_viewer(doc: impl AsRef<SessionDoc>, id: &str, payload: SessionComman
         expires_at: None,
         status: SessionCommandStatus::Pending,
         resolution: None,
+        context: Vec::new(),
     })
     .expect("queue command");
 }
@@ -672,6 +673,8 @@ async fn processed_commands_are_skipped_on_redelivery() {
             entries: &commands,
             current_turn_id: None,
             turn_is_past: &never_past,
+            queue: &comet_doc::QueueView::default(),
+            chat_is_running: false,
         },
     );
     assert_eq!(verdict, comet_doc::CommandDisposition::Skip);

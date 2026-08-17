@@ -374,14 +374,16 @@ impl Pickers {
         // the same convention the branch picker and the add-space palette use.
         let search = cx.new(|cx| ComposerInput::with_context("Search…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
-            ComposerInputEvent::Edited => {
+            ComposerInputEvent::Edited(_) => {
                 this.active = 0;
                 cx.notify();
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
             // Pasted images/files don't apply to a search box, and a palette
-            // hosts no `/` picker, so no menu events reach here either.
-            ComposerInputEvent::Menu(_)
+            // hosts no `/` or `@` picker, so neither menu events nor the
+            // queue-submit chord reach here.
+            ComposerInputEvent::QueueSubmitted
+            | ComposerInputEvent::Menu(_)
             | ComposerInputEvent::PastedImages(_)
             | ComposerInputEvent::PastedPaths(_) => {}
         });

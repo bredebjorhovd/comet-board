@@ -135,18 +135,57 @@ struct ComposerView: View {
     let store: SessionStore
     let chat: Chat
     let runLive: Bool
+    var searchContext: (String) async -> ContextSearch = {
+        _ in ContextSearch(matches: [], truncated: false)
+    }
 
     @State private var text = ""
+    @State private var context: [ContextRef] = []
+    @State private var contextMatches: [ContextRef] = []
+    @State private var contextCheckoutId: String?
+    @State private var showContextPicker = false
+    @State private var editing: FollowupRow?
+    @State private var editText = ""
+    @State private var followupFailure: String?
 
     var body: some View {
-        ComposerShell(
-            draft: $text,
-            sendEnabled: true,
-            showStop: runLive,
-            onSend: send,
-            onStop: { store.sendInterrupt() }
-        ) {
-            EmptyView()
+        VStack(spacing: 8) {
+            if !store.followups.isEmpty || store.followupsPaused {
+                queueTray
+            }
+            ComposerShell(
+                draft: $text,
+                sendEnabled: true,
+                showStop: runLive,
+                onSend: send,
+                onStop: { store.sendInterrupt() }
+            ) {
+                ForEach(context) { reference in
+                    contextChip(reference)
+                }
+            }
+            if runLive && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Button {
+                    queue()
+                } label: {
+                    Label("Do after this turn", systemImage: "clock.badge.plus")
+                        .font(Theme.sans(Theme.textCaption, weight: .medium))
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(Theme.textMuted)
+                .accessibilityLabel("Do after this turn")
+            }
+        }
+        .onChange(of: text) { _, value in searchAtToken(value) }
+        .sheet(isPresented: $showContextPicker) { contextPicker }
+        .sheet(item: $editing) { row in editSheet(row) }
+        .alert("Couldn’t save follow-up", isPresented: Binding(
+            get: { followupFailure != nil },
+            set: { if !$0 { followupFailure = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(followupFailure ?? "The durable command could not be written.")
         }
     }
 
@@ -154,11 +193,12 @@ struct ComposerView: View {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !prompt.isEmpty else { return }
         if runLive {
-            store.sendSteer(prompt: prompt)
+            store.sendSteer(prompt: prompt, context: context)
         } else {
-            store.sendRun(prompt: prompt, chat: chat)
+            store.sendRun(prompt: prompt, chat: chat, context: context)
         }
         text = ""
+        context = []
         // The clear above is unconditional, so a prompt left sitting in the
         // composer after a successful send is not this path failing to run —
         // it is the text view writing the pre-send string back. A focused
@@ -167,6 +207,144 @@ struct ComposerView: View {
         // Re-clear once that has drained; a keystroke can't land inside the
         // same main-actor turn, so this can never eat real input.
         Task { @MainActor in text = "" }
+    }
+
+    private func queue() {
+        let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        guard store.queueFollowup(prompt: prompt, context: context) else {
+            followupFailure = "Your draft is still here. Try again after reconnecting."
+            return
+        }
+        text = ""
+        context = []
+        Task { @MainActor in text = "" }
+    }
+
+    private func searchAtToken(_ value: String) {
+        guard let token = value.split(whereSeparator: { $0.isWhitespace }).last,
+              token.first == "@", token.count > 1 else { return }
+        let query = String(token.dropFirst())
+        Task {
+            let result = await searchContext(query)
+            guard text.hasSuffix("@\(query)") else { return }
+            contextCheckoutId = result.checkoutId
+            contextMatches = result.matches
+            showContextPicker = !result.matches.isEmpty
+        }
+    }
+
+    private var contextPicker: some View {
+        NavigationStack {
+            List(contextMatches) { match in
+                Button {
+                    selectContext(match)
+                } label: {
+                    Label(match.path,
+                          systemImage: match.kind == .directory ? "folder" : "doc")
+                }
+            }
+            .navigationTitle("Reference from checkout")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .presentationDetents([.medium, .large])
+    }
+
+    private func selectContext(_ reference: ContextRef) {
+        var reference = reference
+        reference.checkoutId = contextCheckoutId
+        if let token = text.split(whereSeparator: { $0.isWhitespace }).last,
+           token.first == "@", let range = text.range(of: String(token), options: .backwards) {
+            text.replaceSubrange(range, with: "@\(reference.path) ")
+        }
+        if !context.contains(reference) { context.append(reference) }
+        showContextPicker = false
+    }
+
+    private func contextChip(_ reference: ContextRef) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: reference.kind == .directory ? "folder" : "doc")
+            Text((reference.path as NSString).lastPathComponent).lineLimit(1)
+            Button { context.removeAll { $0 == reference } } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.plain)
+        }
+        .font(Theme.sans(Theme.textCaption))
+        .padding(.horizontal, 8)
+        .frame(height: 26)
+        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+        .accessibilityLabel("\(reference.kind == .directory ? "Directory" : "File") reference \(reference.path)")
+    }
+
+    private var queueTray: some View {
+        VStack(spacing: 4) {
+            HStack {
+                Text("\(store.followups.count) after this turn")
+                    .font(Theme.sans(Theme.textCaption, weight: .medium))
+                Spacer()
+                Button(store.followupsPaused ? "Resume" : "Pause") {
+                    saveQueueControl(store.setFollowupsPaused(!store.followupsPaused))
+                }
+                .font(Theme.sans(Theme.textCaption))
+            }
+            ForEach(Array(store.followups.enumerated()), id: \.element.id) { index, row in
+                HStack(spacing: 8) {
+                    Text("\(index + 1)").foregroundStyle(Theme.textFaint)
+                    Button { editText = row.prompt; editing = row } label: {
+                        Text(row.prompt).lineLimit(1).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .buttonStyle(.plain)
+                    Button { move(row, index: index, delta: -1) } label: { Image(systemName: "arrow.up") }
+                        .disabled(index == 0)
+                    Button { move(row, index: index, delta: 1) } label: { Image(systemName: "arrow.down") }
+                        .disabled(index + 1 == store.followups.count)
+                    Button { saveQueueControl(store.runNext(id: row.id)) } label: { Image(systemName: "play") }
+                        .accessibilityLabel("Run next")
+                    Button(role: .destructive) { saveQueueControl(store.removeFollowup(id: row.id)) } label: {
+                        Image(systemName: "xmark")
+                    }
+                }
+                .font(Theme.sans(Theme.textCaption))
+            }
+        }
+        .padding(10)
+        .background(Theme.chip, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
+        .padding(.horizontal, 16)
+    }
+
+    private func move(_ row: FollowupRow, index: Int, delta: Int) {
+        let target = index + delta
+        guard store.followups.indices.contains(target) else { return }
+        let after: String? = target == 0 ? nil : store.followups[target - (delta > 0 ? 0 : 1)].id
+        saveQueueControl(store.moveFollowup(id: row.id, after: after))
+    }
+
+    private func saveQueueControl(_ saved: Bool) {
+        if !saved {
+            followupFailure = "The queue change was not saved. Try again after reconnecting."
+        }
+    }
+
+    private func editSheet(_ row: FollowupRow) -> some View {
+        NavigationStack {
+            TextEditor(text: $editText).padding()
+                .navigationTitle("Edit follow-up")
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Cancel") { editing = nil }
+                    }
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Save") {
+                            if store.editFollowup(id: row.id, prompt: editText, context: row.context) {
+                                editing = nil
+                            } else {
+                                followupFailure = "Your edit is still open. Try again after reconnecting."
+                            }
+                        }
+                    }
+                }
+        }
     }
 }
 

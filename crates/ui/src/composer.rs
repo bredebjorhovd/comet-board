@@ -23,9 +23,16 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use comet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
+use comet_doc::{
+    MessagePart, MessageRole, QueueOp, QueuePause, QueueView, SessionCommandPayload,
+    SessionMessageEntry,
+};
+use comet_proto::view::context as view_context;
 use comet_proto::view::skills as view_skills;
-use comet_proto::{RunRequest, SandboxLevel, SkillDescriptor, UserInputAnswer, UserInputQuestion};
+use comet_proto::{
+    ContextMatch, ContextRef, ContextRefKind, ContextSearch, RunRequest, SandboxLevel,
+    SkillDescriptor, UserInputAnswer, UserInputQuestion,
+};
 use comet_rpc::methods;
 
 use crate::attachments::{self, StagedAttachment};
@@ -41,6 +48,147 @@ use crate::theme::{Bed, ListRow as _, Theme};
 /// Expanded-mode textarea vertical padding: `pt-4 pb-1` (comet composer.tsx
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextSelection {
+    path: String,
+    kind: comet_proto::ContextRefKind,
+    checkout_id: String,
+    token_start: usize,
+    token_end: usize,
+}
+
+fn exact_token_at(text: &str, token: &str, start: usize) -> bool {
+    let end = start.saturating_add(token.len());
+    text.get(start..end) == Some(token)
+        && text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+        && text[end..].chars().next().is_none_or(char::is_whitespace)
+}
+
+fn exact_token_occurrences<'a>(text: &'a str, token: &'a str) -> impl Iterator<Item = usize> + 'a {
+    text.match_indices(token)
+        .map(|(start, _)| start)
+        .filter(|start| exact_token_at(text, token, *start))
+}
+
+fn selected_context_refs(
+    text: &str,
+    selections: Option<&Vec<ContextSelection>>,
+) -> Vec<ContextRef> {
+    let mut selected: Vec<_> = selections
+        .into_iter()
+        .flatten()
+        .filter_map(|selection| {
+            let expected = ContextRef {
+                path: selection.path.clone(),
+                kind: selection.kind,
+                checkout_id: None,
+            }
+            .token();
+            (selection.token_end == selection.token_start + expected.len()
+                && exact_token_at(text, &expected, selection.token_start))
+            .then(|| selection.clone())
+        })
+        .collect();
+    selected.sort_by_key(|selection| selection.token_start);
+    selected
+        .into_iter()
+        .map(|selection| ContextRef {
+            path: selection.path,
+            kind: selection.kind,
+            checkout_id: Some(selection.checkout_id),
+        })
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerTextEdit {
+    replaced: Range<usize>,
+    inserted_len: usize,
+}
+
+fn apply_context_edit(selections: &mut Vec<ContextSelection>, edit: &ComposerTextEdit) {
+    let removed_len = edit.replaced.end.saturating_sub(edit.replaced.start);
+    let delta = edit.inserted_len as isize - removed_len as isize;
+    selections.retain_mut(|selection| {
+        if edit.replaced.end < selection.token_start {
+            selection.token_start = selection.token_start.saturating_add_signed(delta);
+            selection.token_end = selection.token_end.saturating_add_signed(delta);
+            true
+        } else {
+            edit.replaced.start > selection.token_end
+        }
+    });
+}
+
+fn queued_context_selections(prompt: &str, context: &[ContextRef]) -> Vec<ContextSelection> {
+    context
+        .iter()
+        .filter_map(|reference| {
+            let checkout_id = reference.checkout_id.as_deref()?.trim();
+            if checkout_id.is_empty()
+                || context
+                    .iter()
+                    .filter(|other| other.path == reference.path)
+                    .count()
+                    != 1
+            {
+                return None;
+            }
+            let token = reference.token();
+            let mut occurrences = exact_token_occurrences(prompt, &token);
+            let token_start = occurrences.next()?;
+            if occurrences.next().is_some() {
+                return None;
+            }
+            Some(ContextSelection {
+                path: reference.path.clone(),
+                kind: reference.kind,
+                checkout_id: checkout_id.to_string(),
+                token_start,
+                token_end: token_start + token.len(),
+            })
+        })
+        .collect()
+}
+
+fn replace_with_queued_context(
+    all: &mut HashMap<String, Vec<ContextSelection>>,
+    draft_key: &str,
+    prompt: &str,
+    context: &[ContextRef],
+) {
+    let selections = queued_context_selections(prompt, context);
+    if selections.is_empty() {
+        all.remove(draft_key);
+    } else {
+        all.insert(draft_key.to_string(), selections);
+    }
+}
+
+fn clear_draft_provenance(
+    drafts: &mut HashMap<String, String>,
+    context: &mut HashMap<String, Vec<ContextSelection>>,
+    draft_key: &str,
+) {
+    drafts.remove(draft_key);
+    context.remove(draft_key);
+}
+
+fn take_context_selections(
+    all: &mut HashMap<String, Vec<ContextSelection>>,
+    draft_key: &str,
+) -> Option<Vec<ContextSelection>> {
+    all.remove(draft_key)
+}
+
+fn queue_add_gesture_key(chat_id: &str, prompt: &str, context: &[ContextRef]) -> String {
+    serde_json::to_string(&(chat_id, prompt, context))
+        .unwrap_or_else(|_| format!("{chat_id}:{prompt}"))
+}
 /// The expanded textarea BOX (content + padding) is clamped by the original's
 /// auto-grow effect: `ta.style.height = Math.min(Math.max(scrollHeight, 76),
 /// 260)` (comet composer.tsx line 235). The 76px floor applies even when
@@ -67,6 +215,14 @@ pub const MIN_COMPACT_INPUT_WIDTH: f32 = 200.0;
 /// prose — what you type is set at the size it is read back at (gh#174).
 pub const INPUT_LINE_HEIGHT: f32 = 22.75;
 pub const INPUT_TEXT_SIZE: f32 = Theme::TEXT_PROSE;
+/// How long the `@` picker waits after a keystroke before asking the host
+/// (gh#424). Long enough that a burst of typing is one search, short enough
+/// that a menu still feels like it is tracking the caret.
+const CONTEXT_SEARCH_DEBOUNCE_MS: u64 = 90;
+
+/// How many characters of a queued follow-up the tray shows on its row.
+const QUEUE_ROW_CHARS: usize = 120;
+
 /// Single-select questions auto-advance after this long.
 pub const AUTO_ADVANCE_MS: u64 = 220;
 
@@ -324,6 +480,53 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
+/// What pressing send actually does (gh#424).
+///
+/// Four outcomes, and the product requirement is that they stay four — that a
+/// person can say which one they are about to get before they press anything:
+///
+/// | state                 | verb    | what it does                                |
+/// |-----------------------|---------|---------------------------------------------|
+/// | idle                  | Send    | starts a turn now                            |
+/// | running, Enter        | Steer   | joins the LIVE turn; a newer steer supersedes|
+/// | running, ⌘/Ctrl-Enter | Queue   | waits for the turn, in a visible ordered plan|
+/// | running, no text      | Stop    | ends the turn — and holds the plan           |
+///
+/// Steer stays the default because it is the existing behaviour and the common
+/// intent mid-turn ("no, not that"); queueing is the deliberate second gesture,
+/// because "do this next" is a thing you decide, not a thing you fall into.
+/// Idle never queues: with nothing running there is nothing to wait for, and a
+/// follow-up that ran instantly would be a send with extra steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendIntent {
+    Send,
+    Steer,
+    Queue,
+    Stop,
+}
+
+pub fn send_intent(run_live: bool, has_text: bool, queue_modifier: bool) -> SendIntent {
+    match (run_live, has_text) {
+        (false, _) => SendIntent::Send,
+        (true, false) => SendIntent::Stop,
+        (true, true) if queue_modifier => SendIntent::Queue,
+        (true, true) => SendIntent::Steer,
+    }
+}
+
+/// A multi-line prompt as one tray row: newlines collapsed, elided at `max`
+/// characters. Collapsed rather than clipped by the layout because a queued
+/// follow-up is often a paragraph, and the first line of one says less about it
+/// than the first `max` characters of the whole.
+pub fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -543,6 +746,9 @@ actions!(
         Paste,
         Newline,
         Submit,
+        /// ⌘/Ctrl-Enter: queue the text as a follow-up instead of steering the
+        /// live turn (gh#424).
+        QueueSubmit,
     ]
 );
 
@@ -574,6 +780,13 @@ pub fn init(cx: &mut App) {
         bindings.push(KeyBinding::new(&format!("{prefix}-c"), Copy, ctx));
         bindings.push(KeyBinding::new(&format!("{prefix}-x"), Cut, ctx));
         bindings.push(KeyBinding::new(&format!("{prefix}-v"), Paste, ctx));
+        // Both conventions, like the clipboard above: the same gesture must
+        // queue a follow-up on a Mac and on the Linux box people mosh into.
+        bindings.push(KeyBinding::new(
+            &format!("{prefix}-enter"),
+            QueueSubmit,
+            ctx,
+        ));
     }
     // Palette-search context: TEXT-EDITING keys only. gpui dispatches matched
     // keybindings BEFORE raw key listeners (window.rs `dispatch_key_event`),
@@ -612,7 +825,9 @@ pub enum MenuNav {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComposerInputEvent {
     Submitted,
-    Edited,
+    /// ⌘/Ctrl-Enter — send as a queued follow-up (gh#424).
+    QueueSubmitted,
+    Edited(Option<ComposerTextEdit>),
     /// A navigation key arrived while a completion menu was up — the wrapper
     /// owns the menu, so the input only reports the intent.
     Menu(MenuNav),
@@ -759,7 +974,7 @@ impl ComposerInput {
         self.selection_reversed = false;
         self.marked_range = None;
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(None));
         cx.notify();
     }
 
@@ -797,7 +1012,7 @@ impl ComposerInput {
         self.marked_range = None;
         self.scroll_top = 0.0;
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(None));
         cx.notify();
     }
 
@@ -1050,6 +1265,18 @@ impl ComposerInput {
             return;
         }
         cx.emit(ComposerInputEvent::Submitted);
+    }
+
+    /// ⌘/Ctrl-Enter (gh#424). A completion menu takes it too — accepting the
+    /// highlighted row is what the person looking at an open menu means by any
+    /// flavour of Enter, and queueing a half-typed `@src/comp` would be the
+    /// least useful reading of the keystroke available.
+    fn queue_submit(&mut self, _: &QueueSubmit, _: &mut Window, cx: &mut Context<Self>) {
+        if self.menu_active {
+            cx.emit(ComposerInputEvent::Menu(MenuNav::Accept));
+            return;
+        }
+        cx.emit(ComposerInputEvent::QueueSubmitted);
     }
 
     // ---- geometry ----
@@ -1315,13 +1542,17 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let edit = ComposerTextEdit {
+            replaced: range.clone(),
+            inserted_len: new_text.len(),
+        };
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range.take();
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(Some(edit)));
         cx.notify();
     }
 
@@ -1338,6 +1569,10 @@ impl EntityInputHandler for ComposerInput {
             .map(|r| self.range_from_utf16(r))
             .or(self.marked_range.clone())
             .unwrap_or(self.selected_range.clone());
+        let edit = ComposerTextEdit {
+            replaced: range.clone(),
+            inserted_len: new_text.len(),
+        };
         self.content =
             self.content[0..range.start].to_owned() + new_text + &self.content[range.end..];
         if new_text.is_empty() {
@@ -1351,7 +1586,7 @@ impl EntityInputHandler for ComposerInput {
             .map(|new_range| new_range.start + range.start..new_range.end + range.start)
             .unwrap_or_else(|| range.start + new_text.len()..range.start + new_text.len());
         self.reset_blink();
-        cx.emit(ComposerInputEvent::Edited);
+        cx.emit(ComposerInputEvent::Edited(Some(edit)));
         cx.notify();
     }
 
@@ -1610,6 +1845,7 @@ impl Render for ComposerInput {
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::newline))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::queue_submit))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -1668,6 +1904,41 @@ pub struct Composer {
     /// Offset of a `/` token Escape closed the picker on; see
     /// [`Composer::dismiss_skill_menu`].
     skill_dismissed: Option<usize>,
+    // ---- the `@` context picker (gh#424) ----
+    /// Rows the HOST answered for the current query — paths in the chat's own
+    /// checkout, never this device's disk.
+    context_rows: Vec<ContextMatch>,
+    /// Did the host's walk hit its budget? The menu says so rather than
+    /// presenting a capped list as the whole tree.
+    context_truncated: bool,
+    context_checkout_id: Option<String>,
+    /// Checkout stamps captured when a picker row was completed, per draft.
+    /// Search chrome may close or refresh; provenance belongs to the inserted
+    /// reference and must survive until that reference/draft is removed.
+    context_ref_checkouts: HashMap<String, Vec<ContextSelection>>,
+    /// `(chat key, query)` the rows answer. Both halves matter: the same query
+    /// means different files in a different checkout.
+    context_key: Option<(String, String)>,
+    context_task: Option<Task<()>>,
+    context_selected: usize,
+    context_first: usize,
+    context_dismissed: Option<usize>,
+    // ---- the follow-up queue (gh#424) ----
+    /// The plan for the selected chat, as the host folds it out of the ledger.
+    queue: QueueView,
+    /// Which chat `queue` is about (a stale pump must not paint another chat's
+    /// plan under this one's composer).
+    queue_chat: Option<String>,
+    queue_task: Option<Task<()>>,
+    queue_action_task: Option<Task<()>>,
+    /// Client-owned ids retained while an append's acknowledgement is unknown.
+    /// The serialized intent is the key: editing it creates a new gesture;
+    /// retrying it after response loss reuses the old id.
+    pending_queue_gestures: HashMap<String, String>,
+    pending_queue_message_ids: HashMap<String, String>,
+    /// The queued row the composer is editing, if any. Sending commits an edit
+    /// against this id instead of queueing a new row.
+    editing: Option<String>,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
@@ -1723,19 +1994,29 @@ impl Composer {
         let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
-            ComposerInputEvent::Submitted => this.on_submit(cx),
+            ComposerInputEvent::Submitted => this.on_submit(false, cx),
+            ComposerInputEvent::QueueSubmitted => this.on_submit(true, cx),
             // Recomputed on every edit rather than only on render: the input
             // asks `menu_active` while dispatching the NEXT keystroke, so a
             // flag that lagged a frame would send the prompt on the Enter that
             // was meant to complete it.
-            ComposerInputEvent::Edited => {
-                this.sync_skill_menu(cx);
+            ComposerInputEvent::Edited(edit) => {
+                if let Some(edit) = edit {
+                    this.apply_context_edit(edit);
+                }
+                this.sync_menus(cx);
                 cx.notify();
             }
-            ComposerInputEvent::Menu(nav) => match nav {
-                MenuNav::Up => this.step_skill(-1, cx),
-                MenuNav::Down => this.step_skill(1, cx),
-                MenuNav::Accept => this.accept_skill(cx),
+            // Whichever menu is open owns the keys. They cannot both be: a `/`
+            // token stops at a slash and an `@` token starts at whitespace, so
+            // the caret is in at most one of them.
+            ComposerInputEvent::Menu(nav) => match (this.context_menu(cx).is_some(), nav) {
+                (true, MenuNav::Up) => this.step_context(-1, cx),
+                (true, MenuNav::Down) => this.step_context(1, cx),
+                (true, MenuNav::Accept) => this.accept_context(cx),
+                (false, MenuNav::Up) => this.step_skill(-1, cx),
+                (false, MenuNav::Down) => this.step_skill(1, cx),
+                (false, MenuNav::Accept) => this.accept_skill(cx),
             },
             ComposerInputEvent::PastedImages(images) => {
                 let staged = images
@@ -1762,6 +2043,22 @@ impl Composer {
             skill_selected: 0,
             skill_first: 0,
             skill_dismissed: None,
+            context_rows: Vec::new(),
+            context_truncated: false,
+            context_checkout_id: None,
+            context_ref_checkouts: HashMap::new(),
+            context_key: None,
+            context_task: None,
+            context_selected: 0,
+            context_first: 0,
+            context_dismissed: None,
+            queue: QueueView::default(),
+            queue_chat: None,
+            queue_task: None,
+            queue_action_task: None,
+            pending_queue_gestures: HashMap::new(),
+            pending_queue_message_ids: HashMap::new(),
+            editing: None,
             sending: false,
             failure: None,
             wizard: None,
@@ -2058,6 +2355,7 @@ impl Composer {
             }
         }
         self.ensure_skills(cx);
+        self.ensure_queue_watch(cx);
         cx.notify();
     }
 
@@ -2172,9 +2470,10 @@ impl Composer {
         (!rows.is_empty()).then_some((token, rows))
     }
 
-    /// Re-derive the picker's open state after an edit: clamp the selection to
-    /// the new row set and tell the input whose keys the arrows are.
-    fn sync_skill_menu(&mut self, cx: &mut Context<Self>) {
+    /// Re-derive both pickers' open state after an edit: clamp the selections to
+    /// the new row sets, fetch context rows for a changed `@` query, and tell
+    /// the input whose keys the arrows are.
+    fn sync_menus(&mut self, cx: &mut Context<Self>) {
         // Forget a dismissal once the caret has left the token it was about,
         // so the next `/` — even one typed at the same offset after clearing
         // the line — opens a menu again.
@@ -2186,13 +2485,236 @@ impl Composer {
                 self.skill_dismissed = None;
             }
         }
-        let len = self.skill_menu(cx).map_or(0, |(_, rows)| rows.len());
-        if self.skill_selected >= len {
+        if self.context_dismissed.is_some() {
+            let input = self.input.read(cx);
+            let inside = view_context::at_token(input.text(), input.caret())
+                .is_some_and(|t| Some(t.start) == self.context_dismissed);
+            if !inside {
+                self.context_dismissed = None;
+            }
+        }
+        self.ensure_context_rows(cx);
+        let skills = self.skill_menu(cx).map_or(0, |(_, rows)| rows.len());
+        if self.skill_selected >= skills {
             self.skill_selected = 0;
             self.skill_first = 0;
         }
+        let context = self.context_menu(cx).map_or(0, |(_, rows)| rows.len());
+        if self.context_selected >= context {
+            self.context_selected = 0;
+            self.context_first = 0;
+        }
         self.input
-            .update(cx, |input, _| input.set_menu_active(len > 0));
+            .update(cx, |input, _| input.set_menu_active(skills + context > 0));
+    }
+
+    // ---- the `@` context picker (gh#424) ----
+
+    /// Ask the chat's HOST for paths matching the `@` token under the caret.
+    ///
+    /// Per query rather than once per chat (which is what the `/` picker does):
+    /// a skill list is tens of rows and fixed, a checkout is a tree that the
+    /// agent itself is editing, and shipping it to the composer to filter
+    /// locally would mean shipping a repo listing over a relay to a phone. The
+    /// host walks it under a budget and answers with the top rows.
+    ///
+    /// Keyed on `(chat, query)`: a reply for a query the caret has moved past —
+    /// or for the chat you have since navigated away from — is dropped, which is
+    /// what keeps the menu about what is on screen.
+    fn ensure_context_rows(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.at_token(cx) else {
+            // Do not retain a filesystem answer after the token closes. The
+            // agent may create, delete, or rename the same path before the
+            // user types the same query again.
+            self.context_key = None;
+            self.context_checkout_id = None;
+            self.context_rows.clear();
+            self.context_task.take();
+            return;
+        };
+        let state = self.state.read(cx);
+        let chat = state.selected_chat_row().cloned();
+        let (chat_id, space_id, device, scope) = match &chat {
+            Some(chat) => (
+                Some(chat.id.clone()),
+                None,
+                Some(chat.device_id.clone()),
+                format!(
+                    "chat:{}:{}:{}",
+                    chat.id,
+                    chat.cwd.as_deref().unwrap_or(""),
+                    chat.checkout_id.as_deref().unwrap_or("")
+                ),
+            ),
+            None => match state.selected_space_row() {
+                Some(space) => (
+                    None,
+                    Some(space.id.clone()),
+                    Some(space.device_id.clone()),
+                    format!(
+                        "space:{}:{}:{}",
+                        space.id,
+                        space.path,
+                        space.checkout_id.as_deref().unwrap_or("")
+                    ),
+                ),
+                None => return,
+            },
+        };
+        let key = (scope, token.query.clone());
+        if self.context_key.as_ref() == Some(&key) {
+            return;
+        }
+        let Some(engine) = state.engine().cloned() else {
+            return;
+        };
+        let target = device.filter(|d| state.local_device_id.as_deref() != Some(d.as_str()));
+        // Claim the key before the call so a re-entrant render cannot queue a
+        // second search for the same keystroke.
+        self.context_key = Some(key.clone());
+        let query = token.query.clone();
+
+        self.context_task = Some(cx.spawn(async move |this, cx| {
+            // A keystroke's worth of grace before crossing the relay: typing
+            // `@crates/ui/src/comp` would otherwise be nineteen searches of a
+            // box's disk, eighteen of whose answers are discarded on arrival.
+            cx.background_executor()
+                .timer(Duration::from_millis(CONTEXT_SEARCH_DEBOUNCE_MS))
+                .await;
+            let alive = this.update(cx, |composer, _| {
+                composer.context_key.as_ref() == Some(&key)
+            });
+            if !matches!(alive, Ok(true)) {
+                return;
+            }
+            let mut params = serde_json::Map::new();
+            let mut put = |k: &str, v: Option<String>| {
+                if let Some(v) = v {
+                    params.insert(k.into(), serde_json::Value::String(v));
+                }
+            };
+            put("chatId", chat_id);
+            put("spaceId", space_id);
+            put("targetDeviceId", target);
+            params.insert("query".into(), serde_json::Value::String(query));
+            let result = engine
+                .client()
+                .call(
+                    methods::SEARCH_CONTEXT_FILES,
+                    serde_json::Value::Object(params),
+                )
+                .await;
+            this.update(cx, |composer, cx| {
+                if composer.context_key.as_ref() != Some(&key) {
+                    return; // the caret moved on; this answer is about the past
+                }
+                match result {
+                    Ok(value) => match serde_json::from_value::<ContextSearch>(value) {
+                        Ok(found) => {
+                            composer.context_rows = found.matches;
+                            composer.context_truncated = found.truncated;
+                            composer.context_checkout_id = found.checkout_id;
+                        }
+                        // Never surfaced, for the same reason the skill picker
+                        // stays quiet: an empty menu and a menu that could not
+                        // load look identical to somebody typing, and a red
+                        // notice under the composer for it would be noise.
+                        Err(err) => {
+                            tracing::warn!(error = %err, "SearchContextFiles decode failed")
+                        }
+                    },
+                    Err(err) => tracing::warn!(error = %err, "SearchContextFiles failed"),
+                }
+                composer.context_selected = 0;
+                composer.context_first = 0;
+                composer.sync_menus(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// The `@…` token under the caret, if the picker should be looking at one.
+    fn at_token(&self, cx: &App) -> Option<view_context::AtToken> {
+        if self.wizard.is_some() {
+            return None;
+        }
+        let input = self.input.read(cx);
+        let token = view_context::at_token(input.text(), input.caret())?;
+        (self.context_dismissed != Some(token.start)).then_some(token)
+    }
+
+    /// The token and the rows matching it — `None` whenever the menu should be
+    /// closed, including when nothing matches.
+    fn context_menu(&self, cx: &App) -> Option<(view_context::AtToken, Vec<ContextMatch>)> {
+        let token = self.at_token(cx)?;
+        // Filtered again locally against the host's rows: the host answered a
+        // query that may be one keystroke stale, and the same pure ranking
+        // (`view::context::filter`) narrows it without waiting for a round trip.
+        let rows = view_context::filter(&token.query, &self.context_rows);
+        (!rows.is_empty()).then_some((token, rows))
+    }
+
+    fn step_context(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some((_, rows)) = self.context_menu(cx) else {
+            return;
+        };
+        self.context_selected = view_skills::step(self.context_selected, delta, rows.len());
+        let (first, _) = view_skills::window(
+            self.context_first,
+            self.context_selected,
+            rows.len(),
+            view_skills::PICKER_MAX_ROWS,
+        );
+        self.context_first = first;
+        cx.notify();
+    }
+
+    /// Complete the highlighted row into the buffer as a reference token.
+    fn accept_context(&mut self, cx: &mut Context<Self>) {
+        let Some((token, rows)) = self.context_menu(cx) else {
+            return;
+        };
+        let Some(row) = rows.get(self.context_selected) else {
+            return;
+        };
+        let reference = row.to_ref();
+        let inserted = reference.token();
+        let (text, caret) = view_context::complete(self.input.read(cx).text(), &token, &reference);
+        self.apply_context_edit(&ComposerTextEdit {
+            replaced: token.start..token.end,
+            inserted_len: inserted.len() + usize::from(reference.kind == ContextRefKind::File),
+        });
+        if let Some(checkout_id) = self.context_checkout_id.clone() {
+            self.context_ref_checkouts
+                .entry(self.current_key.clone())
+                .or_default()
+                .push(ContextSelection {
+                    path: row.path.clone(),
+                    kind: row.kind,
+                    checkout_id,
+                    token_start: token.start,
+                    token_end: token.start + inserted.len(),
+                });
+        }
+        self.input
+            .update(cx, |input, cx| input.set_text_with_caret(text, caret, cx));
+        self.context_selected = 0;
+        self.context_first = 0;
+        self.sync_menus(cx);
+        cx.notify();
+    }
+
+    /// Escape closes the `@` picker and leaves the text alone (same contract as
+    /// the `/` one, keyed on the dismissed token's offset).
+    fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        let input = self.input.read(cx);
+        let Some(token) = view_context::at_token(input.text(), input.caret()) else {
+            return;
+        };
+        self.context_dismissed = Some(token.start);
+        self.sync_menus(cx);
+        cx.notify();
     }
 
     fn step_skill(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -2219,6 +2741,10 @@ impl Composer {
             return;
         };
         let (text, caret) = view_skills::complete(self.input.read(cx).text(), &token, &skill.name);
+        self.apply_context_edit(&ComposerTextEdit {
+            replaced: token.start..token.end,
+            inserted_len: 1 + skill.name.len() + 1,
+        });
         self.input
             .update(cx, |input, cx| input.set_text_with_caret(text, caret, cx));
         self.skill_selected = 0;
@@ -2226,7 +2752,7 @@ impl Composer {
         // The completion left a trailing space, so the token is gone and the
         // menu closes — but say so explicitly rather than relying on the
         // `Edited` event's ordering with the next keystroke.
-        self.sync_skill_menu(cx);
+        self.sync_menus(cx);
         cx.notify();
     }
 
@@ -2245,7 +2771,7 @@ impl Composer {
             return;
         };
         self.skill_dismissed = Some(token.start);
-        self.sync_skill_menu(cx);
+        self.sync_menus(cx);
         cx.notify();
     }
 
@@ -2267,7 +2793,7 @@ impl Composer {
         send_button_mode(self.run_live(cx), has_text)
     }
 
-    fn on_submit(&mut self, cx: &mut Context<Self>) {
+    fn on_submit(&mut self, queue_modifier: bool, cx: &mut Context<Self>) {
         if self.wizard.is_some() {
             // Enter inside the panel's free-text input submits the page.
             let typed = self.input.read(cx).text().trim().to_string();
@@ -2278,12 +2804,416 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
-        match self.button_mode(cx) {
-            SendButtonMode::Stop => self.interrupt(cx),
-            _ if text.is_empty() && self.staged().is_empty() => {}
-            SendButtonMode::Send => self.send(text, false, cx),
-            SendButtonMode::Steer => self.send(text, true, cx),
+        // Editing a queued row is its own submit: the text goes back to the row
+        // it came from, not into the conversation.
+        if self.editing.is_some() {
+            if text.is_empty() {
+                return;
+            }
+            self.commit_edit(text, cx);
+            return;
         }
+        let has_content = !text.is_empty() || !self.staged().is_empty();
+        match send_intent(self.run_live(cx), has_content, queue_modifier) {
+            SendIntent::Stop => self.interrupt(cx),
+            _ if !has_content => {}
+            SendIntent::Send => self.send(text, false, cx),
+            SendIntent::Steer => self.send(text, true, cx),
+            SendIntent::Queue => self.queue_follow_up(text, cx),
+        }
+    }
+
+    fn context_tokens(&self, text: &str) -> Vec<ContextRef> {
+        selected_context_refs(text, self.context_ref_checkouts.get(&self.current_key))
+    }
+
+    fn clear_input_and_provenance(&mut self, cx: &mut Context<Self>) {
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        clear_draft_provenance(
+            &mut self.drafts,
+            &mut self.context_ref_checkouts,
+            &self.current_key,
+        );
+    }
+
+    fn apply_context_edit(&mut self, edit: &ComposerTextEdit) {
+        let Some(selections) = self.context_ref_checkouts.get_mut(&self.current_key) else {
+            return;
+        };
+        apply_context_edit(selections, edit);
+        if selections.is_empty() {
+            self.context_ref_checkouts.remove(&self.current_key);
+        }
+    }
+
+    fn queue_gesture_id(
+        &mut self,
+        chat_id: &str,
+        payload: &SessionCommandPayload,
+        context: &[ContextRef],
+    ) -> (String, String) {
+        let key = serde_json::to_string(&(chat_id, payload, context))
+            .unwrap_or_else(|_| format!("{chat_id}:{payload:?}"));
+        let id = self
+            .pending_queue_gestures
+            .entry(key.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        (key, id)
+    }
+
+    fn queue_add_ids(
+        &mut self,
+        chat_id: &str,
+        prompt: &str,
+        context: &[ContextRef],
+    ) -> (String, String, String) {
+        let key = queue_add_gesture_key(chat_id, prompt, context);
+        let command_id = self
+            .pending_queue_gestures
+            .entry(key.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        let message_id = self
+            .pending_queue_message_ids
+            .entry(key.clone())
+            .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        (key, command_id, message_id)
+    }
+
+    // ---- the follow-up queue (gh#424) ----
+
+    /// Follow the selected chat's plan. Re-subscribed on navigation, dropped
+    /// with the composer — the stream ends when the host releases the chat, and
+    /// re-opens with it.
+    fn ensure_queue_watch(&mut self, cx: &mut Context<Self>) {
+        let chat_id = self.state.read(cx).selected_chat.clone();
+        if self.queue_chat == chat_id {
+            return;
+        }
+        self.queue_chat = chat_id.clone();
+        self.queue = QueueView::default();
+        self.editing = None;
+        self.queue_task = None;
+        let (Some(chat_id), Some(engine)) = (chat_id, self.state.read(cx).engine().cloned()) else {
+            return;
+        };
+        // Watched locally, not forwarded: the plan lives in the chat's SESSION
+        // doc, which this device holds a synced replica of — the same reason the
+        // transcript watch is local. (The file search is not, because files are
+        // not in any doc.)
+        self.queue_task = Some(cx.spawn(async move |this, cx| {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match engine
+                .client()
+                .subscribe(methods::WATCH_DOC_QUEUE, params)
+                .await
+            {
+                Ok(rx) => rx,
+                Err(err) => {
+                    tracing::warn!(%chat_id, error = %err, "queue watch failed");
+                    return;
+                }
+            };
+            while let Some(value) = rx.recv().await {
+                let view: QueueView = match serde_json::from_value(value) {
+                    Ok(view) => view,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed queue frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |composer, cx| {
+                    if composer.queue_chat.as_deref() != Some(chat_id.as_str()) {
+                        return;
+                    }
+                    // An edit whose row the plan no longer has (it ran, or
+                    // somebody else removed it) releases the composer rather
+                    // than leaving it editing a ghost.
+                    if let Some(editing) = composer.editing.clone()
+                        && view.position(&editing).is_none()
+                    {
+                        composer.stop_editing(cx);
+                    }
+                    composer.queue = view;
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
+            }
+        }));
+    }
+
+    /// Append a follow-up to the plan.
+    ///
+    /// No optimistic row: the tray is fed by the host's fold of the ledger, and
+    /// an optimistic row would be a second source of truth for the one thing
+    /// this design exists to have exactly one of. The round trip is local (the
+    /// doc commits on this device and syncs), so the row appears immediately
+    /// anyway — and if it does not, that is the truth about a queue the engine
+    /// did not accept.
+    fn queue_follow_up(&mut self, text: String, cx: &mut Context<Self>) {
+        if !self.staged().is_empty() {
+            // Until queued rows own a host-staged upload lifecycle, refusing is
+            // safer than silently dropping images. Keep both draft and staged
+            // files exactly where the user left them.
+            self.failure = Some(
+                "Images can’t be queued yet — steer them now or wait for the turn to finish."
+                    .into(),
+            );
+            cx.notify();
+            return;
+        }
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let context = self.context_tokens(&text);
+        let (gesture_key, command_id, message_id) = self.queue_add_ids(&chat_id, &text, &context);
+        let payload = SessionCommandPayload::Queue {
+            prompt: text.clone(),
+            message_id,
+            attachments: Vec::new(),
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "commandId": command_id,
+            "command": payload,
+            "context": context,
+        });
+        self.sending = true;
+        self.failure = None;
+        self.queue_action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                match result {
+                    Ok(_) => {
+                        composer.pending_queue_gestures.remove(&gesture_key);
+                        composer.pending_queue_message_ids.remove(&gesture_key);
+                        // Do not erase keystrokes entered while the durable
+                        // append was in flight.
+                        if composer.input.read(cx).text().trim() == text {
+                            composer.clear_input_and_provenance(cx);
+                        }
+                    }
+                    Err(err) => composer.failure = Some(format!("Queue failed: {err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Load a queued row back into the composer for editing.
+    fn start_editing(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.queue.rows.iter().find(|r| r.id == row_id) else {
+            return;
+        };
+        let prompt = row.prompt.clone();
+        replace_with_queued_context(
+            &mut self.context_ref_checkouts,
+            &self.current_key,
+            &prompt,
+            &row.context,
+        );
+        self.editing = Some(row_id.to_string());
+        self.input
+            .update(cx, |input, cx| input.set_text(prompt, cx));
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder("Editing a queued follow-up — Enter saves, Esc cancels", cx)
+        });
+        cx.notify();
+    }
+
+    fn stop_editing(&mut self, cx: &mut Context<Self>) {
+        if self.editing.take().is_none() {
+            return;
+        }
+        self.clear_input_and_provenance(cx);
+        self.input
+            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+        cx.notify();
+    }
+
+    fn commit_edit(&mut self, text: String, cx: &mut Context<Self>) {
+        let (Some(chat_id), Some(target)) = (
+            self.state.read(cx).selected_chat.clone(),
+            self.editing.clone(),
+        ) else {
+            return;
+        };
+        let context = self.context_tokens(&text);
+        let op = QueueOp::Edit {
+            target,
+            prompt: text.clone(),
+            context,
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let payload = SessionCommandPayload::QueueControl { op };
+        let (gesture_key, command_id) = self.queue_gesture_id(&chat_id, &payload, &[]);
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "commandId": command_id,
+            "command": payload,
+        });
+        self.sending = true;
+        self.queue_action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                match result {
+                    Ok(_) => {
+                        composer.pending_queue_gestures.remove(&gesture_key);
+                        composer.stop_editing(cx)
+                    }
+                    Err(err) => {
+                        composer.failure = Some(format!("Queue update failed: {err}").into());
+                        // editing id and draft remain intact for retry.
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Move a row one place up or down: expressed as an anchor
+    /// ("after this neighbour"), never an index, so two clients holding
+    /// different-length views of the plan converge on the same order.
+    fn nudge_row(&mut self, row_id: &str, delta: isize, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let Some(ix) = self.queue.position(row_id) else {
+            return;
+        };
+        let after = match delta {
+            d if d < 0 => match ix {
+                0 => return, // already the head
+                1 => None,   // to the head
+                _ => Some(self.queue.rows[ix - 2].id.clone()),
+            },
+            _ => match self.queue.rows.get(ix + 1) {
+                Some(next) => Some(next.id.clone()),
+                None => return, // already the tail
+            },
+        };
+        self.queue_control(
+            &chat_id,
+            QueueOp::Move {
+                target: row_id.to_string(),
+                after,
+            },
+            cx,
+        );
+    }
+
+    fn remove_row(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        if self.editing.as_deref() == Some(row_id) {
+            self.stop_editing(cx);
+        }
+        self.queue_control(
+            &chat_id,
+            QueueOp::Remove {
+                target: row_id.to_string(),
+            },
+            cx,
+        );
+    }
+
+    fn run_next(&mut self, row_id: &str, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        self.queue_control(
+            &chat_id,
+            QueueOp::RunNext {
+                target: row_id.to_string(),
+            },
+            cx,
+        );
+    }
+
+    fn set_paused(&mut self, paused: bool, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+        let op = match paused {
+            true => QueueOp::Pause {},
+            false => QueueOp::Resume {},
+        };
+        self.queue_control(&chat_id, op, cx);
+    }
+
+    fn queue_control(&mut self, chat_id: &str, op: QueueOp, cx: &mut Context<Self>) {
+        self.queue_command(
+            chat_id,
+            SessionCommandPayload::QueueControl { op },
+            Vec::new(),
+            "Queue update failed",
+            cx,
+        );
+    }
+
+    /// One durable command, one failure notice. Every plan mutation goes through
+    /// here so there is exactly one path from a tray button to the ledger.
+    fn queue_command(
+        &mut self,
+        chat_id: &str,
+        payload: SessionCommandPayload,
+        context: Vec<ContextRef>,
+        failure: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let command = match serde_json::to_value(&payload) {
+            Ok(command) => command,
+            Err(err) => {
+                self.failure = Some(format!("{failure}: {err}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let (gesture_key, command_id) = self.queue_gesture_id(chat_id, &payload, &context);
+        let params = serde_json::json!({
+            "chatId": chat_id,
+            "commandId": command_id,
+            "command": command,
+            "context": context,
+        });
+        self.failure = None;
+        cx.notify();
+        self.queue_action_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::QUEUE_COMMAND, params).await;
+            this.update(cx, |composer, cx| {
+                match result {
+                    Ok(_) => {
+                        composer.pending_queue_gestures.remove(&gesture_key);
+                    }
+                    Err(err) => composer.failure = Some(format!("{failure}: {err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Queue a Run (or Steer) doc command with an optimistic echo. New chats
@@ -2298,6 +3228,7 @@ impl Composer {
         };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
+        let draft_key = self.current_key.clone();
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
             Some(id) => (id, false),
             None => (uuid::Uuid::new_v4().to_string(), true),
@@ -2373,6 +3304,12 @@ impl Composer {
         } else {
             text.clone()
         };
+        // Snapshot reference provenance with the draft. The async upload may
+        // outlive navigation to another chat, and the picker identity is the
+        // one captured at completion—not whichever checkout is current later.
+        let picked_context = self.context_tokens(&echo_text);
+        let picked_provenance =
+            take_context_selections(&mut self.context_ref_checkouts, &draft_key);
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -2397,7 +3334,7 @@ impl Composer {
         });
 
         self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
+        self.drafts.remove(&draft_key);
         self.failure = None;
         self.sending = true;
         cx.emit(ComposerEvent::Sent {
@@ -2563,6 +3500,10 @@ impl Composer {
                     .ok();
                 }
 
+                // Typed references were snapshotted with the draft before the
+                // async upload/navigation boundary. The host resolves them;
+                // nothing here touches the filesystem.
+                let context = picked_context.clone();
                 let command = if steer_cmd {
                     SessionCommandPayload::Steer {
                         prompt: content.clone(),
@@ -2586,7 +3527,12 @@ impl Composer {
                 };
                 let command = serde_json::to_value(&command)
                     .map_err(|e| format!("Send failed: {e}"))?;
-                let params = serde_json::json!({ "chatId": chat_id, "command": command });
+                let params = serde_json::json!({
+                    "chatId": chat_id,
+                    "commandId": uuid::Uuid::new_v4().to_string(),
+                    "command": command,
+                    "context": context,
+                });
                 engine
                     .client()
                     .call(methods::QUEUE_COMMAND, params)
@@ -2606,6 +3552,11 @@ impl Composer {
                         cx.notify();
                     });
                     composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    if let Some(provenance) = picked_provenance {
+                        composer
+                            .context_ref_checkouts
+                            .insert(err_chat_id.clone(), provenance);
+                    }
                     if !staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
                         // while the send was in flight survive the hand-back.
@@ -2633,6 +3584,7 @@ impl Composer {
         };
         let params = serde_json::json!({
             "chatId": chat_id,
+            "commandId": uuid::Uuid::new_v4().to_string(),
             "command": { "kind": "interrupt" },
         });
         self.send_task = Some(cx.spawn(async move |this, cx| {
@@ -2691,7 +3643,7 @@ impl Composer {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
                 // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.clear_input_and_provenance(cx);
                 cx.notify();
             }
         }
@@ -2711,8 +3663,8 @@ impl Composer {
         };
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
+        self.clear_input_and_provenance(cx);
         self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
             // The panel borrowed the composer input; hand back its identity.
             input.set_placeholder("Do anything…", cx);
         });
@@ -3105,6 +4057,270 @@ impl Composer {
         )
     }
 
+    /// The `@` picker (gh#424) — same card, same window arithmetic and same
+    /// "N more" honesty as the `/` one, two columns instead of three: the name
+    /// somebody is typing at, and the directory that disambiguates it.
+    fn render_context_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let (_, rows) = self.context_menu(cx)?;
+        let theme = Theme::of(cx).clone();
+        let (first, visible) = view_skills::window(
+            self.context_first,
+            self.context_selected,
+            rows.len(),
+            view_skills::PICKER_MAX_ROWS,
+        );
+        let hidden = rows.len().saturating_sub(visible);
+        let selected = self.context_selected;
+        let truncated = self.context_truncated;
+
+        let list = div()
+            .flex()
+            .flex_col()
+            .p(px(Theme::NEST_GUTTER))
+            .children(
+                rows.iter()
+                    .enumerate()
+                    .skip(first)
+                    .take(visible)
+                    .map(|(ix, row)| {
+                        let active = ix == selected;
+                        let name: SharedString = match row.kind.is_dir() {
+                            true => format!("{}/", row.name()).into(),
+                            false => row.name().to_string().into(),
+                        };
+                        let parent: SharedString = row.parent().to_string().into();
+                        div()
+                            .id(SharedString::from(format!("context-row-{ix}")))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .rounded(px(Theme::RADIUS_ROW))
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .cursor_pointer()
+                            .list_row(&theme, Bed::Shell, active, format!("context-row-{ix}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.context_selected = ix;
+                                this.accept_context(cx);
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(if active { theme.text } else { theme.text_muted })
+                                    .child(name),
+                            )
+                            .when(!parent.is_empty(), |el| {
+                                el.child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(Theme::TEXT_DENSE))
+                                        .text_color(theme.text_subtle)
+                                        .child(parent),
+                                )
+                            })
+                    }),
+            )
+            // Two different "there is more": more matches than fit the window,
+            // and a host walk that stopped at its budget. Both are said, because
+            // both mean the list on screen is not the whole answer.
+            .when(hidden > 0 || truncated, |el| {
+                el.child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(4.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(match (hidden, truncated) {
+                            (0, _) => "more in the checkout — keep typing".to_string(),
+                            (n, false) => format!("{n} more — keep typing"),
+                            (n, true) => format!("{n} more, and more in the checkout"),
+                        })),
+                )
+            });
+
+        Some(
+            div()
+                .mx(px(4.0))
+                .rounded(px(Theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme.white_alpha(0.08))
+                .bg(theme.surface_raised)
+                .shadow(theme.float_shadow())
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// The follow-up tray (gh#424): the plan, above the composer, in the order
+    /// it will run.
+    ///
+    /// Ordered rows rather than a count badge, because the whole point of the
+    /// slice is that a queued instruction is *inspectable* — a number would tell
+    /// you that three things are going to happen and not which three, which is
+    /// the state the composer was already in.
+    fn render_queue_tray(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.queue.rows.is_empty() {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        let paused = self.queue.paused;
+        let editing = self.editing.clone();
+        let count = self.queue.rows.len();
+        let last = count.saturating_sub(1);
+
+        let header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(8.0))
+            .py(px(4.0))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(match count {
+                        1 => "1 queued after this turn".to_string(),
+                        n => format!("{n} queued after this turn"),
+                    })),
+            )
+            .when_some(paused, |el, cause| {
+                el.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(match cause {
+                            QueuePause::Stopped => "· held by Stop",
+                            QueuePause::User => "· paused",
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .id("queue-pause")
+                    .ml_auto()
+                    .px(px(6.0))
+                    .py(px(2.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
+                    .cursor_pointer()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_muted)
+                    .hover(|s| s.text_color(theme.text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_paused(paused.is_none(), cx);
+                    }))
+                    .child(SharedString::from(match paused {
+                        Some(_) => "Resume",
+                        None => "Pause",
+                    })),
+            );
+
+        let rows = self.queue.rows.clone();
+        let list = div()
+            .flex()
+            .flex_col()
+            .children(rows.iter().enumerate().map(|(ix, row)| {
+                let id = row.id.clone();
+                let being_edited = editing.as_deref() == Some(id.as_str());
+                let text: SharedString = one_line(&row.prompt, QUEUE_ROW_CHARS).into();
+                let button = |key: &'static str, label: &'static str| {
+                    div()
+                        .id(SharedString::from(format!("queue-{key}-{ix}")))
+                        .flex_none()
+                        .px(px(4.0))
+                        .cursor_pointer()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .hover(|s| s.text_color(theme.text))
+                        .child(label)
+                };
+                div()
+                    .id(SharedString::from(format!("queue-row-{ix}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(Theme::RADIUS_ROW))
+                    .list_row(&theme, Bed::Shell, being_edited, format!("queue-row-{ix}"))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(14.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(format!("{}", ix + 1))),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .cursor_pointer()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .text_color(match being_edited {
+                                true => theme.text,
+                                false => theme.text_muted,
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener({
+                                    let id = id.clone();
+                                    move |this, _, _, cx| this.start_editing(&id, cx)
+                                }),
+                            )
+                            .child(text),
+                    )
+                    .when(row.edited, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_subtle)
+                                .child("edited"),
+                        )
+                    })
+                    .when(ix > 0, |el| {
+                        el.child(button("up", "↑").on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, _, cx| this.nudge_row(&id, -1, cx)
+                        })))
+                    })
+                    .when(ix < last, |el| {
+                        el.child(button("down", "↓").on_click(cx.listener({
+                            let id = id.clone();
+                            move |this, _, _, cx| this.nudge_row(&id, 1, cx)
+                        })))
+                    })
+                    .child(button("run-next", "▶").on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| this.run_next(&id, cx)
+                    })))
+                    .child(button("remove", "✕").on_click(cx.listener({
+                        let id = id.clone();
+                        move |this, _, _, cx| this.remove_row(&id, cx)
+                    })))
+            }));
+
+        Some(
+            div()
+                .mx(px(4.0))
+                .mb(px(4.0))
+                .rounded(px(Theme::RADIUS_CARD))
+                .border_1()
+                .border_color(theme.white_alpha(0.08))
+                .bg(theme.surface_raised)
+                .child(div().p(px(Theme::NEST_GUTTER)).child(header).child(list))
+                .into_any_element(),
+        )
+    }
+
     fn render_send_button(
         &mut self,
         mode: SendButtonMode,
@@ -3143,7 +4359,7 @@ impl Composer {
                 .justify_center()
                 .cursor_pointer()
                 .hover(|s| s.opacity(0.85))
-                .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
+                .on_click(cx.listener(|this, _, _, cx| this.on_submit(false, cx)))
                 .child(
                     crate::icons::icon(crate::icons::ARROW_UP)
                         .size(px(14.0))
@@ -3540,8 +4756,23 @@ impl Render for Composer {
         // its chrome. Rendered before the input in the column so it opens
         // upward, away from the caret — a menu covering the line being typed
         // is a menu you close to see what you wrote.
+        // The plan sits ABOVE both menus (gh#424): it is standing state about
+        // what happens next, not a transient completion, so a menu must open
+        // between it and the caret rather than on top of it.
+        let container = match self.render_queue_tray(cx) {
+            Some(tray) => container.child(motion::fade_quick("composer-queue", div().child(tray))),
+            None => container,
+        };
         let container = match self.render_skill_menu(cx) {
             Some(menu) => container.child(motion::fade_quick("composer-skills", div().child(menu))),
+            None => container,
+        };
+        // The `@` picker shares the slot and the reasoning: above the pill,
+        // opening upward, away from the caret.
+        let container = match self.render_context_menu(cx) {
+            Some(menu) => {
+                container.child(motion::fade_quick("composer-context", div().child(menu)))
+            }
             None => container,
         };
         // The file dropzone lives in the shell (the whole conversation column,
@@ -3552,19 +4783,41 @@ impl Render for Composer {
             // arrive here as raw keys — which is exactly where they belong:
             // both are about the menu, and the menu is the wrapper's.
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-                if this.skill_menu(cx).is_none() {
+                let key = event.keystroke.key.as_str();
+                if this.context_menu(cx).is_some() {
+                    match key {
+                        "escape" => {
+                            this.dismiss_context_menu(cx);
+                            cx.stop_propagation();
+                        }
+                        "tab" => {
+                            this.accept_context(cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
+                    }
                     return;
                 }
-                match event.keystroke.key.as_str() {
-                    "escape" => {
-                        this.dismiss_skill_menu(cx);
-                        cx.stop_propagation();
+                if this.skill_menu(cx).is_some() {
+                    match key {
+                        "escape" => {
+                            this.dismiss_skill_menu(cx);
+                            cx.stop_propagation();
+                        }
+                        "tab" => {
+                            this.accept_skill(cx);
+                            cx.stop_propagation();
+                        }
+                        _ => {}
                     }
-                    "tab" => {
-                        this.accept_skill(cx);
-                        cx.stop_propagation();
-                    }
-                    _ => {}
+                    return;
+                }
+                // With no menu up, Escape leaves an edit of a queued row
+                // (gh#424) — the tray said "Esc cancels", and the row it was
+                // about is still there, untouched.
+                if key == "escape" && this.editing.is_some() {
+                    this.stop_editing(cx);
+                    cx.stop_propagation();
                 }
             }))
             .child(motion::fade_quick("composer-input", body));
@@ -3870,6 +5123,263 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn completed_context_keeps_the_checkout_it_was_picked_from() {
+        let input = "inspect @src/f";
+        let token = view_context::at_token(input, input.len()).expect("active picker token");
+        let row = ContextMatch {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+        };
+        let (completed, _) = view_context::complete(input, &token, &row.to_ref());
+        assert!(completed.ends_with(' '), "completion closes the picker");
+
+        let refs = selected_context_refs(
+            &completed,
+            Some(&vec![ContextSelection {
+                path: "src/foo.rs".into(),
+                kind: comet_proto::ContextRefKind::File,
+                checkout_id: "checkout-before".into(),
+                token_start: token.start,
+                token_end: token.start + "@src/foo.rs".len(),
+            }]),
+        );
+        assert_eq!(refs[0].checkout_id.as_deref(), Some("checkout-before"));
+        assert_ne!(refs[0].checkout_id.as_deref(), Some("checkout-after"));
+    }
+
+    #[test]
+    fn hand_typed_context_syntax_remains_plain_prompt_text() {
+        assert!(selected_context_refs("inspect @src/forged.rs", None).is_empty());
+        assert!(selected_context_refs("inspect @src/forged.rs", Some(&Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn successful_send_drops_selection_authority_before_the_same_path_is_typed_again() {
+        let text = "inspect @src/foo.rs";
+        let selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 8,
+            token_end: text.len(),
+        }];
+        assert_eq!(selected_context_refs(text, Some(&selections)).len(), 1);
+
+        // Successful Send/Steer consumes the draft provenance. Identical text
+        // in the next draft is only text until the picker selects it again.
+        let mut drafts = HashMap::from([("chat-a".into(), selections)]);
+        take_context_selections(&mut drafts, "chat-a");
+        assert!(selected_context_refs(text, drafts.get("chat-a")).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_selected_token_revokes_authority_before_retyping_it() {
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 8,
+            token_end: 19,
+        }];
+
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 8..19,
+                inserted_len: 0,
+            },
+        );
+        assert!(selections.is_empty(), "deleting the exact token revokes it");
+        assert!(selected_context_refs("inspect @src/foo.rs", Some(&selections)).is_empty());
+    }
+
+    #[test]
+    fn one_picker_occurrence_never_authorizes_a_typed_duplicate() {
+        let selected_text = "@src/foo.rs ";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 0,
+            token_end: 11,
+        }];
+        let typed = "and @src/foo.rs";
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: selected_text.len()..selected_text.len(),
+                inserted_len: typed.len(),
+            },
+        );
+        let text = format!("{selected_text}{typed}");
+        let refs = selected_context_refs(&text, Some(&selections));
+        assert_eq!(refs.len(), 1, "only the picker-selected span is typed");
+    }
+
+    #[test]
+    fn editor_paste_over_identical_selected_bytes_revokes_the_occurrence() {
+        let text = "inspect @src/foo.rs";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 8,
+            token_end: text.len(),
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 8..text.len(),
+                inserted_len: "@src/foo.rs".len(),
+            },
+        );
+        assert!(
+            selected_context_refs(text, Some(&selections)).is_empty(),
+            "an indistinguishable editor replacement fails closed"
+        );
+    }
+
+    #[test]
+    fn extending_a_selected_token_at_its_endpoint_revokes_it() {
+        let selected = "@src/foo.rs";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 0,
+            token_end: selected.len(),
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: selected.len()..selected.len(),
+                inserted_len: 1,
+            },
+        );
+        assert!(selected_context_refs("@src/foo.rsx ", Some(&selections)).is_empty());
+    }
+
+    #[test]
+    fn removing_the_preceding_delimiter_revokes_the_selected_token() {
+        let mut selections = vec![ContextSelection {
+            path: "foo".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 2,
+            token_end: 6,
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 1..2,
+                inserted_len: 0,
+            },
+        );
+        assert!(selected_context_refs("x@foo ", Some(&selections)).is_empty());
+    }
+
+    fn stamped_file(path: &str) -> ContextRef {
+        ContextRef {
+            path: path.into(),
+            kind: ContextRefKind::File,
+            checkout_id: Some("host-checkout".into()),
+        }
+    }
+
+    #[test]
+    fn starting_queue_edit_replaces_prior_draft_provenance() {
+        let mut all = HashMap::from([(
+            "chat-a".into(),
+            vec![ContextSelection {
+                path: "old.rs".into(),
+                kind: ContextRefKind::File,
+                checkout_id: "host-checkout".into(),
+                token_start: 0,
+                token_end: 7,
+            }],
+        )]);
+        replace_with_queued_context(
+            &mut all,
+            "chat-a",
+            "edit @new.rs",
+            &[stamped_file("new.rs")],
+        );
+        let selections = all.get("chat-a").unwrap();
+        assert_eq!(selections.len(), 1);
+        assert_eq!(selections[0].path, "new.rs");
+    }
+
+    #[test]
+    fn ambiguous_duplicate_queue_context_requires_reselection() {
+        let prompt = "typed @same.rs then selected @same.rs";
+        assert!(queued_context_selections(prompt, &[stamped_file("same.rs")]).is_empty());
+    }
+
+    #[test]
+    fn queue_context_never_rehydrates_a_prefix_inside_a_longer_token() {
+        assert!(queued_context_selections("inspect @foobar", &[stamped_file("foo")]).is_empty());
+    }
+
+    #[test]
+    fn queue_context_never_rehydrates_a_midword_at_sign() {
+        assert!(queued_context_selections("inspect x@foo", &[stamped_file("foo")]).is_empty());
+    }
+
+    #[test]
+    fn clearing_an_edit_or_wizard_draft_also_revokes_provenance() {
+        let text = "edit @same.rs";
+        let selection = ContextSelection {
+            path: "same.rs".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 5,
+            token_end: text.len(),
+        };
+        let mut drafts = HashMap::from([("chat-a".into(), text.into())]);
+        let mut context = HashMap::from([("chat-a".into(), vec![selection])]);
+        clear_draft_provenance(&mut drafts, &mut context, "chat-a");
+        assert!(!drafts.contains_key("chat-a"));
+        assert!(selected_context_refs(text, context.get("chat-a")).is_empty());
+    }
+
+    #[test]
+    fn programmatic_completion_shifts_later_selected_occurrences() {
+        let before = "/x @src/foo.rs";
+        let mut selections = vec![ContextSelection {
+            path: "src/foo.rs".into(),
+            kind: ContextRefKind::File,
+            checkout_id: "host-checkout".into(),
+            token_start: 3,
+            token_end: before.len(),
+        }];
+        apply_context_edit(
+            &mut selections,
+            &ComposerTextEdit {
+                replaced: 0..2,
+                inserted_len: "/longer-skill ".len(),
+            },
+        );
+        let after = "/longer-skill  @src/foo.rs";
+        assert_eq!(selected_context_refs(after, Some(&selections)).len(), 1);
+    }
+
+    #[test]
+    fn queued_add_retry_key_is_stable_and_chat_scoped() {
+        let context = vec![ContextRef::file("src/foo.rs")];
+        let first = queue_add_gesture_key("chat-a", "follow up", &context);
+        assert_eq!(
+            first,
+            queue_add_gesture_key("chat-a", "follow up", &context),
+            "a response-loss retry finds the same retained command/message ids"
+        );
+        assert_ne!(
+            first,
+            queue_add_gesture_key("chat-b", "follow up", &context)
+        );
+        assert_ne!(first, queue_add_gesture_key("chat-a", "changed", &context));
     }
 
     #[test]

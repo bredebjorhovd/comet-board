@@ -54,8 +54,38 @@ fn session_store_swift() -> String {
     read("apps/ios/Comet/Sync/SessionStore.swift")
 }
 
+fn composer_swift() -> String {
+    read("apps/ios/Comet/Composer/ComposerView.swift")
+}
+
 fn doc_disk_swift() -> String {
     read("apps/ios/Comet/Sync/DocDisk.swift")
+}
+
+/// The Swift test harness cannot replace Loro's document with an insertion
+/// failure. Keep the source-level ownership rule explicit: durable append
+/// reports a Bool, and both destructive composer transitions are gated on it.
+#[test]
+fn ios_followup_drafts_survive_a_failed_durable_append() {
+    let store = session_store_swift();
+    let composer = composer_swift();
+    assert!(
+        store.contains("private func queueCommand(kind: String, payload: [String: Any],")
+            && store.contains("context: [ContextRef] = [], expires: Bool = true) -> Bool")
+            && store.contains("if queued { nudgeHost() }")
+            && store.contains("return queued"),
+        "SessionStore must report durable command insertion success"
+    );
+    assert!(
+        composer.contains("guard store.queueFollowup(prompt: prompt, context: context) else")
+            && composer.contains("if store.editFollowup(id: row.id, prompt: editText")
+            && composer.contains("saveQueueControl(store.moveFollowup")
+            && composer.contains("saveQueueControl(store.removeFollowup")
+            && composer.contains("saveQueueControl(store.runNext")
+            && composer.contains("saveQueueControl(store.setFollowupsPaused")
+            && composer.contains("followupFailure ="),
+        "Composer must retain drafts/edits and surface every failed queue write"
+    );
 }
 
 /// `const NAME: Duration = Duration::from_secs(30);` → 30_000 ms.

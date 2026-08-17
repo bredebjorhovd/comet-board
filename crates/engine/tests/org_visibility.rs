@@ -292,6 +292,7 @@ async fn a_teammate_opening_a_shared_chat_never_executes_it() {
             expires_at: None,
             status: SessionCommandStatus::Pending,
             resolution: None,
+            context: Vec::new(),
         })
         .expect("queue command");
 

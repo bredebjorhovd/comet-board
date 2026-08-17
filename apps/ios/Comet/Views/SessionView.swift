@@ -225,7 +225,14 @@ struct SessionView: View {
                 }
                 .padding(.bottom, 8)
             } else {
-                ComposerView(store: store, chat: chat, runLive: status == .working)
+                ComposerView(
+                    store: store,
+                    chat: chat,
+                    runLive: status == .working,
+                    searchContext: { query in
+                        await model.searchContext(chat: chat, query: query)
+                    }
+                )
                     .padding(.bottom, 8)
             }
         }

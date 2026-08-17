@@ -44,8 +44,26 @@ pub mod methods {
     /// account that chat names — a laptop enumerating its own `~/.claude` for a
     /// chat running on the box would offer skills that run cannot invoke.
     pub const LIST_SKILLS: &str = "ListSkills";
+    /// Files and directories under the chat's own checkout, for the composer's
+    /// `@` picker (gh#424). Params: `{chatId?, cwd?, query, limit?}` →
+    /// [`comet_proto::ContextSearch`].
+    ///
+    /// Forwardable, and it has to be, for a sharper version of the reason
+    /// [`LIST_SKILLS`] is: the checkout is a directory on the device that hosts
+    /// the chat — a laptop searching its own disk for a chat running on the box
+    /// would offer paths that do not exist where the turn runs. Bounded per
+    /// call rather than indexed; the reply says when it was truncated.
+    pub const SEARCH_CONTEXT_FILES: &str = "SearchContextFiles";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Stream: the chat's follow-up plan ([`comet_doc::QueueView`]), current
+    /// value first, then every change (gh#424).
+    ///
+    /// The projection rather than the raw ledger: the plan is a fold over
+    /// append-only entries, and a viewport that folded it itself could show a
+    /// different plan for the same doc. One fold, on the host, watched like the
+    /// transcript is.
+    pub const WATCH_DOC_QUEUE: &str = "WatchDocQueue";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";

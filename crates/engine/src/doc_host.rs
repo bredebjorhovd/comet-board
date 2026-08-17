@@ -8,9 +8,9 @@
 //! - on every doc change (local commit or remote import) the handle re-emits the joined
 //!   transcript to watchers, drains pending commands, and schedules a snapshot save;
 //! - command drain: evaluate via `evaluate_command` (with the DocsStore processed
-//!   ledger), execute `Run` commands before marking them processed so a crash cannot
-//!   strand a paid turn before spawn, retain mark-before-execute for non-Run side
-//!   effects, then write the outcome status back as the sole outcome writer.
+//!   ledger), execute recoverable Run/Queue commands, durably snapshot their terminal
+//!   outcome, and only then mark them processed so neither crash window can strand or
+//!   duplicate a paid turn; other side effects retain mark-before-execute.
 //!
 //! Chat ownership is gated on the workspace doc (`chats[chat_id].deviceId`), with
 //! claim-on-first-command for unknown chats. Queueing a command for a chat hosted on
@@ -36,11 +36,11 @@ use tokio::sync::watch;
 
 use comet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, SessionCommandEntry, SessionCommandPayload,
+    MessagePart, MessageRole, MessageStatus, QueueView, SessionCommandEntry, SessionCommandPayload,
     SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
-    join_continuation_entries,
+    join_continuation_entries, queue,
 };
-use comet_proto::{HarnessId, UserInputAnswer, UserInputQuestion};
+use comet_proto::{ContextRef, HarnessId, UserInputAnswer, UserInputQuestion};
 use comet_sync::{DocsStore, RoomClient};
 
 use crate::sessions::{SessionsEngine, SteerOutcome};
@@ -80,6 +80,8 @@ const RELEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// must therefore run the command.
 #[cfg(test)]
 static FAIL_BEFORE_RUN_DISPATCH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+#[cfg(test)]
+static FAIL_AFTER_OUTCOME_PERSIST: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Resident-memory estimate per compressed snapshot byte. Loro snapshots are
 /// columnar+compressed; the in-memory doc plus mirror runs well above the blob
@@ -197,6 +199,7 @@ struct DocHostInner {
     config: DocHostConfig,
     sessions: OnceLock<SessionsEngine>,
     workspace: OnceLock<WorkspaceHost>,
+    repos: OnceLock<crate::Repos>,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
     /// Commands whose session snapshot must be durable before the executor may
     /// see them. Checkout-preparation handoff is the only producer.
@@ -225,6 +228,9 @@ pub struct ChatDocHandle {
     doc: RwLock<Arc<SessionDoc>>,
     changed_tx: watch::Sender<u64>,
     messages_tx: watch::Sender<Vec<SessionMessageEntry>>,
+    /// The follow-up plan, folded from the command ledger (gh#424) and
+    /// republished on every commit that anybody is watching for.
+    queue_tx: watch::Sender<QueueView>,
     /// The session room, supervised by [`crate::workspace_host::spawn_room_join`].
     /// An `Arc` because the supervisor holds a `Weak` to it: dropping the handle
     /// is what ends the supervision (and, with it, the room client).
@@ -242,24 +248,39 @@ pub struct ChatDocHandle {
     _sub: Mutex<loro::Subscription>,
 }
 
-fn replay_unresolved_device_commands(
+fn reconcile_device_commands(
     stale: &SessionDoc,
     replacement: &SessionDoc,
     device_id: &str,
 ) -> Result<usize, DocError> {
-    let existing: HashSet<String> = replacement
+    let existing: HashMap<String, SessionCommandStatus> = replacement
         .read_commands()?
         .into_iter()
-        .map(|command| command.id)
+        .map(|command| (command.id, command.status))
         .collect();
     let mut replayed = 0;
-    for command in stale.read_commands()?.into_iter().filter(|command| {
-        command.status == SessionCommandStatus::Pending
-            && command.issued_by == device_id
-            && !existing.contains(&command.id)
-    }) {
-        replacement.queue_command(&command)?;
-        replayed += 1;
+    for command in stale
+        .read_commands()?
+        .into_iter()
+        .filter(|command| command.issued_by == device_id)
+    {
+        match existing.get(&command.id) {
+            None => {
+                replacement.queue_command(&command)?;
+                replayed += 1;
+            }
+            Some(SessionCommandStatus::Pending)
+                if command.status != SessionCommandStatus::Pending =>
+            {
+                replacement.set_command_status(
+                    &command.id,
+                    command.status,
+                    command.resolution.as_deref(),
+                )?;
+                replayed += 1;
+            }
+            _ => {}
+        }
     }
     Ok(replayed)
 }
@@ -283,7 +304,10 @@ impl ChatDocHandle {
     /// watched chat would cut a live viewer's transcript off — the sweep pins on
     /// this rather than letting the UI discover it.
     fn watched(&self) -> bool {
-        self.messages_tx.receiver_count() > 0
+        // The plan watch counts too: it is fed the same way and ends the same
+        // way, so releasing a chat somebody has a queue tray open on would cut
+        // that tray off exactly as it would cut a transcript off.
+        self.messages_tx.receiver_count() > 0 || self.queue_tx.receiver_count() > 0
     }
 
     pub fn doc(&self) -> Arc<SessionDoc> {
@@ -309,11 +333,8 @@ impl ChatDocHandle {
         // command either finishes on the old owner and is copied below, or
         // starts after the replacement is visible and writes there directly.
         let mut owner = self.doc.write().unwrap_or_else(PoisonError::into_inner);
-        let replayed = replay_unresolved_device_commands(
-            owner.as_ref(),
-            replacement.as_ref(),
-            &self.device_id,
-        )?;
+        let replayed =
+            reconcile_device_commands(owner.as_ref(), replacement.as_ref(), &self.device_id)?;
         let changed_tx = self.changed_tx.clone();
         let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
             changed_tx.send_modify(|v| *v = v.wrapping_add(1));
@@ -343,6 +364,44 @@ impl ChatDocHandle {
             self.publish_messages();
         }
         rx
+    }
+
+    /// The follow-up plan watch — the projection, re-sent on every doc change
+    /// (`WatchDocQueue`, gh#424).
+    ///
+    /// A watch of the *derived* plan rather than of the raw ledger: every
+    /// viewport would otherwise fold the same log itself, and a device that
+    /// folded a beat differently would show a different plan for the same doc.
+    /// The fold is pure and cheap, so the host does it once.
+    pub fn watch_queue(&self) -> watch::Receiver<QueueView> {
+        self.touch();
+        let rx = self.queue_tx.subscribe();
+        self.publish_queue();
+        rx
+    }
+
+    /// The plan as it stands, folded from this doc's ledger.
+    pub fn queue_view(&self) -> QueueView {
+        match self.with_current(|doc| doc.read_commands()) {
+            Ok(commands) => queue::project(&commands),
+            Err(err) => {
+                tracing::warn!(chat = %self.chat_id, error = %err, "command read failed");
+                QueueView::default()
+            }
+        }
+    }
+
+    fn publish_queue(&self) {
+        self.queue_tx.send_replace(self.queue_view());
+    }
+
+    /// Per-commit publish path, watched-only for the same reason the transcript
+    /// mirror is: folding a plan nobody is looking at is per-commit work on
+    /// every open doc, and the fold is rebuilt on attach anyway.
+    fn publish_queue_if_watched(&self) {
+        if self.queue_tx.receiver_count() > 0 {
+            self.publish_queue();
+        }
     }
 
     /// Is this chat's session room joined RIGHT NOW? (Not "do we hold a client"
@@ -497,6 +556,7 @@ impl DocHost {
                 config,
                 sessions: OnceLock::new(),
                 workspace: OnceLock::new(),
+                repos: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
                 durable_pending: Mutex::new(HashSet::new()),
                 starting_runs: Mutex::new(HashSet::new()),
@@ -518,6 +578,10 @@ impl DocHost {
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
     pub fn set_workspace(&self, workspace: WorkspaceHost) {
         let _ = self.inner.workspace.set(workspace);
+    }
+
+    pub fn set_repos(&self, repos: crate::Repos) {
+        let _ = self.inner.repos.set(repos);
     }
 
     /// The workspace host, once wired (tests may assemble a DocHost without one).
@@ -591,6 +655,7 @@ impl DocHost {
         // drains, nudges) never watch the transcript, and the first
         // watch_messages attach materializes it on demand.
         let (messages_tx, _) = watch::channel(Vec::new());
+        let (queue_tx, _) = watch::channel(QueueView::default());
 
         let handle = Arc::new(ChatDocHandle {
             chat_id: chat_id.to_string(),
@@ -598,6 +663,7 @@ impl DocHost {
             doc: RwLock::new(doc.clone()),
             changed_tx: changed_tx.clone(),
             messages_tx,
+            queue_tx,
             room: Arc::new(Mutex::new(None)),
             last_used: AtomicI64::new(now_ms()),
             mirror_dirty: AtomicBool::new(true),
@@ -750,7 +816,13 @@ impl DocHost {
     /// [`Self::release_idle`] with the clock and the bounds passed in — the seam
     /// the policy tests drive, so they need neither a five-minute wait nor 32
     /// chats.
-    fn release_idle_at(&self, now: i64, idle_ms: i64, max_open: usize, byte_budget: usize) -> usize {
+    fn release_idle_at(
+        &self,
+        now: i64,
+        idle_ms: i64,
+        max_open: usize,
+        byte_budget: usize,
+    ) -> usize {
         // Pass 1, under the lock: everything the cache itself knows. No call out
         // to another service from here — a dispatch on another thread walks
         // sessions → doc host, and this lock must never be held facing back.
@@ -846,8 +918,23 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
+        self.queue_command_with_context(chat_id, payload, Vec::new())
+    }
+
+    /// [`Self::queue_command`] carrying typed `@` references (gh#424).
+    ///
+    /// The references ride the entry rather than the prompt text because the
+    /// text is a text: it can be edited, pasted, re-wrapped, and a renderer's
+    /// chip decoration cannot survive any of that, let alone a surface that
+    /// draws no chips. What the host resolves at execute time is this list.
+    pub fn queue_command_with_context(
+        &self,
+        chat_id: &str,
+        payload: SessionCommandPayload,
+        context: Vec<ContextRef>,
+    ) -> Result<String, EngineError> {
         let id = new_id();
-        self.queue_command_with_id(chat_id, &id, payload)?;
+        self.queue_command_with_id_and_context(chat_id, &id, payload, context)?;
         Ok(id)
     }
 
@@ -860,25 +947,48 @@ impl DocHost {
         id: &str,
         payload: SessionCommandPayload,
     ) -> Result<(), EngineError> {
+        self.queue_command_with_id_and_context(chat_id, id, payload, Vec::new())
+    }
+
+    pub fn queue_command_with_id_and_context(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+        context: Vec<ContextRef>,
+    ) -> Result<(), EngineError> {
         let handle = self.open(chat_id)?;
         let now = now_ms();
         handle.with_current(|doc| {
-            if doc.read_commands()?.iter().any(|command| command.id == id) {
-                return Ok(());
+            if let Some(existing) = doc
+                .read_commands()?
+                .into_iter()
+                .find(|command| command.id == id)
+            {
+                if existing.payload == payload && existing.context == context {
+                    return Ok(());
+                }
+                return Err(comet_doc::DocError::Schema(format!(
+                    "command id collision: {id} already names different intent"
+                )));
             }
             let based_on = doc.read_entries()?.last().map(|m| CommandBasedOn {
                 turn_id: Some(m.id.clone()),
                 frontier: None,
             });
+            // A queued follow-up (and any mutation of the plan) carries no
+            // TTL: it was deliberately written to wait.
+            let expires_at = entry_expires(&payload).then_some(now + COMMAND_DEFAULT_TTL_MS);
             doc.queue_command(&SessionCommandEntry {
                 id: id.to_string(),
                 payload,
                 issued_by: self.inner.config.device_id.clone(),
                 issued_at: now,
                 based_on,
-                expires_at: Some(now + COMMAND_DEFAULT_TTL_MS),
+                expires_at,
                 status: SessionCommandStatus::Pending,
                 resolution: None,
+                context,
             })
         })?;
         // §7 durable delivery: when another device hosts this chat, nudge its device
@@ -900,8 +1010,18 @@ impl DocHost {
         id: &str,
         payload: SessionCommandPayload,
     ) -> Result<(), EngineError> {
+        self.queue_command_with_id_and_context_durable(chat_id, id, payload, Vec::new())
+    }
+
+    pub fn queue_command_with_id_and_context_durable(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+        context: Vec<ContextRef>,
+    ) -> Result<(), EngineError> {
         lock(&self.inner.durable_pending).insert(id.to_string());
-        if let Err(error) = self.queue_command_with_id(chat_id, id, payload) {
+        if let Err(error) = self.queue_command_with_id_and_context(chat_id, id, payload, context) {
             lock(&self.inner.durable_pending).remove(id);
             return Err(error);
         }
@@ -913,7 +1033,9 @@ impl DocHost {
         lock(&self.inner.durable_pending).remove(id);
         // The notification raised by the append may already have drained while
         // this id was gated. Raise another after the durable acknowledgement.
-        handle.changed_tx.send_modify(|value| *value = value.wrapping_add(1));
+        handle
+            .changed_tx
+            .send_modify(|value| *value = value.wrapping_add(1));
         Ok(())
     }
 
@@ -1118,6 +1240,7 @@ impl DocHost {
             let messages = doc.read_entries().unwrap_or_default();
             let current_turn_id = messages.last().map(|m| m.id.clone());
             let turn_is_past = |turn_id: &str| messages.iter().any(|m| m.id == turn_id);
+            let plan = queue::project(&commands);
             let disposition = evaluate_command(
                 &entry,
                 &EvaluationContext {
@@ -1126,8 +1249,17 @@ impl DocHost {
                     entries: &commands,
                     current_turn_id: current_turn_id.as_deref(),
                     turn_is_past: &turn_is_past,
+                    queue: &plan,
+                    chat_is_running: self.chat_is_running(&handle.chat_id),
                 },
             );
+            // A deferred follow-up remains durable and pending. It must not
+            // enter the processed ledger until its turn is actually owned.
+            if disposition == CommandDisposition::Defer {
+                skipped.insert(entry.id.clone());
+                continue;
+            }
+
             // A Run is different from every other command side effect. The
             // sessions engine installs its RunHandle before dispatch returns,
             // and engine death tears that run down. Marking it processed
@@ -1135,7 +1267,10 @@ impl DocHost {
             // hole for checkout recovery. Keep the durable command Pending,
             // claim it in-process, and mark only after Sessions owns the run.
             let recoverable_run = matches!(disposition, CommandDisposition::Execute)
-                && matches!(&entry.payload, SessionCommandPayload::Run { .. });
+                && matches!(
+                    &entry.payload,
+                    SessionCommandPayload::Run { .. } | SessionCommandPayload::Queue { .. }
+                );
             if recoverable_run {
                 if !lock(&self.inner.starting_runs).insert(entry.id.clone()) {
                     skipped.insert(entry.id.clone());
@@ -1154,6 +1289,22 @@ impl DocHost {
                     Ok(outcome) => outcome,
                     Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                 };
+                if let Err(err) =
+                    self.persist_command_outcome(handle, &entry.id, status, resolution.as_deref())
+                {
+                    tracing::error!(chat = %handle.chat_id, command = %entry.id, error = %err,
+                        "run outcome snapshot failed; retaining command claim until restart");
+                    return;
+                }
+                #[cfg(test)]
+                {
+                    let failpoint = FAIL_AFTER_OUTCOME_PERSIST.get_or_init(|| Mutex::new(None));
+                    let mut command = lock(failpoint);
+                    if command.as_deref() == Some(entry.id.as_str()) {
+                        command.take();
+                        return;
+                    }
+                }
                 if let Err(err) = self.inner.store.mark_processed(&entry.id) {
                     // Retain the in-process claim. Re-running after Sessions
                     // has accepted the prompt would duplicate a turn; restart
@@ -1164,7 +1315,6 @@ impl DocHost {
                     return;
                 }
                 lock(&self.inner.starting_runs).remove(&entry.id);
-                self.resolve_command(handle, &entry.id, status, resolution.as_deref());
                 continue;
             }
 
@@ -1175,6 +1325,7 @@ impl DocHost {
                 return;
             }
             match disposition {
+                CommandDisposition::Defer => unreachable!("handled above"),
                 CommandDisposition::Skip => {
                     skipped.insert(entry.id.clone());
                 }
@@ -1183,6 +1334,14 @@ impl DocHost {
                 }
                 CommandDisposition::Superseded => {
                     self.resolve_command(handle, &entry.id, SessionCommandStatus::Superseded, None);
+                }
+                CommandDisposition::Cancelled => {
+                    self.resolve_command(
+                        handle,
+                        &entry.id,
+                        SessionCommandStatus::Cancelled,
+                        Some("removed from the queue"),
+                    );
                 }
                 CommandDisposition::Execute => {
                     let (status, resolution) = match self.execute(sessions, handle, &entry).await {
@@ -1193,6 +1352,22 @@ impl DocHost {
                 }
             }
         }
+    }
+
+    /// Is a turn live on this chat? Distinct from [`Self::chat_is_busy`], which
+    /// answers "may the handle be released" and stays true for a PARKED
+    /// persistent session — a follow-up gated on that would never run, because a
+    /// steerable harness parks for thirty minutes after every completed turn.
+    /// What a follow-up waits for is the turn, not the process.
+    fn chat_is_running(&self, chat_id: &str) -> bool {
+        self.inner.sessions.get().is_some_and(|sessions| {
+            matches!(
+                sessions.session_status(chat_id).map(|s| s.status),
+                Some(
+                    comet_proto::SessionStatus::Working | comet_proto::SessionStatus::AwaitingInput
+                )
+            )
+        })
     }
 
     /// Host-only outcome write (ledger rule 2).
@@ -1249,15 +1424,32 @@ impl DocHost {
                 {
                     request.cwd = cwd;
                 }
+                // References resolve HERE, against the checkout this run is
+                // about to start in — not where they were picked. That is what
+                // makes a file picked on a phone name the same file when the
+                // box runs the turn, and the only place an escape can be caught.
+                let context = self
+                    .apply_context(chat_id, &request.cwd, &entry.context, &mut request.prompt)
+                    .await?;
                 let harness = self.harness_for(chat_id);
                 sessions
                     .dispatch(chat_id, harness, request, Some(message_id.clone()))
                     .await?;
-                Ok((SessionCommandStatus::Applied, None))
+                Ok((SessionCommandStatus::Applied, context))
             }
             SessionCommandPayload::Steer { prompt, message_id } => {
+                let mut prompt = prompt.clone();
+                let context = self
+                    .apply_context(
+                        chat_id,
+                        &self.checkout_root(chat_id, sessions),
+                        &entry.context,
+                        &mut prompt,
+                    )
+                    .await?;
+                let prompt = &prompt;
                 match sessions.steer(chat_id, prompt, message_id.clone()).await? {
-                    SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, None)),
+                    SteerOutcome::Accepted => Ok((SessionCommandStatus::Applied, context)),
                     SteerOutcome::NotSteerable => {
                         // No live steerable run: the durable command still delivers —
                         // run it as the next turn (comet's fallback, executor-side).
@@ -1291,7 +1483,10 @@ impl DocHost {
                             .await?;
                         Ok((
                             SessionCommandStatus::Applied,
-                            Some("queued as new turn".into()),
+                            Some(match context {
+                                Some(context) => format!("queued as new turn; {context}"),
+                                None => "queued as new turn".into(),
+                            }),
                         ))
                     }
                 }
@@ -1367,7 +1562,144 @@ impl DocHost {
                     Some("answered as new turn".into()),
                 ))
             }
+            // A follow-up whose turn has come (the drain only reaches this once
+            // the plan says so — head of an unpaused queue, nothing running).
+            SessionCommandPayload::Queue {
+                prompt,
+                message_id,
+                attachments,
+            } => {
+                // The PLAN's text, not the entry's: an edit is a later ledger
+                // entry, and running the original would run the version the user
+                // replaced. Falls back to the entry for a plan that no longer
+                // lists it, which the drain should have cancelled instead — a
+                // belt-and-braces path, never the normal one.
+                let row = handle
+                    .queue_view()
+                    .rows
+                    .into_iter()
+                    .find(|row| row.id == entry.id);
+                let (mut prompt, context, attachments) = match row {
+                    Some(row) => (row.prompt, row.context, row.attachments),
+                    None => (prompt.clone(), entry.context.clone(), attachments.clone()),
+                };
+                // Same config source as the steer→new-turn fallback: the live
+                // request when there is one (a parked persistent session is
+                // reused — the follow-up becomes its next turn on the warm
+                // child), else the chat's workspace row after a restart.
+                let request = sessions
+                    .last_request(chat_id)
+                    .or_else(|| self.request_from_chat_row(chat_id, &prompt));
+                let Some(mut request) = request else {
+                    return Ok((
+                        SessionCommandStatus::Rejected,
+                        Some("no run config for the queued follow-up".into()),
+                    ));
+                };
+                let note = self
+                    .apply_context(chat_id, &request.cwd, &context, &mut prompt)
+                    .await?;
+                request.prompt = prompt;
+                request.resume = None; // dispatch re-derives the harness session
+                request.attachments = attachments; // this row's images, never the previous turn's
+                sessions
+                    .dispatch(
+                        chat_id,
+                        self.harness_for(chat_id),
+                        request,
+                        Some(message_id.clone()),
+                    )
+                    .await?;
+                Ok((
+                    SessionCommandStatus::Applied,
+                    Some(match note {
+                        Some(note) => format!("ran from the queue; {note}"),
+                        None => "ran from the queue".into(),
+                    }),
+                ))
+            }
+            // A mutation of the plan has no side effect to execute: its effect
+            // IS the entry, which every reader of the ledger already folds
+            // ([`comet_doc::queue::project`]). Marking it applied is what stops
+            // the drain from re-examining it, and what tells the client its
+            // optimistic edit landed durably.
+            SessionCommandPayload::QueueControl { op } => {
+                Ok((SessionCommandStatus::Applied, Some(control_note(op))))
+            }
         }
+    }
+
+    /// The checkout a chat's `@` references resolve against: the workspace row's
+    /// cwd (what the run will actually use), falling back to the live request's.
+    fn checkout_root(&self, chat_id: &str, sessions: &SessionsEngine) -> String {
+        self.workspace()
+            .and_then(|ws| ws.doc().chat(chat_id).ok().flatten())
+            .and_then(|chat| chat.cwd)
+            .filter(|cwd| !cwd.is_empty())
+            .or_else(|| sessions.last_request(chat_id).map(|r| r.cwd))
+            .unwrap_or_default()
+    }
+
+    /// Resolve an instruction's references against `root`, appending the
+    /// staleness note to `prompt`. Returns the one-line account for the ledger.
+    ///
+    /// `Err` for a reference that escapes the checkout — which fails the command
+    /// rather than dropping the reference, because the picker cannot produce one
+    /// and a client that did is not a client whose other references should be
+    /// trusted into a prompt.
+    async fn apply_context(
+        &self,
+        chat_id: &str,
+        root: &str,
+        refs: &[ContextRef],
+        prompt: &mut String,
+    ) -> Result<Option<String>, EngineError> {
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        if root.is_empty() {
+            return Err(EngineError::Other(
+                "context references need a checkout, and this chat has no cwd".into(),
+            ));
+        }
+        let workspace = self.workspace().ok_or_else(|| {
+            EngineError::Other("context references require a workspace host".into())
+        })?;
+        let chat = workspace
+            .doc()
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other("context references require a chat row".into()))?;
+        let space_id = chat.space_id.as_deref().ok_or_else(|| {
+            EngineError::Other("context references require an owning space".into())
+        })?;
+        let space = workspace
+            .doc()
+            .space(space_id)?
+            .filter(|space| space.device_id == workspace.device_id())
+            .ok_or_else(|| {
+                EngineError::Other("context checkout is not owned by this host".into())
+            })?;
+        let repos =
+            self.inner.repos.get().ok_or_else(|| {
+                EngineError::Other("context checkout registry is unavailable".into())
+            })?;
+        let validated_root = repos
+            .validated_checkout_root(&space.path, root)
+            .await
+            .ok_or_else(|| EngineError::Other("context checkout is not registered".into()))?;
+        let declared_checkout = chat.checkout_id.or(space.checkout_id);
+        let device_id = workspace.device_id().to_string();
+        let expected_checkout = crate::context_files::checkout_identity(
+            &device_id,
+            &validated_root,
+            declared_checkout.as_deref(),
+        );
+        crate::context_files::validate_checkout(refs, Some(&expected_checkout))?;
+        let resolved = crate::context_files::resolve(&validated_root, refs)?;
+        if let Some(note) = crate::context_files::missing_note(&resolved) {
+            prompt.push_str(&note);
+        }
+        Ok(crate::context_files::resolution_note(&resolved))
     }
 
     /// A steer-turned-run with no in-process `last_request` (engine restarted
@@ -1413,6 +1745,35 @@ impl DocHost {
         self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
         handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
         Ok(bytes.len())
+    }
+
+    fn persist_command_outcome(
+        &self,
+        handle: &ChatDocHandle,
+        command_id: &str,
+        status: SessionCommandStatus,
+        resolution: Option<&str>,
+    ) -> Result<usize, EngineError> {
+        self.persist_command_outcome_with_hook(handle, command_id, status, resolution, || {})
+    }
+
+    fn persist_command_outcome_with_hook(
+        &self,
+        handle: &ChatDocHandle,
+        command_id: &str,
+        status: SessionCommandStatus,
+        resolution: Option<&str>,
+        after_status: impl FnOnce(),
+    ) -> Result<usize, EngineError> {
+        let bytes_len = handle.with_current(|doc| -> Result<usize, EngineError> {
+            doc.set_command_status(command_id, status, resolution)?;
+            after_status();
+            let bytes = doc.export_snapshot()?;
+            self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+            Ok(bytes.len())
+        })?;
+        handle.snapshot_bytes.store(bytes_len, Ordering::Relaxed);
+        Ok(bytes_len)
     }
 
     fn save_snapshot(&self, handle: &ChatDocHandle) {
@@ -1539,6 +1900,30 @@ pub fn respond_input_prompt(
     lines.join("\n")
 }
 
+/// What a plan mutation writes into the ledger's `resolution` — the line a
+/// client renders next to the entry, and the only trace an op leaves once its
+/// effect has been folded into the plan.
+fn control_note(op: &comet_doc::QueueOp) -> String {
+    use comet_doc::QueueOp;
+    match op {
+        QueueOp::Edit { target, .. } => format!("edited {target}"),
+        QueueOp::Move { target, .. } => format!("reordered {target}"),
+        QueueOp::Remove { target } => format!("removed {target}"),
+        QueueOp::Clear {} => "cleared the queue".into(),
+        QueueOp::Pause {} => "paused the queue".into(),
+        QueueOp::Resume {} => "resumed the queue".into(),
+        QueueOp::RunNext { target } => format!("run {target} next"),
+    }
+}
+
+/// Does this command kind get the send TTL?
+fn entry_expires(payload: &SessionCommandPayload) -> bool {
+    !matches!(
+        payload,
+        SessionCommandPayload::Queue { .. } | SessionCommandPayload::QueueControl { .. }
+    )
+}
+
 /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
@@ -1562,6 +1947,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 // Keeps a chat that is quietly syncing out of the idle sweep.
                 handle.touch();
                 handle.publish_messages_if_watched();
+                handle.publish_queue_if_watched();
                 host.drain_commands(&handle).await;
                 if save_deadline.is_none() {
                     save_deadline = Some(
@@ -1769,7 +2155,14 @@ mod tests {
         let now = 1_000_000;
         assert!(rooms_to_release(Vec::new(), now, 30_000, 4, NO_BUDGET).is_empty());
         assert!(
-            rooms_to_release(vec![candidate("fresh", now, false)], now, 30_000, 4, NO_BUDGET).is_empty(),
+            rooms_to_release(
+                vec![candidate("fresh", now, false)],
+                now,
+                30_000,
+                4,
+                NO_BUDGET
+            )
+            .is_empty(),
             "a quiet, under-bound cache is left alone"
         );
     }
@@ -1912,6 +2305,7 @@ mod tests {
                     .queue_command(&SessionCommandEntry {
                         id: "boundary-command".into(),
                         payload: SessionCommandPayload::Interrupt {},
+                        context: Vec::new(),
                         issued_by: queue_handle.device_id.clone(),
                         issued_at: 1,
                         based_on: None,
@@ -1957,21 +2351,261 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_terminal_outcome_crossing_reseed_never_reopens_pending_and_processed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_host = host(dir.path());
+        let chat_id = "chat-outcome-reseed";
+        let command_id = "outcome-reseed";
+        first_host
+            .queue_command_with_id(
+                chat_id,
+                command_id,
+                SessionCommandPayload::Queue {
+                    prompt: "already dispatched".into(),
+                    message_id: "outcome-reseed-message".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        let handle = first_host.open(chat_id).unwrap();
+
+        // The incoming room snapshot was cut while the command was Pending.
+        let replacement = SessionDoc::init(chat_id).unwrap();
+        let pending = handle
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|command| command.id == command_id)
+            .unwrap();
+        replacement.queue_command(&pending).unwrap();
+
+        let (outcome_written_tx, outcome_written_rx) = std::sync::mpsc::channel();
+        let (release_outcome_tx, release_outcome_rx) = std::sync::mpsc::channel();
+        let outcome_host = first_host.clone();
+        let outcome_handle = handle.clone();
+        let outcome = std::thread::spawn(move || {
+            outcome_host
+                .persist_command_outcome_with_hook(
+                    &outcome_handle,
+                    command_id,
+                    SessionCommandStatus::Applied,
+                    Some("dispatched"),
+                    || {
+                        outcome_written_tx.send(()).unwrap();
+                        release_outcome_rx.recv().unwrap();
+                    },
+                )
+                .unwrap();
+            outcome_host.inner.store.mark_processed(command_id).unwrap();
+        });
+        outcome_written_rx.recv().unwrap();
+
+        let (reseed_done_tx, reseed_done_rx) = std::sync::mpsc::channel();
+        let reseed_handle = handle.clone();
+        let reseed = std::thread::spawn(move || {
+            reseed_handle.reseed(replacement.doc().clone()).unwrap();
+            reseed_done_tx.send(()).unwrap();
+        });
+        assert!(
+            reseed_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "reseed waits until status mutation and exact snapshot save finish"
+        );
+        release_outcome_tx.send(()).unwrap();
+        outcome.join().unwrap();
+        reseed.join().unwrap();
+        reseed_done_rx.recv().unwrap();
+
+        let current = handle.doc().read_commands().unwrap();
+        assert!(current.iter().any(|command| {
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
+        }));
+        first_host.persist_snapshot(&handle).unwrap();
+
+        let restarted = host(dir.path());
+        let reopened = restarted.open(chat_id).unwrap();
+        let commands = reopened.doc().read_commands().unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
+        }));
+        assert!(restarted.inner.store.is_processed(command_id).unwrap());
+        assert!(!commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Pending
+        }));
+    }
+
+    #[tokio::test]
+    async fn an_absent_terminal_command_crossing_reseed_survives_processed_and_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_host = host(dir.path());
+        let chat_id = "chat-absent-outcome-reseed";
+        let command_id = "absent-outcome-reseed";
+        first_host
+            .queue_command_with_id(
+                chat_id,
+                command_id,
+                SessionCommandPayload::Queue {
+                    prompt: "already dispatched before server saw it".into(),
+                    message_id: "absent-outcome-message".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        let handle = first_host.open(chat_id).unwrap();
+
+        // This incoming snapshot predates the command entirely, not merely its
+        // outcome. It must receive the locally issued terminal row at reseed.
+        let replacement = SessionDoc::init(chat_id).unwrap();
+        let (outcome_written_tx, outcome_written_rx) = std::sync::mpsc::channel();
+        let (release_outcome_tx, release_outcome_rx) = std::sync::mpsc::channel();
+        let outcome_host = first_host.clone();
+        let outcome_handle = handle.clone();
+        let outcome = std::thread::spawn(move || {
+            outcome_host
+                .persist_command_outcome_with_hook(
+                    &outcome_handle,
+                    command_id,
+                    SessionCommandStatus::Applied,
+                    Some("dispatched"),
+                    || {
+                        outcome_written_tx.send(()).unwrap();
+                        release_outcome_rx.recv().unwrap();
+                    },
+                )
+                .unwrap();
+            outcome_host.inner.store.mark_processed(command_id).unwrap();
+        });
+        outcome_written_rx.recv().unwrap();
+
+        let (reseed_done_tx, reseed_done_rx) = std::sync::mpsc::channel();
+        let reseed_handle = handle.clone();
+        let reseed = std::thread::spawn(move || {
+            reseed_handle.reseed(replacement.doc().clone()).unwrap();
+            reseed_done_tx.send(()).unwrap();
+        });
+        assert!(
+            reseed_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "missing-snapshot reseed waits for the exact terminal snapshot"
+        );
+        release_outcome_tx.send(()).unwrap();
+        outcome.join().unwrap();
+        reseed.join().unwrap();
+        reseed_done_rx.recv().unwrap();
+
+        assert!(first_host.inner.store.is_processed(command_id).unwrap());
+        let current = handle.doc().read_commands().unwrap();
+        assert!(current.iter().any(|command| {
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
+        }));
+        first_host.persist_snapshot(&handle).unwrap();
+
+        let restarted = host(dir.path());
+        let commands = restarted
+            .open(chat_id)
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == command_id
+                && command.status == SessionCommandStatus::Applied
+                && command.resolution.as_deref() == Some("dispatched")
+        }));
+        assert!(restarted.inner.store.is_processed(command_id).unwrap());
+        assert!(!commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Pending
+        }));
+    }
+
+    #[tokio::test]
+    async fn typed_context_reaches_execution_validation_after_snapshot_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first_host = host(dir.path());
+        let chat_id = "chat-context-restart";
+        let context = vec![ContextRef {
+            path: "src/main.rs".into(),
+            kind: comet_proto::ContextRefKind::File,
+            checkout_id: Some("host-checkout".into()),
+        }];
+        first_host
+            .queue_command_with_id_and_context(
+                chat_id,
+                "context-restart",
+                SessionCommandPayload::Steer {
+                    prompt: "inspect @src/main.rs".into(),
+                    message_id: None,
+                },
+                context.clone(),
+            )
+            .unwrap();
+        let handle = first_host.open(chat_id).unwrap();
+        first_host.persist_snapshot(&handle).unwrap();
+
+        let restarted = host(dir.path());
+        let entry = restarted
+            .open(chat_id)
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap()
+            .into_iter()
+            .find(|command| command.id == "context-restart")
+            .unwrap();
+        assert_eq!(entry.context, context, "snapshot preserves typed authority");
+        let mut prompt = "inspect @src/main.rs".to_string();
+        let err = restarted
+            .apply_context(chat_id, "/registered/checkout", &entry.context, &mut prompt)
+            .await
+            .expect_err("the restored non-empty context reaches host validation");
+        assert!(
+            err.to_string().contains("workspace host"),
+            "validation was reached after restart: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_caller_owned_command_id_is_idempotent() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = host(dir.path());
-        host.queue_command_with_id(
+        let queued = SessionCommandPayload::Queue {
+            prompt: "first".into(),
+            message_id: "message-first".into(),
+            attachments: Vec::new(),
+        };
+        host.queue_command_with_id_and_context(
             "chat-fixed-command",
             "prep-release-1",
-            SessionCommandPayload::Interrupt {},
+            queued.clone(),
+            Vec::new(),
         )
         .unwrap();
+        // The append committed but its response was lost. Another client's
+        // operation lands before the original gesture retries.
         host.queue_command_with_id(
             "chat-fixed-command",
-            "prep-release-1",
-            SessionCommandPayload::Interrupt {},
+            "intervening-control",
+            SessionCommandPayload::QueueControl {
+                op: comet_doc::QueueOp::Pause {},
+            },
         )
         .unwrap();
+        host.queue_command_with_id_and_context(
+            "chat-fixed-command",
+            "prep-release-1",
+            queued,
+            Vec::new(),
+        )
+        .expect("same gesture retry is acknowledged without a second append");
         let commands = host
             .open("chat-fixed-command")
             .unwrap()
@@ -1985,6 +2619,23 @@ mod tests {
                 .count(),
             1
         );
+        assert_eq!(
+            commands.len(),
+            2,
+            "retry did not append after intervening work"
+        );
+
+        let collision = host.queue_command_with_id(
+            "chat-fixed-command",
+            "prep-release-1",
+            SessionCommandPayload::Interrupt {},
+        );
+        assert!(
+            collision
+                .expect_err("same id cannot acknowledge different intent")
+                .to_string()
+                .contains("collision")
+        );
     }
 
     #[tokio::test]
@@ -1992,12 +2643,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let first = host(dir.path());
         first
-            .queue_command_with_id_durable(
+            .queue_command_with_id_and_context_durable(
                 "chat-durable-command",
                 "prep-release-durable",
-                SessionCommandPayload::Interrupt {},
+                SessionCommandPayload::Queue {
+                    prompt: "survive acknowledged crash".into(),
+                    message_id: "durable-message".into(),
+                    attachments: Vec::new(),
+                },
+                Vec::new(),
             )
-            .expect("durable queue acknowledged");
+            .expect("durable follow-up acknowledged");
 
         // Do not flush or wait for the ordinary debounce. A new host reading
         // only the store models a crash immediately after the acknowledgement.
@@ -2009,9 +2665,98 @@ mod tests {
             .read_commands()
             .unwrap();
         assert!(commands.iter().any(|command| {
-            command.id == "prep-release-durable"
-                && command.status == SessionCommandStatus::Pending
+            command.id == "prep-release-durable" && command.status == SessionCommandStatus::Pending
         }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_queued_dispatch_snapshots_its_terminal_outcome_before_processed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let command_id = "queue-crash-after-outcome";
+        let chat_id = "chat-queue-crash-after-outcome";
+        let assemble = || {
+            let registry = crate::HarnessRegistry::new();
+            registry.register(Arc::new(comet_harness::mock::MockHarness {
+                script: vec![comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }],
+            }));
+            crate::EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+                .expect("engine assembles")
+        };
+
+        let core = assemble();
+        core.workspace
+            .create_space(
+                "space-queue-outcome",
+                &core.device_id,
+                &dir.path().to_string_lossy(),
+                None,
+                false,
+            )
+            .unwrap();
+        core.workspace
+            .create_chat(chat_id, "space-queue-outcome", None, None)
+            .unwrap();
+        *lock(FAIL_AFTER_OUTCOME_PERSIST.get_or_init(|| Mutex::new(None))) =
+            Some(command_id.into());
+        core.doc_host
+            .queue_command_with_id_and_context_durable(
+                chat_id,
+                command_id,
+                SessionCommandPayload::Queue {
+                    prompt: "one durable follow-up".into(),
+                    message_id: "one-durable-message".into(),
+                    attachments: Vec::new(),
+                },
+                Vec::new(),
+            )
+            .expect("queue acknowledgement is durable");
+
+        let handle = core.doc_host.open(chat_id).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if handle.doc().read_commands().unwrap().iter().any(|command| {
+                command.id == command_id && command.status == SessionCommandStatus::Applied
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "outcome crash point not reached"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!core.doc_host.inner.store.is_processed(command_id).unwrap());
+
+        core.shutdown().await;
+        drop(core);
+        let restarted = assemble();
+        let reopened = restarted
+            .doc_host
+            .open(chat_id)
+            .expect("terminal outcome reopens");
+        restarted.doc_host.drain_commands(&reopened).await;
+        let commands = reopened.doc().read_commands().unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == command_id && command.status == SessionCommandStatus::Applied
+        }));
+        assert_eq!(
+            reopened
+                .doc()
+                .read_entries()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry.role == MessageRole::User)
+                .count(),
+            1,
+            "a terminal queued command is not dispatched again after restart"
+        );
+        restarted.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2130,7 +2875,9 @@ mod tests {
         let host = host(dir.path());
 
         let handle = host.open("chat-doomed").expect("open");
-        handle.write_user_message("m1", "gone soon", 1).expect("write");
+        handle
+            .write_user_message("m1", "gone soon", 1)
+            .expect("write");
         host.flush_all(); // persist so the purge has a snapshot to delete
         drop(handle);
         settle().await;

@@ -611,6 +611,15 @@ final class AppModel {
         return await workspace?.listRefs(deviceId: space.deviceId, repoPath: space.path)
     }
 
+    func searchContext(chat: Chat, query: String) async -> ContextSearch {
+        guard demo == nil else { return ContextSearch(matches: [], truncated: false) }
+        return await workspace?.searchContext(
+            deviceId: chat.deviceId,
+            chatId: chat.id,
+            query: query
+        ) ?? ContextSearch(matches: [], truncated: false)
+    }
+
     /// Draft-mode checkout switch: `git checkout` in the SPACE's folder.
     /// Returns an error message, or nil on success.
     func switchSpaceRef(space: Space, refName: String) async -> String? {

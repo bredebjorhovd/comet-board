@@ -379,7 +379,7 @@ impl ReviewPanel {
         let edits = cx.subscribe(
             &comment,
             |panel: &mut Self, _, event: &ComposerInputEvent, cx| match event {
-                ComposerInputEvent::Edited => cx.notify(),
+                ComposerInputEvent::Edited(_) => cx.notify(),
                 ComposerInputEvent::Submitted => panel.submit(cx),
                 _ => {}
             },

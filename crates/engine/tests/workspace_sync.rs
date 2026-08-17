@@ -182,6 +182,7 @@ fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &st
             expires_at: None,
             status: SessionCommandStatus::Pending,
             resolution: None,
+            context: Vec::new(),
         })
         .expect("queue command");
 }

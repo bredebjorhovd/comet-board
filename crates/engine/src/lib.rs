@@ -18,6 +18,7 @@ pub mod board;
 pub mod board_runtime;
 pub mod checkout_prep;
 mod checkout_prep_sandbox;
+pub mod context_files;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
@@ -231,7 +232,9 @@ impl EngineCore {
                 edge: edge.clone(),
             },
         )?;
+        let repos = Repos::new(data_dir, &device_id);
         doc_host.set_workspace(workspace.clone());
+        doc_host.set_repos(repos.clone());
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
         match sessions.recover_stale() {
@@ -251,7 +254,6 @@ impl EngineCore {
         // socket for the life of the process, and per-chat rooms become the
         // dominant load on the edge. Also runtime-gated (it spawns).
         doc_host.spawn_idle_release();
-        let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
         let uploads = Uploads::new(data_dir, edge.clone());
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));

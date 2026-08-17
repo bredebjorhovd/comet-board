@@ -116,6 +116,32 @@ pub struct Repos {
 }
 
 impl Repos {
+    /// Resolve mutable workspace rows only when both the owning space and the
+    /// requested checkout are roots registered on this host.
+    pub async fn validated_checkout_root(
+        &self,
+        space_path: &str,
+        candidate: &str,
+    ) -> Option<PathBuf> {
+        let space_root = std::fs::canonicalize(space_path).ok()?;
+        let candidate_root = std::fs::canonicalize(candidate).ok()?;
+        for repo in self.list().await {
+            let repo_root = std::fs::canonicalize(&repo.path).ok()?;
+            let mut registered = vec![repo_root];
+            if let Ok(refs) = self.refs(Path::new(&repo.path)).await {
+                registered.extend(
+                    refs.into_iter()
+                        .filter_map(|reference| reference.worktree_path)
+                        .filter_map(|path| std::fs::canonicalize(path).ok()),
+                );
+            }
+            if registered.contains(&space_root) && registered.contains(&candidate_root) {
+                return Some(candidate_root);
+            }
+        }
+        None
+    }
+
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
     /// comes from `$COMET_WORKTREES_DIR` or `~/.comet-native/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {

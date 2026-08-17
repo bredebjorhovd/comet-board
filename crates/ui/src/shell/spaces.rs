@@ -2246,7 +2246,7 @@ impl Shell {
         // text caret — Enter and ⌘Enter are both handled there.
         let search = cx.new(|cx| ComposerInput::with_context("Search repos…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Edited) {
+            if matches!(event, ComposerInputEvent::Edited(_)) {
                 if let Some(flow) = this.add_space.as_mut() {
                     flow.active = 0;
                 }

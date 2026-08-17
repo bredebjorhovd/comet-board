@@ -29,6 +29,8 @@ final class SessionStore {
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
+    private(set) var followups: [FollowupRow] = []
+    private(set) var followupsPaused = false
 
     private let document = RoomDocument()
     var doc: LoroDoc { document.current() }
@@ -136,12 +138,14 @@ final class SessionStore {
         let doc = self.doc
         Task { @MainActor [weak self] in
             let decoded = await Task.detached(priority: .userInitiated) {
-                Self.decodeEntries(from: doc)
+                Self.decodeSession(from: doc)
             }.value
             guard let self else { return }
             self.projecting = false
             if let decoded {
-                self.apply(decoded)
+                self.apply(decoded.entries)
+                self.followups = decoded.followups
+                self.followupsPaused = decoded.paused
             }
             if self.projectPending {
                 self.projectPending = false
@@ -164,6 +168,78 @@ final class SessionStore {
         guard let root = doc.getDeepValue().mapValue else { return nil }
         let raw = (root["messages"]?.listValue ?? []).compactMap(entryFrom)
         return joinContinuations(raw)
+    }
+
+    private struct DecodedSession {
+        var entries: [MessageEntry]
+        var followups: [FollowupRow]
+        var paused: Bool
+    }
+
+    nonisolated private static func decodeSession(from doc: LoroDoc) -> DecodedSession? {
+        guard let root = doc.getDeepValue().mapValue else { return nil }
+        let entries = joinContinuations(
+            (root["messages"]?.listValue ?? []).compactMap(entryFrom)
+        )
+        var rows: [FollowupRow] = []
+        var paused = false
+        for value in root["commands"]?.listValue ?? [] {
+            guard let command = value.mapValue,
+                  let payload = command["payload"]?.mapValue,
+                  let kind = payload["kind"]?.stringValue else { continue }
+            switch kind {
+            case "queue":
+                guard command["status"]?.stringValue == "pending",
+                      let id = command["id"]?.stringValue,
+                      let prompt = payload["prompt"]?.stringValue,
+                      let messageId = payload["messageId"]?.stringValue else { continue }
+                let context = decodeContext(command["context"])
+                rows.append(FollowupRow(id: id, prompt: prompt, context: context,
+                                        messageId: messageId, edited: false))
+            case "interrupt":
+                if !rows.isEmpty { paused = true }
+            case "queueControl":
+                guard let op = payload["op"]?.mapValue,
+                      let tag = op["op"]?.stringValue else { continue }
+                let target = op["target"]?.stringValue
+                switch tag {
+                case "edit":
+                    if let target, let ix = rows.firstIndex(where: { $0.id == target }) {
+                        rows[ix].prompt = op["prompt"]?.stringValue ?? rows[ix].prompt
+                        rows[ix].context = decodeContext(op["context"])
+                        rows[ix].edited = true
+                    }
+                case "move":
+                    if let target, let from = rows.firstIndex(where: { $0.id == target }) {
+                        let row = rows.remove(at: from)
+                        if let after = op["after"]?.stringValue,
+                           let anchor = rows.firstIndex(where: { $0.id == after }) {
+                            rows.insert(row, at: anchor + 1)
+                        } else if op["after"] == nil {
+                            rows.insert(row, at: 0)
+                        } else {
+                            rows.append(row)
+                        }
+                    }
+                case "remove": rows.removeAll { $0.id == target }
+                case "clear": rows.removeAll()
+                case "pause": paused = true
+                case "resume": paused = false
+                default: break // runNext changes delivery, not visible order
+                }
+            default: break
+            }
+        }
+        return DecodedSession(entries: entries, followups: rows, paused: paused)
+    }
+
+    nonisolated private static func decodeContext(_ value: LoroValue?) -> [ContextRef] {
+        guard let list = value?.listValue,
+              let data = try? JSONSerialization.data(withJSONObject: list.map(\.jsonObject)),
+              let decoded = try? JSONDecoder().decode([ContextRef].self, from: data) else {
+            return []
+        }
+        return decoded
     }
 
     nonisolated private static func entryFrom(_ value: LoroValue) -> MessageEntry? {
@@ -260,7 +336,7 @@ final class SessionStore {
 
     // MARK: Command plane (ledger rule 1: append-only, own entries only)
 
-    func sendRun(prompt: String, chat: Chat) {
+    func sendRun(prompt: String, chat: Chat, context: [ContextRef] = []) {
         if offline {
             demoResponder?(prompt)
             return
@@ -275,12 +351,12 @@ final class SessionStore {
             "kind": "run",
             "request": encodableJSON(request),
             "messageId": messageId,
-        ])
+        ], context: context)
         pendingSends.append((messageId, prompt, nowMs()))
         revision &+= 1
     }
 
-    func sendSteer(prompt: String) {
+    func sendSteer(prompt: String, context: [ContextRef] = []) {
         if offline {
             demoResponder?(prompt)
             return
@@ -290,7 +366,7 @@ final class SessionStore {
             "kind": "steer",
             "prompt": prompt,
             "messageId": messageId,
-        ])
+        ], context: context)
         pendingSends.append((messageId, prompt, nowMs()))
         revision &+= 1
     }
@@ -307,9 +383,49 @@ final class SessionStore {
         ])
     }
 
+    @discardableResult
+    func queueFollowup(prompt: String, context: [ContextRef] = []) -> Bool {
+        queueCommand(kind: "queue", payload: [
+            "kind": "queue",
+            "prompt": prompt,
+            "messageId": UUID().uuidString.lowercased(),
+            "attachments": [],
+        ], context: context, expires: false)
+    }
+
+    @discardableResult
+    func editFollowup(id: String, prompt: String, context: [ContextRef] = []) -> Bool {
+        queueControl(["op": "edit", "target": id, "prompt": prompt,
+                      "context": context.map(encodableJSON)])
+    }
+
+    @discardableResult
+    func moveFollowup(id: String, after: String?) -> Bool {
+        var op: [String: Any] = ["op": "move", "target": id]
+        if let after { op["after"] = after }
+        return queueControl(op)
+    }
+
+    @discardableResult
+    func removeFollowup(id: String) -> Bool { queueControl(["op": "remove", "target": id]) }
+    @discardableResult
+    func runNext(id: String) -> Bool { queueControl(["op": "runNext", "target": id]) }
+    @discardableResult
+    func setFollowupsPaused(_ paused: Bool) -> Bool {
+        queueControl(["op": paused ? "pause" : "resume"])
+    }
+
+    @discardableResult
+    private func queueControl(_ op: [String: Any]) -> Bool {
+        queueCommand(kind: "queueControl", payload: ["kind": "queueControl", "op": op],
+                     expires: false)
+    }
+
     /// schema.rs queue_command, field for field.
-    private func queueCommand(kind: String, payload: [String: Any]) {
-        document.withCurrent { doc in
+    @discardableResult
+    private func queueCommand(kind: String, payload: [String: Any],
+                              context: [ContextRef] = [], expires: Bool = true) -> Bool {
+        let queued = document.withCurrent { doc -> Bool in
             let commands = doc.getList(id: "commands")
             do {
                 let map = try commands.pushContainer(child: LoroMap())
@@ -324,14 +440,20 @@ final class SessionStore {
                         "frontier": .null,
                     ]))
                 }
-                try map.insert(key: "expiresAt", v: nowMs() + commandDefaultTtlMs)
+                if expires { try map.insert(key: "expiresAt", v: nowMs() + commandDefaultTtlMs) }
+                if !context.isEmpty {
+                    try map.insert(key: "context", v: LoroValue.fromJSON(context.map(encodableJSON)))
+                }
                 try map.insert(key: "status", v: "pending")
                 doc.commit()
+                return true
             } catch {
                 roomLog.error("session \(self.chatId, privacy: .public): failed to queue \(kind, privacy: .public) command")
+                return false
             }
         }
-        nudgeHost()
+        if queued { nudgeHost() }
+        return queued
     }
 
     /// Durable-nudge the host device so a cold host opens the doc and drains

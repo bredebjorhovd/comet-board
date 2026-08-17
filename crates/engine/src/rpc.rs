@@ -73,8 +73,8 @@ use tokio::sync::watch;
 
 use comet_doc::SessionCommandPayload;
 use comet_proto::view::stats::{
-    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe,
-    StatsProbeResult, aggregate_board_stats,
+    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe, StatsProbeResult,
+    aggregate_board_stats,
 };
 use comet_proto::{ChatConfig, HarnessId};
 use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
@@ -102,6 +102,10 @@ use comet_board::dispatch::{DispatchOrigin, DispatchOverrides, VerifiedCaller};
 /// Short on purpose: somebody is waiting on an `onboard`, and a peer that has
 /// not answered in five seconds is one this write proceeds without.
 const PEER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Ceiling on what one `SearchContextFiles` call may ask for (gh#424). The
+/// picker wants seven rows; this is the bound on a client asking for the disk.
+const MAX_CONTEXT_RESULTS: usize = 100;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -207,7 +211,34 @@ struct ListSkillsParams {
 #[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
     chat_id: String,
+    /// Client-owned idempotency key. Old clients may omit it; queue-aware
+    /// clients retain it when retrying the same user gesture.
+    #[serde(default)]
+    command_id: Option<String>,
     command: SessionCommandPayload,
+    /// Typed `@` references the instruction was written against (gh#424).
+    /// Defaulted: every caller that predates the picker sends none.
+    #[serde(default)]
+    context: Vec<comet_proto::ContextRef>,
+}
+
+/// `SearchContextFiles` (gh#424). Shaped like [`ListSkillsParams`] and for the
+/// same reason: the composer on the new-chat canvas has no chat yet and asks
+/// with the space's folder, while an open chat names itself and lets the host
+/// resolve the checkout.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchContextParams {
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    space_id: Option<String>,
+    #[serde(default)]
+    query: String,
+    /// Rows wanted, capped host-side — a client asking for ten thousand is
+    /// asking the box to walk its disk for a menu.
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -687,6 +718,77 @@ impl EngineRpc {
             .or(params.cwd)
             .map(std::path::PathBuf::from);
         crate::skills::list(&crate::skills::SkillRoots { config_dir, cwd })
+    }
+
+    /// The `@` picker's rows, from the chat's own checkout (gh#424).
+    ///
+    /// The root is derived from a chat or space row owned by this host. A
+    /// forwarded caller never supplies a filesystem path as authority.
+    ///
+    /// Never fails, for the same reason [`Self::list_skills`] never does: an
+    /// unknown chat, a folder that is not there, an unreadable tree all produce
+    /// an empty list, and a red box under a composer mid-keystroke helps nobody.
+    async fn search_context_files(
+        &self,
+        params: SearchContextParams,
+    ) -> comet_proto::ContextSearch {
+        let chat = params
+            .chat_id
+            .as_deref()
+            .and_then(|id| self.workspace.chat(id))
+            .filter(|chat| chat.device_id == self.workspace.device_id());
+        let chat_root = chat
+            .as_ref()
+            .and_then(|chat| chat.cwd.clone())
+            .filter(|cwd| !cwd.is_empty());
+        let owning_space_id = chat.as_ref().and_then(|chat| chat.space_id.clone());
+        if chat.is_some()
+            && params.space_id.is_some()
+            && params.space_id.as_deref() != owning_space_id.as_deref()
+        {
+            return comet_proto::ContextSearch::default();
+        }
+        let space_id = owning_space_id.or(params.space_id);
+        let space = space_id.as_deref().and_then(|id| {
+            self.workspace
+                .doc()
+                .space(id)
+                .ok()
+                .flatten()
+                .filter(|space| space.device_id == self.workspace.device_id())
+        });
+        let declared_checkout_id = chat
+            .as_ref()
+            .and_then(|chat| chat.checkout_id.clone())
+            .or_else(|| space.as_ref().and_then(|space| space.checkout_id.clone()));
+        let candidate = chat_root.or_else(|| space.as_ref().map(|space| space.path.clone()));
+        let (Some(space), Some(candidate)) = (space.as_ref(), candidate) else {
+            return comet_proto::ContextSearch::default();
+        };
+        let Some(root) = self
+            .repos
+            .validated_checkout_root(&space.path, &candidate)
+            .await
+        else {
+            tracing::warn!(candidate, space = %space.id, "context search refused an unregistered checkout");
+            return comet_proto::ContextSearch::default();
+        };
+        let defaults = crate::context_files::SearchLimits::default();
+        let limits = crate::context_files::SearchLimits {
+            max_results: params
+                .limit
+                .unwrap_or(defaults.max_results)
+                .clamp(1, MAX_CONTEXT_RESULTS),
+            ..defaults
+        };
+        let mut result =
+            crate::context_files::search(std::path::Path::new(&root), &params.query, limits);
+        result.checkout_id = Some(crate::context_files::checkout_identity(
+            self.workspace.device_id(),
+            &root,
+            declared_checkout_id.as_deref(),
+        ));
+        result
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1647,8 +1749,15 @@ fn forwardable(method: &str) -> bool {
             // the agent account that chat names (gh#134) — a laptop answering
             // from its own `~/.claude` would offer what the run cannot invoke.
             | methods::LIST_SKILLS
+            // The `@` picker searches the chat's checkout, and the checkout is
+            // a directory on the host device (gh#424) — the sharper case of the
+            // same rule: a laptop answering from its own disk would offer paths
+            // that do not exist where the turn runs.
+            | methods::SEARCH_CONTEXT_FILES
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
+            // The follow-up plan lives in the chat's doc, hosted where the chat is.
+            | methods::WATCH_DOC_QUEUE
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -1755,6 +1864,7 @@ fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_DOC_QUEUE
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
@@ -2026,10 +2136,30 @@ impl RpcService for EngineRpc {
             methods::LIST_SKILLS => RpcReply::value(&self.list_skills(parse_params(params)?)),
             methods::QUEUE_COMMAND => {
                 let p: QueueCommandParams = parse_params(params)?;
-                let command_id = self
-                    .doc_host
-                    .queue_command(&p.chat_id, p.command)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let command_id = p
+                    .command_id
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let durable = matches!(
+                    &p.command,
+                    SessionCommandPayload::Queue { .. }
+                        | SessionCommandPayload::QueueControl { .. }
+                );
+                let result = if durable {
+                    self.doc_host.queue_command_with_id_and_context_durable(
+                        &p.chat_id,
+                        &command_id,
+                        p.command,
+                        p.context,
+                    )
+                } else {
+                    self.doc_host.queue_command_with_id_and_context(
+                        &p.chat_id,
+                        &command_id,
+                        p.command,
+                        p.context,
+                    )
+                };
+                result.map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "commandId": command_id }))
             }
             methods::WATCH_DOC_MESSAGES => {
@@ -2041,6 +2171,17 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
                 )))
+            }
+            methods::WATCH_DOC_QUEUE => {
+                let p: ChatParams = parse_params(params)?;
+                let handle = self
+                    .doc_host
+                    .open(&p.chat_id)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                Ok(RpcReply::Stream(watch_stream(handle.watch_queue())))
+            }
+            methods::SEARCH_CONTEXT_FILES => {
+                RpcReply::value(&self.search_context_files(parse_params(params)?).await)
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
@@ -2517,9 +2658,7 @@ impl RpcService for EngineRpc {
             }
             methods::CANCEL_CHECKOUT_PREPARATION => {
                 let p: PrepareCheckoutParams = parse_params(params)?;
-                let cancelled = self
-                    .prep
-                    .cancel(std::path::Path::new(&p.worktree_path));
+                let cancelled = self.prep.cancel(std::path::Path::new(&p.worktree_path));
                 RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
             }
             methods::APPROVE_CHECKOUT_PREPARATION => {
@@ -2819,6 +2958,8 @@ mod tests {
         assert!(!forwardable(methods::APPROVE_TASK_PREPARATION));
         assert!(forwardable(methods::CANCEL_CHECKOUT_PREPARATION));
         assert!(forwardable(methods::QUEUE_COMMAND));
+        assert!(forwardable(methods::WATCH_DOC_QUEUE));
+        assert!(is_stream_method(methods::WATCH_DOC_QUEUE));
         // Skills are files on the chat's host, and which files depends on the
         // agent account that chat names (gh#134).
         assert!(forwardable(methods::LIST_SKILLS));
