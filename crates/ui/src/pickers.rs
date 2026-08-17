@@ -1626,7 +1626,7 @@ impl Pickers {
                 .and_then(|_| state.selected_chat_row().cloned());
             (space, session)
         };
-        let new_chat = session.is_none();
+        let new_chat = session.is_none() || self.state.read(cx).selected_chat_is_configurable();
 
         // Refs feed both modes (draft labels, mid-session switch list) —
         // eager + idempotent. Self-guarding on `git_detected`, so the non-git
@@ -1694,7 +1694,9 @@ impl Pickers {
         let ref_side =
             attach_overlay_end(ref_chip, &mut overlay, PickerKind::Branch, "branch-popover");
 
-        if let Some(chat) = &session {
+        if let Some(chat) = &session
+            && !new_chat
+        {
             // The checkout KIND is fixed at creation (harness resume is
             // cwd-scoped — the session never moves folders): label only.
             let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);

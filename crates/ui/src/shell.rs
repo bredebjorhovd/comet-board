@@ -27,7 +27,7 @@ use gpui_tokio::Tokio;
 
 use crate::board::{BoardEvent, BoardPanel, ToggleBoard};
 use crate::changes::Changes;
-use crate::commands::{self, NewSession};
+use crate::commands::{self, NewSession, NewSessionIntent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -563,8 +563,11 @@ pub struct Shell {
     mutate_task: Option<Task<()>>,
     /// One New Session invocation at a time; also absorbs key-repeat events.
     new_session_task: Option<Task<()>>,
-    /// No-context New Session asks explicitly instead of choosing a space by order.
-    new_session_chooser: bool,
+    /// Durable until the exact row returns through WATCH_CHATS.
+    new_session_intent: Option<NewSessionIntent>,
+    new_session_intent_attempted: bool,
+    /// Highlighted row in the keyboard-operable no-context chooser.
+    new_session_chooser: Option<usize>,
     focus_composer_next_render: bool,
     auth_task: Option<Task<()>>,
     /// Kept for the failed-gate "Retry" action.
@@ -812,7 +815,9 @@ impl Shell {
             org: None,
             mutate_task: None,
             new_session_task: None,
-            new_session_chooser: false,
+            new_session_intent: commands::load_intent(&data_dir),
+            new_session_intent_attempted: false,
+            new_session_chooser: None,
             focus_composer_next_render: false,
             auth_task: None,
             boot,
@@ -851,6 +856,13 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        self.reconcile_new_session(cx);
+        if self.new_session_intent.is_some()
+            && !self.new_session_intent_attempted
+            && state.read(cx).engine().is_some()
+        {
+            self.submit_new_session_intent(cx);
+        }
         // Capture knob: the add-space palette needs only the device registry.
         // `add-space-error` opens it already carrying a failed clone (gh#317) —
         // the footer's one line is otherwise reachable only with a real board
@@ -1482,7 +1494,7 @@ impl Shell {
             || self.rename_space_dialog.is_some()
             || self.delete_space_confirm.is_some()
             || self.add_space.is_some()
-            || self.new_session_chooser
+            || self.new_session_chooser.is_some()
             || self.user_menu_open
             || self.board_open
     }
@@ -1681,6 +1693,11 @@ impl Shell {
         if self.new_session_task.is_some() || (requested_space.is_none() && self.overlay_open()) {
             return;
         }
+        if self.new_session_intent.is_some() {
+            self.new_session_intent_attempted = false;
+            self.submit_new_session_intent(cx);
+            return;
+        }
         let space_id = requested_space.or_else(|| {
             commands::current_space(
                 self.state.read(cx),
@@ -1688,10 +1705,31 @@ impl Shell {
             )
         });
         let Some(space_id) = space_id else {
-            self.new_session_chooser = true;
+            self.new_session_chooser = Some(0);
             cx.notify();
             return;
         };
+        let intent = NewSessionIntent {
+            chat_id: uuid::Uuid::new_v4().to_string(),
+            space_id,
+        };
+        if let Err(err) = commands::save_intent(&self.data_dir, &intent) {
+            self.sidebar_notice = Some(format!(
+                "New Session failed: couldn't save its recovery record ({err}). Check disk access and try again."
+            ).into());
+            cx.notify();
+            return;
+        }
+        self.new_session_intent = Some(intent);
+        self.new_session_intent_attempted = false;
+        self.new_session_chooser = None;
+        self.submit_new_session_intent(cx);
+    }
+
+    fn submit_new_session_intent(&mut self, cx: &mut Context<Self>) {
+        if self.new_session_task.is_some() {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.sidebar_notice = Some(
                 "New Session failed: engine not connected. Try again when Comet reconnects.".into(),
@@ -1699,38 +1737,55 @@ impl Shell {
             cx.notify();
             return;
         };
-        let chat_id = uuid::Uuid::new_v4().to_string();
+        let Some(intent) = self.new_session_intent.clone() else {
+            return;
+        };
+        self.new_session_intent_attempted = true;
         let params = serde_json::json!({
-            "op": "createChat", "chatId": chat_id, "spaceId": space_id,
+            "op": "createChat", "chatId": intent.chat_id, "spaceId": intent.space_id,
         });
-        self.new_session_chooser = false;
         self.new_session_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::MUTATE, params).await;
             this.update(cx, |shell, cx| {
                 shell.new_session_task = None;
-                match result {
-                    Ok(_) => {
-                        if matches!(shell.route, Route::Review { .. }) {
-                            shell.close_review(cx);
-                        } else {
-                            shell.route = Route::Chat;
-                        }
-                        shell
-                            .state
-                            .update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
-                        shell.focus_composer_next_render = true;
-                    }
-                    Err(err) => {
-                        shell.sidebar_notice = Some(format!(
-                            "New Session failed: {err}. Check the workspace device and try again."
-                        ).into());
-                    }
+                if let Err(err) = result {
+                    // Keep the stable intent. A retry (or a recreated Shell)
+                    // reuses its UUID, so commit-before-response-loss cannot
+                    // strand a second empty session.
+                    shell.sidebar_notice = Some(format!(
+                        "Couldn't confirm New Session: {err}. Check the workspace device and retry; Comet will reuse the same session."
+                    ).into());
                 }
+                shell.reconcile_new_session(cx);
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    /// WATCH_CHATS is the commit acknowledgement. Selection waits for this
+    /// exact row, which closes the stale-frame race around selected_space.
+    fn reconcile_new_session(&mut self, cx: &mut Context<Self>) {
+        let Some(intent) = self.new_session_intent.clone() else {
+            return;
+        };
+        let arrived = commands::intent_arrived(&intent, self.state.read(cx));
+        if !arrived {
+            return;
+        }
+        commands::clear_intent(&self.data_dir);
+        self.new_session_intent = None;
+        self.new_session_intent_attempted = false;
+        self.new_session_task = None;
+        if matches!(self.route, Route::Review { .. }) {
+            self.close_review(cx);
+        } else {
+            self.route = Route::Chat;
+        }
+        self.state
+            .update(cx, |state, cx| state.select_chat(Some(intent.chat_id), cx));
+        self.focus_composer_next_render = true;
     }
 
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -3005,35 +3060,42 @@ impl Shell {
             overlays.push(overlay);
         }
 
-        if self.new_session_chooser {
-            let rows: Vec<AnyElement> =
-                self.state
-                    .read(cx)
-                    .spaces
-                    .iter()
-                    .map(|space| {
-                        let id = space.id.clone();
-                        popover::menu_row(&theme, false, format!("new-session-space-{id}"))
-                            .id(format!("new-session-space-row-{id}"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
+        if let Some(selected) = self.new_session_chooser {
+            let rows: Vec<AnyElement> = self
+                .state
+                .read(cx)
+                .spaces
+                .iter()
+                .enumerate()
+                .map(|(index, space)| {
+                    let id = space.id.clone();
+                    popover::menu_row(&theme, index == selected, format!("new-session-space-{id}"))
+                        .id(format!("new-session-space-row-{id}"))
+                        .on_click(
+                            cx.listener(move |this, _, _, cx| {
                                 this.new_session(Some(id.clone()), cx)
-                            }))
-                            .child(SharedString::from(space.display_name().to_string()))
-                            .into_any_element()
-                    })
-                    .collect();
+                            }),
+                        )
+                        .child(SharedString::from(space.display_name().to_string()))
+                        .into_any_element()
+                })
+                .collect();
             let card = popover::dialog_card(&theme)
                 .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                     if event.keystroke.key == "escape" {
                         cx.stop_propagation();
-                        this.new_session_chooser = false;
+                        this.new_session_chooser = None;
                         cx.notify();
                     }
                 }))
                 .child(popover::dialog_title(&theme, "New Session"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
-                    "Choose a workspace for this session.",
+                    if rows.is_empty() {
+                        "No workspaces yet. Press Enter to add one."
+                    } else {
+                        "Choose a workspace with ↑/↓ and Enter."
+                    },
                 )))
                 .child(
                     div()
@@ -4499,6 +4561,52 @@ impl Render for Shell {
             .on_drag_move(cx.listener(Self::on_right_pane_drag))
             .on_drag_move(cx.listener(Self::on_terminal_drag))
             .on_drag_move(cx.listener(Self::on_review_session_drag))
+            // GPUI exposes native key-repeat directly. Swallow only repeated
+            // physical Cmd-T keydowns; the initial keydown continues to the
+            // typed action binding, while menu and click actions are untouched.
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if commands::suppress_repeated_shortcut(
+                    &event.keystroke.key,
+                    event.keystroke.modifiers.platform,
+                    event.is_held,
+                ) {
+                    cx.stop_propagation();
+                    return;
+                }
+                if let Some(selected) = this.new_session_chooser {
+                    let count = this.state.read(cx).spaces.len();
+                    match event.keystroke.key.as_str() {
+                        "up" if count > 0 => {
+                            this.new_session_chooser = Some(commands::step_chooser(selected, count, -1));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                        "down" if count > 0 => {
+                            this.new_session_chooser = Some(commands::step_chooser(selected, count, 1));
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                        "enter" if count > 0 => {
+                            let space = this.state.read(cx).spaces[selected.min(count - 1)]
+                                .id
+                                .clone();
+                            cx.stop_propagation();
+                            this.new_session(Some(space), cx);
+                        }
+                        "enter" => {
+                            this.new_session_chooser = None;
+                            cx.stop_propagation();
+                            this.open_add_space(cx);
+                        }
+                        "escape" => {
+                            this.new_session_chooser = None;
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                        _ => {}
+                    }
+                }
+            }))
             // `esc` leaves a review (gh#311). The board panel says "esc close"
             // in its own footer and the review must not be the one surface in
             // this app where the key does nothing — a route you can only leave

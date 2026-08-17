@@ -720,6 +720,15 @@ impl AppState {
         self.chats.iter().find(|c| c.id == id)
     }
 
+    /// Empty user-created sessions retain the draft checkout controls until
+    /// their first run fixes cwd/worktree. Board-created attempts already have
+    /// a Session row and are never drafts.
+    pub fn selected_chat_is_configurable(&self) -> bool {
+        self.selected_chat_row().is_some_and(|chat| {
+            chat.last_message_at.is_none() && self.session_for(&chat.id).is_none()
+        })
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.auth.as_ref())
     }
@@ -1567,6 +1576,16 @@ mod tests {
         sort_tabs(&mut tabs);
         let order: Vec<&str> = tabs.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(order, ["b", "a"]);
+    }
+
+    #[test]
+    fn empty_user_session_keeps_first_turn_checkout_configuration() {
+        let mut state = AppState::new();
+        state.chats = vec![chat("draft", 1, None)];
+        state.selected_chat = Some("draft".into());
+        assert!(state.selected_chat_is_configurable());
+        state.chats[0].last_message_at = Some(Utc::now());
+        assert!(!state.selected_chat_is_configurable());
     }
 
     #[test]

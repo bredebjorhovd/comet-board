@@ -3403,8 +3403,9 @@ impl Composer {
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let draft_key = self.current_key.clone();
+        let configurable = self.state.read(cx).selected_chat_is_configurable();
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
-            Some(id) => (id, false),
+            Some(id) => (id, configurable),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
         // Where the new session runs (Current checkout / reuse an existing
