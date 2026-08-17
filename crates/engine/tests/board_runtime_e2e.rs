@@ -798,7 +798,7 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
     )
     .unwrap();
     std::fs::write(codex_home.join("config.toml"), format!(
-        "model = \"gpt-5.4\"\nmodel_provider = \"mock\"\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[features]\nunified_exec = true\nshell_snapshot = true\n[shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n",
+        "model = \"gpt-5.4\"\nmodel_provider = \"mock\"\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[features]\nunified_exec = true\nshell_snapshot = true\n[sandbox_workspace_write]\nnetwork_access = true\n[shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n",
         model
     )).unwrap();
     let codex = std::env::split_paths(&std::env::var_os("PATH").unwrap())
