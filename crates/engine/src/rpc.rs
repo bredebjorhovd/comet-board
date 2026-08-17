@@ -103,6 +103,22 @@ use comet_board::dispatch::{DispatchOrigin, DispatchOverrides, VerifiedCaller};
 /// not answered in five seconds is one this write proceeds without.
 const PEER_SWEEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// The compatibility promise is deliberately one released minor line, not
+/// "anything that rejects the method". Patch releases within N-1 remain
+/// compatible; same/newer/malformed versions are protocol failures.
+fn supported_n_minus_one(peer: &str, collector: &str) -> bool {
+    fn line(version: &str) -> Option<(u64, u64)> {
+        let parts = comet_update::release_version_parts(version)?;
+        (parts.len() == 3).then(|| (parts[0], parts[1]))
+    }
+    matches!((line(peer), line(collector)), (Some((pm, pn)), Some((cm, cn))) if pm == cm && pn.checked_add(1) == Some(cn))
+}
+
+fn unknown_stats_snapshot(error: &RpcError) -> bool {
+    matches!(error, RpcError::UnknownMethod(method) if method == methods::BOARD_STATS_SNAPSHOT)
+        || matches!(error, RpcError::Failed(message) if message == "unknown method: BoardStatsSnapshot")
+}
+
 /// Ceiling on what one `SearchContextFiles` call may ask for (gh#424). The
 /// picker wants seven rows; this is the bound on a client asking for the disk.
 const MAX_CONTEXT_RESULTS: usize = 100;
@@ -1096,36 +1112,145 @@ impl EngineRpc {
         }
     }
 
+    /// Read the first frame of the N-1-compatible update stream. This is only
+    /// used after an old peer explicitly rejects BoardStatsSnapshot, so a
+    /// normal aggregate still performs exactly one request per candidate.
+    async fn peer_update_status(
+        &self,
+        target: &str,
+    ) -> Result<comet_update::UpdateStatus, RpcError> {
+        let reply = self
+            .forward(target, methods::UPDATE_STATUS, serde_json::json!({}))
+            .await?;
+        let RpcReply::Stream(mut stream) = reply else {
+            return Err(RpcError::Failed(
+                "UpdateStatus answered without a stream".into(),
+            ));
+        };
+        let value = stream.next().await.ok_or_else(|| RpcError::Closed)?;
+        serde_json::from_value::<comet_update::UpdateStatus>(value)
+            .map_err(|error| RpcError::Failed(format!("could not decode UpdateStatus: {error}")))
+    }
+
+    async fn peer_has_board(
+        &self,
+        target: &str,
+        since_days: Option<i64>,
+    ) -> Result<bool, RpcError> {
+        match self
+            .forward(
+                target,
+                methods::BOARD_STATS,
+                serde_json::json!({ "sinceDays": since_days }),
+            )
+            .await
+        {
+            Ok(RpcReply::Value(value)) => {
+                serde_json::from_value::<comet_proto::view::stats::BoardStats>(value)
+                    .map(|_| true)
+                    .map_err(|error| {
+                        RpcError::Failed(format!("could not decode legacy BoardStats: {error}"))
+                    })
+            }
+            Ok(RpcReply::Stream(_)) => Err(RpcError::Failed(
+                "legacy BoardStats answered with a stream".into(),
+            )),
+            Err(RpcError::Refused(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Ask one candidate under the same per-device budget as the existing
     /// board census. All candidates run concurrently, so one dark laptop costs
     /// five seconds of wall time, not five seconds multiplied by the fleet.
     async fn stats_probe(&self, candidate: StatsDevice, since_days: Option<i64>) -> StatsProbe {
+        let timeout_candidate = candidate.clone();
+        match tokio::time::timeout(
+            PEER_SWEEP_BUDGET,
+            self.stats_probe_within_budget(candidate, since_days),
+        )
+        .await
+        {
+            Ok(probe) => probe,
+            Err(_) => StatsProbe {
+                candidate: timeout_candidate,
+                result: StatsProbeResult::Unreachable(format!(
+                    "timed out after {}s",
+                    PEER_SWEEP_BUDGET.as_secs()
+                )),
+            },
+        }
+    }
+
+    /// Spend one caller-owned deadline across the entire compatibility chain.
+    /// No fallback step renews the five-second per-device sweep budget.
+    async fn stats_probe_within_budget(
+        &self,
+        candidate: StatsDevice,
+        since_days: Option<i64>,
+    ) -> StatsProbe {
         let local = self.doc_host.device_id();
         let answer = if candidate.device_id == local {
-            tokio::time::timeout(PEER_SWEEP_BUDGET, self.local_stats_snapshot(since_days))
+            self.local_stats_snapshot(since_days)
                 .await
-                .map(|answer| answer.and_then(|snapshot| RpcReply::value(&snapshot)))
+                .and_then(|snapshot| RpcReply::value(&snapshot))
         } else {
-            tokio::time::timeout(
-                PEER_SWEEP_BUDGET,
-                self.forward(
-                    &candidate.device_id,
-                    methods::BOARD_STATS_SNAPSHOT,
-                    serde_json::json!({ "sinceDays": since_days }),
-                ),
+            self.forward(
+                &candidate.device_id,
+                methods::BOARD_STATS_SNAPSHOT,
+                serde_json::json!({ "sinceDays": since_days }),
             )
             .await
         };
         let result = match answer {
-            Err(_) => StatsProbeResult::Unreachable(format!(
-                "timed out after {}s",
-                PEER_SWEEP_BUDGET.as_secs()
-            )),
-            Ok(Err(error)) => Self::stats_probe_error(error),
-            Ok(Ok(RpcReply::Stream(_))) => {
+            Err(error) if candidate.device_id != local && unknown_stats_snapshot(&error) => {
+                let underlying = error.to_string();
+                match self.peer_has_board(&candidate.device_id, since_days).await {
+                    Ok(false) => {
+                        return StatsProbe {
+                            candidate,
+                            result: StatsProbeResult::NoBoard,
+                        };
+                    }
+                    Ok(true) => {}
+                    Err(error) => {
+                        return StatsProbe {
+                            candidate,
+                            result: Self::stats_probe_error(error),
+                        };
+                    }
+                }
+                match self.peer_update_status(&candidate.device_id).await {
+                    Ok(status) => {
+                        let required = env!("CARGO_PKG_VERSION");
+                        if supported_n_minus_one(&status.current_version, required) {
+                            StatsProbeResult::UpgradeRequired {
+                                // v0.7 exposes version facts but not its running
+                                // executable/install kind. A stale managed tree
+                                // beside a source build is not proof that
+                                // ApplyUpdate will accept, so fail closed.
+                                can_apply: false,
+                                current_version: status.current_version,
+                                required_version: required.to_string(),
+                                error: underlying,
+                            }
+                        } else {
+                            StatsProbeResult::Unreadable(format!(
+                                "{underlying}; incompatible peer version {} (collector is v{required})",
+                                status.current_version
+                            ))
+                        }
+                    }
+                    Err(version_error) => StatsProbeResult::Unreadable(format!(
+                        "{underlying}; UpdateStatus failed: {version_error}"
+                    )),
+                }
+            }
+            Err(error) => Self::stats_probe_error(error),
+            Ok(RpcReply::Stream(_)) => {
                 StatsProbeResult::Unreadable("stats snapshot answered with a stream".into())
             }
-            Ok(Ok(RpcReply::Value(value))) => {
+            Ok(RpcReply::Value(value)) => {
                 match serde_json::from_value::<BoardStatsSnapshot>(value) {
                     Ok(snapshot) => StatsProbeResult::Answered(snapshot),
                     Err(error) => StatsProbeResult::Unreadable(format!(
@@ -2119,6 +2244,14 @@ impl RpcService for EngineRpc {
         params: serde_json::Value,
         caller: &Caller,
     ) -> Result<RpcReply, RpcError> {
+        if method == methods::APPLY_UPDATE
+            && params.get("targetDeviceId").is_some()
+            && !caller.is_operator()
+        {
+            return Err(RpcError::Refused(
+                "updating another device requires the embedded operator surface".into(),
+            ));
+        }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         //
@@ -2241,6 +2374,15 @@ impl RpcService for EngineRpc {
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
             methods::APPLY_UPDATE => {
+                let verified_owner = caller.user().is_some_and(|user| {
+                    self.auth.as_ref().and_then(Auth::user_id).as_deref() == Some(user)
+                });
+                if !caller.is_operator() && !verified_owner {
+                    return Err(RpcError::Refused(
+                        "applying an update requires the embedded operator or verified device owner"
+                            .into(),
+                    ));
+                }
                 let version = self
                     .updater()?
                     .apply()
@@ -3042,6 +3184,17 @@ mod tests {
             aggregate.hosts[0].status,
             comet_proto::view::stats::StatsHostStatus::Unreadable
         );
+    }
+
+    #[test]
+    fn snapshot_compatibility_is_only_the_previous_minor_line() {
+        assert!(supported_n_minus_one("0.7.1", "0.8.0"));
+        assert!(supported_n_minus_one("v0.7.9", "0.8.0"));
+        assert!(!supported_n_minus_one("0.8.0", "0.8.0"));
+        assert!(!supported_n_minus_one("0.9.0", "0.8.0"));
+        assert!(!supported_n_minus_one("garbage", "0.8.0"));
+        assert!(!supported_n_minus_one("0.7.1.9", "0.8.0"));
+        assert!(!supported_n_minus_one("1.7.1", "0.8.0"));
     }
 
     /// gh#97: onboarding is three device-local effects behind one verb — a

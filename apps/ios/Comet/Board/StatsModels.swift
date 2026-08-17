@@ -551,7 +551,7 @@ struct StatsDevice: Decodable, Hashable, Identifiable {
 }
 
 enum StatsHostStatus: String, Decodable, Hashable {
-    case answered, duplicate, noBoard, unreachable, unreadable, unknown
+    case answered, duplicate, noBoard, unreachable, unreadable, upgradeRequired, unknown
 
     init(from decoder: Decoder) throws {
         let raw = try decoder.singleValueContainer().decode(String.self)
@@ -559,7 +559,7 @@ enum StatsHostStatus: String, Decodable, Hashable {
     }
 
     var compromisesAggregate: Bool {
-        self == .unreachable || self == .unreadable || self == .unknown
+        self == .unreachable || self == .unreadable || self == .upgradeRequired || self == .unknown
     }
 }
 
@@ -568,7 +568,15 @@ struct StatsHost: Decodable, Hashable, Identifiable {
     var status: StatsHostStatus
     var boardId: String?
     var error: String?
+    var upgrade: StatsUpgradeDetails?
     var id: String { device.deviceId }
+}
+
+struct StatsUpgradeDetails: Decodable, Hashable {
+    var currentVersion: String
+    var requiredVersion: String
+    var error: String
+    var canApply: Bool
 }
 
 struct AggregateBoardStatsSource: Decodable, Hashable, Identifiable {
@@ -585,11 +593,20 @@ struct AggregateBoardStats: Decodable, Hashable {
     var hosts: [StatsHost]
     var complete: Bool
 
+    /// No board contributed facts and at least one host prevented a complete
+    /// read. The merged zero-shaped payload is only an identity value for the
+    /// wire fold here; it is not evidence that zero dispatches occurred.
+    var whollyPartial: Bool { !complete && boards.isEmpty }
+
     /// Mirrors `AggregateBoardStats::completeness_note`, including its promise
     /// that missing hosts are never represented as zero activity.
     var completenessNote: String? {
         let missing = hosts.compactMap { host -> String? in
             guard host.status.compromisesAggregate else { return nil }
+            if host.status == .upgradeRequired {
+                return "\(host.device.label) is on v\(host.upgrade?.currentVersion ?? "unknown"); "
+                    + "v\(host.upgrade?.requiredVersion ?? "unknown") is required for all-board stats"
+            }
             return host.status == .unreadable
                 ? "\(host.device.label) was unreadable"
                 : "\(host.device.label) did not answer"

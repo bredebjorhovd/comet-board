@@ -118,6 +118,7 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
 use serde::{Deserialize, Serialize};
@@ -132,7 +133,7 @@ use comet_proto::view::stats::{
 use comet_rpc::methods;
 
 use crate::settings::widgets;
-use crate::state::AppState;
+use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 // ---- the design's measurements (`Comet Stats Window.dc.html`) --------------
@@ -425,6 +426,11 @@ pub struct StatsPage {
     swept: bool,
     error: Option<SharedString>,
     task: Option<Task<()>>,
+    /// Monotonic fence for aggregate reads. A slower request for an old
+    /// window must never repaint beneath the newly selected window label.
+    reload_generation: u64,
+    updating: Option<String>,
+    update_task: Option<Task<()>>,
 }
 
 impl StatsPage {
@@ -448,6 +454,9 @@ impl StatsPage {
             swept: false,
             error: None,
             task: None,
+            reload_generation: 0,
+            updating: None,
+            update_task: None,
         };
         page.reload(cx);
         page
@@ -464,56 +473,57 @@ impl StatsPage {
         };
         let local = self.state.read(cx).local_device_id.clone();
         let since_days = self.since_days;
+        self.reload_generation = self.reload_generation.wrapping_add(1);
+        let generation = self.reload_generation;
         self.error = None;
         self.swept = false;
         self.task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({});
-            if let (Some(days), Some(object)) = (since_days, params.as_object_mut()) {
-                object.insert("sinceDays".into(), serde_json::json!(days));
-            }
-            let result = engine
-                .client()
-                .call(methods::AGGREGATE_BOARD_STATS, params)
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|value| {
-                    serde_json::from_value::<AggregateBoardStats>(value)
-                        .map_err(|error| format!("Unreadable aggregate stats: {error}"))
-                });
+            let result = fetch_aggregate(&engine, since_days).await;
             let _ = this.update(cx, |page, cx| {
-                page.swept = true;
-                match result {
-                    Ok(aggregate) => {
-                        let answers = aggregate
-                            .boards
-                            .iter()
-                            .map(|board| {
-                                let target = (Some(board.host.device_id.as_str())
-                                    != local.as_deref())
-                                .then(|| board.host.device_id.clone());
-                                (target, board.stats.clone())
-                            })
-                            .collect::<Vec<_>>();
-                        page.error = if answers.is_empty() {
-                            Some(
-                                aggregate
-                                    .completeness_note()
-                                    .unwrap_or_else(|| {
-                                        "No device on this account hosts a board".into()
-                                    })
-                                    .into(),
-                            )
-                        } else {
-                            None
-                        };
-                        page.answers = answers;
-                        page.aggregate = Some(aggregate);
-                    }
-                    Err(error) => page.error = Some(error.into()),
-                }
-                cx.notify();
+                page.commit_aggregate(generation, result, local.as_deref(), cx);
             });
         }));
+    }
+
+    /// The one generation-fenced aggregate commit seam used by ordinary reads
+    /// and update recovery. Every caller either owns the current generation or
+    /// is a stale result with no authority to repaint the page.
+    fn commit_aggregate(
+        &mut self,
+        generation: u64,
+        result: Result<AggregateBoardStats, String>,
+        local: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.reload_generation != generation {
+            return false;
+        }
+        self.swept = true;
+        match result {
+            Ok(aggregate) => {
+                let empty_note = aggregate
+                    .completeness_note()
+                    .unwrap_or_else(|| "No device on this account hosts a board".into());
+                self.apply_aggregate(aggregate, local);
+                self.error = self.answers.is_empty().then(|| empty_note.into());
+            }
+            Err(error) => self.error = Some(error.into()),
+        }
+        cx.notify();
+        true
+    }
+
+    fn apply_aggregate(&mut self, aggregate: AggregateBoardStats, local: Option<&str>) {
+        self.answers = aggregate
+            .boards
+            .iter()
+            .map(|board| {
+                let target = (Some(board.host.device_id.as_str()) != local)
+                    .then(|| board.host.device_id.clone());
+                (target, board.stats.clone())
+            })
+            .collect();
+        self.aggregate = Some(aggregate);
     }
 
     /// This device's id, as the sweep and the pin both spell it.
@@ -581,6 +591,87 @@ impl StatsPage {
             }
         }
         cx.notify();
+    }
+
+    /// Apply an old peer's managed update, then ride through the relay restart.
+    /// A lost ApplyUpdate reply is expected: convergence is the peer answering
+    /// the aggregate protocol, not the mutation socket surviving its restart.
+    fn update_stats_host(&mut self, device_id: String, cx: &mut Context<Self>) {
+        if self.updating.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.updating = Some(device_id.clone());
+        self.error = None;
+        let since_days = self.since_days;
+        let timer = cx.background_executor().clone();
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let apply = await_update_mutation(
+                engine.client().call(
+                    methods::APPLY_UPDATE,
+                    serde_json::json!({ "targetDeviceId": device_id }),
+                ),
+                Duration::from_secs(5),
+            )
+            .await;
+            if let Err(error) = apply {
+                let _ = this.update(cx, |page, cx| {
+                    page.updating = None;
+                    page.error = Some(format!("Update refused: {error}").into());
+                    cx.notify();
+                });
+                return;
+            }
+            let mut outcome = Err("The device did not return after its update".to_string());
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < deadline {
+                timer.timer(Duration::from_secs(1)).await;
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let Ok(Ok(aggregate)) =
+                    tokio::time::timeout(remaining, fetch_aggregate(&engine, since_days)).await
+                else {
+                    continue;
+                };
+                let converged = update_recovery_converged(&aggregate, &device_id);
+                if converged {
+                    outcome = Ok(aggregate);
+                    break;
+                }
+            }
+            let _ = this.update(cx, |page, cx| {
+                page.updating = None;
+                match outcome {
+                    Ok(aggregate)
+                        if recovery_commit_generation(
+                            since_days,
+                            page.since_days,
+                            &mut page.reload_generation,
+                        ) == RecoveryPaint::Apply =>
+                    {
+                        // Invalidate and cancel any ordinary reload which began
+                        // before convergence. Its partial answer must not paint
+                        // after this complete recovery result.
+                        page.task.take();
+                        let generation = page.reload_generation;
+                        let local = page.local_device(cx);
+                        page.commit_aggregate(
+                            generation,
+                            Ok(aggregate),
+                            local.as_deref(),
+                            cx,
+                        );
+                    }
+                    // The reload started by the window switch may have landed
+                    // while the peer was still away. Now that recovery proved
+                    // it returned, ask the selected window again.
+                    Ok(_) => page.reload(cx),
+                    Err(message) => page.error = Some(message.into()),
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn set_window(&mut self, since_days: Option<i64>, cx: &mut Context<Self>) {
@@ -2165,6 +2256,88 @@ impl StatsPage {
     }
 }
 
+async fn fetch_aggregate(
+    engine: &EngineHandle,
+    since_days: Option<i64>,
+) -> Result<AggregateBoardStats, String> {
+    let mut params = serde_json::json!({});
+    if let (Some(days), Some(object)) = (since_days, params.as_object_mut()) {
+        object.insert("sinceDays".into(), serde_json::json!(days));
+    }
+    engine
+        .client()
+        .call(methods::AGGREGATE_BOARD_STATS, params)
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|value| {
+            serde_json::from_value::<AggregateBoardStats>(value)
+                .map_err(|error| format!("Unreadable aggregate stats: {error}"))
+        })
+}
+
+fn update_recovery_converged(aggregate: &AggregateBoardStats, device_id: &str) -> bool {
+    aggregate.hosts.iter().any(|host| {
+        host.device.device_id == device_id
+            && matches!(
+                host.status,
+                comet_proto::view::stats::StatsHostStatus::Answered
+                    | comet_proto::view::stats::StatsHostStatus::Duplicate
+            )
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryPaint {
+    Apply,
+    Reload,
+}
+
+fn recovery_paint(recovery_window: Option<i64>, selected_window: Option<i64>) -> RecoveryPaint {
+    if recovery_window == selected_window {
+        RecoveryPaint::Apply
+    } else {
+        RecoveryPaint::Reload
+    }
+}
+
+/// Reserve a new aggregate commit generation for a same-window recovery.
+/// Mismatched windows reload instead and obtain their generation in `reload`.
+fn recovery_commit_generation(
+    recovery_window: Option<i64>,
+    selected_window: Option<i64>,
+    generation: &mut u64,
+) -> RecoveryPaint {
+    let paint = recovery_paint(recovery_window, selected_window);
+    if paint == RecoveryPaint::Apply {
+        *generation = generation.wrapping_add(1);
+    }
+    paint
+}
+
+async fn await_update_mutation<F>(future: F, wait: Duration) -> Result<(), comet_rpc::RpcError>
+where
+    F: std::future::Future<Output = Result<serde_json::Value, comet_rpc::RpcError>>,
+{
+    match tokio::time::timeout(wait, future).await {
+        Ok(Ok(_)) | Err(_) => Ok(()),
+        Ok(Err(error)) if apply_failure_may_be_restart(&error) => Ok(()),
+        Ok(Err(error)) => Err(error),
+    }
+}
+
+fn apply_failure_may_be_restart(error: &comet_rpc::RpcError) -> bool {
+    match error {
+        comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_) => true,
+        comet_rpc::RpcError::Failed(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("connection closed")
+                || message.contains("transport:")
+                || message.contains("offline")
+        }
+        _ => false,
+    }
+}
+
 /// The scroll container every settings page wraps its column in — and the one
 /// this page shipped without, which on the longest page in the app meant
 /// everything below the fold was simply unreachable (operator, 2026-08-08).
@@ -2260,7 +2433,31 @@ impl Render for StatsPage {
                 .as_ref()
                 .and_then(AggregateBoardStats::completeness_note)
         {
-            column = column.child(widgets::warning_strip(&theme, note));
+            let upgrade = self.aggregate.as_ref().and_then(|aggregate| {
+                aggregate.hosts.iter().find(|host| {
+                    host.status == comet_proto::view::stats::StatsHostStatus::UpgradeRequired
+                        && host
+                            .upgrade
+                            .as_ref()
+                            .is_some_and(|upgrade| upgrade.can_apply)
+                })
+            });
+            let mut strip = widgets::warning_strip(&theme, note);
+            if let Some(host) = upgrade {
+                let device_id = host.device.device_id.clone();
+                let busy = self.updating.as_deref() == Some(device_id.as_str());
+                strip = strip.child(
+                    widgets::ghost_action(&theme)
+                        .id("update-stats-host")
+                        .ml_auto()
+                        .when(busy, |el| el.opacity(0.5))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_stats_host(device_id.clone(), cx)
+                        }))
+                        .child(if busy { "Updating…" } else { "Update" }),
+                );
+            }
+            column = column.child(strip);
         }
 
         // A pin whose board has stopped answering: the page falls back to the
@@ -2362,6 +2559,139 @@ impl Render for StatsPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use comet_proto::view::stats::StatsHostStatus;
+
+    fn recovery(status: comet_proto::view::stats::StatsHostStatus) -> AggregateBoardStats {
+        AggregateBoardStats {
+            since_days: Some(7),
+            stats: BoardStats::empty(Some(7)),
+            boards: vec![],
+            hosts: vec![comet_proto::view::stats::StatsHost {
+                device: comet_proto::view::stats::StatsDevice {
+                    device_id: "peer".into(),
+                    label: "Peer".into(),
+                },
+                status,
+                board_id: None,
+                error: None,
+                upgrade: None,
+            }],
+            complete: false,
+        }
+    }
+
+    #[test]
+    fn update_recovery_waits_for_an_exact_new_protocol_answer() {
+        use comet_proto::view::stats::StatsHostStatus::*;
+        for transient in [NoBoard, Unreachable, Unreadable, UpgradeRequired] {
+            assert!(!update_recovery_converged(&recovery(transient), "peer"));
+        }
+        assert!(!update_recovery_converged(&recovery(Answered), "other"));
+        assert!(update_recovery_converged(&recovery(Answered), "peer"));
+        assert!(update_recovery_converged(&recovery(Duplicate), "peer"));
+    }
+
+    #[test]
+    fn old_window_recovery_reloads_the_selected_window_after_reconnect() {
+        assert_eq!(recovery_paint(Some(7), Some(7)), RecoveryPaint::Apply);
+        assert_eq!(recovery_paint(Some(7), Some(30)), RecoveryPaint::Reload);
+        assert_eq!(recovery_paint(Some(7), None), RecoveryPaint::Reload);
+    }
+
+    #[tokio::test]
+    async fn a_pending_update_mutation_advances_to_recovery() {
+        let pending = futures::future::pending::<Result<serde_json::Value, comet_rpc::RpcError>>();
+        assert!(
+            await_update_mutation(pending, Duration::from_millis(1))
+                .await
+                .is_ok()
+        );
+        assert!(
+            await_update_mutation(
+                async { Err(comet_rpc::RpcError::Refused("not managed".into())) },
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn same_window_recovery_fences_an_older_partial_reload(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let state = cx.new(|_| AppState::new());
+        let page = cx.new(|_| StatsPage {
+            state,
+            since_days: Some(7),
+            dimension: Dimension::Model,
+            answers: Vec::new(),
+            aggregate: None,
+            pinned: None,
+            swept: false,
+            error: None,
+            task: None,
+            reload_generation: 3,
+            updating: Some("peer".into()),
+            update_task: None,
+        });
+        let old_generation = 3;
+        let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+        let (commit_tx, commit_rx) = tokio::sync::oneshot::channel();
+        page.update(cx, |page, cx| {
+            page.task = Some(cx.spawn(async move |this, cx| {
+                let partial = partial_rx.await.expect("release partial reload");
+                let _ = this.update(cx, |page, cx| {
+                    let accepted =
+                        page.commit_aggregate(old_generation, Ok(partial), None, cx);
+                    let _ = commit_tx.send(accepted);
+                });
+            }));
+            // Keep the in-flight callback alive even after recovery removes the
+            // page's cancellation handle, so this regression exercises the
+            // generation fence rather than merely task cancellation.
+            page.task.take().unwrap().detach();
+        });
+
+        let mut complete = recovery(StatsHostStatus::Answered);
+        complete.stats.attempts = 89;
+        page.update(cx, |page, cx| {
+            assert_eq!(
+                recovery_commit_generation(
+                    Some(7),
+                    page.since_days,
+                    &mut page.reload_generation,
+                ),
+                RecoveryPaint::Apply
+            );
+            page.task.take();
+            let generation = page.reload_generation;
+            assert!(page.commit_aggregate(generation, Ok(complete), None, cx));
+        });
+
+        let partial = recovery(StatsHostStatus::UpgradeRequired);
+        partial_tx.send(partial).unwrap();
+        cx.run_until_parked();
+        assert!(!commit_rx.await.expect("stale callback reports its commit"));
+        page.read_with(cx, |page, _| {
+            assert_eq!(page.aggregate.as_ref().unwrap().stats.attempts, 89);
+            assert!(page.reload_generation > old_generation);
+        });
+    }
+
+    #[test]
+    fn apply_refusal_is_immediate_but_a_lost_restart_reply_recovers() {
+        assert!(!apply_failure_may_be_restart(
+            &comet_rpc::RpcError::Refused("not update-managed".into())
+        ));
+        assert!(!apply_failure_may_be_restart(&comet_rpc::RpcError::Failed(
+            "this install is not update-managed".into()
+        )));
+        assert!(apply_failure_may_be_restart(&comet_rpc::RpcError::Closed));
+        assert!(apply_failure_may_be_restart(&comet_rpc::RpcError::Failed(
+            "connection closed".into()
+        )));
+    }
 
     #[test]
     fn an_all_unpriced_spend_still_has_desktop_agent_rows() {
