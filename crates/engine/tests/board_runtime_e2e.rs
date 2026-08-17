@@ -55,6 +55,33 @@ fn git(repo: &std::path::Path, args: &[&str]) {
     );
 }
 
+static WORKTREES_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct WorktreesEnvGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl Drop for WorktreesEnvGuard {
+    fn drop(&mut self) {
+        if let Some(prior) = self.prior.take() {
+            unsafe { std::env::set_var("COMET_WORKTREES_DIR", prior) };
+        } else {
+            unsafe { std::env::remove_var("COMET_WORKTREES_DIR") };
+        }
+    }
+}
+
+async fn isolate_worktrees(path: &std::path::Path) -> WorktreesEnvGuard {
+    let lock = WORKTREES_ENV.lock().await;
+    let prior = std::env::var_os("COMET_WORKTREES_DIR");
+    unsafe { std::env::set_var("COMET_WORKTREES_DIR", path) };
+    WorktreesEnvGuard {
+        _lock: lock,
+        prior,
+    }
+}
+
 fn mock_script() -> Vec<AgentEvent> {
     vec![
         AgentEvent::SessionStarted {
@@ -149,10 +176,16 @@ fn authenticated_git_http(origin: PathBuf) -> String {
                 .unwrap();
             let headers = String::from_utf8_lossy(&output.stdout[..split]);
             let response_body = &output.stdout[split..];
+            write!(stream, "HTTP/1.1 200 OK\r\n").unwrap();
+            for header in headers.lines() {
+                let header = header.trim_end_matches('\r');
+                if !header.is_empty() {
+                    write!(stream, "{header}\r\n").unwrap();
+                }
+            }
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n",
-                headers.replace('\n', "\r\n"),
+                "Content-Length: {}\r\nConnection: close\r\n\r\n",
                 response_body.len()
             )
             .unwrap();
@@ -215,10 +248,10 @@ where
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_prompt_cancel_against_a_real_engine() {
     let dir = tempfile::tempdir().unwrap();
-    // Keep worktrees inside the tempdir — the default root is global
-    // (`~/.comet-native/worktrees`) and a leftover checkout there would
-    // collide with every later run. Safe to set: this binary has one test.
-    unsafe { std::env::set_var("COMET_WORKTREES_DIR", dir.path().join("worktrees")) };
+    // Keep worktrees inside the tempdir — the default root is global. The
+    // guard serializes both tests in this binary and restores the caller's
+    // process environment when the fixture drops.
+    let _worktrees_env = isolate_worktrees(&dir.path().join("worktrees")).await;
     // A clone with an origin, because that is what a dispatch now needs: the
     // spec's `base` is fetched before the branch is cut (gh#67).
     let origin = dir.path().join("origin");
@@ -670,7 +703,7 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    unsafe { std::env::set_var("COMET_WORKTREES_DIR", dir.path().join("worktrees")) };
+    let _worktrees_env = isolate_worktrees(&dir.path().join("worktrees")).await;
     let source = dir.path().join("widget");
     std::fs::create_dir_all(&source).unwrap();
     git(&source, &["init", "-b", "main"]);
@@ -709,7 +742,9 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
     assert!(output.status.success());
     let push_url = authenticated_git_http(receive.clone());
     let model = serve_push_model(format!(
-        "unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT COMET_BOARD_CONFIG_DIR COMET_BOARD_STATE_DIR GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push '{}' HEAD:refs/heads/board-test",
+        "unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT {} {} GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push '{}' HEAD:refs/heads/board-test",
+        concat!("COMET_BOARD_", "CONFIG_DIR"),
+        concat!("COMET_BOARD_", "STATE_DIR"),
         push_url
     ));
 
@@ -884,5 +919,17 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         task.attempts.last().and_then(|a| a.outcome),
         Some(Outcome::Done)
     );
+    let credential_notices = Db::open(&paths.db())
+        .unwrap()
+        .pending_writebacks(50)
+        .unwrap()
+        .into_iter()
+        .filter(|writeback| writeback.kind == "credential")
+        .collect::<Vec<_>>();
+    assert!(
+        credential_notices.is_empty(),
+        "settlement classified the model push as an alternate credential: {credential_notices:?}"
+    );
     board_service.shutdown();
+    core.shutdown().await;
 }

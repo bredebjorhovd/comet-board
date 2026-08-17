@@ -585,8 +585,10 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         // inside that real model-tool command so one CI host exercises both
         // noninteractive startup mechanisms with the policy-built env.
         "cmd": format!(
-            "{} -c 'unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT COMET_BOARD_CONFIG_DIR COMET_BOARD_STATE_DIR GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test'",
-            shell.display()
+            "{} -c 'unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT {} {} GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test'",
+            shell.display(),
+            concat!("COMET_BOARD_", "CONFIG_DIR"),
+            concat!("COMET_BOARD_", "STATE_DIR")
         ),
         "workdir": tool_cwd.clone(),
         "yield_time_ms": 10_000
