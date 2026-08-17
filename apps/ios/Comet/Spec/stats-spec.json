@@ -329,7 +329,7 @@
             },
             "status": "upgradeRequired",
             "upgrade": {
-              "canApply": true,
+              "canApply": false,
               "currentVersion": "0.7.1",
               "error": "unknown method: BoardStatsSnapshot",
               "requiredVersion": "0.8.0"

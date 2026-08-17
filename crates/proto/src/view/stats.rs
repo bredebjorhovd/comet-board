@@ -3490,7 +3490,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_version_host_is_actionable_and_auditable_without_legacy_totals() {
+    fn mixed_version_host_is_auditable_without_inventing_update_capability_or_legacy_totals() {
         let aggregate = aggregate_board_stats(
             Some(7),
             vec![StatsProbe {
@@ -3502,7 +3502,7 @@ mod tests {
                     current_version: "0.7.1".into(),
                     required_version: "0.8.0".into(),
                     error: "unknown method: BoardStatsSnapshot".into(),
-                    can_apply: true,
+                    can_apply: false,
                 },
             }],
         );
@@ -3517,6 +3517,7 @@ mod tests {
         assert_eq!(upgrade.current_version, "0.7.1");
         assert_eq!(upgrade.required_version, "0.8.0");
         assert_eq!(upgrade.error, "unknown method: BoardStatsSnapshot");
+        assert!(!upgrade.can_apply);
         assert!(
             aggregate
                 .completeness_note()
@@ -4531,8 +4532,10 @@ mod spec {
         );
         // The mixed-version rollout fixture has two frames: the v0.7-shaped
         // peer lacks BoardStatsSnapshot but still answers UpdateStatus, then
-        // the same peer returns with a stable board id after ApplyUpdate and
-        // its relay restart. Legacy BoardStats is intentionally not merged.
+        // the same peer returns with a stable board id after an out-of-band
+        // update and relay restart. v0.7 has no acceptance-equivalent install
+        // capability, so this fixture must not invent one; gh#486 adds it for
+        // future N-1 releases. Legacy BoardStats is intentionally not merged.
         let mixed_version = aggregate_board_stats(
             Some(7),
             vec![StatsProbe {
@@ -4544,7 +4547,7 @@ mod spec {
                     current_version: "0.7.1".into(),
                     required_version: "0.8.0".into(),
                     error: "unknown method: BoardStatsSnapshot".into(),
-                    can_apply: true,
+                    can_apply: false,
                 },
             }],
         );

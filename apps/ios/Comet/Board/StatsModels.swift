@@ -593,6 +593,11 @@ struct AggregateBoardStats: Decodable, Hashable {
     var hosts: [StatsHost]
     var complete: Bool
 
+    /// No board contributed facts and at least one host prevented a complete
+    /// read. The merged zero-shaped payload is only an identity value for the
+    /// wire fold here; it is not evidence that zero dispatches occurred.
+    var whollyPartial: Bool { !complete && boards.isEmpty }
+
     /// Mirrors `AggregateBoardStats::completeness_note`, including its promise
     /// that missing hosts are never represented as zero activity.
     var completenessNote: String? {

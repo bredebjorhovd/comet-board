@@ -50,7 +50,7 @@ struct StatsView: View {
             if boardId == nil, let note = aggregate?.completenessNote {
                 warningStrip(note)
             }
-            if let error {
+            if let error, aggregate?.completenessNote != error {
                 errorStrip(error)
             }
             if let stats = selectedStats {
@@ -67,7 +67,7 @@ struct StatsView: View {
                 }
             } else if !loaded {
                 loadingRow
-            } else if error == nil {
+            } else if error == nil && aggregate?.whollyPartial != true {
                 note("No board answered.")
             }
         }
@@ -129,7 +129,7 @@ struct StatsView: View {
             } else if !selectedStillExists {
                 boardId = nil
             }
-            if read.boards.isEmpty {
+            if read.boards.isEmpty && !read.whollyPartial {
                 error = read.completenessNote
                     ?? "No device in this org is hosting a board"
             }
@@ -141,6 +141,7 @@ struct StatsView: View {
 
     private var selectedStats: BoardStats? {
         guard let aggregate else { return nil }
+        guard !aggregate.whollyPartial else { return nil }
         guard let boardId else { return aggregate.stats }
         return aggregate.boards.first { $0.boardId == boardId }?.stats
     }

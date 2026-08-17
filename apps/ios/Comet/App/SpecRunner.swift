@@ -257,6 +257,8 @@ enum SpecRunner {
             expect(a.complete, c.expect.complete, "\(what): complete")
             expect(a.completenessNote, c.expect.completenessNote,
                    "\(what): completeness note")
+            expect(a.whollyPartial, !c.expect.complete && c.expect.boardCount == 0,
+                   "\(what): wholly partial")
             expect(a.stats.attempts, c.expect.attempts, "\(what): attempts")
             expect(a.stats.tokens.total, c.expect.tokenTotal, "\(what): token total")
         }
