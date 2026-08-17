@@ -2895,6 +2895,14 @@ to = ".env.local"
     }
 
     #[test]
+    fn the_checked_in_repository_recipe_parses_and_validates() {
+        let checked_in = include_str!("../../../.comet/repo.toml");
+        let r = recipe(checked_in).expect("the repository's .comet/repo.toml is valid");
+
+        assert_eq!(r.archive.as_ref().unwrap().paths, ["target"]);
+    }
+
+    #[test]
     fn an_empty_recipe_is_a_recipe() {
         let r = recipe("version = 1").expect("parses");
         assert!(r.setup.is_none());
