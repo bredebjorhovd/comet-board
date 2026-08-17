@@ -169,6 +169,13 @@ enum Told {
 /// has no session row, which is [`AgentStatus::Missing`].
 pub type SessionStatuses = HashMap<String, AgentStatus>;
 
+/// The credential verdict applied when work is present on origin at settle.
+/// Kept as one seam so end-to-end push tests can assert the exact production
+/// decision rather than reimplementing Handed/Minted interpretation.
+pub fn credential_is_sanctioned_at_settle(paths: &Paths, chat: &str) -> bool {
+    !credential_ledger::for_chat(paths, chat).unsanctioned()
+}
+
 pub struct SyncEngine {
     pub db: Db,
     pub cfg: RoutingConfig,
@@ -3664,7 +3671,7 @@ impl SyncEngine {
                 failure.summary()
             ));
         }
-        if !record.unsanctioned() {
+        if credential_is_sanctioned_at_settle(&self.paths, chat) {
             return None;
         }
         let reason = record

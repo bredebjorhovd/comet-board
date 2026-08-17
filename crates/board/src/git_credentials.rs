@@ -629,24 +629,8 @@ pub fn install_git_shim(
     contract: comet_proto::GithubPushContract,
     chat: &str,
 ) -> Result<PathBuf> {
-    let contract = match (contract.contents_write, contract.workflows_write) {
-        (false, false) => "none",
-        (true, false) => "contents",
-        (true, true) => "contents+workflows",
-        (false, true) => "workflows",
-    };
-    let vars = [
-        ("GIT_ASKPASS", askpass.display().to_string()),
-        (ASKPASS_REPO_ENV, repo.to_string()),
-        ("GIT_TERMINAL_PROMPT", "0".into()),
-        ("GIT_CONFIG_COUNT", "1".into()),
-        ("GIT_CONFIG_KEY_0", "credential.helper".into()),
-        ("GIT_CONFIG_VALUE_0", String::new()),
-        (crate::config::CONFIG_DIR_ENV, paths.config_dir.display().to_string()),
-        (crate::config::STATE_DIR_ENV, paths.state_dir.display().to_string()),
-        (PUSH_CONTRACT_ENV, contract.into()),
-        ("COMET_BOARD_CHAT_ID", chat.to_string()),
-    ];
+    let mut vars = agent_env_with_contract(askpass, repo, paths, contract);
+    vars.push(("COMET_BOARD_CHAT_ID".into(), chat.to_string()));
     let exports = vars
         .into_iter()
         .map(|(key, value)| format!("{key}={}; export {key}", sh_quote(&value)))
