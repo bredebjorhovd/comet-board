@@ -919,16 +919,15 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         task.attempts.last().and_then(|a| a.outcome),
         Some(Outcome::Done)
     );
-    let credential_notices = Db::open(&paths.db())
+    let attempt = task.attempts.last().unwrap();
+    let credential_notice_key = format!("{}:credential:{}", task.id, attempt.id);
+    let credential_notice_exists = Db::open(&paths.db())
         .unwrap()
-        .pending_writebacks(50)
-        .unwrap()
-        .into_iter()
-        .filter(|writeback| writeback.kind == "credential")
-        .collect::<Vec<_>>();
+        .has_writeback(&task.id, "credential", &credential_notice_key)
+        .unwrap();
     assert!(
-        credential_notices.is_empty(),
-        "settlement classified the model push as an alternate credential: {credential_notices:?}"
+        !credential_notice_exists,
+        "settlement classified the model push as an alternate credential"
     );
     board_service.shutdown();
     core.shutdown().await;
