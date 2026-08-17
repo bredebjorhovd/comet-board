@@ -155,7 +155,7 @@ impl PushCredentials {
                 anyhow::bail!("the board's credential handoff for {repo} failed: {err}");
             }
         };
-        let bin_dir = match self.gh_shim(exe) {
+        let bin_dir = match self.tool_shims(exe, &askpass, repo, contract, chat) {
             Ok(dir) => dir,
             Err(error) => {
                 let err = format!("{error:#}");
@@ -208,11 +208,32 @@ impl PushCredentials {
     ///
     /// This is part of the required handoff: allowing a missing wrapper would
     /// make `gh` silently use the box user's ambient login.
-    fn gh_shim(&self, board_exe: &Path) -> anyhow::Result<PathBuf> {
-        let dir = self.paths.state_dir.join(SHIM_DIR);
+    fn tool_shims(
+        &self,
+        board_exe: &Path,
+        askpass: &Path,
+        repo: &str,
+        contract: comet_proto::GithubPushContract,
+        chat: Option<&str>,
+    ) -> anyhow::Result<PathBuf> {
+        let Some(chat) = chat else {
+            let dir = self.paths.state_dir.join(SHIM_DIR);
+            let gh = git_credentials::resolve_gh(Some(&dir))
+                .ok_or_else(|| anyhow::anyhow!("the gh binary is not installed on this device"))?;
+            return git_credentials::install_gh_shim(&dir, board_exe, &gh);
+        };
+        if chat.is_empty() || !chat.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            anyhow::bail!("a credentialed run has an unsafe chat id");
+        }
+        let dir = self.paths.state_dir.join(SHIM_DIR).join(chat);
         let gh = git_credentials::resolve_gh(Some(&dir))
             .ok_or_else(|| anyhow::anyhow!("the gh binary is not installed on this device"))?;
-        git_credentials::install_gh_shim(&dir, board_exe, &gh)
+        git_credentials::install_gh_shim(&dir, board_exe, &gh)?;
+        let git = git_credentials::resolve_git(Some(&dir))
+            .ok_or_else(|| anyhow::anyhow!("git is not installed on this device"))?;
+        git_credentials::install_git_shim(
+            &dir, &git, askpass, repo, &self.paths, contract, chat,
+        )
     }
 }
 
