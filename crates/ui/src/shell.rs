@@ -27,6 +27,7 @@ use gpui_tokio::Tokio;
 
 use crate::board::{BoardEvent, BoardPanel, ToggleBoard};
 use crate::changes::Changes;
+use crate::commands::{self, NewSession};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -560,6 +561,11 @@ pub struct Shell {
     install: comet_update::InstallKind,
     org: Option<OrgGateUi>,
     mutate_task: Option<Task<()>>,
+    /// One New Session invocation at a time; also absorbs key-repeat events.
+    new_session_task: Option<Task<()>>,
+    /// No-context New Session asks explicitly instead of choosing a space by order.
+    new_session_chooser: bool,
+    focus_composer_next_render: bool,
     auth_task: Option<Task<()>>,
     /// Kept for the failed-gate "Retry" action.
     boot: EngineBootConfig,
@@ -805,6 +811,9 @@ impl Shell {
             install: comet_update::detect_install(),
             org: None,
             mutate_task: None,
+            new_session_task: None,
+            new_session_chooser: false,
+            focus_composer_next_render: false,
             auth_task: None,
             boot,
             data_dir,
@@ -1473,6 +1482,7 @@ impl Shell {
             || self.rename_space_dialog.is_some()
             || self.delete_space_confirm.is_some()
             || self.add_space.is_some()
+            || self.new_session_chooser
             || self.user_menu_open
             || self.board_open
     }
@@ -1663,6 +1673,64 @@ impl Shell {
                 .ok();
             }
         }));
+    }
+
+    /// Execute the typed New Session command. Menu items, ⌘T, and chooser rows
+    /// all enter here; no input handler owns session-creation logic.
+    fn new_session(&mut self, requested_space: Option<String>, cx: &mut Context<Self>) {
+        if self.new_session_task.is_some() || (requested_space.is_none() && self.overlay_open()) {
+            return;
+        }
+        let space_id = requested_space.or_else(|| {
+            commands::current_space(
+                self.state.read(cx),
+                matches!(self.route, Route::Chat) && !self.board_open,
+            )
+        });
+        let Some(space_id) = space_id else {
+            self.new_session_chooser = true;
+            cx.notify();
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.sidebar_notice = Some(
+                "New Session failed: engine not connected. Try again when Comet reconnects.".into(),
+            );
+            cx.notify();
+            return;
+        };
+        let chat_id = uuid::Uuid::new_v4().to_string();
+        let params = serde_json::json!({
+            "op": "createChat", "chatId": chat_id, "spaceId": space_id,
+        });
+        self.new_session_chooser = false;
+        self.new_session_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::MUTATE, params).await;
+            this.update(cx, |shell, cx| {
+                shell.new_session_task = None;
+                match result {
+                    Ok(_) => {
+                        if matches!(shell.route, Route::Review { .. }) {
+                            shell.close_review(cx);
+                        } else {
+                            shell.route = Route::Chat;
+                        }
+                        shell
+                            .state
+                            .update(cx, |state, cx| state.select_chat(Some(chat_id.clone()), cx));
+                        shell.focus_composer_next_render = true;
+                    }
+                    Err(err) => {
+                        shell.sidebar_notice = Some(format!(
+                            "New Session failed: {err}. Check the workspace device and try again."
+                        ).into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -2935,6 +3003,51 @@ impl Shell {
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
+        }
+
+        if self.new_session_chooser {
+            let rows: Vec<AnyElement> =
+                self.state
+                    .read(cx)
+                    .spaces
+                    .iter()
+                    .map(|space| {
+                        let id = space.id.clone();
+                        popover::menu_row(&theme, false, format!("new-session-space-{id}"))
+                            .id(format!("new-session-space-row-{id}"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.new_session(Some(id.clone()), cx)
+                            }))
+                            .child(SharedString::from(space.display_name().to_string()))
+                            .into_any_element()
+                    })
+                    .collect();
+            let card = popover::dialog_card(&theme)
+                .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                    if event.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        this.new_session_chooser = false;
+                        cx.notify();
+                    }
+                }))
+                .child(popover::dialog_title(&theme, "New Session"))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(
+                    &theme,
+                    "Choose a workspace for this session.",
+                )))
+                .child(
+                    div()
+                        .mt(px(12.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .children(rows),
+                );
+            overlays.push(popover::modal(
+                "new-session-chooser",
+                viewport,
+                card.into_any_element(),
+            ));
         }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
@@ -4368,6 +4481,9 @@ impl Render for Shell {
         {
             window.focus(&self.composer.focus_handle(cx), cx);
         }
+        if std::mem::take(&mut self.focus_composer_next_render) {
+            window.focus(&self.composer.focus_handle(cx), cx);
+        }
 
         let root = div()
             .id("shell-root")
@@ -4427,7 +4543,8 @@ impl Render for Shell {
                 } else {
                     this.open_add_space(cx);
                 }
-            }));
+            }))
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| this.new_session(None, cx)));
 
         let root = match &gate {
             GatePhase::Ready => {

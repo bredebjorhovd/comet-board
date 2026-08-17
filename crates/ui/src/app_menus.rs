@@ -14,6 +14,7 @@
 
 use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
 
+use crate::commands::NEW_SESSION;
 use crate::composer;
 
 actions!(
@@ -95,6 +96,7 @@ pub fn bind_keys(cx: &mut App) {
 /// (no `App`), so unit tests can inspect it directly.
 fn macos_key_bindings() -> Vec<KeyBinding> {
     vec![
+        KeyBinding::new(NEW_SESSION.macos_shortcut, NewSession, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
@@ -129,6 +131,7 @@ pub fn app_menus() -> Vec<Menu> {
 
     let mut menus = vec![
         Menu::new("Comet").items(app_items),
+        Menu::new("File").items([MenuItem::action(NEW_SESSION.label, NewSession)]),
         // Standard clipboard verbs tied to the composer's existing actions via
         // their native selectors (`OsAction` → cut:/copy:/paste:/selectAll:),
         // so the OS Edit menu routes through the responder chain to the focused
@@ -157,17 +160,8 @@ pub fn app_menus() -> Vec<Menu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::NewSession;
     use gpui::{Action as _, Keystroke};
-
-    fn action_names(menu: &Menu) -> Vec<&'static str> {
-        menu.items
-            .iter()
-            .filter_map(|item| match item {
-                MenuItem::Action { action, .. } => Some(action.name()),
-                _ => None,
-            })
-            .collect()
-    }
 
     #[test]
     fn app_menu_ends_with_quit() {
@@ -242,5 +236,28 @@ mod tests {
         assert_eq!(find(Quit.name()), Some(combo("cmd-q")));
         assert_eq!(find(CloseWindow.name()), Some(combo("cmd-w")));
         assert_eq!(find(Minimize.name()), Some(combo("cmd-m")));
+        assert_eq!(
+            find(NewSession.name()),
+            Some(combo(NEW_SESSION.macos_shortcut))
+        );
+    }
+
+    #[test]
+    fn file_menu_and_shortcut_share_the_new_session_action() {
+        let menus = app_menus();
+        let file = menus
+            .iter()
+            .find(|menu| menu.name.as_ref() == "File")
+            .unwrap();
+        let Some(MenuItem::Action { name, action, .. }) = file.items.first() else {
+            panic!("New Session must be a native action");
+        };
+        assert_eq!(name.as_ref(), NEW_SESSION.label);
+        assert_eq!(action.name(), NewSession.name());
+        assert!(
+            macos_key_bindings()
+                .iter()
+                .any(|binding| binding.action().name() == action.name())
+        );
     }
 }
