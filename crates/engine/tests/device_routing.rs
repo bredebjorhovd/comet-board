@@ -21,7 +21,7 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -36,7 +36,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 
 use comet_doc::{QueueOp, SessionCommandPayload};
-use comet_engine::{EngineCore, HarnessRegistry, Repos};
+use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
@@ -337,9 +337,8 @@ fn links(relay_url: &str, user: &str, org: &str) -> Arc<LinkCache> {
 struct LegacyStatsPeer {
     phase: Arc<AtomicU8>,
     has_board: Arc<AtomicBool>,
-    update_managed: Arc<AtomicBool>,
+    probe_delay_ms: Arc<AtomicU64>,
     managed_home: std::path::PathBuf,
-    repos: Repos,
     restart: Mutex<Option<oneshot::Sender<()>>>,
 }
 
@@ -355,6 +354,15 @@ impl RpcService for LegacyStatsPeer {
         params: serde_json::Value,
         _caller: &Caller,
     ) -> Result<RpcReply, RpcError> {
+        if matches!(
+            method,
+            methods::BOARD_STATS_SNAPSHOT | methods::BOARD_STATS | methods::UPDATE_STATUS
+        ) {
+            let delay = self.probe_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+        }
         match method {
             methods::LIST_HARNESSES => RpcReply::value(&serde_json::json!([])),
             methods::BOARD_STATS_SNAPSHOT if self.phase.load(Ordering::SeqCst) == 0 => {
@@ -390,19 +398,6 @@ impl RpcService for LegacyStatsPeer {
                     "entries": [],
                     "truncated": false
                 }))
-            }
-            methods::LIST_FOLDERS if self.update_managed.load(Ordering::SeqCst) => {
-                let path = params
-                    .get("path")
-                    .and_then(|path| path.as_str())
-                    .map(str::to_owned);
-                RpcReply::value(
-                    &self
-                        .repos
-                        .list_folders(path)
-                        .await
-                        .map_err(|error| RpcError::Failed(error.to_string()))?,
-                )
             }
             methods::LIST_FOLDERS => Err(RpcError::Failed("could not read that folder".into())),
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(
@@ -614,7 +609,10 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     let dirs = tempfile::tempdir().expect("tempdir");
     let phase = Arc::new(AtomicU8::new(0));
     let has_board = Arc::new(AtomicBool::new(false));
-    let update_managed = Arc::new(AtomicBool::new(false));
+    let probe_delay_ms = Arc::new(AtomicU64::new(0));
+    // A source-shaped process may have a stale managed install beside it. The
+    // N-1 protocol cannot prove which executable is running, so this tree must
+    // never be enough to advertise ApplyUpdate.
     let managed_home = dirs.path().join("legacy-home");
     let managed_version = managed_home.join(".comet-native/app/0.7.1");
     std::fs::create_dir_all(&managed_version).expect("managed version directory");
@@ -629,9 +627,8 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     let legacy_peer = Arc::new(LegacyStatsPeer {
         phase: phase.clone(),
         has_board: has_board.clone(),
-        update_managed: update_managed.clone(),
+        probe_delay_ms: probe_delay_ms.clone(),
         managed_home,
-        repos: Repos::new(&dirs.path().join("legacy-repos"), "legacy-peer"),
         restart: Mutex::new(Some(restart_tx)),
     });
     let host_config = || {
@@ -722,6 +719,34 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     }
     has_board.store(true, Ordering::SeqCst);
 
+    // Snapshot, legacy BoardStats, and UpdateStatus share one five-second
+    // deadline. Three delayed steps must not each renew that budget.
+    probe_delay_ms.store(2_100, Ordering::SeqCst);
+    let started = tokio::time::Instant::now();
+    let delayed: comet_proto::view::stats::AggregateBoardStats = serde_json::from_value(
+        operator
+            .call(
+                methods::AGGREGATE_BOARD_STATS,
+                serde_json::json!({ "sinceDays": 7 }),
+            )
+            .await
+            .expect("aggregate remains readable after a peer timeout"),
+    )
+    .expect("aggregate shape");
+    assert!(
+        started.elapsed() < Duration::from_millis(5_800),
+        "compatibility fallbacks renewed the per-device deadline"
+    );
+    assert!(delayed.hosts.iter().any(|host| {
+        host.device.device_id == "legacy-peer"
+            && host.status == comet_proto::view::stats::StatsHostStatus::Unreachable
+            && host
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out"))
+    }));
+    probe_delay_ms.store(0, Ordering::SeqCst);
+
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let aggregate: Option<comet_proto::view::stats::AggregateBoardStats> = operator
@@ -750,8 +775,6 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    update_managed.store(true, Ordering::SeqCst);
-
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let before: comet_proto::view::stats::AggregateBoardStats = loop {
         match operator
@@ -788,7 +811,10 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
         .and_then(|host| host.upgrade.as_ref())
         .expect("upgrade details");
     assert_eq!(upgrade.current_version, "0.7.1");
-    assert!(upgrade.can_apply);
+    assert!(
+        !upgrade.can_apply,
+        "a stale managed tree cannot prove the running process is managed"
+    );
     assert!(upgrade.error.contains("BoardStatsSnapshot"));
 
     let update_service = core.rpc_service();

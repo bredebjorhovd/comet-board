@@ -1160,110 +1160,76 @@ impl EngineRpc {
         }
     }
 
-    /// N-1-safe, read-only proof of the symlink-managed install layout.
-    /// ListFolders without a path reports the peer's real home directory; the
-    /// shared updater helper derives its actual `app/current` path. Both calls
-    /// were already relay-forwardable in v0.7.
-    async fn peer_update_managed(&self, target: &str) -> bool {
-        let home = self
-            .forward(target, methods::LIST_FOLDERS, serde_json::json!({}))
-            .await;
-        let Ok(RpcReply::Value(home)) = home else {
-            return false;
-        };
-        let Some(home) = home.get("path").and_then(serde_json::Value::as_str) else {
-            return false;
-        };
-        let path = comet_update::managed_install_probe_path(std::path::Path::new(home));
-        let answer = self
-            .forward(
-                target,
-                methods::LIST_FOLDERS,
-                serde_json::json!({ "path": path }),
-            )
-            .await;
-        let Ok(RpcReply::Value(value)) = answer else {
-            return false;
-        };
-        value
-            .get("entries")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|entries| entries.iter().any(|entry| entry["name"] == "comet"))
-    }
-
     /// Ask one candidate under the same per-device budget as the existing
     /// board census. All candidates run concurrently, so one dark laptop costs
     /// five seconds of wall time, not five seconds multiplied by the fleet.
     async fn stats_probe(&self, candidate: StatsDevice, since_days: Option<i64>) -> StatsProbe {
+        let timeout_candidate = candidate.clone();
+        match tokio::time::timeout(
+            PEER_SWEEP_BUDGET,
+            self.stats_probe_within_budget(candidate, since_days),
+        )
+        .await
+        {
+            Ok(probe) => probe,
+            Err(_) => StatsProbe {
+                candidate: timeout_candidate,
+                result: StatsProbeResult::Unreachable(format!(
+                    "timed out after {}s",
+                    PEER_SWEEP_BUDGET.as_secs()
+                )),
+            },
+        }
+    }
+
+    /// Spend one caller-owned deadline across the entire compatibility chain.
+    /// No fallback step renews the five-second per-device sweep budget.
+    async fn stats_probe_within_budget(
+        &self,
+        candidate: StatsDevice,
+        since_days: Option<i64>,
+    ) -> StatsProbe {
         let local = self.doc_host.device_id();
         let answer = if candidate.device_id == local {
-            tokio::time::timeout(PEER_SWEEP_BUDGET, self.local_stats_snapshot(since_days))
+            self.local_stats_snapshot(since_days)
                 .await
-                .map(|answer| answer.and_then(|snapshot| RpcReply::value(&snapshot)))
+                .and_then(|snapshot| RpcReply::value(&snapshot))
         } else {
-            tokio::time::timeout(
-                PEER_SWEEP_BUDGET,
-                self.forward(
-                    &candidate.device_id,
-                    methods::BOARD_STATS_SNAPSHOT,
-                    serde_json::json!({ "sinceDays": since_days }),
-                ),
+            self.forward(
+                &candidate.device_id,
+                methods::BOARD_STATS_SNAPSHOT,
+                serde_json::json!({ "sinceDays": since_days }),
             )
             .await
         };
         let result = match answer {
-            Err(_) => StatsProbeResult::Unreachable(format!(
-                "timed out after {}s",
-                PEER_SWEEP_BUDGET.as_secs()
-            )),
-            Ok(Err(error)) if candidate.device_id != local && unknown_stats_snapshot(&error) => {
+            Err(error) if candidate.device_id != local && unknown_stats_snapshot(&error) => {
                 let underlying = error.to_string();
-                match tokio::time::timeout(
-                    PEER_SWEEP_BUDGET,
-                    self.peer_has_board(&candidate.device_id, since_days),
-                )
-                .await
-                {
-                    Ok(Ok(false)) => {
+                match self.peer_has_board(&candidate.device_id, since_days).await {
+                    Ok(false) => {
                         return StatsProbe {
                             candidate,
                             result: StatsProbeResult::NoBoard,
                         };
                     }
-                    Ok(Ok(true)) => {}
-                    Ok(Err(error)) => {
+                    Ok(true) => {}
+                    Err(error) => {
                         return StatsProbe {
                             candidate,
                             result: Self::stats_probe_error(error),
                         };
                     }
-                    Err(_) => {
-                        return StatsProbe {
-                            candidate,
-                            result: StatsProbeResult::Unreachable(format!(
-                                "legacy BoardStats timed out after {}s",
-                                PEER_SWEEP_BUDGET.as_secs()
-                            )),
-                        };
-                    }
                 }
-                match tokio::time::timeout(
-                    PEER_SWEEP_BUDGET,
-                    self.peer_update_status(&candidate.device_id),
-                )
-                .await
-                {
-                    Ok(Ok(status)) => {
+                match self.peer_update_status(&candidate.device_id).await {
+                    Ok(status) => {
                         let required = env!("CARGO_PKG_VERSION");
                         if supported_n_minus_one(&status.current_version, required) {
-                            let can_apply = tokio::time::timeout(
-                                PEER_SWEEP_BUDGET,
-                                self.peer_update_managed(&candidate.device_id),
-                            )
-                            .await
-                            .unwrap_or(false);
                             StatsProbeResult::UpgradeRequired {
-                                can_apply,
+                                // v0.7 exposes version facts but not its running
+                                // executable/install kind. A stale managed tree
+                                // beside a source build is not proof that
+                                // ApplyUpdate will accept, so fail closed.
+                                can_apply: false,
                                 current_version: status.current_version,
                                 required_version: required.to_string(),
                                 error: underlying,
@@ -1275,20 +1241,16 @@ impl EngineRpc {
                             ))
                         }
                     }
-                    Ok(Err(version_error)) => StatsProbeResult::Unreadable(format!(
+                    Err(version_error) => StatsProbeResult::Unreadable(format!(
                         "{underlying}; UpdateStatus failed: {version_error}"
-                    )),
-                    Err(_) => StatsProbeResult::Unreadable(format!(
-                        "{underlying}; UpdateStatus timed out after {}s",
-                        PEER_SWEEP_BUDGET.as_secs()
                     )),
                 }
             }
-            Ok(Err(error)) => Self::stats_probe_error(error),
-            Ok(Ok(RpcReply::Stream(_))) => {
+            Err(error) => Self::stats_probe_error(error),
+            Ok(RpcReply::Stream(_)) => {
                 StatsProbeResult::Unreadable("stats snapshot answered with a stream".into())
             }
-            Ok(Ok(RpcReply::Value(value))) => {
+            Ok(RpcReply::Value(value)) => {
                 match serde_json::from_value::<BoardStatsSnapshot>(value) {
                     Ok(snapshot) => StatsProbeResult::Answered(snapshot),
                     Err(error) => StatsProbeResult::Unreadable(format!(

@@ -654,8 +654,16 @@ impl StatsPage {
                 page.updating = None;
                 match outcome {
                     Ok(aggregate)
-                        if recovery_paint(since_days, page.since_days) == RecoveryPaint::Apply =>
+                        if recovery_commit_generation(
+                            since_days,
+                            page.since_days,
+                            &mut page.reload_generation,
+                        ) == RecoveryPaint::Apply =>
                     {
+                        // Invalidate and cancel any ordinary reload which began
+                        // before convergence. Its partial answer must not paint
+                        // after this complete recovery result.
+                        page.task.take();
                         let local = page.local_device(cx);
                         page.apply_aggregate(aggregate, local.as_deref());
                     }
@@ -2277,6 +2285,20 @@ fn recovery_paint(recovery_window: Option<i64>, selected_window: Option<i64>) ->
     }
 }
 
+/// Reserve a new aggregate commit generation for a same-window recovery.
+/// Mismatched windows reload instead and obtain their generation in `reload`.
+fn recovery_commit_generation(
+    recovery_window: Option<i64>,
+    selected_window: Option<i64>,
+    generation: &mut u64,
+) -> RecoveryPaint {
+    let paint = recovery_paint(recovery_window, selected_window);
+    if paint == RecoveryPaint::Apply {
+        *generation = generation.wrapping_add(1);
+    }
+    paint
+}
+
 async fn await_update_mutation<F>(future: F, wait: Duration) -> Result<(), comet_rpc::RpcError>
 where
     F: std::future::Future<Output = Result<serde_json::Value, comet_rpc::RpcError>>,
@@ -2575,6 +2597,27 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn same_window_recovery_fences_an_older_partial_reload() {
+        let (partial_tx, partial_rx) = tokio::sync::oneshot::channel::<&'static str>();
+        let mut generation = 3;
+        let old_generation = generation;
+        let old_reload = async move { partial_rx.await.expect("partial reload") };
+
+        assert_eq!(
+            recovery_commit_generation(Some(7), Some(7), &mut generation),
+            RecoveryPaint::Apply
+        );
+        assert_ne!(generation, old_generation);
+        partial_tx.send("partial").expect("release old reload");
+        let stale = old_reload.await;
+        assert_eq!(stale, "partial");
+        assert_ne!(
+            generation, old_generation,
+            "the older reload's generation cannot commit after recovery"
         );
     }
 
