@@ -341,7 +341,7 @@ async fn cancellation_revokes_parked_work_before_a_late_setup_can_release_it() {
 
     // This is the ordering the dispatch cancellation path promises: first
     // make release impossible, then stop preparation.
-    prep.revoke_parked(&b.worktree);
+    prep.revoke_parked(&b.worktree).unwrap();
     assert!(prep.cancel(&b.worktree));
     let record = task.await.unwrap();
     assert_eq!(record.state, PrepState::Failed);
@@ -492,15 +492,19 @@ async fn repository_code_cannot_execute_before_the_host_approves_its_exact_diges
     assert!(record.requires_approval);
     assert!(!b.worktree.join("stolen").exists());
 
-    b.prep()
-        .approve(&b.worktree, &b.repository_id)
-        .expect("host approval");
-    let record = b.prep().prepare(b.request()).await;
-    assert_eq!(record.state, PrepState::Ready, "{:?}", record.detail);
-    assert_eq!(
-        std::fs::read_to_string(b.worktree.join("stolen")).unwrap(),
-        "do-not-read\n"
-    );
+    // Approval authorizes this repository to run *inside the preparation
+    // sandbox*; it does not make arbitrary host paths readable. This test must
+    // exercise the real host adapter (CI installs bubblewrap). The local Codex
+    // development sandbox cannot nest Seatbelt, so its explicit test bypass is
+    // used only by focused developer runs and skips this one assertion.
+    if std::env::var_os("COMET_TEST_ASSUME_OUTER_SANDBOX").is_none() {
+        b.prep()
+            .approve(&b.worktree, &b.repository_id)
+            .expect("host approval");
+        let record = b.prep().prepare(b.request()).await;
+        assert_eq!(record.state, PrepState::Failed, "{:?}", record.detail);
+        assert!(!b.worktree.join("stolen").exists());
+    }
 
     // A repository edit is a new trust decision, not an inherited approval.
     set_recipe(&b, "version = 1\n[setup]\nrun = \"touch changed\"\n");
@@ -584,6 +588,50 @@ async fn tracked_edits_cannot_borrow_their_heads_approval() {
             .contains("tracked files differ")
     );
     assert!(!b.worktree.join("dirty").exists());
+}
+
+#[tokio::test]
+async fn a_concurrent_script_switch_is_cancelled_before_the_replacement_runs() {
+    let b = a_box(Some(
+        "version = 1\n[setup]\nrun = \"sleep 3; sh scripts/setup.sh\"\n",
+    ));
+    std::fs::create_dir_all(b.worktree.join("scripts")).unwrap();
+    std::fs::write(
+        b.worktree.join("scripts/setup.sh"),
+        "touch approved-script-ran\n",
+    )
+    .unwrap();
+    git(&b.worktree, &["add", "scripts/setup.sh"]);
+    git(&b.worktree, &["commit", "-m", "approved script"]);
+    let prep = b.prep();
+    prep.approve(&b.worktree, &b.repository_id).unwrap();
+
+    let preparation = prep.prepare(PrepareRequest {
+        worktree: &b.worktree,
+        repository_id: &b.repository_id,
+        force: true,
+        cancel: None,
+    });
+    let switch = async {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        std::fs::write(
+            b.worktree.join("scripts/setup.sh"),
+            "touch replacement-script-ran\n",
+        )
+        .unwrap();
+    };
+    let (record, ()) = tokio::join!(preparation, switch);
+
+    assert_eq!(record.state, PrepState::Failed, "{:?}", record.detail);
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("tracked")),
+        "{:?}",
+        record.detail
+    );
+    assert!(!b.worktree.join("replacement-script-ran").exists());
 }
 
 #[tokio::test]
@@ -852,7 +900,7 @@ fn cancellation_after_claim_prevents_the_release_callback() {
     prep.park(&b.worktree, "run this agent").unwrap();
     let claim = prep.claim_parked(&b.worktree).expect("claimed");
 
-    prep.revoke_parked(&b.worktree);
+    prep.revoke_parked(&b.worktree).unwrap();
     let called = AtomicBool::new(false);
     let delivered = claim
         .deliver(|_| {
@@ -898,6 +946,18 @@ fn parking_is_create_only_and_never_replaces_recovery_state() {
     assert_eq!(prep.parked(&b.worktree).as_deref(), Some("first"));
 }
 
+#[test]
+fn cancellation_reports_a_tombstone_write_failure() {
+    let b = a_box(None);
+    let prep = b.prep();
+    prep.park(&b.worktree, "must not release").unwrap();
+    let state = prep.state_dir(&b.worktree).join("brief.json");
+    std::fs::remove_file(&state).unwrap();
+    std::fs::create_dir(&state).unwrap();
+
+    assert!(prep.revoke_parked(&b.worktree).is_err());
+}
+
 #[tokio::test]
 async fn archive_runs_the_repositorys_own_cleanup() {
     let b = a_box(Some(
@@ -924,6 +984,39 @@ async fn archive_runs_the_repositorys_own_cleanup() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn archive_uses_the_approved_contract_after_ordinary_agent_changes() {
+    let b = a_box(Some(
+        "version = 1\n[archive]\nrun = \"rm -rf build-output\"\n",
+    ));
+    let prep = b.prep();
+    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    let ready = prep.prepare(b.request()).await;
+    assert_eq!(ready.state, PrepState::Ready, "{:?}", ready.detail);
+
+    std::fs::create_dir_all(b.worktree.join("build-output")).unwrap();
+    std::fs::write(b.worktree.join("agent-change"), "normal work\n").unwrap();
+    git(&b.worktree, &["add", "agent-change"]);
+    git(&b.worktree, &["commit", "-m", "ordinary agent change"]);
+    // Even replacing the current recipe cannot replace the retained cleanup
+    // implementation approved before the agent started.
+    std::fs::write(
+        b.worktree.join(RECIPE_PATH),
+        "version = 1\n[archive]\nrun = \"touch replacement-ran\"\n",
+    )
+    .unwrap();
+    git(&b.worktree, &["add", RECIPE_PATH]);
+    git(&b.worktree, &["commit", "-m", "agent edits recipe"]);
+
+    let said = prep
+        .archive(&b.worktree, &b.repository_id, None)
+        .await
+        .expect("approved archive remains available");
+    assert!(said.contains("succeeded"), "{said}");
+    assert!(!b.worktree.join("build-output").exists());
+    assert!(!b.worktree.join("replacement-ran").exists());
 }
 
 #[tokio::test]

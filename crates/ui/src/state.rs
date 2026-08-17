@@ -33,7 +33,9 @@ use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use comet_proto::view::board::{self as board_view, OrchestratorPin};
 use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
-use comet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+use comet_rpc::{
+    RpcClient, RpcError, RpcReply, RpcService, connect_ws, methods, operator_memory_client,
+};
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -237,7 +239,10 @@ impl EngineHandle {
             auth: AuthRpc::new(auth.clone()),
             state: state_rx,
         });
-        let client = memory_client(service.clone());
+        // Only the embedded desktop carries operator authority. A localhost
+        // WebSocket client can be repository code or a dispatched agent and
+        // must never approve host preparation on a person's behalf.
+        let client = operator_memory_client(service.clone());
 
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the

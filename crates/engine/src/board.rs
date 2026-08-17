@@ -850,6 +850,9 @@ fn handle_dispatch(
         // reason `handle_cancel` reads them first (gh#151).
         engine.record_tokens(Some(runtime), attempt);
         engine.record_context(Some(runtime), attempt);
+        if let Some(worktree) = attempt.worktree.as_deref() {
+            runtime.cancel_checkout_preparation(worktree)?;
+        }
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {
@@ -1238,6 +1241,13 @@ fn handle_cancel(
         // to record what it spent (gh#151).
         engine.record_tokens(Some(runtime), attempt);
         engine.record_context(Some(runtime), attempt);
+        // The attempt owns the checkout identity. Chat cwd is mutable and the
+        // chat may already be deleted; revoking through it can tombstone the
+        // wrong checkout or no checkout at all. This write is fail-closed: a
+        // late successful setup must not release after the row says cancelled.
+        if let Some(worktree) = attempt.worktree.as_deref() {
+            runtime.cancel_checkout_preparation(worktree)?;
+        }
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {
@@ -1375,6 +1385,9 @@ mod tests {
     struct FakeRuntime {
         dispatched: std::sync::Mutex<Vec<DispatchSpec>>,
         cancelled: std::sync::Mutex<Vec<String>>,
+        preparation_cancellations: std::sync::Mutex<Vec<String>>,
+        fail_preparation_cancel: std::sync::atomic::AtomicBool,
+        fail_chat_cancel: std::sync::atomic::AtomicBool,
         /// Chat id → text, for the notices the board queues into a chat
         /// rather than the dispatches it starts.
         prompted: std::sync::Mutex<Vec<(String, String)>>,
@@ -1417,6 +1430,9 @@ mod tests {
             Self {
                 dispatched: Default::default(),
                 cancelled: Default::default(),
+                preparation_cancellations: Default::default(),
+                fail_preparation_cancel: std::sync::atomic::AtomicBool::new(false),
+                fail_chat_cancel: std::sync::atomic::AtomicBool::new(false),
                 prompted: Default::default(),
                 alive: std::sync::atomic::AtomicBool::new(true),
                 logins: Default::default(),
@@ -1494,8 +1510,27 @@ mod tests {
                 .push((chat_id.to_string(), text.to_string()));
             Ok(())
         }
+        fn cancel_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+            self.preparation_cancellations
+                .lock()
+                .unwrap()
+                .push(worktree.to_string());
+            if self
+                .fail_preparation_cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("checkout tombstone could not be written");
+            }
+            Ok(())
+        }
         fn cancel(&self, chat_id: &str) -> anyhow::Result<()> {
             self.cancelled.lock().unwrap().push(chat_id.to_string());
+            if self
+                .fail_chat_cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("chat was deleted or retargeted");
+            }
             Ok(())
         }
         fn session(&self, _chat_id: &str) -> anyhow::Result<Option<Session>> {
@@ -2927,6 +2962,95 @@ max_concurrent_per_workspace = 1
         // Cancelling again is an error a caller can read, not a crash.
         let err = service.cancel_task("gh:owner/widget#9").await.unwrap_err();
         assert!(err.to_string().contains("no live attempt"), "{err}");
+
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_uses_the_attempt_checkout_and_fails_closed_on_tombstone_errors() {
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#422", "gh#422");
+        seed_attempt(
+            &paths,
+            "gh:owner/widget#422",
+            "deleted-or-retargeted-chat",
+        );
+        let db = Db::open(&paths.db()).unwrap();
+        let attempt = db
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap()
+            .live_attempt()
+            .unwrap()
+            .id;
+        db.set_attempt_worktree(attempt, "/worktrees/attempt-owned-checkout")
+            .unwrap();
+        drop(db);
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![]);
+        runtime
+            .fail_preparation_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = service
+            .cancel_task("gh:owner/widget#422")
+            .await
+            .expect_err("a non-durable tombstone must keep the attempt live");
+        assert!(error.to_string().contains("tombstone"), "{error:#}");
+        assert_eq!(
+            runtime
+                .preparation_cancellations
+                .lock()
+                .unwrap()
+                .as_slice(),
+            ["/worktrees/attempt-owned-checkout"]
+        );
+        assert!(
+            runtime.cancelled.lock().unwrap().is_empty(),
+            "chat interruption cannot race ahead of the tombstone"
+        );
+        assert!(
+            Db::open(&paths.db())
+                .unwrap()
+                .get_task("gh:owner/widget#422")
+                .unwrap()
+                .unwrap()
+                .live_attempt()
+                .is_some(),
+            "the attempt stays live when revocation is not durable"
+        );
+
+        // A missing or retargeted chat is no longer the preparation identity.
+        // Once the exact checkout is tombstoned, failure to interrupt that
+        // stale chat is best-effort and cannot keep the attempt open forever.
+        runtime
+            .fail_preparation_cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        runtime
+            .fail_chat_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service.cancel_task("gh:owner/widget#422").await.unwrap();
+        assert_eq!(
+            runtime
+                .preparation_cancellations
+                .lock()
+                .unwrap()
+                .as_slice(),
+            [
+                "/worktrees/attempt-owned-checkout",
+                "/worktrees/attempt-owned-checkout"
+            ]
+        );
+        let task = Db::open(&paths.db())
+            .unwrap()
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap();
+        assert!(task.live_attempt().is_none());
+        assert_eq!(
+            task.attempts.last().and_then(|attempt| attempt.outcome),
+            Some(Outcome::Cancelled)
+        );
 
         service.shutdown();
     }

@@ -325,19 +325,8 @@ impl Repos {
     /// common git directory; machine-local projections and recipe approvals
     /// must follow the repository, not whichever branch happened to ask.
     pub async fn repository_identity(&self, path: &Path) -> Result<String, EngineError> {
-        let common_dir = self
-            .git(
-                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-                Some(path),
-            )
-            .await?;
-        let canonical_common =
-            std::fs::canonicalize(&common_dir).unwrap_or_else(|_| PathBuf::from(&common_dir));
-        let mut hasher = Sha256::new();
-        hasher.update(self.inner.device_id.as_bytes());
-        hasher.update([0u8]);
-        hasher.update(canonical_common.to_string_lossy().as_bytes());
-        Ok(hex(&hasher.finalize()))
+        crate::checkout_prep::repository_identity(path, &self.inner.device_id)
+            .map_err(EngineError::Other)
     }
 
     async fn to_repo(&self, path: &Path) -> Result<Repo, EngineError> {

@@ -664,20 +664,26 @@ impl Runtime for CometRuntime {
     }
 
     fn cancel(&self, chat_id: &str) -> anyhow::Result<()> {
-        if let Some(chat) = self.workspace.doc().chat(chat_id)?
-            && let Some(cwd) = chat.cwd
-        {
-            let worktree = Path::new(&cwd);
-            // Revoke before signalling the process. A setup that happens to
-            // finish at the same instant then finds no command to release.
-            self.prep.revoke_parked(worktree);
-            self.prep.cancel(worktree);
-        }
         // Interrupt is durable and idempotent; an idle chat resolves it as a
         // no-op. Archive regardless — cancel ends the attempt either way.
         self.doc_host
             .queue_command(chat_id, SessionCommandPayload::Interrupt {})?;
         self.workspace.set_chat_archived(chat_id, true)?;
+        Ok(())
+    }
+
+    fn cancel_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+        let worktree = Path::new(worktree);
+        // The tombstone is the fail-closed half: if it cannot be made durable,
+        // report failure and leave the attempt live. Closing it while a late
+        // setup can still release would start work after cancellation.
+        self.prep.revoke_parked(worktree).map_err(|error| {
+            anyhow::anyhow!(
+                "revoking checkout preparation at {}: {error}",
+                worktree.display()
+            )
+        })?;
+        self.prep.cancel(worktree);
         Ok(())
     }
 
@@ -1084,7 +1090,7 @@ mod review_candidate_tests {
         git(&repo, &["config", "user.name", "Checkout Prep Test"]);
         std::fs::write(
             repo.join(crate::checkout_prep::RECIPE_PATH),
-            "version = 1\n[setup]\nrun = \"true\"\n",
+            "version = 1\n",
         )
         .unwrap();
         git(&repo, &["add", "."]);

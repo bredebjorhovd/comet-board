@@ -1259,12 +1259,19 @@ pub async fn cancel(board: &Board, task_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn approve_preparation(board: &Board, task_id: &str) -> Result<()> {
+/// Re-run the engine preparation primitive for one exact checkout. Approval is
+/// intentionally not part of this RPC: the host CLI writes trust directly to
+/// the engine-owned data directory, which a dispatched sandbox cannot write,
+/// then this ordinary retry is safe to expose over localhost.
+pub async fn prepare_checkout(board: &Board, worktree: &str) -> Result<()> {
     board
         .client
         .call(
-            methods::APPROVE_TASK_PREPARATION,
-            serde_json::json!({ "taskId": task_id }),
+            methods::PREPARE_CHECKOUT,
+            board.params(serde_json::json!({
+                "worktreePath": worktree,
+                "force": true,
+            })),
         )
         .await?;
     Ok(())

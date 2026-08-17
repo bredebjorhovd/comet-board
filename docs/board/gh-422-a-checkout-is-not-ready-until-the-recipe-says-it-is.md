@@ -77,15 +77,22 @@ that is `ready` for this execution digest is not prepared again (a retry lands
 in an already-warm worktree at zero cost). Changing a referenced script,
 lockfile, hook, or the recipe itself changes the digest; tracked worktree/index
 edits are refused before host execution so they cannot borrow the approval of
-`HEAD`. Only `ready` short-circuits — a `failed` record retries on the next
-visit, and a `preparing` record left by a killed engine reads as failed and
-re-runs, which is why the contract demands setup be idempotent.
+`HEAD`. A content-comparing watcher covers every Git-owned leaf plus HEAD and
+the index from the final check until the command is reaped; a concurrent
+script/tree switch cancels the process group, and a final Git check refuses
+`ready` if anything moved. Only `ready` short-circuits — a `failed` record
+retries on the next visit, and a `preparing` record left by a killed engine
+reads as failed and re-runs, which is why the contract demands setup be
+idempotent.
 
-Bounded, all of it: the step runs in its own process group (`sh` alone dying
-while its `npm` grandchild runs on is how a bounded setup becomes an unbounded
-one that also lies about having stopped), SIGKILLed on timeout or
-cancellation, output capped, and the recipe may shorten the budget but never
-lift it past the ceiling.
+Bounded, all of it: the step runs inside a host filesystem sandbox (Seatbelt on
+macOS, bubblewrap on Linux; unsupported hosts fail closed) with only the
+checkout and a private runtime directory writable. The host home and unrelated
+paths are not in its filesystem view. It also runs in its own process group
+(`sh` alone dying while its `npm` grandchild runs on is how a bounded setup
+becomes an unbounded one that also lies about having stopped), SIGKILLed on
+timeout, cancellation, or tracked-input change; output is capped, and the
+recipe may shorten the budget but never lift it past the ceiling.
 
 ### Where it sits in a dispatch
 
@@ -117,17 +124,25 @@ attempt is minted, no new checkout is cut. Delivery is one durable
 parking. The command-ledger snapshot is durably saved before the handoff is
 removed, and engine startup reconciles any `ready` checkout still carrying a
 parked or crash-abandoned claimed handoff. A cancel uses the same lock and
-writes `revoked`; a late completion therefore cannot enqueue behind it. Two
-racing retries cannot both release the brief, and a crash on either side of
-queueing cannot lose or duplicate the billable run.
+writes `revoked` through the attempt's own worktree path, not mutable chat cwd;
+the attempt stays live if that tombstone cannot be made durable. A late
+completion therefore cannot enqueue behind it even when the chat was deleted
+or retargeted. Two racing retries cannot both release the brief. `Run` is kept
+Pending until the sessions engine owns its live handle, then marked processed;
+a crash before spawn retries it after restart, while the in-process start claim
+prevents a duplicate. Startup installs GitHub push credentials before releasing
+ready handoffs, so a recovered GitHub run is not durably rejected during boot.
 
 The `[archive]` step rides reclamation: `reclaim_build_output` runs the
 repository's own cleanup first (best-effort, its own shorter budget), then
 gh#186's name-list sweep as before — the repo knows about the generated
 directory the list could not have guessed, the list catches the repo that
-never wrote a recipe. Deleting a worktree forgets its preparation record;
-paths get reused, and a stale `ready` on a re-cut path would short-circuit a
-checkout that was never prepared.
+never wrote a recipe. The approved archive command and environment are retained
+in engine-owned trust state, so ordinary agent commits cannot replace the
+cleanup contract and do not make it unusable; it still runs inside the same
+host sandbox. Deleting a worktree forgets its preparation record; paths get
+reused, and a stale `ready` on a re-cut path would short-circuit a checkout that
+was never prepared.
 
 ### Ordinary sessions — the board composes, it does not own
 
@@ -150,13 +165,19 @@ operator already on that host:
   the automatic path.
 - `CancelCheckoutPreparation { worktreePath }` — cancel the checkout-owned
   token and kill the command's process group.
-- `ApproveCheckoutPreparation { worktreePath }` — host-local only: approve the
-  exact stable repository identity plus current committed-tree execution
-  digest. Repository code cannot relay this call or approve itself.
+- `ApproveCheckoutPreparation { worktreePath }` — embedded-operator only:
+  approve the exact stable repository identity plus current committed-tree
+  execution digest. Localhost IPC is deliberately not operator authority; an
+  agent or setup process calling the public port is refused.
 
 For board work, `comet-board approve-preparation --task <id>` performs that
-host-local approval and retries the same attempt. Plain `comet-board retry`
-does the in-place retry when no approval is needed.
+host-local approval and retries the same attempt. It refuses remote routing and
+non-interactive stdin, prints every command and machine-local projection, asks
+for confirmation, then writes trust directly into the engine-owned data
+directory outside the repository/setup sandbox; approval is not tunneled over
+the public RPC. The embedded desktop uses its separate in-process operator
+transport. Plain `comet-board retry` does the in-place retry when no approval is
+needed.
 
 Deliberately a verb, not something `CreateWorktree` does on its own:
 preparation runs the repository's code, and a checkout appearing in a sidebar
@@ -179,6 +200,16 @@ repository-authored effect requires an engine-owned trust decision:
   any tracked uncommitted edit is refused. Before that, the
   lifecycle is `failed` with `requires_approval = true`: no file is projected
   and no command is spawned.
+- **Localhost is not a person.** Public IPC and relayed callers never carry the
+  operator bit. Only the embedded desktop's private in-process client can call
+  the approval RPC; the interactive host CLI writes the approval store itself,
+  a path excluded from repository setup and agent workspace sandboxes.
+- **Approved code still gets a narrow host view.** Environment clearing is not
+  filesystem isolation. Seatbelt/bubblewrap expose toolchain/system roots and
+  Git metadata read-only, plus the checkout and a private runtime root
+  writable. `$HOME` and arbitrary host credentials outside explicit links are
+  absent. Missing sandbox support is a preparation failure, never an
+  unsandboxed fallback.
 - **The child does not inherit the engine's environment.** It receives a small
   shell baseline (`PATH`, user/shell names and locale), an empty engine-owned
   `HOME` and temporary directory, the committed `[env]`, and
@@ -197,9 +228,12 @@ repository-authored effect requires an engine-owned trust decision:
   not followed.** Unix traversal and creation are descriptor-relative
   (`openat`/`mkdirat`, `O_NOFOLLOW`, create-exclusive), so swapping an ancestor
   after it was checked cannot redirect the eventual read or write.
-- **Projection copies, never symlinks, preserving mode** — a symlink out of
-  the checkout is unreadable to a sandboxed run and editable-through by an
-  unsandboxed one; a 0600 credential that lands 0644 is a finding.
+- **Projection publishes atomically, never via symlink, preserving mode.** Unix
+  copies into a private create-exclusive sibling, preserves mode, fsyncs it,
+  publishes with no-replace `linkat`, fsyncs the directory, then removes the
+  temporary name. A crash cannot leave a partial credential at the requested
+  path. Hosts without descriptor-relative/no-follow semantics disable links
+  rather than using a weaker fallback.
 - **Ownership stays explicit** — Unix sources must belong to the engine uid;
   the copied destination belongs to that same uid. A shared host never silently
   changes ownership on another user's credential.
@@ -223,9 +257,10 @@ repository-authored effect requires an engine-owned trust decision:
 - *Agent not started or billed until preparation succeeds* — the brief is
   parked before preparation begins and released only by `settle_preparation`
   on a `ready` record; a failure queues nothing.
-- *Idempotent, bounded, cancellable, diagnosable* — committed-tree digest short-circuit +
-  re-run-on-failure; process-group kill on a ceilinged timeout and on a
-  `CancellationToken`; head-kept capped log that outlives the attempt.
+- *Idempotent, bounded, cancellable, diagnosable* — committed-tree digest
+  short-circuit + re-run-on-failure; host filesystem sandbox; process-group
+  kill on a ceilinged timeout, tracked-input switch and `CancellationToken`;
+  head-kept capped log that outlives the attempt.
 - *Retry reuses the worktree* — Board Retry and `PrepareCheckout` run against
   the existing checkout and release the existing parked brief; the attempt
   row, chat and branch all continue.

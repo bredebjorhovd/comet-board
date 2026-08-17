@@ -17,6 +17,7 @@ pub mod auth;
 pub mod board;
 pub mod board_runtime;
 pub mod checkout_prep;
+mod checkout_prep_sandbox;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
@@ -666,12 +667,6 @@ impl Engine {
         }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
-        // A crash can land after preparation persisted `ready` but before its
-        // parked brief was durably acknowledged by the command ledger. Reuse
-        // the live settlement path before the board starts reconciling rows;
-        // the stable command id makes either crash window exact-once.
-        board_runtime::reconcile_prepared_checkouts(&core.checkout_prep, &core.doc_host);
-
         // The board service (§board-service): the sync loop herdr-board ran
         // as `syncd`, fed by the same merged session stream `WatchSessions`
         // serves. Failure to start is a warning, not fatal — the engine's job
@@ -702,6 +697,16 @@ impl Engine {
                     let push = Arc::new(push_credentials::PushCredentials::detect(paths));
                     core.sessions.set_push_credentials(push.clone());
                     runtime.set_push_credentials(push);
+
+                    // A crash can land after preparation persisted `ready`
+                    // but before its parked brief reached the command ledger.
+                    // Recover only after the credential resolver is installed:
+                    // a GitHub Run drained one line earlier is durably rejected
+                    // for missing credentials and can never start on retry.
+                    board_runtime::reconcile_prepared_checkouts(
+                        &core.checkout_prep,
+                        &core.doc_host,
+                    );
                 }
                 Err(err) => tracing::warn!(
                     error = %err,

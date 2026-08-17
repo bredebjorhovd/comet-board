@@ -86,7 +86,7 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::popover;
-use crate::state::{AppState, EngineHandle};
+use crate::state::{AppState, EngineHandle, EngineMode};
 use crate::theme::{Bed, ListRow as _, Theme};
 
 // One runtime a dispatch can be pointed at, as the engine's `ListBoardRuntimes`
@@ -1932,20 +1932,20 @@ impl BoardPanel {
     /// in the preparation card instead of a button which would always refuse.
     fn approve_preparation(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(row) = self.model.task(id) else { return };
-        if self.host.is_some() {
+        let Some(engine) = self.engine(cx) else {
+            self.set_notice("Engine not connected", cx);
+            return;
+        };
+        if self.host.is_some() || engine.mode() != EngineMode::InProcess {
             self.set_notice(
                 format!(
-                    "Approve on the worktree host: comet-board approve-preparation --task {}",
+                    "Approve from an interactive terminal on the worktree host: comet-board approve-preparation --task {}",
                     row.id
                 ),
                 cx,
             );
             return;
         }
-        let Some(engine) = self.engine(cx) else {
-            self.set_notice("Engine not connected", cx);
-            return;
-        };
         let task_id = row.id.clone();
         let identifier = row.identifier.clone();
         cx.spawn(async move |this, cx| {
@@ -4073,7 +4073,10 @@ impl BoardPanel {
             let approve = preparation.requires_approval;
             let failed = preparation.state
                 == comet_proto::view::board::CheckoutPreparationState::Failed;
-            let local = self.host.is_none();
+            let local_operator = self.host.is_none()
+                && self
+                    .engine(cx)
+                    .is_some_and(|engine| engine.mode() == EngineMode::InProcess);
             let approve_id = id.clone();
             let retry_id = id.clone();
             div()
@@ -4095,7 +4098,7 @@ impl BoardPanel {
                         .text_color(theme.text_muted)
                         .child(SharedString::from(lines.join("\n"))),
                 )
-                .when(approve && local, |element| {
+                .when(approve && local_operator, |element| {
                     element.child(
                         div()
                             .id(SharedString::from(format!("board-prep-approve-{id}")))

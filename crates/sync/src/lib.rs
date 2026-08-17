@@ -7,7 +7,8 @@
 //!   exponential backoff. Wire format is the official `loro-protocol` crate — byte-identical
 //!   to the npm package the edge imports.
 //! - [`DocsStore`]: snapshot persistence (the doc IS the outbox — commands + user entries
-//!   flush immediately) and the processed-command ledger with mark-BEFORE-execute semantics.
+//!   flush immediately) and the processed-command ledger. Consumers choose the safe claim
+//!   boundary for their side effect; see `comet-engine`'s recoverable `Run` transition.
 
 pub mod jitter;
 mod room;

@@ -2323,15 +2323,21 @@ impl SyncEngine {
         age: i64,
         cap: u64,
     ) -> Result<()> {
-        if let (Some(runtime), Some(chat_id)) = (runtime, attempt.pane_id.as_deref())
-            && let Err(e) = runtime.cancel(chat_id)
-        {
-            // The attempt closes either way: a chat that cannot be interrupted
-            // is a reason to stop counting it as live, not to keep it.
-            self.log.warn(format!(
-                "{}: cancelling chat {chat_id} at the duration cap: {e:#}",
-                task.identifier
-            ));
+        if let Some(runtime) = runtime {
+            if let Some(worktree) = attempt.worktree.as_deref() {
+                runtime.cancel_checkout_preparation(worktree)?;
+            }
+            if let Some(chat_id) = attempt.pane_id.as_deref()
+                && let Err(e) = runtime.cancel(chat_id)
+            {
+                // The durable checkout tombstone above is the fail-closed
+                // boundary. A chat may already be gone; once late release is
+                // impossible, that is not a reason to keep an overrun live.
+                self.log.warn(format!(
+                    "{}: cancelling chat {chat_id} at the duration cap: {e:#}",
+                    task.identifier
+                ));
+            }
         }
         let note = format!(
             "timed out after {} (cap {})",

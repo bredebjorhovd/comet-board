@@ -1181,6 +1181,7 @@ dependencies = [
  "chrono",
  "clap",
  "comet-board",
+ "comet-engine",
  "comet-proto",
  "comet-rpc",
  "comet-update",

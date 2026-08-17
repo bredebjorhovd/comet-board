@@ -296,10 +296,7 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
                 "worktreePath": handle.cwd.clone(),
                 "repoPath": origin.to_string_lossy(),
             }),
-            &comet_rpc::Caller {
-                user: Some("relayed-user".into()),
-                org: Some("test-org".into()),
-            },
+            &comet_rpc::Caller::relayed(Some("relayed-user".into()), Some("test-org".into())),
         )
         .await;
     let relayed = match relayed {
@@ -307,14 +304,26 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         Ok(_) => panic!("relayed callers have the same repository boundary"),
     };
     assert!(relayed.to_string().contains("does not belong"), "{relayed}");
-    client
+    let local_refusal = client
         .call(
             methods::APPROVE_CHECKOUT_PREPARATION,
             serde_json::json!({ "worktreePath": handle.cwd.clone() }),
         )
         .await
-        .expect("host approves the edited digest");
-    let prepared = client
+        .expect_err("localhost alone is not operator authority");
+    assert!(
+        local_refusal.to_string().contains("operator surface"),
+        "{local_refusal}"
+    );
+    let operator = comet_rpc::operator_memory_client(core.rpc_service());
+    operator
+        .call(
+            methods::APPROVE_CHECKOUT_PREPARATION,
+            serde_json::json!({ "worktreePath": handle.cwd.clone() }),
+        )
+        .await
+        .expect("embedded operator approves the edited digest");
+    let prepared = operator
         .call(
             methods::PREPARE_CHECKOUT,
             serde_json::json!({ "worktreePath": handle.cwd.clone() }),

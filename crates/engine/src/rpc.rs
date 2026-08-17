@@ -2142,9 +2142,9 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
             methods::APPROVE_TASK_PREPARATION => {
-                if caller != &Caller::LOCAL {
+                if !caller.is_operator() {
                     return Err(RpcError::Failed(
-                        "repository preparation approval is host-local; run the command on the worktree host"
+                        "repository preparation approval requires the embedded operator surface on the worktree host"
                             .to_string(),
                     ));
                 }
@@ -2517,9 +2517,9 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
             }
             methods::APPROVE_CHECKOUT_PREPARATION => {
-                if caller != &Caller::LOCAL {
+                if !caller.is_operator() {
                     return Err(RpcError::Failed(
-                        "repository preparation approval is host-local"
+                        "repository preparation approval requires the embedded operator surface"
                             .to_string(),
                     ));
                 }

@@ -466,6 +466,15 @@ pub trait Runtime {
         anyhow::bail!("this runtime cannot approve checkout preparation")
     }
 
+    /// Revoke a parked dispatch and stop its active setup using the attempt's
+    /// own checkout identity. This is separate from [`Runtime::cancel`]: chat
+    /// metadata is mutable and may already be deleted or retargeted when the
+    /// board closes the attempt, while the attempt row still owns the exact
+    /// worktree whose handoff must be tombstoned.
+    fn cancel_checkout_preparation(&self, _worktree: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Deliver text into a live chat — review comments, settle notices to a
     /// dispatching orchestrator. Queued as a steer if a run is live, a send
     /// otherwise; the command ledger's supersede rules apply.

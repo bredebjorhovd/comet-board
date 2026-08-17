@@ -58,12 +58,13 @@
 //! [`PrepState::Failed`] with the sentence and the log path on them. The
 //! caller's job is then simple and always the same: do not start the agent.
 //!
-//! **Everything is bounded.** The setup step runs in its own process group with
-//! a timeout the recipe may shorten but not lift past [`MAX_TIMEOUT`], its
-//! output is capped at [`LOG_CAP_BYTES`] with the head kept and the truncation
-//! said out loud, and a [`CancellationToken`] kills the group rather than the
-//! shell — a `npm install` whose parent `sh` was killed is otherwise still
-//! running an hour later.
+//! **Everything is bounded.** The setup step runs in a host sandbox with only
+//! the checkout and its private runtime directory writable, in its own process
+//! group, with a timeout the recipe may shorten but not lift past
+//! [`MAX_TIMEOUT`]. Its output is capped at [`LOG_CAP_BYTES`] with the head
+//! kept and the truncation said out loud, and a [`CancellationToken`] kills the
+//! group rather than the shell — a `npm install` whose parent `sh` was killed
+//! is otherwise still running an hour later.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -73,6 +74,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use comet_harness::CancellationToken;
+use notify::Watcher;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -103,6 +105,10 @@ pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
 /// what diagnoses a broken setup, and a 200MB `npm install` log that pushed it
 /// out is a file nobody can read anyway.
 pub const LOG_CAP_BYTES: usize = 256 * 1024;
+
+#[cfg(all(test, unix))]
+static FAIL_PROJECTION_AFTER_COPY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Environment names a recipe may not set, and why each one is here.
 ///
@@ -398,7 +404,9 @@ pub struct PrepRecord {
     /// sha256 of the immutable Git tree which owns the recipe. Approval and
     /// idempotency bind to this value, not merely to the TOML: an unchanged
     /// `run = "scripts/setup.sh"` cannot retain trust after that script, a
-    /// lockfile, or a postinstall hook changes on another branch.
+    /// lockfile, or a postinstall hook changes on another branch. Preparation
+    /// rejects tracked worktree changes and watches those inputs until the
+    /// sandboxed command ends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_digest: Option<String>,
     /// The setup command as run. `None` = there was no recipe, or it had no
@@ -555,6 +563,10 @@ struct Approval {
     repository_id: String,
     recipe_digest: String,
     execution_digest: String,
+    /// The reviewed effect contract is retained outside the checkout. Archive
+    /// therefore keeps using the command the operator approved even after an
+    /// ordinary agent commit changes (or removes) the repository recipe.
+    recipe: Recipe,
     approved_at: i64,
 }
 
@@ -562,6 +574,7 @@ struct Approval {
 struct RecipeSnapshot {
     recipe: Recipe,
     recipe_digest: String,
+    tree: String,
     execution_digest: String,
 }
 
@@ -799,8 +812,12 @@ impl CheckoutPrep {
             ));
         }
 
+        // Resolve HEAD once, then address every reviewed byte through that
+        // immutable tree object. Reading `HEAD:path` and `HEAD^{tree}` in two
+        // commands lets a concurrent checkout splice recipe A onto tree B.
+        let tree = git_output(&worktree, &["rev-parse", "--verify", "HEAD^{tree}"])?;
         let recipe_bytes =
-            match git_output_bytes(&worktree, &["show", &format!("HEAD:{RECIPE_PATH}")]) {
+            match git_output_bytes(&worktree, &["show", &format!("{tree}:{RECIPE_PATH}")]) {
                 Ok(bytes) => bytes,
                 Err(_error) if !worktree.join(RECIPE_PATH).exists() => return Ok(None),
                 Err(_) => {
@@ -812,7 +829,6 @@ impl CheckoutPrep {
         let text = std::str::from_utf8(&recipe_bytes)
             .map_err(|_| format!("{RECIPE_PATH} is not UTF-8"))?;
         let recipe = Recipe::parse(text)?;
-        let tree = git_output(&worktree, &["rev-parse", "HEAD^{tree}"])?;
         let recipe_digest = digest_bytes(&recipe_bytes);
         let mut hasher = Sha256::new();
         hasher.update(b"comet-checkout-preparation-v1\0");
@@ -821,6 +837,7 @@ impl CheckoutPrep {
         Ok(Some(RecipeSnapshot {
             recipe,
             recipe_digest,
+            tree,
             execution_digest,
         }))
     }
@@ -830,25 +847,39 @@ impl CheckoutPrep {
     /// command cannot borrow approval from `HEAD` while opening different
     /// script bytes from disk. Untracked setup output remains allowed: retries
     /// are explicitly idempotent and often resume package-manager output.
-    fn ensure_tracked_inputs(&self, worktree: &Path) -> Result<(), String> {
-        let status = git_command(worktree)
-            .args(["diff", "--quiet", "--no-ext-diff", "HEAD", "--"])
-            .status()
-            .map_err(|e| format!("checking tracked preparation inputs: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else if status.code() == Some(1) {
-            Err(
-                "tracked files differ from the approved Git tree; commit or restore them before preparation"
-                    .to_string(),
-            )
-        } else {
-            Err(format!(
-                "Git could not verify the tracked preparation inputs (status {status})"
-            ))
-        }
+    fn ensure_tracked_inputs(&self, worktree: &Path, expected_tree: &str) -> Result<(), String> {
+        verify_tracked_inputs(worktree, expected_tree)
     }
+}
 
+fn verify_tracked_inputs(worktree: &Path, expected_tree: &str) -> Result<(), String> {
+    let current_tree = git_output(worktree, &["rev-parse", "--verify", "HEAD^{tree}"])?;
+    if current_tree != expected_tree {
+        return Err(format!(
+            "checkout HEAD changed while preparation was being authorized (expected tree {}, found {})",
+            &expected_tree[..expected_tree.len().min(12)],
+            &current_tree[..current_tree.len().min(12)]
+        ));
+    }
+    let status = git_command(worktree)
+        .args(["diff", "--quiet", "--no-ext-diff", "HEAD", "--"])
+        .status()
+        .map_err(|e| format!("checking tracked preparation inputs: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else if status.code() == Some(1) {
+        Err(
+            "tracked files differ from the approved Git tree; commit or restore them before preparation"
+                .to_string(),
+        )
+    } else {
+        Err(format!(
+            "Git could not verify the tracked preparation inputs (status {status})"
+        ))
+    }
+}
+
+impl CheckoutPrep {
     /// Park the work that is waiting on this preparation, so that a retry
     /// which succeeds can release it without anybody minting a second attempt.
     ///
@@ -925,15 +956,20 @@ impl CheckoutPrep {
     /// Revoke work that has not been released yet. Cancellation calls this
     /// before interrupting the chat, so a late successful setup cannot start a
     /// run after its attempt was cancelled.
-    pub fn revoke_parked(&self, worktree: &Path) {
+    pub fn revoke_parked(&self, worktree: &Path) -> std::io::Result<()> {
         let _guard = self.release.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.brief_path(worktree);
-        let _ = write_release_state(
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        write_release_state(
             &path,
             &ReleaseState::Revoked {
                 revoked_at: now_ms(),
             },
-        );
+        )
     }
 
     /// Cancel the active setup for this checkout, if there is one. The token
@@ -962,11 +998,12 @@ impl CheckoutPrep {
         let snapshot = self
             .recipe_snapshot(worktree)?
             .ok_or_else(|| format!("{} has no {RECIPE_PATH}", worktree.display()))?;
-        self.ensure_tracked_inputs(worktree)?;
+        self.ensure_tracked_inputs(worktree, &snapshot.tree)?;
         let approval = Approval {
             repository_id: repository_id.to_string(),
             recipe_digest: snapshot.recipe_digest,
             execution_digest: snapshot.execution_digest.clone(),
+            recipe: snapshot.recipe,
             approved_at: now_ms(),
         };
         let text = serde_json::to_vec_pretty(&approval).map_err(|e| e.to_string())?;
@@ -978,17 +1015,32 @@ impl CheckoutPrep {
         Ok(snapshot.execution_digest)
     }
 
-    fn approved(&self, repository_id: &str, snapshot: &RecipeSnapshot) -> bool {
-        let Ok(text) =
-            std::fs::read_to_string(self.approval_path(repository_id, &snapshot.execution_digest))
+    fn approval(
+        &self,
+        repository_id: &str,
+        recipe_digest: &str,
+        execution_digest: &str,
+    ) -> Option<Approval> {
+        let Ok(text) = std::fs::read_to_string(self.approval_path(repository_id, execution_digest))
         else {
-            return false;
+            return None;
         };
-        serde_json::from_str::<Approval>(&text).is_ok_and(|approval| {
-            approval.repository_id == repository_id
-                && approval.recipe_digest == snapshot.recipe_digest
-                && approval.execution_digest == snapshot.execution_digest
-        })
+        serde_json::from_str::<Approval>(&text)
+            .ok()
+            .filter(|approval| {
+                approval.repository_id == repository_id
+                    && approval.recipe_digest == recipe_digest
+                    && approval.execution_digest == execution_digest
+            })
+    }
+
+    fn approved(&self, repository_id: &str, snapshot: &RecipeSnapshot) -> bool {
+        self.approval(
+            repository_id,
+            &snapshot.recipe_digest,
+            &snapshot.execution_digest,
+        )
+        .is_some()
     }
 
     /// Prepare the checkout: project the links, run `[setup]`, write down what
@@ -1087,7 +1139,7 @@ impl CheckoutPrep {
             return self.write(record);
         }
 
-        if let Err(detail) = self.ensure_tracked_inputs(&worktree) {
+        if let Err(detail) = self.ensure_tracked_inputs(&worktree, &snapshot.tree) {
             record.state = PrepState::Failed;
             record.ended_at = Some(now_ms());
             record.detail = Some(detail);
@@ -1123,6 +1175,7 @@ impl CheckoutPrep {
             recipe.setup_timeout(),
             &log,
             Some(&token),
+            Some(&snapshot.tree),
         )
         .await;
 
@@ -1130,8 +1183,20 @@ impl CheckoutPrep {
         record.exit_code = outcome.exit_code;
         match outcome.verdict {
             Verdict::Ok => {
-                record.state = PrepState::Ready;
-                record.detail = None;
+                // The watcher inside `run_step` kills the command tree as soon
+                // as a tracked input changes. Recheck after reap as the durable
+                // proof that the bytes authorized at entry remained the tree
+                // which the confined command observed.
+                match self.ensure_tracked_inputs(&worktree, &snapshot.tree) {
+                    Ok(()) => {
+                        record.state = PrepState::Ready;
+                        record.detail = None;
+                    }
+                    Err(detail) => {
+                        record.state = PrepState::Failed;
+                        record.detail = Some(detail);
+                    }
+                }
             }
             Verdict::Failed(detail) => {
                 record.state = PrepState::Failed;
@@ -1154,25 +1219,38 @@ impl CheckoutPrep {
         cancel: Option<&CancellationToken>,
     ) -> Option<String> {
         let worktree = canonical(worktree);
-        let snapshot = self.recipe_snapshot(&worktree).ok().flatten()?;
-        let step = snapshot.recipe.archive.as_ref()?;
-        if !self.approved(repository_id, &snapshot) {
-            return Some(format!(
-                "`{}` was not run because this recipe is not approved on this host",
-                step.run
-            ));
-        }
-        if let Err(detail) = self.ensure_tracked_inputs(&worktree) {
-            return Some(format!("`{}` was not run: {detail}", step.run));
-        }
+        // Archive is approved before the run, then intentionally survives the
+        // run's commits and dirty files. Loading the *current* recipe here made
+        // cleanup unusable after ordinary work and could execute an agent's
+        // replacement script. Use the retained approved contract; the host
+        // sandbox below confines it to this checkout and its runtime root.
+        let (recipe_digest, execution_digest, current_step) = match self.status(&worktree) {
+            Some(record) => (record.recipe_digest?, record.execution_digest?, None),
+            None => {
+                let snapshot = self.recipe_snapshot(&worktree).ok().flatten()?;
+                let step = snapshot.recipe.archive.as_ref()?.run.clone();
+                (
+                    snapshot.recipe_digest,
+                    snapshot.execution_digest,
+                    Some(step),
+                )
+            }
+        };
+        let Some(approval) = self.approval(repository_id, &recipe_digest, &execution_digest) else {
+            return current_step.map(|step| {
+                format!("`{step}` was not run because this recipe is not approved on this host")
+            });
+        };
+        let step = approval.recipe.archive.as_ref()?;
         let log = self.state_dir(&worktree).join("archive.log");
         let outcome = run_step(
             &step.run,
             &worktree,
-            &snapshot.recipe.env,
-            snapshot.recipe.archive_timeout(),
+            &approval.recipe.env,
+            approval.recipe.archive_timeout(),
             &log,
             cancel,
+            None,
         )
         .await;
         Some(match outcome.verdict {
@@ -1490,66 +1568,103 @@ fn project_links_unix(
         else {
             unreachable!("destination parent creation returns a directory")
         };
+        // Write a private sibling first. The named destination is published
+        // only after copy, mode preservation and fsync all succeed; a failed
+        // or interrupted projection therefore leaves no partial credential
+        // which a retry could mistake for an operator-owned existing file.
+        let temporary_name =
+            CString::new(format!(".comet-projection-{}.tmp", uuid::Uuid::new_v4()))
+                .map_err(|_| "temporary projection name contains NUL".to_string())?;
         let destination_fd = unsafe {
             libc::openat(
                 destination_parent.as_raw_fd(),
-                destination_name.as_ptr(),
+                temporary_name.as_ptr(),
                 libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-                source_meta.mode() & 0o7777,
+                0o600,
             )
         };
         if destination_fd < 0 {
             let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EEXIST) {
-                let stat = stat_at(&destination_parent, &destination_name)
-                    .map_err(|e| format!("inspecting existing {}: {e}", to_display.display()))?;
-                if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
-                    return Err(format!(
-                        "{} is a symlink — projection destinations may not be symlinks",
-                        to_display.display()
-                    ));
-                }
-                outcomes.push(LinkOutcome {
-                    from: from_display.to_string_lossy().into_owned(),
-                    to: link.to.clone(),
-                    result: "kept".into(),
-                    mode: Some(formatted_mode(stat.st_mode)),
-                });
-                continue;
-            }
-            if error.raw_os_error() == Some(libc::ELOOP) {
-                return Err(format!(
-                    "{} is a symlink — projection destinations may not be symlinks",
-                    to_display.display()
-                ));
-            }
             return Err(format!(
-                "creating {} for a projection: {error}",
+                "creating a temporary file beside {} for a projection: {error}",
                 to_display.display()
             ));
         }
         // SAFETY: `openat` returned a new owned descriptor.
         let mut destination = unsafe { std::fs::File::from_raw_fd(destination_fd) };
-        std::io::copy(&mut source, &mut destination)
-            .map_err(|e| format!("copying {} into the checkout: {e}", from_display.display()))?;
         let source_mode = (source_meta.mode() & 0o7777) as libc::mode_t;
-        let chmod = unsafe { libc::fchmod(destination.as_raw_fd(), source_mode) };
-        if chmod != 0 {
-            return Err(format!(
-                "preserving mode on {}: {}",
-                to_display.display(),
-                std::io::Error::last_os_error()
-            ));
+        let publication = (|| -> Result<bool, String> {
+            std::io::copy(&mut source, &mut destination).map_err(|e| {
+                format!("copying {} into the checkout: {e}", from_display.display())
+            })?;
+            #[cfg(test)]
+            if FAIL_PROJECTION_AFTER_COPY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err("simulated interruption after projection copy".to_string());
+            }
+            let chmod = unsafe { libc::fchmod(destination.as_raw_fd(), source_mode) };
+            if chmod != 0 {
+                return Err(format!(
+                    "preserving mode on {}: {}",
+                    to_display.display(),
+                    std::io::Error::last_os_error()
+                ));
+            }
+            destination
+                .sync_all()
+                .map_err(|e| format!("syncing {}: {e}", to_display.display()))?;
+            let linked = unsafe {
+                libc::linkat(
+                    destination_parent.as_raw_fd(),
+                    temporary_name.as_ptr(),
+                    destination_parent.as_raw_fd(),
+                    destination_name.as_ptr(),
+                    0,
+                )
+            };
+            if linked == 0 {
+                destination_parent
+                    .sync_all()
+                    .map_err(|e| format!("syncing {}: {e}", to_display.display()))?;
+                return Ok(true);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                return Ok(false);
+            }
+            Err(format!(
+                "publishing {} without replacing an existing file: {error}",
+                to_display.display()
+            ))
+        })();
+        drop(destination);
+        unsafe {
+            libc::unlinkat(destination_parent.as_raw_fd(), temporary_name.as_ptr(), 0);
         }
-        destination
-            .sync_all()
-            .map_err(|e| format!("syncing {}: {e}", to_display.display()))?;
-        outcomes.push(LinkOutcome {
-            from: from_display.to_string_lossy().into_owned(),
-            to: link.to.clone(),
-            result: "copied".into(),
-            mode: Some(formatted_mode(source_mode)),
-        });
+        let _ = destination_parent.sync_all();
+        let copied = publication?;
+        if copied {
+            outcomes.push(LinkOutcome {
+                from: from_display.to_string_lossy().into_owned(),
+                to: link.to.clone(),
+                result: "copied".into(),
+                mode: Some(formatted_mode(source_mode)),
+            });
+        } else {
+            let stat = stat_at(&destination_parent, &destination_name)
+                .map_err(|e| format!("inspecting existing {}: {e}", to_display.display()))?;
+            if stat.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                return Err(format!(
+                    "{} is a symlink — projection destinations may not be symlinks",
+                    to_display.display()
+                ));
+            }
+            outcomes.push(LinkOutcome {
+                from: from_display.to_string_lossy().into_owned(),
+                to: link.to.clone(),
+                result: "kept".into(),
+                mode: Some(formatted_mode(stat.st_mode)),
+            });
+        }
     }
     Ok(outcomes)
 }
@@ -1560,6 +1675,12 @@ fn project_links_portable(
     locals: &Path,
     worktree: &Path,
 ) -> Result<Vec<LinkOutcome>, String> {
+    if !links.is_empty() {
+        return Err(
+            "machine-local file projection is disabled on this host because Comet cannot publish it with descriptor-relative, no-follow semantics"
+                .to_string(),
+        );
+    }
     let mut out = Vec::new();
     for link in links {
         let from_rel = relative_within("from", &link.from)?;
@@ -1738,6 +1859,7 @@ async fn run_step(
     timeout: Duration,
     log_path: &Path,
     cancel: Option<&CancellationToken>,
+    expected_tree: Option<&str>,
 ) -> StepOutcome {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1745,12 +1867,44 @@ async fn run_step(
     let runtime_root = log_path.parent().unwrap_or(worktree).join("runtime");
     let isolated_home = runtime_root.join("home");
     let isolated_tmp = runtime_root.join("tmp");
+    let isolated_cargo = runtime_root.join("cargo");
+    let isolated_xdg_config = runtime_root.join("xdg-config");
+    let isolated_xdg_cache = runtime_root.join("xdg-cache");
+    let isolated_xdg_data = runtime_root.join("xdg-data");
     let _ = std::fs::create_dir_all(&isolated_home);
     let _ = std::fs::create_dir_all(&isolated_tmp);
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(worktree)
+    let _ = std::fs::create_dir_all(&isolated_cargo);
+    let _ = std::fs::create_dir_all(&isolated_xdg_config);
+    let _ = std::fs::create_dir_all(&isolated_xdg_cache);
+    let _ = std::fs::create_dir_all(&isolated_xdg_data);
+
+    // Install the watcher before the final tree check and keep it alive until
+    // the command has been reaped. A checkout/script switch after approval is
+    // therefore a cancellation event, not a different set of bytes gaining
+    // the approved command's host reach.
+    let tracked = match expected_tree {
+        Some(tree) => match TrackedInputGuard::new(worktree, tree) {
+            Ok(guard) => Some(guard),
+            Err(detail) => {
+                return StepOutcome {
+                    verdict: Verdict::Failed(detail),
+                    exit_code: None,
+                };
+            }
+        },
+        None => None,
+    };
+
+    let mut cmd = match crate::checkout_prep_sandbox::command(command, worktree, &runtime_root) {
+        Ok(command) => command,
+        Err(detail) => {
+            return StepOutcome {
+                verdict: Verdict::Failed(detail),
+                exit_code: None,
+            };
+        }
+    };
+    cmd.current_dir(worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1772,6 +1926,10 @@ async fn run_step(
         .env("TMPDIR", &isolated_tmp)
         .env("TEMP", &isolated_tmp)
         .env("TMP", &isolated_tmp)
+        .env("CARGO_HOME", &isolated_cargo)
+        .env("XDG_CONFIG_HOME", &isolated_xdg_config)
+        .env("XDG_CACHE_HOME", &isolated_xdg_cache)
+        .env("XDG_DATA_HOME", &isolated_xdg_data)
         .kill_on_drop(true);
     for name in ["USER", "LOGNAME", "SHELL", "PATH", "LANG", "TERM"] {
         if let Some(value) = std::env::var_os(name) {
@@ -1785,6 +1943,11 @@ async fn run_step(
     }
     for (k, v) in env {
         cmd.env(k, v);
+    }
+    if let Some(rustup) = std::env::var_os("RUSTUP_HOME").or_else(|| {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".rustup").into_os_string())
+    }) {
+        cmd.env("RUSTUP_HOME", rustup);
     }
     #[cfg(unix)]
     cmd.process_group(0);
@@ -1837,9 +2000,19 @@ async fn run_step(
         child.wait().await
     };
     let cancelled = async {
-        match cancel {
-            Some(token) => token.cancelled().await,
-            None => std::future::pending().await,
+        tokio::select! {
+            _ = async {
+                match cancel {
+                    Some(token) => token.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => "was cancelled".to_string(),
+            _ = async {
+                match tracked.as_ref() {
+                    Some(guard) => guard.changed.cancelled().await,
+                    None => std::future::pending().await,
+                }
+            } => "tracked preparation inputs changed while the command was running".to_string(),
         }
     };
 
@@ -1871,10 +2044,10 @@ async fn run_step(
                 exit_code: None,
             }, false)
         }
-        _ = cancelled => {
+        detail = cancelled => {
             kill_group(pid);
             (StepOutcome {
-                verdict: Verdict::Failed("was cancelled".to_string()),
+                verdict: Verdict::Failed(detail),
                 exit_code: None,
             }, false)
         }
@@ -1884,6 +2057,93 @@ async fn run_step(
     }
     sink.finish(&outcome.verdict);
     outcome
+}
+
+/// A live guard over the tracked execution input. `notify` is only the wakeup;
+/// Git remains the authority, so an ignored/untracked dependency directory can
+/// churn freely while any HEAD/index/tracked-file change cancels the process.
+struct TrackedInputGuard {
+    _watcher: notify::PollWatcher,
+    changed: CancellationToken,
+}
+
+impl TrackedInputGuard {
+    fn new(worktree: &Path, expected_tree: &str) -> Result<Self, String> {
+        let changed = CancellationToken::new();
+        let changed_for_event = changed.clone();
+        // Native macOS notifications are deliberately coalesced (often for a
+        // full second), which is long enough for `sleep; sh changed-script` to
+        // cross the check/use window. Poll only Git-owned leaves and HEAD/index
+        // at a short cadence: dependency output can create a million untracked
+        // files without entering this watch set, while a tracked replacement
+        // is noticed before the delayed command can consume it.
+        let config = notify::Config::default()
+            .with_poll_interval(Duration::from_millis(50))
+            // Metadata alone misses an overwrite on filesystems whose mtime
+            // granularity is coarser than this authorization window. Content
+            // comparison is the security property; only Git-owned leaves are
+            // watched, so dependency output never enters this scan.
+            .with_compare_contents(true);
+        let mut watcher = notify::PollWatcher::new(
+            move |_event: notify::Result<notify::Event>| changed_for_event.cancel(),
+            config,
+        )
+        .map_err(|error| format!("starting tracked-input watcher: {error}"))?;
+        for path in tracked_watch_paths(worktree)? {
+            watcher
+                .watch(&path, notify::RecursiveMode::NonRecursive)
+                .map_err(|error| format!("watching tracked input {}: {error}", path.display()))?;
+        }
+        // PollWatcher establishes its own comparison baseline asynchronously.
+        // Let one complete interval pass before the final Git check; otherwise
+        // a fast overwrite can become the watcher's baseline and be diagnosed
+        // only after the replacement bytes already ran.
+        std::thread::sleep(Duration::from_millis(75));
+        if changed.is_cancelled() {
+            return Err("tracked preparation inputs changed while the watcher started".into());
+        }
+        verify_tracked_inputs(worktree, expected_tree)?;
+        Ok(Self {
+            _watcher: watcher,
+            changed,
+        })
+    }
+}
+
+fn tracked_watch_paths(worktree: &Path) -> Result<Vec<PathBuf>, String> {
+    let bytes = git_output_bytes(worktree, &["ls-files", "-z"])?;
+    let mut paths = bytes
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStrExt;
+                Ok(worktree.join(std::ffi::OsStr::from_bytes(path)))
+            }
+            #[cfg(not(unix))]
+            {
+                std::str::from_utf8(path)
+                    .map(|path| worktree.join(path))
+                    .map_err(|_| "a tracked preparation path is not UTF-8".to_string())
+            }
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    for git_path in ["HEAD", "index"] {
+        let path = git_output(
+            worktree,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                git_path,
+            ],
+        )?;
+        paths.push(PathBuf::from(path));
+    }
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
 }
 
 /// Last-resort cleanup when the async preparation future itself is dropped
@@ -2014,6 +2274,22 @@ fn identity_key(repository_id: &str) -> String {
     hex(&hasher.finalize())[..24].to_string()
 }
 
+/// Stable, device-local identity shared by a repository's main checkout and
+/// linked worktrees. Exported so the host CLI's direct (non-RPC) approval path
+/// and the engine derive the same trust/locals namespace.
+pub fn repository_identity(worktree: &Path, device_id: &str) -> Result<String, String> {
+    let common = git_output(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let common = std::fs::canonicalize(&common).unwrap_or_else(|_| PathBuf::from(common));
+    let mut hasher = Sha256::new();
+    hasher.update(device_id.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(common.to_string_lossy().as_bytes());
+    Ok(hex(&hasher.finalize()))
+}
+
 /// Create a durable file without replacing an existing one. `rename` is not
 /// suitable here because Unix rename replaces; a hard link publishes the
 /// fully-written temp file atomically and returns AlreadyExists to the loser.
@@ -2142,6 +2418,36 @@ mod tests {
 
     fn recipe(text: &str) -> Result<Recipe, String> {
         Recipe::parse(text)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupted_projection_never_publishes_a_partial_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let locals = dir.path().join("locals");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&locals).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(locals.join("credential"), b"complete secret bytes").unwrap();
+        FAIL_PROJECTION_AFTER_COPY.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let error = project_links_unix(
+            &[Link {
+                from: "credential".into(),
+                to: ".secrets/credential".into(),
+            }],
+            &locals,
+            &worktree,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("simulated interruption"), "{error}");
+        assert!(!worktree.join(".secrets/credential").exists());
+        let parent = worktree.join(".secrets");
+        assert!(
+            std::fs::read_dir(parent).unwrap().next().is_none(),
+            "temporary projection is cleaned up too"
+        );
     }
 
     #[test]
