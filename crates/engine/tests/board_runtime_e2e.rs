@@ -18,6 +18,8 @@ use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use comet_board::config::Paths;
@@ -213,11 +215,14 @@ fn authenticated_git_http(origin: PathBuf) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn serve_push_model(command: String) -> String {
+fn serve_push_model(command: String) -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let served = Arc::clone(&requests);
     std::thread::spawn(move || {
         for (index, stream) in listener.incoming().take(2).enumerate() {
+            served.fetch_add(1, Ordering::SeqCst);
             let mut stream = stream.unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut length = 0;
@@ -245,7 +250,7 @@ fn serve_push_model(command: String) -> String {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
         }
     });
-    base
+    (base, requests)
 }
 
 async fn wait_for<F>(mut predicate: F, what: &str)
@@ -758,7 +763,7 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         .unwrap();
     assert!(output.status.success());
     let push_url = authenticated_git_http(receive.clone());
-    let model = serve_push_model(format!(
+    let (model, model_requests) = serve_push_model(format!(
         "unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT {} {} GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push '{}' HEAD:refs/heads/board-test",
         concat!("COMET_BOARD_", "CONFIG_DIR"),
         concat!("COMET_BOARD_", "STATE_DIR"),
@@ -867,7 +872,7 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         paths.clone(),
         core.workspace
             .merged_sessions_watch(core.sessions.watch_sessions()),
-        runtime,
+        runtime.clone(),
         core.workspace.watch_spaces(),
         tokio::runtime::Handle::current(),
         Some(PushCapabilities {
@@ -886,8 +891,9 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         .await
         .unwrap();
 
-    wait_for(
-        || {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let pushed = loop {
+        if {
             Command::new("git")
                 .args([
                     "--git-dir",
@@ -900,10 +906,22 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
                 .status()
                 .unwrap()
                 .success()
-        },
-        "model-issued remote ref",
-    )
-    .await;
+        } {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        pushed,
+        "model-issued remote ref missing; model requests={}; sessions={:?}; run_end={:?}; ledger={:?}",
+        model_requests.load(Ordering::SeqCst),
+        core.sessions.watch_sessions().borrow().clone(),
+        runtime.last_run_end(&dispatched.chat_id),
+        credential_ledger::for_chat(&paths, &dispatched.chat_id),
+    );
     wait_for(
         || {
             let facts = credential_ledger::for_chat(&paths, &dispatched.chat_id);
