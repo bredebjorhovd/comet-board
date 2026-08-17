@@ -186,6 +186,25 @@ async fn a_malformed_recipe_fails_rather_than_reads_as_absent() {
     assert!(record.detail.as_deref().unwrap().contains("runn"));
 }
 
+#[cfg(unix)]
+async fn assert_logged_child_exited(log_path: &str, context: &str) {
+    let log = std::fs::read_to_string(log_path).unwrap();
+    let pid: i32 = log
+        .lines()
+        .find_map(|line| line.strip_prefix("child:"))
+        .expect("the confined shell recorded its descendant")
+        .parse()
+        .unwrap();
+    // The kill is asynchronous to us; give the group a moment to go.
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("pid {pid} outlived {context}");
+}
+
 #[tokio::test]
 async fn a_setup_past_its_budget_is_killed_with_everything_it_started() {
     // The bound is on the process *group*: killing the `sh` and leaving the
@@ -203,23 +222,7 @@ async fn a_setup_past_its_budget_is_killed_with_everything_it_started() {
     );
 
     #[cfg(unix)]
-    {
-        let log = std::fs::read_to_string(record.log.as_ref().unwrap()).unwrap();
-        let pid: i32 = log
-            .lines()
-            .find_map(|line| line.strip_prefix("child:"))
-            .expect("the script recorded its grandchild")
-            .parse()
-            .unwrap();
-        // The kill is asynchronous to us; give the group a moment to go.
-        for _ in 0..50 {
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("pid {pid} outlived the setup that started it");
-    }
+    assert_logged_child_exited(record.log.as_deref().unwrap(), "the setup that started it").await;
 }
 
 #[cfg(target_os = "linux")]
@@ -236,20 +239,11 @@ async fn bubblewrap_owned_session_cancellation_kills_descendants() {
     assert_eq!(record.state, PrepState::Failed);
     assert!(record.detail.as_deref().unwrap().contains("1s budget"));
 
-    let log = std::fs::read_to_string(record.log.as_ref().unwrap()).unwrap();
-    let pid: i32 = log
-        .lines()
-        .find_map(|line| line.strip_prefix("child:"))
-        .expect("the confined shell recorded its descendant")
-        .parse()
-        .unwrap();
-    for _ in 0..50 {
-        if unsafe { libc::kill(pid, 0) } != 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("pid {pid} outlived its bubblewrap-owned session");
+    assert_logged_child_exited(
+        record.log.as_deref().unwrap(),
+        "its bubblewrap-owned session",
+    )
+    .await;
 }
 
 #[tokio::test]
