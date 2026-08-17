@@ -69,6 +69,24 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      # Noble confines unprofiled user namespaces through AppArmor by default.
+      # Grant only the distro bwrap executable the namespace permission it
+      # needs; keep the host-wide restriction in force for everything else.
+      - name: allow bubblewrap user namespaces
+        run: |
+          sudo tee /etc/apparmor.d/comet-bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+          /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/comet-bwrap
+      - name: bubblewrap checkout-prep smoke
+        run: >-
+          cargo test -p comet-engine --lib
+          checkout_prep::tests::bubblewrap_starts_through_the_production_runner
+          -- --exact --nocapture
       # No --all-targets here: it would silently drop doctests.
       - name: cargo test --workspace
         run: cargo test --workspace

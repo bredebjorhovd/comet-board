@@ -10,17 +10,32 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+pub(crate) struct SandboxedCommand {
+    pub(crate) command: tokio::process::Command,
+    pub(crate) isolation: SpawnIsolation,
+}
+
+pub(crate) enum SpawnIsolation {
+    ProcessGroup,
+    /// Spawn as a session leader, making the child pid both SID and PGID.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    SessionLeader,
+}
+
 /// Build (but do not spawn) the confined command.
 pub(crate) fn command(
     script: &str,
     worktree: &Path,
     runtime_root: &Path,
-) -> Result<tokio::process::Command, String> {
+) -> Result<SandboxedCommand, String> {
     #[cfg(debug_assertions)]
     if test_process() && std::env::var_os("COMET_TEST_ASSUME_OUTER_SANDBOX").is_some() {
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg(script);
-        return Ok(command);
+        return Ok(SandboxedCommand {
+            command,
+            isolation: SpawnIsolation::ProcessGroup,
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -121,7 +136,7 @@ fn macos_command(
     script: &str,
     worktree: &Path,
     runtime_root: &Path,
-) -> Result<tokio::process::Command, String> {
+) -> Result<SandboxedCommand, String> {
     let mut reads = read_roots();
     reads.push(worktree.to_path_buf());
     reads.push(runtime_root.to_path_buf());
@@ -156,7 +171,10 @@ fn macos_command(
         .arg("/bin/sh")
         .arg("-c")
         .arg(script);
-    Ok(command)
+    Ok(SandboxedCommand {
+        command,
+        isolation: SpawnIsolation::ProcessGroup,
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -171,7 +189,7 @@ fn linux_command(
     script: &str,
     worktree: &Path,
     runtime_root: &Path,
-) -> Result<tokio::process::Command, String> {
+) -> Result<SandboxedCommand, String> {
     let bwrap = find_program("bwrap").ok_or_else(|| {
         "repository setup/archive requires bubblewrap (`bwrap`) on Linux; install it before retrying"
             .to_string()
@@ -179,7 +197,6 @@ fn linux_command(
     let mut command = tokio::process::Command::new(bwrap);
     command.args([
         "--die-with-parent",
-        "--new-session",
         "--unshare-all",
         "--share-net",
         "--tmpfs",
@@ -211,7 +228,13 @@ fn linux_command(
         .arg("/bin/sh")
         .arg("-c")
         .arg(script);
-    Ok(command)
+    Ok(SandboxedCommand {
+        command,
+        // The production spawner calls setsid(2) before exec. That preserves
+        // bwrap's terminal-isolation boundary while making the pid Comet owns
+        // the PGID it later kills; bwrap's cloned child inherits that group.
+        isolation: SpawnIsolation::SessionLeader,
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -278,4 +301,5 @@ mod tests {
         assert!(allowed_path_root(Path::new("/usr/local/bin"), Some(home)));
         assert!(!allowed_path_root(Path::new("relative/bin"), Some(home)));
     }
+
 }

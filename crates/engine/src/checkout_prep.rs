@@ -2339,7 +2339,7 @@ async fn run_step(
     let _ = std::fs::create_dir_all(&isolated_xdg_cache);
     let _ = std::fs::create_dir_all(&isolated_xdg_data);
 
-    let mut cmd = match crate::checkout_prep_sandbox::command(command, worktree, &runtime_root) {
+    let sandboxed = match crate::checkout_prep_sandbox::command(command, worktree, &runtime_root) {
         Ok(command) => command,
         Err(detail) => {
             return StepOutcome {
@@ -2348,6 +2348,8 @@ async fn run_step(
             };
         }
     };
+    let isolation = sandboxed.isolation;
+    let mut cmd = sandboxed.command;
     cmd.current_dir(worktree)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -2394,7 +2396,27 @@ async fn run_step(
         cmd.env("RUSTUP_HOME", rustup);
     }
     #[cfg(unix)]
-    cmd.process_group(0);
+    match isolation {
+        crate::checkout_prep_sandbox::SpawnIsolation::ProcessGroup => {
+            cmd.process_group(0);
+        }
+        crate::checkout_prep_sandbox::SpawnIsolation::SessionLeader => {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: setsid is async-signal-safe and touches no Rust-owned
+            // memory in the post-fork child.
+            unsafe {
+                cmd.as_std_mut().pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        Ok(())
+                    }
+                });
+            }
+        }
+    }
+
+    let sandbox_argv = format!("{:?}", cmd.as_std());
 
     let mut child = match cmd.spawn() {
         Ok(child) => child,
@@ -2414,13 +2436,15 @@ async fn run_step(
     // for "what went wrong", and errors that arrived in a separate file from
     // the command that caused them answer that badly.
     let mut sink = LogSink::create(log_path, command);
+    sink.write(format!("[comet] sandbox argv: {sandbox_argv}\n").as_bytes());
     let pump = async {
         let mut out_buf = [0u8; 8192];
         let mut err_buf = [0u8; 8192];
+        let mut stderr_excerpt = Vec::new();
         loop {
             let (out_done, err_done) = (stdout.is_none(), stderr.is_none());
             if out_done && err_done {
-                return;
+                return stderr_excerpt;
             }
             tokio::select! {
                 n = async { stdout.as_mut().unwrap().read(&mut out_buf).await }, if !out_done => {
@@ -2432,7 +2456,11 @@ async fn run_step(
                 n = async { stderr.as_mut().unwrap().read(&mut err_buf).await }, if !err_done => {
                     match n {
                         Ok(0) | Err(_) => stderr = None,
-                        Ok(n) => sink.write(&err_buf[..n]),
+                        Ok(n) => {
+                            sink.write(&err_buf[..n]);
+                            let room = 4096usize.saturating_sub(stderr_excerpt.len());
+                            stderr_excerpt.extend_from_slice(&err_buf[..n.min(room)]);
+                        }
                     }
                 }
             }
@@ -2440,8 +2468,8 @@ async fn run_step(
     };
 
     let wait = async {
-        pump.await;
-        child.wait().await
+        let stderr = pump.await;
+        (child.wait().await, stderr)
     };
     let cancelled = async {
         tokio::select! {
@@ -2455,14 +2483,17 @@ async fn run_step(
     };
 
     let (outcome, completed) = tokio::select! {
-        status = wait => (match status {
-            Ok(status) => {
+        result = wait => (match result {
+            (Ok(status), stderr) => {
                 let code = status.code();
                 if status.success() {
                     StepOutcome { verdict: Verdict::Ok, exit_code: code }
                 } else {
+                    let stderr = String::from_utf8_lossy(&stderr);
+                    let stderr = stderr.trim();
                     StepOutcome {
                         verdict: Verdict::Failed(match code {
+                            Some(code) if !stderr.is_empty() => format!("exited {code}: {stderr}"),
                             Some(code) => format!("exited {code}"),
                             None => "was killed by a signal".to_string(),
                         }),
@@ -2470,7 +2501,7 @@ async fn run_step(
                     }
                 }
             }
-            Err(e) => StepOutcome {
+            (Err(e), _) => StepOutcome {
                 verdict: Verdict::Failed(format!("could not be waited on: {e}")),
                 exit_code: None,
             },
@@ -2497,9 +2528,9 @@ async fn run_step(
     outcome
 }
 
-/// Last-resort cleanup when the async preparation future itself is dropped
-/// (for example an RPC request is cancelled). `Child::kill_on_drop` kills only
-/// the shell; this guard owns the process-group promise.
+/// Last-resort cleanup when the async preparation future itself is dropped.
+/// The spawn contract makes the child pid its PGID (and, for bwrap, its SID),
+/// so this guard owns one exact group rather than guessing at a cloned pid.
 struct ProcessGroupGuard(Option<i32>);
 
 impl Drop for ProcessGroupGuard {
@@ -2508,8 +2539,8 @@ impl Drop for ProcessGroupGuard {
     }
 }
 
-/// SIGKILL the child's whole process group. `-pid` is the group, which is the
-/// child's own because [`run_step`] put it in one.
+/// SIGKILL the child's whole process group. `-pid` is valid because
+/// [`run_step`] establishes that identity before exec for every adapter.
 fn kill_group(pid: Option<i32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
@@ -3009,5 +3040,33 @@ to = ".env.local"
             &text[..200]
         );
         assert!(text.len() < LOG_CAP_BYTES + 1024);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bubblewrap_starts_through_the_production_runner() {
+        assert!(
+            std::env::var_os("COMET_TEST_ASSUME_OUTER_SANDBOX").is_none(),
+            "this smoke must exercise bubblewrap"
+        );
+        let source = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let log = runtime.path().join("smoke.log");
+        let outcome = run_step(
+            "test ! -e .git",
+            source.path(),
+            runtime.path(),
+            &BTreeMap::new(),
+            Duration::from_secs(10),
+            &log,
+            None,
+        )
+        .await;
+        if let Verdict::Failed(detail) = outcome.verdict {
+            panic!(
+                "bubblewrap production-runner smoke failed: {detail}\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+        }
     }
 }
