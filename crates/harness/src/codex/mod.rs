@@ -476,6 +476,15 @@ impl Harness for CodexHarness {
             // paired with the credential projection: ordinary chats retain
             // their configured login-shell behavior.
             cmd.arg("-c").arg("allow_login_shell=false");
+            // Codex 0.147 may wrap a model-issued command in the account's
+            // root shell snapshot after constructing the policy environment.
+            // A snapshot captured before this dispatched run can therefore
+            // restore an ambient credential helper over the board's askpass.
+            // This command-line setting wins over the account config; keeping
+            // snapshots enabled when that cannot be established would turn a
+            // successful push into an unattested one, so credentialed runs do
+            // not start without this override being present.
+            cmd.arg("-c").arg("features.shell_snapshot=false");
         }
         for config in mcp_config_overrides(&controls.mcp_servers) {
             cmd.arg("-c").arg(config);

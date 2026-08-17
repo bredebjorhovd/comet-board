@@ -7483,6 +7483,15 @@ mod tests {
             credential_ledger::minted(paths, "git-askpass", "owner/widget", Some("chat-9"));
         });
 
+        // gh#488: this is also the board-side half of the live-Codex
+        // regression. The harness test executes the model-issued push; here
+        // the same chat's Handed + Minted pair travels through a dispatched
+        // attempt, PR discovery, session reconciliation, and final settle.
+        // Do not replace this with a credential-ledger unit assertion: the
+        // bug was observable only when an origin update and settle met.
+        let record = credential_ledger::for_chat(&e.paths, "chat-9");
+        assert!(record.handed && record.minted, "{record:?}");
+        assert!(!record.unsanctioned(), "{record:?}");
         assert!(credential_writebacks(&e).is_empty());
         assert_eq!(hook.posts.lock().unwrap()[0].1["note"], Value::Null);
     }

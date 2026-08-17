@@ -389,8 +389,15 @@ async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
         "the gh shim must lead Codex's tool PATH: {policy}"
     );
     assert_eq!(
-        argv.get(2..4),
-        Some(&["-c", "allow_login_shell=false"][..]),
+        argv.get(2..6),
+        Some(
+            &[
+                "-c",
+                "allow_login_shell=false",
+                "-c",
+                "features.shell_snapshot=false",
+            ][..]
+        ),
         "credentialed runs must prohibit profile mutation after policy application: {argv:?}"
     );
     assert_eq!(argv.last(), Some(&"app-server"), "{argv:?}");
@@ -614,6 +621,7 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     let argv: Vec<&str> = argv.lines().collect();
     let policy = argv.get(1).expect("policy overlay");
     assert_eq!(argv.get(3), Some(&"allow_login_shell=false"), "{argv:?}");
+    assert_eq!(argv.get(5), Some(&"features.shell_snapshot=false"), "{argv:?}");
     assert!(policy.contains(r#""BASH_ENV" = """#), "{policy}");
     assert!(policy.contains(r#""ENV" = """#), "{policy}");
     assert!(policy.contains(r#""ZDOTDIR" = "/dev/null""#), "{policy}");
@@ -625,7 +633,7 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         format!(
             "model = \"gpt-5.4\"\nmodel_provider = \"mock\"\n\
              [model_providers.mock]\nname = \"mock\"\nbase_url = \"{model_base_url}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n\
-             [features]\nunified_exec = true\nshell_snapshot = false\n\
+             [features]\nunified_exec = true\nshell_snapshot = true\n\
              [shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n\
              [shell_environment_policy.set]\nBASH_ENV = {}\nENV = {}\nZDOTDIR = {}\n",
             serde_json::to_string(&bash_env.display().to_string()).expect("BASH_ENV encodes"),
@@ -635,7 +643,15 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     )
     .expect("restrictive lower config");
     let mut child = tokio::process::Command::new("codex")
-        .args(["-c", policy, "-c", "allow_login_shell=false", "app-server"])
+        .args([
+            "-c",
+            policy,
+            "-c",
+            "allow_login_shell=false",
+            "-c",
+            "features.shell_snapshot=false",
+            "app-server",
+        ])
         .env("CODEX_HOME", &codex_home)
         .env("HOME", &home)
         .current_dir(dir.path())
