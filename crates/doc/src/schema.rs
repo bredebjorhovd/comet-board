@@ -283,7 +283,22 @@ impl SessionDoc {
     /// Append a command entry (rule 1: own entries only, append-only).
     pub fn queue_command(&self, entry: &SessionCommandEntry) -> Result<(), DocError> {
         let commands = self.doc.get_list("commands");
-        let map = commands.push_container(LoroMap::new())?;
+        self.insert_recovered_command(commands.len(), entry)
+    }
+
+    /// Insert a command while reconstructing a semantically verified ledger.
+    ///
+    /// Normal clients must use [`Self::queue_command`]. This exists for
+    /// recovery code that starts from a compacted authoritative snapshot and
+    /// must restore locally committed entries at their original positions.
+    #[doc(hidden)]
+    pub fn insert_recovered_command(
+        &self,
+        index: usize,
+        entry: &SessionCommandEntry,
+    ) -> Result<(), DocError> {
+        let commands = self.doc.get_list("commands");
+        let map = commands.insert_container(index, LoroMap::new())?;
         map.insert("id", entry.id.as_str())?;
         map.insert(
             "kind",
