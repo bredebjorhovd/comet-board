@@ -445,7 +445,7 @@ impl Harness for PersistentHarness {
     }
     async fn run(
         &self,
-        request: RunRequest,
+        _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         *self.runs_started.lock().unwrap() += 1;

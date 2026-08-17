@@ -96,6 +96,35 @@ impl RunJournal {
         self.dir.join(format!("{}.resume", sanitize_id(chat_id)))
     }
 
+    fn rejected_resume_path(&self, chat_id: &str) -> PathBuf {
+        self.dir
+            .join(format!("{}.resume-rejected", sanitize_id(chat_id)))
+    }
+
+    /// Persist the journal sequence through which provider session ids are
+    /// known unusable. A later SessionStarted has a greater sequence and
+    /// becomes resumable; older ids stay rejected across process restart.
+    pub fn note_resume_rejected(&self, chat_id: &str) -> Result<u64, JournalError> {
+        let path = self.path_for(chat_id);
+        let (next_seq, _) = scan_tail(&path)?;
+        let cutoff = next_seq.saturating_sub(1);
+        let marker = self.rejected_resume_path(chat_id);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(marker)?;
+        file.write_all(cutoff.to_string().as_bytes())?;
+        file.sync_all()?;
+        Ok(cutoff)
+    }
+
+    pub fn rejected_resume_seq(&self, chat_id: &str) -> Option<u64> {
+        std::fs::read_to_string(self.rejected_resume_path(chat_id))
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+    }
+
     /// Auto-resume revival budget (comet `resumeAttempt`/`MAX_AUTO_RESUME`):
     /// persisted beside the journal so a run that CRASHES THE ENGINE cannot
     /// revive itself in an infinite boot loop.

@@ -247,6 +247,7 @@ pub enum RoomEvent {
 pub struct DocRecovery {
     local_device_id: Option<String>,
     on_reseed: Option<Arc<dyn Fn(LoroDoc) + Send + Sync>>,
+    mutation_gate: Option<Arc<std::sync::Mutex<()>>>,
 }
 
 impl DocRecovery {
@@ -259,6 +260,7 @@ impl DocRecovery {
         Self {
             local_device_id: Some(device_id.into()),
             on_reseed: Some(on_reseed),
+            mutation_gate: None,
         }
     }
 
@@ -267,7 +269,15 @@ impl DocRecovery {
         Self {
             local_device_id: None,
             on_reseed: Some(on_reseed),
+            mutation_gate: None,
         }
+    }
+
+    /// Serialize remote imports and the complete reseed handoff with an
+    /// owner's local mutations. The owner and room actor must share this gate.
+    pub fn with_mutation_gate(mut self, gate: Arc<std::sync::Mutex<()>>) -> Self {
+        self.mutation_gate = Some(gate);
+        self
     }
 
     #[cfg(test)]
@@ -275,6 +285,7 @@ impl DocRecovery {
         Self {
             local_device_id: None,
             on_reseed: None,
+            mutation_gate: None,
         }
     }
 }
@@ -1386,7 +1397,15 @@ impl Session {
                     if update.is_empty() {
                         continue;
                     }
-                    match self.doc.import(&update) {
+                    let import = {
+                        let gate = self.recovery.mutation_gate.clone();
+                        let _guard = gate.as_ref().map(|gate| {
+                            gate.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        });
+                        self.doc.import(&update)
+                    };
+                    match import {
                         Ok(status) if status.pending.is_none() => imported = true,
                         Ok(status) => {
                             incomplete = true;
@@ -1471,6 +1490,16 @@ impl Session {
             return Ok(false);
         }
 
+        // This starts before the old subscription/doc are detached and ends
+        // after the owner callback has installed the candidate. A local
+        // publication therefore lands wholly before the cut or wholly after
+        // it; it cannot commit into a detached old document.
+        let gate = self.recovery.mutation_gate.clone();
+        let guard = gate.as_ref().map(|gate| {
+            gate.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+
         let replayed = if let Some(device_id) = self.recovery.local_device_id.as_deref() {
             replay_unresolved_commands(&self.doc, &candidate, device_id)?
         } else {
@@ -1511,6 +1540,7 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = candidate.clone();
         on_reseed(candidate.clone());
         self.doc = candidate;
+        drop(guard);
 
         if let Some(update) = replay_update.filter(|bytes| !bytes.is_empty()) {
             self.send_loro_updates(vec![update]).await?;

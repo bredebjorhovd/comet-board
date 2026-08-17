@@ -33,11 +33,12 @@ use comet_doc::{
 };
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, RunRequest, Session, SessionStatus,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
+use crate::fork::ForkAuthority;
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
@@ -115,6 +116,13 @@ struct Inner {
     /// pointed at `comet-board`'s askpass helper for it instead of at the box
     /// user's git credentials — gh#68.
     push: OnceLock<Arc<crate::push_credentials::PushCredentials>>,
+    /// The transcript a fork carried, waiting for that fork's first run
+    /// (gh#425; wired at engine assembly, absent in bare tests). Consumed by
+    /// the first dispatch in the chat that does NOT resume a provider session —
+    /// which is every dispatch in a copy-mode fork, and the failed-resume retry
+    /// of one that tried to resume and was refused.
+    handoff: OnceLock<crate::fork::ForkHandoff>,
+    repos: OnceLock<crate::Repos>,
     /// The directory holding the `comet-board` this engine shipped with, put on
     /// every harness child's PATH so an agent can actually run the verbs its
     /// skill hands it — gh#184. Resolved once here rather than per run: it is a
@@ -134,6 +142,19 @@ pub struct SessionsEngine {
 }
 
 impl SessionsEngine {
+    pub(crate) fn clear_fork_state(&self, chat_id: &str) -> Result<(), EngineError> {
+        if let Some(store) = self.inner.handoff.get() {
+            store.clear_fork_state(chat_id)?;
+        }
+        lock(&self.inner.harness_sessions).remove(chat_id);
+        Ok(())
+    }
+    pub(crate) fn fork_is_staged(&self, chat_id: &str) -> bool {
+        self.inner
+            .handoff
+            .get()
+            .is_some_and(|store| store.is_staged(chat_id).unwrap_or(true))
+    }
     pub fn new(
         device_id: String,
         journal: Arc<RunJournal>,
@@ -155,6 +176,8 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 accounts: OnceLock::new(),
                 push: OnceLock::new(),
+                handoff: OnceLock::new(),
+                repos: OnceLock::new(),
                 agent_bin_dirs: comet_board::git_credentials::agent_bin_dir()
                     .into_iter()
                     .collect(),
@@ -193,6 +216,86 @@ impl SessionsEngine {
     /// credentials, which is the behavior that predates gh#68.
     pub fn set_push_credentials(&self, push: Arc<crate::push_credentials::PushCredentials>) {
         let _ = self.inner.push.set(push);
+    }
+
+    /// Wire the fork handoff store (called once at engine assembly, gh#425).
+    /// Without it a copy-mode fork cannot be created at all — which is the
+    /// point: a fork that silently carried nothing would be worse.
+    pub fn set_handoff(&self, handoff: crate::fork::ForkHandoff) {
+        let _ = self.inner.handoff.set(handoff);
+    }
+
+    pub fn set_repos(&self, repos: crate::Repos) {
+        let _ = self.inner.repos.set(repos);
+    }
+
+    pub(crate) fn validate_fork_cwd_change(
+        &self,
+        chat_id: &str,
+        cwd: &str,
+    ) -> Result<(), EngineError> {
+        if let Some(authority) = self
+            .inner
+            .handoff
+            .get()
+            .map(|store| store.authority(chat_id))
+            .transpose()?
+            .flatten()
+            && authority.cwd != cwd
+        {
+            return Err(EngineError::Other(
+                "a fork checkout is immutable; create another fork instead".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_fork_config_change(
+        &self,
+        chat_id: &str,
+        config: &ChatConfig,
+    ) -> Result<(), EngineError> {
+        if let Some(authority) = self
+            .inner
+            .handoff
+            .get()
+            .map(|store| store.authority(chat_id))
+            .transpose()?
+            .flatten()
+            && &authority.config != config
+        {
+            return Err(EngineError::Other(
+                "a fork's harness, sandbox, account, and execution grants are immutable".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_fork_host_change(
+        &self,
+        chat_id: &str,
+        device_id: &str,
+    ) -> Result<(), EngineError> {
+        if let Some(authority) = self
+            .inner
+            .handoff
+            .get()
+            .map(|store| store.authority(chat_id))
+            .transpose()?
+            .flatten()
+            && authority.device_id != device_id
+        {
+            return Err(EngineError::Other(
+                "a fork's host is immutable; create another fork on that device instead".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The fork handoff store, for [`crate::fork::fork_chat`] and the dispatch
+    /// path that consumes what it wrote.
+    pub fn handoff(&self) -> Option<&crate::fork::ForkHandoff> {
+        self.inner.handoff.get()
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -306,15 +409,39 @@ impl SessionsEngine {
     async fn dispatch_inner(
         &self,
         chat_id: &str,
-        harness_id: HarnessId,
+        mut harness_id: HarnessId,
         mut request: RunRequest,
         message_id: Option<String>,
-        inject_resume: bool,
+        mut inject_resume: bool,
     ) -> Result<String, EngineError> {
+        // Fork authority is host-owned on every turn, including relayed Runs.
+        // A wire caller may provide these fields for an ordinary chat, but it
+        // cannot turn a transcript-copy reviewer back into the source session
+        // or widen a shared checkout beyond its row's read-only sandbox.
+        let authority = self.inner.validated_fork_authority(chat_id).await?;
+        let fork_config = if let Some(authority) = authority {
+            let cwd = authority.cwd.as_str();
+            let config = authority.config.clone();
+            request.cwd = cwd.to_string();
+            request.model = config.model.clone();
+            request.reasoning = config.reasoning;
+            request.model_options = config.model_options.clone();
+            request.sandbox = config.sandbox;
+            request.auto_approve = false;
+            request.resume = None;
+            harness_id = config.harness;
+            // Only the destination chat's journal/session map may supply a
+            // resume id. The caller's value was cleared above.
+            inject_resume = true;
+            Some(config)
+        } else {
+            None
+        };
         // Every turn boundary revalidates the current board credential against
         // the nonsecret promise persisted at dispatch. This comes before the
         // live-steer fast path and before any user message is written.
-        self.inner.verify_push_for_turn(chat_id)?;
+        self.inner
+            .verify_push_for_turn(chat_id, fork_config.as_ref())?;
         let routed = lock(&self.inner.runs)
             .get(chat_id)
             .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
@@ -349,15 +476,13 @@ impl SessionsEngine {
         // shared login would quietly bill the wrong person. Before the user
         // message is written, alongside harness resolution, so a refusal leaves
         // no prompt sitting in the transcript with nothing answering it.
-        let (account, account_lease) = self.inner.account_for(chat_id, harness_id)?;
+        let (account, account_lease) =
+            self.inner
+                .account_for(chat_id, harness_id, fork_config.as_ref())?;
         // A board-dispatched GitHub chat must never fall back to ambient box
         // credentials if its late-minting handoff disappeared after dispatch.
         // Resolve and verify it before writing the user message or spawning.
-        let push = self.inner.push_for(chat_id)?;
-
-        let handle = self.doc_handle(chat_id)?;
-        let user_id = message_id.unwrap_or_else(new_id);
-        handle.write_user_message(&user_id, &request.prompt, now_ms())?;
+        let push = self.inner.push_for(chat_id, fork_config.as_ref())?;
 
         // Engine-owned resume (comet sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -365,9 +490,40 @@ impl SessionsEngine {
         // process (app restart) continues the same harness conversation.
         let mut resume_injected = false;
         if request.resume.is_none() && inject_resume {
-            request.resume = self.inner.resume_for(chat_id, &request.cwd);
+            request.resume = if fork_config.is_some() {
+                self.inner.resume_for_fork(chat_id, &request.cwd)
+            } else {
+                self.inner.resume_for(chat_id, &request.cwd)
+            };
             resume_injected = request.resume.is_some();
         }
+
+        // Validate and assemble the bounded first payload before creating a
+        // transcript entry, live handle, or Working status. A refusal must not
+        // leave a ghost run behind.
+        let user_prompt = request.prompt.clone();
+        let mut handoff_carried = false;
+        if fork_config.is_some()
+            && !resume_injected
+            && let Some(handoff) = self.inner.handoff.get()
+        {
+            let already_accepted = self
+                .inner
+                .journal
+                .replay(chat_id, 0)?
+                .iter()
+                .any(|(_, event)| matches!(event, AgentEvent::SessionStarted { .. }));
+            if already_accepted {
+                handoff.clear_checked(chat_id)?;
+            } else if let Some(carried) = handoff.peek(chat_id) {
+                request.prompt = combine_fork_payload(&carried, &user_prompt)?;
+                handoff_carried = true;
+            }
+        }
+
+        let handle = self.doc_handle(chat_id)?;
+        let user_id = message_id.unwrap_or_else(new_id);
+        handle.write_user_message(&user_id, &user_prompt, now_ms())?;
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
 
         let run_id = new_id();
@@ -401,11 +557,15 @@ impl SessionsEngine {
             account,
             push,
             bin_dirs: self.inner.agent_bin_dirs.clone(),
-            mcp_servers: self
-                .inner
-                .workspace()
-                .and_then(|ws| ws.chat_config(chat_id))
-                .map(|c| c.mcp_servers)
+            mcp_servers: fork_config
+                .as_ref()
+                .map(|config| config.mcp_servers.clone())
+                .or_else(|| {
+                    self.inner
+                        .workspace()
+                        .and_then(|ws| ws.chat_config(chat_id))
+                        .map(|c| c.mcp_servers)
+                })
                 .unwrap_or_default(),
         };
 
@@ -424,7 +584,7 @@ impl SessionsEngine {
         self.set_status(chat_id, SessionStatus::Working, true);
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
-        self.inner.note_message(chat_id, &request.prompt);
+        self.inner.note_message(chat_id, &user_prompt);
 
         // Name the chat NOW, off the first prompt — not after the first
         // exchange completes ("called New session for a long time for no
@@ -432,9 +592,20 @@ impl SessionsEngine {
         // the Done-time call below stays as the retry for a failed
         // generation).
         if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+            titles.maybe_generate(chat_id, harness_id, &user_prompt, &request.cwd);
         }
 
+        // A fork's carried transcript rides the FIRST prompt this chat sends to
+        // its harness, and only that one (gh#425). After the title generator
+        // and after `note_message`, both of which are about what the *person*
+        // said: the handoff is context, not their words, and a chat titled
+        // "Forked conversation" would say nothing about what it is for.
+        //
+        // Never on a resuming run: the provider already holds the conversation,
+        // and prefixing a copy of it would be both redundant and a lie about
+        // where the fork's memory came from. The failed-resume retry
+        // re-dispatches with `inject_resume = false`, so a fork whose resume
+        // the harness refuses picks the handoff up there instead.
         tokio::spawn(drive_run(
             self.inner.clone(),
             chat_id.to_string(),
@@ -448,6 +619,7 @@ impl SessionsEngine {
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
+                handoff_carried,
             },
             account_lease,
         ));
@@ -472,7 +644,13 @@ impl SessionsEngine {
         // A live steer used to return before any credential check. Revalidate
         // while the prompt still exists only in the command entry, before it
         // reaches the harness mailbox or transcript.
-        self.inner.verify_push_for_turn(chat_id)?;
+        let authority_config = self
+            .inner
+            .validated_fork_authority(chat_id)
+            .await?
+            .map(|authority| authority.config);
+        self.inner
+            .verify_push_for_turn(chat_id, authority_config.as_ref())?;
         let message = SteerMessage {
             prompt: prompt.to_string(),
             message_id: message_id.clone(),
@@ -711,6 +889,66 @@ impl SessionsEngine {
 }
 
 impl Inner {
+    /// Resolve the one immutable fork policy and prove its checkout is still a
+    /// registered root. Dispatch and direct steer both call this at every turn
+    /// boundary; a surviving path is not registry authority.
+    async fn validated_fork_authority(
+        &self,
+        chat_id: &str,
+    ) -> Result<Option<ForkAuthority>, EngineError> {
+        let authority = self
+            .handoff
+            .get()
+            .map(|store| store.authority(chat_id))
+            .transpose()?
+            .flatten();
+        let Some(authority) = authority else {
+            if self
+                .workspace()
+                .and_then(|workspace| workspace.doc().chat(chat_id).ok().flatten())
+                .is_some_and(|row| row.forked_from.is_some())
+            {
+                return Err(EngineError::Other(
+                    "fork-shaped chat has no host-owned authority".into(),
+                ));
+            }
+            return Ok(None);
+        };
+        if let Some(store) = self.handoff.get() {
+            store.require_committed(chat_id)?;
+        }
+        let workspace = self
+            .workspace()
+            .ok_or_else(|| EngineError::Other("fork workspace authority is unavailable".into()))?;
+        let row = workspace
+            .doc()
+            .chat(chat_id)?
+            .ok_or_else(|| EngineError::Other("fork chat row is missing".into()))?;
+        if authority.device_id != self.device_id || !authority.matches(&row) {
+            return Err(EngineError::Other(
+                "synced fork row conflicts with immutable host authority".into(),
+            ));
+        }
+        let repos = self
+            .repos
+            .get()
+            .ok_or_else(|| EngineError::Other("fork checkout registry is unavailable".into()))?;
+        let space = workspace
+            .doc()
+            .space(&authority.space_id)?
+            .ok_or_else(|| EngineError::Other("fork workspace is no longer registered".into()))?;
+        let registered = repos
+            .validated_checkout_root(&space.path, &authority.cwd)
+            .await
+            .ok_or_else(|| EngineError::Other("fork checkout is no longer registered".into()))?;
+        if repos.checkout_identity(&registered).await?.id != authority.checkout_id {
+            return Err(EngineError::Other(
+                "fork checkout identity no longer matches its host authority".into(),
+            ));
+        }
+        Ok(Some(authority))
+    }
+
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
         let seq = match self.journal.append(chat_id, event) {
@@ -807,7 +1045,10 @@ impl Inner {
     /// right: the follow-up becomes the warm child's next turn rather than a
     /// cold restart.
     fn kick_queue_on_settle(&self, chat_id: &str, status: SessionStatus) {
-        if matches!(status, SessionStatus::Working | SessionStatus::AwaitingInput) {
+        if matches!(
+            status,
+            SessionStatus::Working | SessionStatus::AwaitingInput
+        ) {
             return;
         }
         let Some(host) = self.doc_host.get().cloned() else {
@@ -847,6 +1088,7 @@ impl Inner {
         &self,
         chat_id: &str,
         harness: HarnessId,
+        authority: Option<&ChatConfig>,
     ) -> Result<
         (
             Option<comet_harness::AgentAccount>,
@@ -857,9 +1099,9 @@ impl Inner {
         let Some(accounts) = self.accounts.get() else {
             return Ok((None, None));
         };
-        let account_id = self
-            .workspace()
-            .and_then(|ws| ws.chat_config(chat_id))
+        let account_id = authority
+            .cloned()
+            .or_else(|| self.workspace().and_then(|ws| ws.chat_config(chat_id)))
             .and_then(|c| c.account)
             .filter(|a| !a.is_empty());
         let Some(account_id) = account_id else {
@@ -899,12 +1141,21 @@ impl Inner {
     fn push_for(
         &self,
         chat_id: &str,
+        authority: Option<&ChatConfig>,
     ) -> Result<Option<comet_harness::PushCredentials>, EngineError> {
         let Some(workspace) = self.workspace() else {
             return Ok(None);
         };
-        let config = workspace.chat_config(chat_id);
-        let mut creds = match workspace.github_push_state(chat_id)? {
+        let config = authority
+            .cloned()
+            .or_else(|| workspace.chat_config(chat_id));
+        let push_state = match config.as_ref() {
+            Some(config) => config
+                .github_push_state()
+                .map_err(|error| EngineError::Other(error.to_string()))?,
+            None => None,
+        };
+        let mut creds = match push_state {
             Some(push) => Some(
                 self.push
                     .get()
@@ -939,11 +1190,22 @@ impl Inner {
     /// a handoff. New runs call `push_for` again when they build their child
     /// environment; live steers need this standalone check because they reuse
     /// the already-running child.
-    fn verify_push_for_turn(&self, chat_id: &str) -> Result<(), EngineError> {
-        let Some(workspace) = self.workspace() else {
-            return Ok(());
+    fn verify_push_for_turn(
+        &self,
+        chat_id: &str,
+        authority: Option<&ChatConfig>,
+    ) -> Result<(), EngineError> {
+        let push = if let Some(config) = authority {
+            config
+                .github_push_state()
+                .map_err(|error| EngineError::Other(error.to_string()))?
+        } else {
+            let Some(workspace) = self.workspace() else {
+                return Ok(());
+            };
+            workspace.github_push_state(chat_id)?
         };
-        let Some(push) = workspace.github_push_state(chat_id)? else {
+        let Some(push) = push else {
             return Ok(());
         };
         self.push
@@ -965,6 +1227,13 @@ impl Inner {
     /// to. A chat nobody dispatched — and every chat that predates the field —
     /// carries [`comet_proto::TurnLimits::default`], which is off.
     fn turn_limits(&self, chat_id: &str) -> comet_proto::TurnLimits {
+        if let Some(authority) = self
+            .handoff
+            .get()
+            .and_then(|store| store.authority(chat_id).ok().flatten())
+        {
+            return authority.config.turn_limits;
+        }
         self.workspace()
             .and_then(|ws| ws.chat_config(chat_id))
             .map(|c| c.turn_limits)
@@ -1003,7 +1272,8 @@ impl Inner {
     /// A harness rejected the stored session id: tombstone it (empty string on
     /// the row, cleared cache) so no lookup source — including the journal,
     /// which still names the dead id — can re-inject it.
-    fn forget_harness_session(&self, chat_id: &str) {
+    fn forget_harness_session(&self, chat_id: &str) -> Result<(), EngineError> {
+        self.journal.note_resume_rejected(chat_id)?;
         lock(&self.harness_sessions).insert(
             chat_id.to_string(),
             HarnessSessionRef {
@@ -1014,6 +1284,7 @@ impl Inner {
         if let Some(ws) = self.workspace() {
             ws.set_chat_harness_session(chat_id, "", "");
         }
+        Ok(())
     }
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
@@ -1042,6 +1313,29 @@ impl Inner {
         cwd_ok(&session_cwd).then_some(session_id)
     }
 
+    /// Fork continuity is destination-owned only. A synced row is mutable and
+    /// can carry the source session id, so restart consults the durable journal
+    /// after the live cache and never reads that row.
+    fn resume_for_fork(&self, chat_id: &str, cwd: &str) -> Option<String> {
+        let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || session_cwd == cwd;
+        if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
+            return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
+                .then_some(known.session_id);
+        }
+        let (session_id, session_cwd) = self.journal_harness_session(chat_id)?;
+        if !cwd_ok(&session_cwd) {
+            return None;
+        }
+        lock(&self.harness_sessions).insert(
+            chat_id.to_string(),
+            HarnessSessionRef {
+                session_id: session_id.clone(),
+                cwd: session_cwd,
+            },
+        );
+        Some(session_id)
+    }
+
     /// The last harness session id named anywhere in the chat's journal, with
     /// the cwd of the `SessionStarted` that governs it. `Done.session_id`
     /// inherits the cwd of the most recent `SessionStarted` (same run).
@@ -1054,27 +1348,32 @@ impl Inner {
             }
         };
         let mut current_cwd = String::new();
-        let mut found: Option<(String, String)> = None;
-        for (_, event) in events {
+        let rejected_through = self.journal.rejected_resume_seq(chat_id);
+        let mut found: Option<(u64, String, String)> = None;
+        for (seq, event) in events {
             match event {
                 AgentEvent::SessionStarted {
                     session_id, cwd, ..
                 } => {
                     current_cwd = cwd;
                     if !session_id.is_empty() {
-                        found = Some((session_id, current_cwd.clone()));
+                        found = Some((seq, session_id, current_cwd.clone()));
                     }
                 }
                 AgentEvent::Done {
                     session_id: Some(session_id),
                     ..
                 } if !session_id.is_empty() => {
-                    found = Some((session_id, current_cwd.clone()));
+                    found = Some((seq, session_id, current_cwd.clone()));
                 }
                 _ => {}
             }
         }
-        found
+        found.and_then(|(seq, session_id, cwd)| {
+            rejected_through
+                .is_none_or(|cutoff| seq > cutoff)
+                .then_some((session_id, cwd))
+        })
     }
 
     fn remove_run(&self, chat_id: &str, run_id: &str) {
@@ -1168,6 +1467,26 @@ fn finish_segment<'a>(
 struct RunResumeState {
     user_message_id: String,
     resume_injected: bool,
+    handoff_carried: bool,
+}
+
+const FORK_FIRST_PAYLOAD_BYTES: usize = 32 * 1024;
+
+pub(crate) fn combine_fork_payload(carried: &str, prompt: &str) -> Result<String, EngineError> {
+    if prompt.len() > FORK_FIRST_PAYLOAD_BYTES {
+        return Err(EngineError::Other(format!(
+            "fork prompt exceeds the {} byte first-payload limit",
+            FORK_FIRST_PAYLOAD_BYTES
+        )));
+    }
+    let separator = "\n\n";
+    if carried.len() + separator.len() + prompt.len() > FORK_FIRST_PAYLOAD_BYTES {
+        return Err(EngineError::Other(format!(
+            "copied context and fork prompt exceed the {} byte first-payload limit",
+            FORK_FIRST_PAYLOAD_BYTES
+        )));
+    }
+    Ok(format!("{carried}{separator}{prompt}"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1553,7 +1872,12 @@ async fn drive_run(
                 chat = %chat_id,
                 "harness rejected injected resume id; retrying as a fresh session"
             );
-            inner.forget_harness_session(&chat_id);
+            if let Err(error) = inner.forget_harness_session(&chat_id) {
+                tracing::error!(chat = %chat_id, %error, "rejected resume tombstone could not be persisted");
+                inner.remove_run(&chat_id, &run_id);
+                inner.set_status(&chat_id, SessionStatus::Errored, false);
+                return;
+            }
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
@@ -1643,7 +1967,14 @@ async fn drive_run(
             _ => {}
         }
 
-        inner.publish(&chat_id, &event);
+        let journal_seq = inner.publish(&chat_id, &event);
+        if resume_state.handoff_carried
+            && journal_seq > 0
+            && matches!(&event, AgentEvent::SessionStarted { .. })
+            && let Some(handoff) = inner.handoff.get()
+        {
+            handoff.clear(&chat_id);
+        }
 
         // Defensive rule from comet: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
@@ -1758,6 +2089,96 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authority_row() -> comet_proto::Chat {
+        let mut row: comet_proto::Chat = serde_json::from_value(serde_json::json!({
+            "id": "fork-1", "deviceId": "host-1", "title": "Fork",
+            "archived": false, "cwd": "/checkout", "branch": null,
+            "checkoutId": "checkout-1",
+            "config": {
+                "harness": "mock", "model": "safe-model", "reasoning": "medium",
+                "modelOptions": {}, "sandbox": "read-only", "account": null,
+                "pushRepo": null, "pushContract": null, "gitAuthor": null,
+                "turnLimits": {}, "mcpServers": []
+            },
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-08-17T00:00:00Z", "harnessSessionId": null,
+            "harnessSessionCwd": null, "spaceId": "space-1", "lastSeenAt": null,
+            "forkedFrom": null
+        }))
+        .unwrap();
+        row.forked_from = Some(comet_proto::ChatLineage {
+            source_chat_id: "source".into(),
+            source_message_id: None,
+            checkout: comet_proto::ForkCheckout::Shared,
+            context: comet_proto::ForkContext::TranscriptCopy,
+            copy_reason: Some(comet_proto::CopyReason::ProviderCloneUnavailable),
+            carried_messages: Some(1),
+            truncated: false,
+            truncation: None,
+            forked_at: chrono::Utc::now(),
+        });
+        row
+    }
+
+    fn authority_for(row: &comet_proto::Chat) -> crate::fork::ForkAuthority {
+        crate::fork::ForkAuthority {
+            chat_id: row.id.clone(),
+            device_id: row.device_id.clone(),
+            space_id: row.space_id.clone().unwrap(),
+            cwd: row.cwd.clone().unwrap(),
+            checkout_id: row.checkout_id.clone().unwrap(),
+            config: row.config.clone().unwrap(),
+            lineage: row.forked_from.clone().unwrap(),
+        }
+    }
+
+    #[test]
+    fn post_validation_row_poisoning_cannot_change_the_execution_snapshot() {
+        let authority = authority_row();
+        let capsule = authority_for(&authority);
+        let execution = capsule.config.clone();
+        let mut poisoned = authority;
+        poisoned.config.as_mut().unwrap().sandbox = comet_proto::SandboxLevel::DangerFullAccess;
+        poisoned.config.as_mut().unwrap().model = Some("poisoned-model".into());
+
+        assert!(!capsule.matches(&poisoned));
+        assert_eq!(execution.sandbox, comet_proto::SandboxLevel::ReadOnly);
+        assert_eq!(execution.model.as_deref(), Some("safe-model"));
+    }
+
+    #[test]
+    fn journal_owned_session_cache_fields_do_not_poison_static_authority() {
+        let authority = authority_row();
+        let capsule = authority_for(&authority);
+        let mut synced = authority.clone();
+        synced.harness_session_id = Some("untrusted-row-session".into());
+        synced.harness_session_cwd = Some("/elsewhere".into());
+        synced.last_message_preview = Some("runtime cache".into());
+        synced.title = Some("Renamed fork".into());
+        synced.archived = true;
+        synced.branch = Some("renamed-branch".into());
+        assert!(capsule.matches(&synced));
+    }
+
+    #[test]
+    fn an_overfull_fork_payload_is_refused_without_unreported_truncation() {
+        let prompt = "do exactly this";
+        let carried = "é".repeat(FORK_FIRST_PAYLOAD_BYTES);
+        assert!(combine_fork_payload(&carried, prompt).is_err());
+    }
+
+    #[test]
+    fn an_instruction_too_large_for_the_payload_is_refused() {
+        let prompt = "x".repeat(FORK_FIRST_PAYLOAD_BYTES + 1);
+        assert!(combine_fork_payload("context", &prompt).is_err());
+    }
+
+    #[test]
+    fn an_exact_limit_instruction_refuses_to_misreport_dropped_context() {
+        let prompt = "x".repeat(FORK_FIRST_PAYLOAD_BYTES);
+        assert!(combine_fork_payload("context", &prompt).is_err());
+    }
 
     /// gh#395 — the doc host asks this before it releases a chat's room, so
     /// what counts as "busy" is worth pinning down on its own: a settled chat

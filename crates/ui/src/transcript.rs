@@ -263,6 +263,8 @@ pub struct Row {
     /// LAST row of a completed entry (user rows always; assistant rows only
     /// once streaming ends — "the turn isn't at a time yet", chat-view.tsx).
     pub timestamp: Option<i64>,
+    /// Only completed user/assistant entries are valid host fork points.
+    pub forkable: bool,
 }
 
 /// Absolute hover-timestamp label, e.g. "Jul 1, 3:45 PM" — the exact
@@ -315,6 +317,8 @@ pub fn rows_for_entry(
 ) -> Vec<Row> {
     let mut rows: Vec<Row> = Vec::new();
     let streaming = entry.status == Some(MessageStatus::Streaming);
+    let forkable = entry.status == Some(MessageStatus::Complete)
+        && matches!(entry.role, MessageRole::User | MessageRole::Assistant);
     let entry_id: SharedString = entry.id.clone().into();
 
     if entry.role == MessageRole::User {
@@ -343,6 +347,7 @@ pub fn rows_for_entry(
             // User rows always carry the strip (chat-view.tsx: whenever
             // `createdAt` exists — the optimistic echo included).
             timestamp: Some(entry.created_at),
+            forkable,
         }];
     }
 
@@ -369,6 +374,7 @@ pub fn rows_for_entry(
                 },
                 entry_id: entry.id.clone().into(),
                 timestamp: None,
+                forkable,
             });
             *group_ix += 1;
         };
@@ -415,6 +421,7 @@ pub fn rows_for_entry(
                     },
                     entry_id: entry_id.clone(),
                     timestamp: None,
+                    forkable,
                 });
             }
             MessagePart::Tool {
@@ -465,6 +472,7 @@ pub fn rows_for_entry(
                                 turn_start: false,
                                 entry_id: entry_id.clone(),
                                 timestamp: None,
+                                forkable,
                                 kind: if streaming {
                                     RowKind::LiveMarkdown {
                                         tree: tree.clone(),
@@ -503,6 +511,7 @@ pub fn rows_for_entry(
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
+                            forkable,
                         });
                     }
                     MessagePart::Error {
@@ -519,6 +528,7 @@ pub fn rows_for_entry(
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
+                            forkable,
                         });
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
@@ -899,6 +909,21 @@ struct FoldState {
     /// reappearance (user report).
     toggled_at: Option<Instant>,
 }
+
+/// What the transcript asks the shell to do (gh#425).
+///
+/// An event rather than a call because the fork menu is shell chrome: it is a
+/// modal over the whole window, it needs the viewport to size its scrim, and it
+/// ends by *selecting another chat* — all things the transcript has no business
+/// knowing about. The transcript's job is to know which message the pointer was
+/// on.
+#[derive(Debug, Clone)]
+pub enum TranscriptEvent {
+    /// Fork this conversation at this message.
+    ForkAt { message_id: SharedString },
+}
+
+impl gpui::EventEmitter<TranscriptEvent> for Transcript {}
 
 pub struct Transcript {
     state: Entity<AppState>,
@@ -1759,6 +1784,38 @@ impl Transcript {
         // flush: the Timestamp follows the bubble HStack directly (VStack gap
         // defaults to 0 in mugen), the label's centering inside the 16px lane
         // is all the gap the original has.
+        // The fork affordance shares that lane (gh#425). In the strip and not
+        // in a hover toolbar of its own because the strip is already the
+        // per-entry, reveal-on-hover, layout-reserved surface: a second one
+        // would be a second thing that can shift the virtualizer.
+        //
+        // Offered exactly where the timestamp is — the last row of a COMPLETED
+        // entry — because that is the same rule a fork point has to satisfy: a
+        // message that finished happening. A send still in flight (`pending`)
+        // is not in the doc yet and would be forked at nothing.
+        let pending_row = matches!(row.kind, RowKind::User { pending: true, .. });
+        let fork_button = (hovered && row.timestamp.is_some() && !pending_row && row.forkable)
+            .then(|| {
+                let key = SharedString::from(format!("fork-{}", row.id));
+                let entry = row.entry_id.clone();
+                motion::fade_quick(
+                    key.clone(),
+                    div()
+                        .id(key)
+                        .px(px(4.0))
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .hover(|s| s.text_color(theme.text))
+                        .cursor_pointer()
+                        .child(SharedString::from("Fork from here"))
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.emit(TranscriptEvent::ForkAt {
+                                message_id: entry.clone(),
+                            });
+                        })),
+                )
+            });
         let strip = row.timestamp.map(|ms| {
             div()
                 .h(px(if is_user_row { 16.0 } else { 20.0 }))
@@ -1766,6 +1823,7 @@ impl Transcript {
                 .w_full()
                 .flex()
                 .items_center()
+                .gap(px(8.0))
                 // No horizontal inset: the original's `px-1` netted out flush
                 // because its message text was inset by the same amount (group
                 // padding 4 + inner VStack 4 = 8 = group 4 + px-1 4). Here the
@@ -1783,6 +1841,7 @@ impl Transcript {
                             .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
                     ))
                 })
+                .children(fork_button)
         });
         let entry_id = row.entry_id.clone();
         let row_id = row.id.clone();
@@ -3125,7 +3184,20 @@ mod tests {
         let rows = rows_for_entry(&done, false, &mut parse);
         assert!(rows.len() >= 2);
         assert_eq!(rows.last().unwrap().timestamp, Some(done.created_at));
+        assert!(rows.last().unwrap().forkable);
         assert!(rows[..rows.len() - 1].iter().all(|r| r.timestamp.is_none()));
+
+        let system = SessionMessageEntry {
+            id: "s1".into(),
+            role: MessageRole::System,
+            parts: vec![text_part("p1", "notice")],
+            created_at: ms,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        };
+        let rows = rows_for_entry(&system, false, &mut parse);
+        assert!(rows.iter().all(|row| !row.forkable));
 
         // …but never mid-stream (chat-view.tsx: no hover under a moving reply).
         let live = assistant(

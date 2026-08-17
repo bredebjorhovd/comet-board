@@ -136,6 +136,24 @@ pub mod methods {
     /// Read-only: the last thing known about a checkout's preparation, plus the
     /// recipe's `run` command so a viewport can offer it.
     pub const CHECKOUT_PREP: &str = "CheckoutPrep";
+
+    /// Fork a conversation from one of its messages (gh#425). Params are a
+    /// [`comet_proto::ForkRequest`] → [`comet_proto::ForkResult`].
+    ///
+    /// Forwardable, and it must be: the transcript, the checkout and the
+    /// provider session all live on the device that hosts the source chat, and
+    /// the person forking is usually at a laptop that is not it.
+    ///
+    /// One call rather than the `CreateWorktree` + `Mutate createChat` +
+    /// `QueueCommand` sequence a new chat is made of, for two reasons. The
+    /// engine is the only party that can honestly decide whether the
+    /// destination resumes the provider's session or carries a copy of the
+    /// visible transcript — it holds the harness session id, the cwd it was
+    /// created under, and the transcript itself. And a worktree cut for a fork
+    /// that then fails has to be reclaimed by whoever cut it: split across
+    /// three calls, a client that dies in the middle leaks a branch and a
+    /// directory nobody will look for.
+    pub const FORK_CHAT: &str = "ForkChat";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";

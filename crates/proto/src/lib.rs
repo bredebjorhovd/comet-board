@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod context;
 pub mod entities;
+pub mod fork;
 pub mod health;
 pub mod motion;
 pub mod view;
@@ -15,4 +16,8 @@ pub mod view;
 pub use agent::*;
 pub use context::*;
 pub use entities::*;
+pub use fork::{
+    ChatLineage, CopyReason, ForkCheckout, ForkContext, ForkPoint, ForkRequest, ForkResult,
+    TranscriptTruncation, decide_context,
+};
 pub use health::EdgeHealth;

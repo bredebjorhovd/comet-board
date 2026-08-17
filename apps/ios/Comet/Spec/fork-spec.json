@@ -1,0 +1,8 @@
+[
+  { "checkout": "shared", "context": "transcriptCopy", "checkoutTag": "shared read-only", "contextTag": "copy" },
+  { "checkout": "isolated", "context": "transcriptCopy", "checkoutTag": "own worktree", "contextTag": "copy" },
+  { "checkout": "shared", "context": "nativeResume", "checkoutTag": "shared read-only", "contextTag": "resumed" },
+  { "checkout": "shared", "context": "transcriptCopy", "checkoutTag": "shared read-only", "contextTag": "copy", "truncation": "oldestMessagesDropped", "truncated": true, "truncationText": "Oldest messages dropped at the size budget." },
+  { "checkout": "shared", "context": "transcriptCopy", "checkoutTag": "shared read-only", "contextTag": "copy", "truncation": "newestMessageTruncated", "truncated": true, "truncationText": "Newest message truncated at the size budget." },
+  { "checkout": "shared", "context": "transcriptCopy", "checkoutTag": "shared read-only", "contextTag": "copy", "truncation": "oldestDroppedAndNewestTruncated", "truncated": true, "truncationText": "Oldest messages dropped and newest message truncated at the size budget." }
+]
