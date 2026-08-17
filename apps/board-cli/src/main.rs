@@ -699,10 +699,6 @@ fn validate_stats_target(command: &Command, device: Option<&str>) -> Result<()> 
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let engine_data_dir = cli
-        .data_dir
-        .clone()
-        .unwrap_or_else(comet_board::config::data_dir);
     let port = cli
         .port
         .or_else(|| {
