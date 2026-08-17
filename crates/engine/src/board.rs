@@ -81,6 +81,7 @@ enum Msg {
     },
     ApprovePreparation {
         task_id: String,
+        expected_execution_digest: String,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     /// Read one task's issue text (gh#132). On the loop's thread like every
@@ -326,12 +327,18 @@ impl BoardService {
         self.dispatch_with(task_id, origin, overrides, true).await
     }
 
-    /// Host-local approval for the exact committed-tree digest blocking this task.
-    pub async fn approve_preparation(&self, task_id: &str) -> anyhow::Result<()> {
+    /// Embedded-operator approval for the exact committed-tree digest blocking
+    /// this task.
+    pub async fn approve_preparation(
+        &self,
+        task_id: &str,
+        expected_execution_digest: &str,
+    ) -> anyhow::Result<()> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(Msg::ApprovePreparation {
                 task_id: task_id.to_string(),
+                expected_execution_digest: expected_execution_digest.to_string(),
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
@@ -635,8 +642,17 @@ fn run_loop(
                 publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
-            Ok(Msg::ApprovePreparation { task_id, reply }) => {
-                let result = handle_approve_preparation(&engine, runtime.as_ref(), &task_id);
+            Ok(Msg::ApprovePreparation {
+                task_id,
+                expected_execution_digest,
+                reply,
+            }) => {
+                let result = handle_approve_preparation(
+                    &engine,
+                    runtime.as_ref(),
+                    &task_id,
+                    &expected_execution_digest,
+                );
                 if let Err(error) = &result {
                     log.error(format!(
                         "preparation approval for {task_id} failed: {error:#}"
@@ -808,7 +824,7 @@ fn handle_dispatch(
     {
         if preparation.requires_approval {
             anyhow::bail!(
-                "{} preparation requires host approval — run `comet-board approve-preparation --task {}` on the worktree host",
+                "{} preparation requires host approval — review and approve it in the embedded Comet app on the worktree host (task {})",
                 task.identifier,
                 task.identifier
             );
@@ -1187,6 +1203,7 @@ fn handle_approve_preparation(
     engine: &SyncEngine,
     runtime: &(dyn Runtime + Send + Sync),
     task_id: &str,
+    expected_execution_digest: &str,
 ) -> anyhow::Result<()> {
     let task = engine
         .db
@@ -1204,11 +1221,21 @@ fn handle_approve_preparation(
             task.identifier
         );
     }
+    let displayed_digest = preparation.execution_digest.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("{} preparation has no execution digest", task.identifier)
+    })?;
+    anyhow::ensure!(
+        displayed_digest == expected_execution_digest,
+        "{} preparation changed after review (displayed {}, current {}); review the current effects before approving",
+        task.identifier,
+        &expected_execution_digest[..expected_execution_digest.len().min(12)],
+        &displayed_digest[..displayed_digest.len().min(12)],
+    );
     let worktree = attempt
         .worktree
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("attempt {} has no checkout", attempt.id))?;
-    runtime.approve_checkout_preparation(worktree)?;
+    runtime.approve_checkout_preparation(worktree, expected_execution_digest)?;
     let mut preparing = preparation.clone();
     preparing.state = CheckoutPreparationState::Preparing;
     preparing.requires_approval = false;
@@ -1496,7 +1523,11 @@ mod tests {
                 .push(worktree.to_string());
             Ok(())
         }
-        fn approve_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+        fn approve_checkout_preparation(
+            &self,
+            worktree: &str,
+            _expected_execution_digest: &str,
+        ) -> anyhow::Result<()> {
             self.preparation_approvals
                 .lock()
                 .unwrap()
@@ -3262,6 +3293,9 @@ max_concurrent_per_workspace = 1
                 log: Some("/logs/prep.log".into()),
                 log_excerpt: Some("setup failed".into()),
                 run_command: Some("cargo run".into()),
+                setup_command: Some("scripts/setup.sh".into()),
+                setup_outputs: vec!["target".into()],
+                archive_paths: vec!["target".into()],
                 requires_approval: false,
                 projections: Vec::new(),
             },

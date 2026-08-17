@@ -3,9 +3,9 @@
 //! This is an internal seam of `checkout_prep`: callers ask that module to run
 //! one bounded step and do not learn which host adapter enforces it. macOS uses
 //! Seatbelt through `sandbox-exec`; Linux uses bubblewrap. Both expose the same
-//! view: the checkout and the step runtime are writable, system/toolchain and
-//! Git metadata roots are read-only, every other host path is absent/denied,
-//! and network remains available for dependency installation.
+//! view: an approved, Git-materialized source tree is read-only; only the
+//! engine-owned runtime directories behind declared output symlinks are
+//! writable. Git metadata and the mutable checkout are absent.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -49,10 +49,10 @@ fn test_process() -> bool {
     })
 }
 
-/// Read-only roots a setup command needs in addition to the checkout. They are
-/// deliberately structural/tool roots, never `$HOME`: credentials become
-/// reachable only through an explicit `[[link]]` copied into the checkout.
-fn read_roots(worktree: &Path) -> Vec<PathBuf> {
+/// Read-only roots a setup command needs in addition to the approved source.
+/// They are deliberately structural/tool roots, never `$HOME`: credentials
+/// become reachable only through an explicit `[[link]]` projection.
+fn read_roots() -> Vec<PathBuf> {
     let mut roots = BTreeSet::new();
     for root in [
         "/bin",
@@ -99,9 +99,6 @@ fn read_roots(worktree: &Path) -> Vec<PathBuf> {
     if let Some(rustup) = rustup.filter(|path| path.is_dir()) {
         roots.insert(rustup);
     }
-    if let Ok(common) = git_common_dir(worktree) {
-        roots.insert(common);
-    }
     roots.into_iter().collect()
 }
 
@@ -119,37 +116,13 @@ fn allowed_path_root(path: &Path, home: Option<&Path>) -> bool {
     }
 }
 
-fn git_common_dir(worktree: &Path) -> Result<PathBuf, String> {
-    let output = std::process::Command::new("git")
-        .args([
-            "-c",
-            "core.hooksPath=/dev/null",
-            "-C",
-            &worktree.to_string_lossy(),
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-common-dir",
-        ])
-        .output()
-        .map_err(|error| format!("locating Git metadata for preparation sandbox: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "locating Git metadata for preparation sandbox: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(PathBuf::from(
-        String::from_utf8_lossy(&output.stdout).trim(),
-    ))
-}
-
 #[cfg(target_os = "macos")]
 fn macos_command(
     script: &str,
     worktree: &Path,
     runtime_root: &Path,
 ) -> Result<tokio::process::Command, String> {
-    let mut reads = read_roots(worktree);
+    let mut reads = read_roots();
     reads.push(worktree.to_path_buf());
     reads.push(runtime_root.to_path_buf());
     let read_rules = reads
@@ -166,7 +139,7 @@ fn macos_command(
          (allow file-read-metadata)\n\
          (allow file-read* {read_rules} (literal \"/dev/null\") \
             (literal \"/dev/random\") (literal \"/dev/urandom\"))\n\
-         (allow file-write* (subpath \"{}\") (subpath \"{}\") \
+         (allow file-write* (subpath \"{}\") \
             (literal \"/dev/null\"))\n\
          (allow network*)\n\
          (allow mach-lookup \
@@ -174,7 +147,6 @@ fn macos_command(
             (global-name \"com.apple.system.opendirectoryd.membership\") \
             (global-name \"com.apple.cfprefsd.agent\") \
             (global-name \"com.apple.mDNSResponder\"))",
-        seatbelt_path(worktree),
         seatbelt_path(runtime_root),
     );
     let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
@@ -212,16 +184,23 @@ fn linux_command(
         "--share-net",
         "--tmpfs",
         "/",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
     ]);
-    for root in read_roots(worktree) {
+    let reads = read_roots();
+    add_parent_dirs(
+        &mut command,
+        reads
+            .iter()
+            .map(PathBuf::as_path)
+            .chain([worktree, runtime_root]),
+    );
+    command.args([
+        "--dir", "/proc", "--dir", "/dev", "--proc", "/proc", "--dev", "/dev",
+    ]);
+    for root in reads {
         command.arg("--ro-bind").arg(&root).arg(&root);
     }
     command
-        .arg("--bind")
+        .arg("--ro-bind")
         .arg(worktree)
         .arg(worktree)
         .arg("--bind")
@@ -233,6 +212,31 @@ fn linux_command(
         .arg("-c")
         .arg(script);
     Ok(command)
+}
+
+#[cfg(target_os = "linux")]
+fn add_parent_dirs<'a>(
+    command: &mut tokio::process::Command,
+    paths: impl Iterator<Item = &'a Path>,
+) {
+    let mut parents = BTreeSet::new();
+    for path in paths {
+        if path.is_dir() {
+            parents.insert(path.to_path_buf());
+        }
+        let mut cursor = path.parent();
+        while let Some(parent) = cursor {
+            if parent != Path::new("/") {
+                parents.insert(parent.to_path_buf());
+            }
+            cursor = parent.parent();
+        }
+    }
+    let mut parents = parents.into_iter().collect::<Vec<_>>();
+    parents.sort_by_key(|path| path.components().count());
+    for parent in parents {
+        command.arg("--dir").arg(parent);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -250,7 +254,7 @@ mod tests {
 
     #[test]
     fn read_roots_never_grants_the_users_home() {
-        let roots = read_roots(Path::new("."));
+        let roots = read_roots();
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             assert!(!roots.iter().any(|root| root == &home));
         }

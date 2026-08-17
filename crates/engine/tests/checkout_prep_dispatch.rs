@@ -83,7 +83,7 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
     git(&origin, &["config", "user.name", "t"]);
     std::fs::write(
         origin.join(RECIPE_PATH),
-        "version = 1\n[setup]\nrun = \"echo ran >> prep-count.txt; echo 'toolchain missing' >&2; exit 7\"\n",
+        "version = 1\n[setup]\nrun = \"echo ran >> prep-output/count.txt; echo 'toolchain missing' >&2; exit 7\"\noutputs = [\"prep-output\"]\n",
     )
     .unwrap();
     git(&origin, &["add", "."]);
@@ -128,8 +128,13 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         tokio::runtime::Handle::current(),
     ));
     let repository_id = core.repos.repository_identity(&repo).await.unwrap();
+    let digest = core
+        .checkout_prep
+        .review_digest(&repo)
+        .unwrap()
+        .unwrap();
     core.checkout_prep
-        .approve(&repo, &repository_id)
+        .approve(&repo, &repository_id, &digest)
         .expect("host trusts the committed failing recipe");
 
     let spec = DispatchSpec {
@@ -212,6 +217,10 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         worktree.exists(),
         "a failed preparation preserves the checkout"
     );
+    assert!(
+        !worktree.join("prep-output").exists(),
+        "failed immutable output is never promoted into the checkout"
+    );
 
     // The one property the issue is named for: no run started, nothing billed.
     // The brief is parked, not queued — the journal has no run and the session
@@ -268,7 +277,7 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
     // board's recovery path.
     std::fs::write(
         worktree.join(RECIPE_PATH),
-        "version = 1\n[setup]\nrun = \"echo ran >> prep-count.txt\"\n",
+        "version = 1\n[setup]\nrun = \"echo ran >> prep-output/count.txt\"\noutputs = [\"prep-output\"]\n",
     )
     .unwrap();
     git(&worktree, &["add", RECIPE_PATH]);
@@ -316,10 +325,18 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         "{local_refusal}"
     );
     let operator = comet_rpc::operator_memory_client(core.rpc_service());
+    let reviewed_digest = core
+        .checkout_prep
+        .review_digest(std::path::Path::new(&handle.cwd))
+        .unwrap()
+        .unwrap();
     operator
         .call(
             methods::APPROVE_CHECKOUT_PREPARATION,
-            serde_json::json!({ "worktreePath": handle.cwd.clone() }),
+            serde_json::json!({
+                "worktreePath": handle.cwd.clone(),
+                "expectedExecutionDigest": reviewed_digest,
+            }),
         )
         .await
         .expect("embedded operator approves the edited digest");
@@ -347,11 +364,11 @@ async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
         )
         .await;
     }
-    let count = std::fs::read_to_string(worktree.join("prep-count.txt")).unwrap();
+    let count = std::fs::read_to_string(worktree.join("prep-output/count.txt")).unwrap();
     assert_eq!(
         count.lines().count(),
-        2,
-        "setup ran once per attempt at it — failed once, then once fixed"
+        1,
+        "only the successful immutable output is promoted into the checkout"
     );
 
     // Same worktree, same branch, same attempt-shaped world: the retry cut

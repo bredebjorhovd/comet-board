@@ -579,8 +579,13 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         .repository_identity(&recovered_repo)
         .await
         .unwrap();
+    let digest = core
+        .checkout_prep
+        .review_digest(&recovered_repo)
+        .unwrap()
+        .unwrap();
     core.checkout_prep
-        .approve(&recovered_repo, &repository_id)
+        .approve(&recovered_repo, &repository_id, &digest)
         .unwrap();
     let ready = core
         .checkout_prep

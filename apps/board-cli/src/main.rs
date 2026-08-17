@@ -22,7 +22,6 @@ use comet_board::doctor::EngineStatus;
 use comet_board::log::Logger;
 use comet_proto::Space;
 use comet_rpc::{RpcClient, connect_ws, methods};
-use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -246,8 +245,7 @@ enum Command {
         #[arg(long)]
         task: String,
     },
-    /// Approve the exact repository recipe blocking a task, then retry it in
-    /// the same worktree. Must run on the worktree host.
+    /// Explain why shell/PTY approval is refused and name the operator surface.
     ApprovePreparation {
         #[arg(long)]
         task: String,
@@ -977,67 +975,9 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Command::ApprovePreparation { task } => {
-            if device.is_some() {
-                bail!(
-                    "approve-preparation is host-local — run it on the device that owns the worktree"
-                );
-            }
-            if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
-                bail!(
-                    "approve-preparation requires an interactive terminal on the worktree host; repository code and dispatched agents cannot pipe an approval"
-                );
-            }
-            runtime.block_on(async {
-                let board = ops::attach(port, None).await?;
-                let review = ops::attempt_review(&board, &task, None).await?;
-                let worktree = review
-                    .worktree
-                    .ok_or_else(|| anyhow::anyhow!("{task} has no attempt checkout to approve"))?;
-                let prep = comet_engine::checkout_prep::CheckoutPrep::new(&engine_data_dir);
-                let recipe = prep
-                    .recipe(std::path::Path::new(&worktree))
-                    .map_err(anyhow::Error::msg)?
-                    .ok_or_else(|| anyhow::anyhow!("{worktree} has no .comet/repo.toml"))?;
-                eprintln!("Repository preparation asks this host to allow:");
-                if let Some(step) = &recipe.setup {
-                    eprintln!("  setup: {}", step.run);
-                }
-                if let Some(step) = &recipe.archive {
-                    eprintln!("  archive: {}", step.run);
-                }
-                for link in &recipe.links {
-                    eprintln!("  machine-local file: {} -> {}", link.from, link.to);
-                }
-                eprint!("Approve this committed tree and retry {task}? [y/N] ");
-                std::io::stderr().flush()?;
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                    bail!("approval cancelled");
-                }
-                let device_id = std::fs::read_to_string(engine_data_dir.join("device-id"))
-                    .context("reading the host engine's device identity")?;
-                let device_id = device_id.trim();
-                if device_id.is_empty() {
-                    bail!("the host engine's device identity is empty");
-                }
-                let repository_id = comet_engine::checkout_prep::repository_identity(
-                    std::path::Path::new(&worktree),
-                    device_id,
-                )
-                .map_err(anyhow::Error::msg)?;
-                let digest = prep
-                    .approve(std::path::Path::new(&worktree), &repository_id)
-                    .map_err(anyhow::Error::msg)?;
-                ops::prepare_checkout(&board, &worktree).await?;
-                println!(
-                    "approved tree {} and retried preparation for {task} in {worktree}",
-                    &digest[..digest.len().min(12)]
-                );
-                Ok(())
-            })
-        }
+        Command::ApprovePreparation { .. } => bail!(
+            "approve-preparation cannot grant host authority from a shell or PTY; review and approve it in the embedded Comet app on the worktree host"
+        ),
         Command::Wait {
             task,
             state,

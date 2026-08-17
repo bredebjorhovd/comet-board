@@ -142,6 +142,22 @@ struct BoardDetailSheet: View {
                                 .foregroundStyle(Theme.textMuted)
                                 .textSelection(.enabled)
                         }
+                        if let command = preparation.setupCommand {
+                            Text("Setup · \(command)")
+                                .font(Theme.mono(Theme.textCaption))
+                                .foregroundStyle(Theme.textMuted)
+                                .textSelection(.enabled)
+                        }
+                        ForEach(preparation.setupOutputs, id: \.self) { output in
+                            Text("Writable setup output · \(output)/")
+                                .font(Theme.mono(Theme.textCaption))
+                                .foregroundStyle(Theme.textMuted)
+                        }
+                        ForEach(preparation.archivePaths, id: \.self) { path in
+                            Text("Archive removes · \(path)/")
+                                .font(Theme.mono(Theme.textCaption))
+                                .foregroundStyle(Theme.textMuted)
+                        }
                         if let log = preparation.log {
                             Text("Retained output · \(log)")
                                 .font(Theme.mono(Theme.textCaption))
@@ -165,16 +181,9 @@ struct BoardDetailSheet: View {
                             .frame(maxHeight: 160)
                         }
                         if preparation.requiresApproval {
-                            let command = "comet-board approve-preparation --task \(row.id)"
-                            Button("Copy host approval command") {
-                                UIPasteboard.general.string = command
-                                onResult("Copied approval command for \(row.identifier)")
-                            }
-                            .buttonStyle(.bordered)
-                            Text("Run on the worktree host: \(command)")
+                            Text("Review every effect above, then approve in Comet on the worktree host.")
                                 .font(Theme.mono(Theme.textCaption))
                                 .foregroundStyle(Theme.textSubtle)
-                                .textSelection(.enabled)
                         } else if preparation.state == .failed {
                             Button("Retry preparation in this checkout") {
                                 Task {

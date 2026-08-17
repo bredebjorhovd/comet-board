@@ -276,6 +276,15 @@ pub struct CheckoutPreparation {
     /// Canonical development command, offered explicitly and never auto-run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_command: Option<String>,
+    /// Exact setup command reviewed for this immutable tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_command: Option<String>,
+    /// Top-level writable directories granted to setup.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_outputs: Vec<String>,
+    /// Top-level reproducible directories the engine may remove at archive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_paths: Vec<String>,
     #[serde(default)]
     pub requires_approval: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

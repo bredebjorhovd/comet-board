@@ -104,11 +104,14 @@ struct CheckoutPreparation: Decodable, Hashable {
     var log: String?
     var logExcerpt: String?
     var runCommand: String?
+    var setupCommand: String?
+    var setupOutputs: [String]
+    var archivePaths: [String]
     var requiresApproval: Bool
     var projections: [CheckoutProjection]
 
     enum CodingKeys: String, CodingKey {
-        case state, detail, log, logExcerpt, runCommand, projections
+        case state, detail, log, logExcerpt, runCommand, setupCommand, setupOutputs, archivePaths, projections
         case recipeDigest = "recipeDigest"
         case executionDigest = "executionDigest"
         case requiresApproval = "requiresApproval"
@@ -123,6 +126,9 @@ struct CheckoutPreparation: Decodable, Hashable {
         log = try c.decodeIfPresent(String.self, forKey: .log)
         logExcerpt = try c.decodeIfPresent(String.self, forKey: .logExcerpt)
         runCommand = try c.decodeIfPresent(String.self, forKey: .runCommand)
+        setupCommand = try c.decodeIfPresent(String.self, forKey: .setupCommand)
+        setupOutputs = try c.decodeIfPresent([String].self, forKey: .setupOutputs) ?? []
+        archivePaths = try c.decodeIfPresent([String].self, forKey: .archivePaths) ?? []
         requiresApproval = try c.decodeIfPresent(Bool.self, forKey: .requiresApproval) ?? false
         projections = try c.decodeIfPresent([CheckoutProjection].self, forKey: .projections) ?? []
     }

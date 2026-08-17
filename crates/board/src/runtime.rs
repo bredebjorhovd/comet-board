@@ -462,7 +462,11 @@ pub trait Runtime {
 
     /// Approve the checkout's exact repository + committed-tree digest on this host,
     /// then retry it. Transport policy decides who may invoke this mutation.
-    fn approve_checkout_preparation(&self, _worktree: &str) -> anyhow::Result<()> {
+    fn approve_checkout_preparation(
+        &self,
+        _worktree: &str,
+        _expected_execution_digest: &str,
+    ) -> anyhow::Result<()> {
         anyhow::bail!("this runtime cannot approve checkout preparation")
     }
 

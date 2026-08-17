@@ -15,12 +15,13 @@
 //! [setup]
 //! run = "scripts/setup.sh"
 //! timeout = "10m"
+//! outputs = ["target"]
 //!
 //! [run]
 //! run = "cargo run -p comet"
 //!
 //! [archive]
-//! run = "cargo clean"
+//! paths = ["target"]
 //!
 //! [env]
 //! RUST_BACKTRACE = "1"
@@ -48,9 +49,10 @@
 //! **Preparation is a property of the checkout, not of the attempt.** The
 //! record lives under `{data_dir}/checkout-prep/{hash of the worktree path}/`,
 //! survives the attempt that caused it, and short-circuits on a second visit
-//! when the committed Git tree has not changed. That is what makes a retry
-//! cheap and what makes an ordinary (non-board) session and a board dispatch
-//! the same code path — the board composes this, it does not own it.
+//! when the committed Git tree and live authenticated approval have not
+//! changed. That is what makes a retry cheap and what makes an ordinary
+//! (non-board) session and a board dispatch the same code path — the board
+//! composes this, it does not own it.
 //!
 //! **A failure is a record, not an exception.** `prepare` returns a
 //! [`PrepRecord`] whichever way it went; a malformed recipe, a link that could
@@ -58,9 +60,10 @@
 //! [`PrepState::Failed`] with the sentence and the log path on them. The
 //! caller's job is then simple and always the same: do not start the agent.
 //!
-//! **Everything is bounded.** The setup step runs in a host sandbox with only
-//! the checkout and its private runtime directory writable, in its own process
-//! group, with a timeout the recipe may shorten but not lift past
+//! **Everything is bounded.** The setup step runs from an immutable approved
+//! source tree, with only declared output directories backed by a private
+//! runtime writable, in its own process group, with a timeout the recipe may
+//! shorten but not lift past
 //! [`MAX_TIMEOUT`]. Its output is capped at [`LOG_CAP_BYTES`] with the head
 //! kept and the truncation said out loud, and a [`CancellationToken`] kills the
 //! group rather than the shell — a `npm install` whose parent `sh` was killed
@@ -74,7 +77,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use comet_harness::CancellationToken;
-use notify::Watcher;
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -93,10 +96,6 @@ pub const RECIPE_VERSION: u32 = 1;
 
 /// How long a setup step may run when the recipe does not say.
 pub const DEFAULT_SETUP_TIMEOUT: Duration = Duration::from_secs(600);
-/// How long an archive step may run when the recipe does not say. Shorter than
-/// setup on purpose: archiving happens during reclamation, on a box whose disk
-/// is already the problem, and a `clean` that hangs must not hold the sweep.
-pub const DEFAULT_ARCHIVE_TIMEOUT: Duration = Duration::from_secs(300);
 /// The ceiling a recipe may not raise. An unbounded setup is an attempt that
 /// never starts and never fails, which is the one outcome nobody can act on.
 pub const MAX_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -130,11 +129,24 @@ const RESERVED_ENV_NAMES: &[&str] = &["PATH", "LD_PRELOAD", "LD_LIBRARY_PATH", "
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Step {
-    /// The command line, run by `sh -c` from the worktree root.
+    /// The command line, run by `sh -c` from the immutable approved source.
     pub run: String,
     /// `"10m"`, `"90s"`, `"1h"`. Absent = the caller's default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
+    /// Top-level, untracked directories the setup may create. The approved Git
+    /// snapshot is otherwise read-only; each name is backed by a private
+    /// writable directory and promoted only after setup succeeds.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<String>,
+}
+
+/// Engine-owned reclamation of top-level reproducible output. No repository
+/// command is evaluated after an agent has been allowed to edit the checkout.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Archive {
+    pub paths: Vec<String>,
 }
 
 /// A machine-local file the repository asks for, by leaf name.
@@ -169,7 +181,7 @@ pub struct Recipe {
     /// Bounded cleanup of reproducible output, run before reclamation
     /// (gh#186's sweep) so a repo that knows how to clean itself gets to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub archive: Option<Step>,
+    pub archive: Option<Archive>,
     /// Values safe to commit — they are in the repository, in the open.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
@@ -204,11 +216,7 @@ impl Recipe {
                 self.version
             ));
         }
-        for (name, step) in [
-            ("setup", &self.setup),
-            ("run", &self.run),
-            ("archive", &self.archive),
-        ] {
+        for (name, step) in [("setup", &self.setup), ("run", &self.run)] {
             let Some(step) = step else { continue };
             if step.run.trim().is_empty() {
                 return Err(format!("[{name}] has an empty `run`"));
@@ -226,6 +234,18 @@ impl Recipe {
                     return Err(format!("[{name}] timeout `{spec}` is zero"));
                 }
             }
+        }
+        if self.run.as_ref().is_some_and(|step| !step.outputs.is_empty()) {
+            return Err("[run] may not declare `outputs`; only [setup] is host preparation".into());
+        }
+        if let Some(setup) = &self.setup {
+            validate_top_level_paths("[setup] `outputs`", &setup.outputs)?;
+        }
+        if let Some(archive) = &self.archive {
+            if archive.paths.is_empty() {
+                return Err("[archive] `paths` is empty".into());
+            }
+            validate_top_level_paths("[archive] `paths`", &archive.paths)?;
         }
         for name in self.env.keys() {
             if let Some(why) = reserved_env(name) {
@@ -251,17 +271,34 @@ impl Recipe {
         step_timeout(self.setup.as_ref(), DEFAULT_SETUP_TIMEOUT)
     }
 
-    /// The archive timeout this recipe asks for, already bounded.
-    pub fn archive_timeout(&self) -> Duration {
-        step_timeout(self.archive.as_ref(), DEFAULT_ARCHIVE_TIMEOUT)
-    }
-
     /// Whether accepting this recipe grants repository-authored effects to
     /// the host engine. `[run]` is excluded: it is only an offer, later run
     /// explicitly under the session's own sandbox. `[mcp]` is parsed-only.
     pub fn requires_host_approval(&self) -> bool {
         self.setup.is_some() || self.archive.is_some() || !self.links.is_empty()
     }
+}
+
+fn validate_top_level_paths(label: &str, paths: &[String]) -> Result<(), String> {
+    if paths.len() > 16 {
+        return Err(format!("{label} names more than the 16 paths Comet allows"));
+    }
+    let mut seen = HashSet::new();
+    for raw in paths {
+        let relative = relative_within(label, raw)?;
+        if relative.components().count() != 1 {
+            return Err(format!(
+                "{label} entry `{raw}` is not a top-level path; preparation output and archive reach must be visible at the repository root"
+            ));
+        }
+        if matches!(raw.as_str(), ".git" | ".comet") {
+            return Err(format!("{label} may not name `{raw}`"));
+        }
+        if !seen.insert(raw) {
+            return Err(format!("{label} names `{raw}` more than once"));
+        }
+    }
+    Ok(())
 }
 
 fn step_timeout(step: Option<&Step>, default: Duration) -> Duration {
@@ -396,6 +433,10 @@ pub struct PrepRecord {
     pub state: PrepState,
     /// The checkout this is about, canonicalized.
     pub worktree: String,
+    /// Stable host-derived repository authority used to revalidate a Ready
+    /// handoff. Never taken from repository content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_id: Option<String>,
     /// sha256 of the recipe file's bytes. The short-circuit key: a checkout
     /// that is `ready` for *this* digest needs nothing, and an edited recipe
     /// re-prepares without anybody having to remember to force it.
@@ -430,9 +471,15 @@ pub struct PrepRecord {
     /// record so a viewport that has the status also has the offer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_command: Option<String>,
+    /// Exact writable setup roots granted for this reviewed tree.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub setup_outputs: Vec<String>,
+    /// Retained declarative cleanup reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_paths: Vec<String>,
     /// A repository-authored host effect exists, but this exact repository +
-    /// committed-tree execution digest has not been approved in the
-    /// engine-owned trust store. No file was projected and no command ran.
+    /// committed-tree execution digest has no live, engine-authenticated
+    /// approval grant. No file was projected and no command ran.
     #[serde(default, skip_serializing_if = "is_false")]
     pub requires_approval: bool,
 }
@@ -448,6 +495,7 @@ impl PrepRecord {
         PrepRecord {
             state: PrepState::Ready,
             worktree: worktree.to_string_lossy().into_owned(),
+            repository_id: None,
             recipe_digest: None,
             execution_digest: None,
             command: None,
@@ -458,6 +506,8 @@ impl PrepRecord {
             log: None,
             links: Vec::new(),
             run_command: None,
+            setup_outputs: Vec::new(),
+            archive_paths: Vec::new(),
             requires_approval: false,
         }
     }
@@ -485,6 +535,9 @@ impl PrepRecord {
             log: self.log.clone(),
             log_excerpt,
             run_command: self.run_command.clone(),
+            setup_command: self.command.clone(),
+            setup_outputs: self.setup_outputs.clone(),
+            archive_paths: self.archive_paths.clone(),
             requires_approval: self.requires_approval,
             projections: self
                 .links
@@ -549,6 +602,12 @@ pub struct PrepareRequest<'a> {
 #[derive(Clone)]
 pub struct CheckoutPrep {
     data_dir: PathBuf,
+    /// Process-private signing authority for host approvals. The key is never
+    /// persisted or exposed over RPC: an agent running as the same Unix user
+    /// may rewrite files under the data directory, but cannot mint a grant the
+    /// live engine will accept. Restarting the engine deliberately expires
+    /// approvals and asks the operator to review them again.
+    approval_key: Arc<[u8; 32]>,
     active: Arc<Mutex<HashMap<PathBuf, (String, CancellationToken)>>>,
     claims: Arc<Mutex<HashSet<PathBuf>>>,
     /// Serializes every parked -> claimed -> delivered/revoked transition.
@@ -564,10 +623,15 @@ struct Approval {
     recipe_digest: String,
     execution_digest: String,
     /// The reviewed effect contract is retained outside the checkout. Archive
-    /// therefore keeps using the command the operator approved even after an
-    /// ordinary agent commit changes (or removes) the repository recipe.
+    /// therefore keeps using the bounded path list the operator approved even
+    /// after an ordinary agent commit changes (or removes) the repository
+    /// recipe.
     recipe: Recipe,
     approved_at: i64,
+    /// HMAC-SHA256 over every field above, using this engine process's
+    /// ephemeral approval key. A same-user write to the trust directory is
+    /// therefore data, never authority.
+    signature: String,
 }
 
 /// One immutable, reviewable input to repository-owned host execution.
@@ -675,8 +739,14 @@ impl Drop for ActivePreparation {
 
 impl CheckoutPrep {
     pub fn new(data_dir: &Path) -> Self {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let mut approval_key = [0u8; 32];
+        approval_key[..16].copy_from_slice(first.as_bytes());
+        approval_key[16..].copy_from_slice(second.as_bytes());
         Self {
             data_dir: data_dir.to_path_buf(),
+            approval_key: Arc::new(approval_key),
             active: Arc::new(Mutex::new(HashMap::new())),
             claims: Arc::new(Mutex::new(HashSet::new())),
             release: Arc::new(Mutex::new(())),
@@ -770,7 +840,23 @@ impl CheckoutPrep {
                 let text = std::fs::read_to_string(entry.path().join("prep.json")).ok()?;
                 let record: PrepRecord = serde_json::from_str(&text).ok()?;
                 let worktree = PathBuf::from(&record.worktree);
+                let authorized = match self.recipe_snapshot(&worktree) {
+                    Ok(None) => record.execution_digest.is_none(),
+                    Ok(Some(snapshot)) => {
+                        record.execution_digest.as_deref()
+                            == Some(snapshot.execution_digest.as_str())
+                            && match record.repository_id.as_deref() {
+                                Some(repository_id) => {
+                                    !snapshot.recipe.requires_host_approval()
+                                        || self.approved(repository_id, &snapshot)
+                                }
+                                None => !snapshot.recipe.requires_host_approval(),
+                            }
+                    }
+                    Err(_) => false,
+                };
                 (record.state == PrepState::Ready
+                    && authorized
                     && worktree.is_dir()
                     && self.parked(&worktree).is_some())
                 .then_some((worktree, record))
@@ -796,6 +882,13 @@ impl CheckoutPrep {
     pub fn recipe(&self, worktree: &Path) -> Result<Option<Recipe>, String> {
         self.recipe_snapshot(worktree)
             .map(|snapshot| snapshot.map(|snapshot| snapshot.recipe))
+    }
+
+    /// Digest an operator surface must display and pass back unchanged when it
+    /// approves. This is a read of the immutable Git snapshot, not a grant.
+    pub fn review_digest(&self, worktree: &Path) -> Result<Option<String>, String> {
+        self.recipe_snapshot(worktree)
+            .map(|snapshot| snapshot.map(|snapshot| snapshot.execution_digest))
     }
 
     /// Read the recipe and the complete trusted execution input from immutable
@@ -991,21 +1084,36 @@ impl CheckoutPrep {
     }
 
     /// Approve the complete immutable Git tree currently owning the recipe for
-    /// this stable repository identity. The record lives outside the
-    /// repository, so a checkout cannot approve itself; changing a script,
-    /// lockfile, hook, or recipe produces a different execution digest.
-    pub fn approve(&self, worktree: &Path, repository_id: &str) -> Result<String, String> {
+    /// this stable repository identity. The engine authenticates the record
+    /// with process-private key material, so same-user filesystem access cannot
+    /// mint a grant; changing a script, lockfile, hook, or recipe produces a
+    /// different execution digest.
+    pub fn approve(
+        &self,
+        worktree: &Path,
+        repository_id: &str,
+        expected_execution_digest: &str,
+    ) -> Result<String, String> {
         let snapshot = self
             .recipe_snapshot(worktree)?
             .ok_or_else(|| format!("{} has no {RECIPE_PATH}", worktree.display()))?;
+        if snapshot.execution_digest != expected_execution_digest {
+            return Err(format!(
+                "repository preparation changed after review (displayed {}, current {}); review the current effects before approving",
+                short_digest(expected_execution_digest),
+                short_digest(&snapshot.execution_digest),
+            ));
+        }
         self.ensure_tracked_inputs(worktree, &snapshot.tree)?;
-        let approval = Approval {
+        let mut approval = Approval {
             repository_id: repository_id.to_string(),
             recipe_digest: snapshot.recipe_digest,
             execution_digest: snapshot.execution_digest.clone(),
             recipe: snapshot.recipe,
             approved_at: now_ms(),
+            signature: String::new(),
         };
+        approval.signature = self.sign_approval(&approval)?;
         let text = serde_json::to_vec_pretty(&approval).map_err(|e| e.to_string())?;
         atomic_replace(
             &self.approval_path(repository_id, &snapshot.execution_digest),
@@ -1031,7 +1139,30 @@ impl CheckoutPrep {
                 approval.repository_id == repository_id
                     && approval.recipe_digest == recipe_digest
                     && approval.execution_digest == execution_digest
+                    && self.verify_approval(approval)
             })
+    }
+
+    fn sign_approval(&self, approval: &Approval) -> Result<String, String> {
+        let bytes = approval_signing_bytes(approval)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(self.approval_key.as_ref())
+            .map_err(|error| format!("creating approval authenticator: {error}"))?;
+        mac.update(&bytes);
+        Ok(hex(&mac.finalize().into_bytes()))
+    }
+
+    fn verify_approval(&self, approval: &Approval) -> bool {
+        let Ok(signature) = decode_hex(&approval.signature) else {
+            return false;
+        };
+        let Ok(bytes) = approval_signing_bytes(approval) else {
+            return false;
+        };
+        let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(self.approval_key.as_ref()) else {
+            return false;
+        };
+        mac.update(&bytes);
+        mac.verify_slice(&signature).is_ok()
     }
 
     fn approved(&self, repository_id: &str, snapshot: &RecipeSnapshot) -> bool {
@@ -1065,8 +1196,16 @@ impl CheckoutPrep {
         let recipe = &snapshot.recipe;
         let recipe_digest = Some(snapshot.recipe_digest.clone());
         let execution_digest = Some(snapshot.execution_digest.clone());
+        // prep.json is same-user writable operational evidence, never
+        // authority. Authenticate the live, process-private approval before
+        // honoring a persisted Ready shortcut; otherwise an agent can forge a
+        // cache hit, and a real Ready record can outlive the key that granted
+        // it across an engine restart.
+        let host_effects_approved =
+            !recipe.requires_host_approval() || self.approved(req.repository_id, &snapshot);
 
         if !req.force
+            && host_effects_approved
             && let Some(previous) = self.status(&worktree)
             && previous.state == PrepState::Ready
             && previous.execution_digest == execution_digest
@@ -1106,9 +1245,11 @@ impl CheckoutPrep {
 
         let run_command = recipe.run.as_ref().map(|s| s.run.clone());
         let command = recipe.setup.as_ref().map(|s| s.run.clone());
+        let locals = self.locals_root(req.repository_id);
         let mut record = PrepRecord {
             state: PrepState::Preparing,
             worktree: worktree.to_string_lossy().into_owned(),
+            repository_id: Some(req.repository_id.to_string()),
             recipe_digest: recipe_digest.clone(),
             execution_digest: execution_digest.clone(),
             command: command.clone(),
@@ -1117,8 +1258,18 @@ impl CheckoutPrep {
             exit_code: None,
             detail: None,
             log: None,
-            links: Vec::new(),
+            links: preview_links(&recipe.links, &locals),
             run_command: run_command.clone(),
+            setup_outputs: recipe
+                .setup
+                .as_ref()
+                .map(|step| step.outputs.clone())
+                .unwrap_or_default(),
+            archive_paths: recipe
+                .archive
+                .as_ref()
+                .map(|archive| archive.paths.clone())
+                .unwrap_or_default(),
             requires_approval: false,
         };
         self.write(record.clone());
@@ -1128,7 +1279,7 @@ impl CheckoutPrep {
         // sufficient: without this exact-tree approval, a repository edit
         // could name a different allowlisted credential leaf and make it
         // reachable to its eventual agent without the host agreeing.
-        if recipe.requires_host_approval() && !self.approved(req.repository_id, &snapshot) {
+        if !host_effects_approved {
             record.state = PrepState::Failed;
             record.ended_at = Some(now_ms());
             record.requires_approval = true;
@@ -1146,20 +1297,16 @@ impl CheckoutPrep {
             return self.write(record);
         }
 
-        // Links first: a setup script's whole reason for existing may be the
-        // `.env.local` it reads.
-        let locals = self.locals_root(req.repository_id);
-        match project_links(&recipe.links, &locals, &worktree) {
-            Ok(outcomes) => record.links = outcomes,
-            Err(detail) => {
-                record.state = PrepState::Failed;
-                record.ended_at = Some(now_ms());
-                record.detail = Some(detail);
-                return self.write(record);
-            }
-        }
-
         let Some(step) = recipe.setup.as_ref() else {
+            match project_links(&recipe.links, &locals, &worktree) {
+                Ok(outcomes) => record.links = outcomes,
+                Err(detail) => {
+                    record.state = PrepState::Failed;
+                    record.ended_at = Some(now_ms());
+                    record.detail = Some(detail);
+                    return self.write(record);
+                }
+            }
             record.state = PrepState::Ready;
             record.ended_at = Some(now_ms());
             record.detail = Some(format!("{RECIPE_PATH} has no [setup] step"));
@@ -1168,14 +1315,28 @@ impl CheckoutPrep {
 
         let log = self.log_path(&worktree);
         record.log = Some(log.to_string_lossy().into_owned());
+        let (execution, _) = match materialize_execution_snapshot(
+            self,
+            &worktree,
+            &snapshot,
+            req.repository_id,
+        ) {
+            Ok(execution) => execution,
+            Err(detail) => {
+                record.state = PrepState::Failed;
+                record.ended_at = Some(now_ms());
+                record.detail = Some(detail);
+                return self.write(record);
+            }
+        };
         let outcome = run_step(
             &step.run,
-            &worktree,
+            &execution.source,
+            &execution.runtime,
             &recipe.env,
             recipe.setup_timeout(),
             &log,
             Some(&token),
-            Some(&snapshot.tree),
         )
         .await;
 
@@ -1183,14 +1344,21 @@ impl CheckoutPrep {
         record.exit_code = outcome.exit_code;
         match outcome.verdict {
             Verdict::Ok => {
-                // The watcher inside `run_step` kills the command tree as soon
-                // as a tracked input changes. Recheck after reap as the durable
-                // proof that the bytes authorized at entry remained the tree
-                // which the confined command observed.
                 match self.ensure_tracked_inputs(&worktree, &snapshot.tree) {
                     Ok(()) => {
-                        record.state = PrepState::Ready;
-                        record.detail = None;
+                        match promote_outputs(&execution, &worktree)
+                            .and_then(|_| project_links(&recipe.links, &locals, &worktree))
+                        {
+                            Ok(outcomes) => {
+                                record.links = outcomes;
+                                record.state = PrepState::Ready;
+                                record.detail = None;
+                            }
+                            Err(detail) => {
+                                record.state = PrepState::Failed;
+                                record.detail = Some(detail);
+                            }
+                        }
                     }
                     Err(detail) => {
                         record.state = PrepState::Failed;
@@ -1206,12 +1374,12 @@ impl CheckoutPrep {
         self.write(record)
     }
 
-    /// Run the recipe's `[archive]` step — bounded cleanup of reproducible
-    /// output, before whatever generic sweep the caller does next.
+    /// Apply the approved `[archive]` path list — bounded engine-owned cleanup
+    /// of reproducible output before whatever generic sweep runs next.
     ///
-    /// Best-effort by construction: the caller is reclaiming disk, and a repo
-    /// whose `cargo clean` fails should still lose its `target/`. The returned
-    /// string is what happened, for the caller's log; `None` = nothing to run.
+    /// Best-effort by construction: the caller is reclaiming disk, and one
+    /// refused path must not prevent the generic sweep. The returned string is
+    /// what happened, for the caller's log; `None` = nothing to remove.
     pub async fn archive(
         &self,
         worktree: &Path,
@@ -1219,44 +1387,46 @@ impl CheckoutPrep {
         cancel: Option<&CancellationToken>,
     ) -> Option<String> {
         let worktree = canonical(worktree);
-        // Archive is approved before the run, then intentionally survives the
-        // run's commits and dirty files. Loading the *current* recipe here made
-        // cleanup unusable after ordinary work and could execute an agent's
-        // replacement script. Use the retained approved contract; the host
-        // sandbox below confines it to this checkout and its runtime root.
-        let (recipe_digest, execution_digest, current_step) = match self.status(&worktree) {
+        // The retained authenticated contract survives ordinary agent commits.
+        // No command or path is read from the mutable checkout during archive.
+        let (recipe_digest, execution_digest, current_paths) = match self.status(&worktree) {
             Some(record) => (record.recipe_digest?, record.execution_digest?, None),
             None => {
                 let snapshot = self.recipe_snapshot(&worktree).ok().flatten()?;
-                let step = snapshot.recipe.archive.as_ref()?.run.clone();
+                let paths = snapshot.recipe.archive.as_ref()?.paths.clone();
                 (
                     snapshot.recipe_digest,
                     snapshot.execution_digest,
-                    Some(step),
+                    Some(paths),
                 )
             }
         };
         let Some(approval) = self.approval(repository_id, &recipe_digest, &execution_digest) else {
-            return current_step.map(|step| {
-                format!("`{step}` was not run because this recipe is not approved on this host")
+            return current_paths.map(|paths| {
+                format!(
+                    "archive paths {} were not removed because this recipe is not approved on this host",
+                    paths.join(", ")
+                )
             });
         };
-        let step = approval.recipe.archive.as_ref()?;
-        let log = self.state_dir(&worktree).join("archive.log");
-        let outcome = run_step(
-            &step.run,
-            &worktree,
-            &approval.recipe.env,
-            approval.recipe.archive_timeout(),
-            &log,
-            cancel,
-            None,
-        )
-        .await;
-        Some(match outcome.verdict {
-            Verdict::Ok => format!("`{}` succeeded", step.run),
-            Verdict::Failed(detail) => format!("`{}` {detail}", step.run),
-        })
+        let archive = approval.recipe.archive.as_ref()?;
+        let mut removed = Vec::new();
+        for path in &archive.paths {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                return Some(format!(
+                    "archive cancelled after removing {}",
+                    removed.join(", ")
+                ));
+            }
+            let target = worktree.join(path);
+            match remove_path(&target) {
+                Ok(()) => removed.push(path.clone()),
+                Err(error) => {
+                    return Some(format!("removing archive path `{path}` failed: {error}"));
+                }
+            }
+        }
+        Some(format!("removed archive paths {}", removed.join(", ")))
     }
 
     /// Forget a checkout's preparation state. Called when the checkout itself
@@ -1294,6 +1464,7 @@ fn failed_record(
     PrepRecord {
         state: PrepState::Failed,
         worktree: worktree.to_string_lossy().into_owned(),
+        repository_id: None,
         recipe_digest,
         execution_digest,
         command,
@@ -1304,6 +1475,8 @@ fn failed_record(
         log: None,
         links: Vec::new(),
         run_command: None,
+        setup_outputs: Vec::new(),
+        archive_paths: Vec::new(),
         requires_approval: false,
     }
 }
@@ -1338,6 +1511,294 @@ fn project_links(
     #[cfg(not(unix))]
     {
         project_links_portable(links, locals, worktree)
+    }
+}
+
+/// The complete effect list shown before approval. Nothing is copied here;
+/// these rows exist so the operator sees every box-local source and checkout
+/// destination before the live engine can authenticate the tree.
+fn preview_links(links: &[Link], locals: &Path) -> Vec<LinkOutcome> {
+    links
+        .iter()
+        .map(|link| {
+            let from = locals.join(&link.from);
+            LinkOutcome {
+                from: from.to_string_lossy().into_owned(),
+                to: link.to.clone(),
+                result: "requested".into(),
+                mode: preview_mode(&from),
+            }
+        })
+        .collect()
+}
+
+/// One execution-only checkout assembled from the approved Git tree. The
+/// source side is mounted/read-confined as immutable; setup can write only the
+/// private directories reached by the declared top-level output symlinks.
+struct ExecutionSnapshot {
+    root: PathBuf,
+    source: PathBuf,
+    runtime: PathBuf,
+    outputs: Vec<(String, PathBuf)>,
+}
+
+impl Drop for ExecutionSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn materialize_execution_snapshot(
+    prep: &CheckoutPrep,
+    worktree: &Path,
+    snapshot: &RecipeSnapshot,
+    repository_id: &str,
+) -> Result<(ExecutionSnapshot, Vec<LinkOutcome>), String> {
+    let root = prep
+        .state_dir(worktree)
+        .join(format!("execution-{}", uuid::Uuid::new_v4()));
+    let source = root.join("source");
+    let runtime = root.join("runtime");
+    std::fs::create_dir_all(&source)
+        .and_then(|_| std::fs::create_dir_all(&runtime))
+        .map_err(|error| format!("creating immutable preparation snapshot: {error}"))?;
+
+    let result = (|| {
+        materialize_git_tree(worktree, &snapshot.tree, &source)?;
+        let links = project_links(
+            &snapshot.recipe.links,
+            &prep.locals_root(repository_id),
+            &source,
+        )?;
+        let mut outputs = Vec::new();
+        if let Some(setup) = &snapshot.recipe.setup {
+            for (index, name) in setup.outputs.iter().enumerate() {
+                let staged = source.join(name);
+                if std::fs::symlink_metadata(&staged).is_ok() {
+                    return Err(format!(
+                        "[setup] output `{name}` overlaps an approved Git input or machine-local file"
+                    ));
+                }
+                let output = runtime.join(format!("output-{index}"));
+                std::fs::create_dir_all(&output).map_err(|error| {
+                    format!("creating writable setup output `{name}`: {error}")
+                })?;
+                let prior = worktree.join(name);
+                if std::fs::symlink_metadata(&prior).is_ok() {
+                    std::fs::remove_dir(&output).map_err(|error| {
+                        format!("seeding writable setup output `{name}`: {error}")
+                    })?;
+                    copy_tree_without_escape(&prior, &output, &prior)?;
+                }
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&output, &staged).map_err(|error| {
+                    format!("attaching writable setup output `{name}`: {error}")
+                })?;
+                #[cfg(not(unix))]
+                return Err(
+                    "repository setup is disabled on this host because Comet cannot attach isolated output directories"
+                        .to_string(),
+                );
+                outputs.push((name.clone(), output));
+            }
+        }
+        Ok((
+            ExecutionSnapshot {
+                root: root.clone(),
+                source,
+                runtime,
+                outputs,
+            },
+            links,
+        ))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    result
+}
+
+fn materialize_git_tree(worktree: &Path, tree: &str, destination: &Path) -> Result<(), String> {
+    let mut archive = git_command(worktree);
+    archive
+        .args(["archive", "--format=tar", tree])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut archive = archive
+        .spawn()
+        .map_err(|error| format!("materializing approved Git tree: {error}"))?;
+    let stdout = archive
+        .stdout
+        .take()
+        .ok_or_else(|| "materializing approved Git tree: Git stdout was unavailable".to_string())?;
+    let extract = Command::new("tar")
+        .args(["-xf", "-", "-C"])
+        .arg(destination)
+        .stdin(stdout)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| format!("extracting approved Git tree: {error}"))?;
+    let archive_status = archive
+        .wait()
+        .map_err(|error| format!("waiting for approved Git tree materialization: {error}"))?;
+    if !archive_status.success() {
+        return Err(format!(
+            "Git could not materialize approved tree {}",
+            short_digest(tree)
+        ));
+    }
+    if !extract.status.success() {
+        return Err(format!(
+            "extracting approved Git tree failed: {}",
+            String::from_utf8_lossy(&extract.stderr).trim()
+        ));
+    }
+    if std::fs::symlink_metadata(destination.join(".git")).is_ok() {
+        return Err("approved Git snapshot unexpectedly contained `.git` metadata".into());
+    }
+    Ok(())
+}
+
+fn promote_outputs(snapshot: &ExecutionSnapshot, worktree: &Path) -> Result<(), String> {
+    for (name, source) in &snapshot.outputs {
+        promote_output(source, &worktree.join(name), worktree)?;
+    }
+    Ok(())
+}
+
+fn promote_output(source: &Path, destination: &Path, worktree: &Path) -> Result<(), String> {
+    let name = destination
+        .file_name()
+        .ok_or_else(|| format!("setup output {} has no leaf name", destination.display()))?;
+    let temporary = worktree.join(format!(
+        ".comet-output-{}-{}.tmp",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    let backup = worktree.join(format!(
+        ".comet-output-{}-{}.old",
+        name.to_string_lossy(),
+        uuid::Uuid::new_v4()
+    ));
+    copy_tree_without_escape(source, &temporary, source)?;
+    let had_destination = std::fs::symlink_metadata(destination).is_ok();
+    if had_destination {
+        std::fs::rename(destination, &backup).map_err(|error| {
+            format!("parking prior setup output {}: {error}", destination.display())
+        })?;
+    }
+    if let Err(error) = std::fs::rename(&temporary, destination) {
+        if had_destination {
+            let _ = std::fs::rename(&backup, destination);
+        }
+        let _ = remove_path(&temporary);
+        return Err(format!(
+            "publishing setup output {}: {error}",
+            destination.display()
+        ));
+    }
+    if had_destination {
+        let _ = remove_path(&backup);
+    }
+    sync_directory(worktree)
+        .map_err(|error| format!("syncing promoted setup output: {error}"))?;
+    Ok(())
+}
+
+fn copy_tree_without_escape(source: &Path, destination: &Path, root: &Path) -> Result<(), String> {
+    let metadata = std::fs::symlink_metadata(source)
+        .map_err(|error| format!("reading setup output {}: {error}", source.display()))?;
+    if metadata.is_dir() {
+        std::fs::create_dir(destination)
+            .map_err(|error| format!("creating setup output {}: {error}", destination.display()))?;
+        for entry in std::fs::read_dir(source)
+            .map_err(|error| format!("reading setup output {}: {error}", source.display()))?
+        {
+            let entry = entry.map_err(|error| format!("reading setup output entry: {error}"))?;
+            copy_tree_without_escape(&entry.path(), &destination.join(entry.file_name()), root)?;
+        }
+        std::fs::set_permissions(destination, metadata.permissions()).map_err(|error| {
+            format!("preserving setup output mode {}: {error}", destination.display())
+        })?;
+        return Ok(());
+    }
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(source)
+            .map_err(|error| format!("reading setup output symlink {}: {error}", source.display()))?;
+        normalize_relative(source.parent().unwrap_or(root), &target, root).ok_or_else(|| {
+            format!(
+                "setup output symlink {} points outside its declared output",
+                source.display()
+            )
+        })?;
+        #[cfg(unix)]
+        return std::os::unix::fs::symlink(&target, destination).map_err(|error| {
+            format!("copying setup output symlink {}: {error}", source.display())
+        });
+        #[cfg(not(unix))]
+        return Err("setup output symlinks are unsupported on this host".into());
+    }
+    if !metadata.is_file() {
+        return Err(format!(
+            "setup output {} is neither a file, directory, nor relative symlink",
+            source.display()
+        ));
+    }
+    std::fs::copy(source, destination)
+        .map_err(|error| format!("copying setup output {}: {error}", source.display()))?;
+    std::fs::set_permissions(destination, metadata.permissions()).map_err(|error| {
+        format!("preserving setup output mode {}: {error}", destination.display())
+    })?;
+    Ok(())
+}
+
+fn normalize_relative(parent: &Path, target: &Path, root: &Path) -> Option<PathBuf> {
+    if target.is_absolute() {
+        return None;
+    }
+    let base = parent.strip_prefix(root).ok()?;
+    let mut stack: Vec<std::ffi::OsString> = base
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_os_string()),
+            _ => None,
+        })
+        .collect();
+    for component in target.components() {
+        match component {
+            Component::Normal(part) => stack.push(part.to_os_string()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                stack.pop()?;
+            }
+            Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(stack.into_iter().collect())
+}
+
+fn remove_path(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn preview_mode(path: &Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .map(|metadata| format!("{:04o}", metadata.permissions().mode() & 0o7777))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
     }
 }
 
@@ -1846,7 +2307,8 @@ struct StepOutcome {
     exit_code: Option<i32>,
 }
 
-/// Run one recipe step from the worktree root, capped in time and in output.
+/// Run one recipe step from the immutable approved source, capped in time and
+/// in output.
 ///
 /// The child gets its own process group so that the timeout and the
 /// cancellation kill the *tree*: killing the `sh` alone leaves the `npm` it
@@ -1855,16 +2317,15 @@ struct StepOutcome {
 async fn run_step(
     command: &str,
     worktree: &Path,
+    runtime_root: &Path,
     env: &BTreeMap<String, String>,
     timeout: Duration,
     log_path: &Path,
     cancel: Option<&CancellationToken>,
-    expected_tree: Option<&str>,
 ) -> StepOutcome {
     if let Some(parent) = log_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let runtime_root = log_path.parent().unwrap_or(worktree).join("runtime");
     let isolated_home = runtime_root.join("home");
     let isolated_tmp = runtime_root.join("tmp");
     let isolated_cargo = runtime_root.join("cargo");
@@ -1877,23 +2338,6 @@ async fn run_step(
     let _ = std::fs::create_dir_all(&isolated_xdg_config);
     let _ = std::fs::create_dir_all(&isolated_xdg_cache);
     let _ = std::fs::create_dir_all(&isolated_xdg_data);
-
-    // Install the watcher before the final tree check and keep it alive until
-    // the command has been reaped. A checkout/script switch after approval is
-    // therefore a cancellation event, not a different set of bytes gaining
-    // the approved command's host reach.
-    let tracked = match expected_tree {
-        Some(tree) => match TrackedInputGuard::new(worktree, tree) {
-            Ok(guard) => Some(guard),
-            Err(detail) => {
-                return StepOutcome {
-                    verdict: Verdict::Failed(detail),
-                    exit_code: None,
-                };
-            }
-        },
-        None => None,
-    };
 
     let mut cmd = match crate::checkout_prep_sandbox::command(command, worktree, &runtime_root) {
         Ok(command) => command,
@@ -2007,12 +2451,6 @@ async fn run_step(
                     None => std::future::pending().await,
                 }
             } => "was cancelled".to_string(),
-            _ = async {
-                match tracked.as_ref() {
-                    Some(guard) => guard.changed.cancelled().await,
-                    None => std::future::pending().await,
-                }
-            } => "tracked preparation inputs changed while the command was running".to_string(),
         }
     };
 
@@ -2057,93 +2495,6 @@ async fn run_step(
     }
     sink.finish(&outcome.verdict);
     outcome
-}
-
-/// A live guard over the tracked execution input. `notify` is only the wakeup;
-/// Git remains the authority, so an ignored/untracked dependency directory can
-/// churn freely while any HEAD/index/tracked-file change cancels the process.
-struct TrackedInputGuard {
-    _watcher: notify::PollWatcher,
-    changed: CancellationToken,
-}
-
-impl TrackedInputGuard {
-    fn new(worktree: &Path, expected_tree: &str) -> Result<Self, String> {
-        let changed = CancellationToken::new();
-        let changed_for_event = changed.clone();
-        // Native macOS notifications are deliberately coalesced (often for a
-        // full second), which is long enough for `sleep; sh changed-script` to
-        // cross the check/use window. Poll only Git-owned leaves and HEAD/index
-        // at a short cadence: dependency output can create a million untracked
-        // files without entering this watch set, while a tracked replacement
-        // is noticed before the delayed command can consume it.
-        let config = notify::Config::default()
-            .with_poll_interval(Duration::from_millis(50))
-            // Metadata alone misses an overwrite on filesystems whose mtime
-            // granularity is coarser than this authorization window. Content
-            // comparison is the security property; only Git-owned leaves are
-            // watched, so dependency output never enters this scan.
-            .with_compare_contents(true);
-        let mut watcher = notify::PollWatcher::new(
-            move |_event: notify::Result<notify::Event>| changed_for_event.cancel(),
-            config,
-        )
-        .map_err(|error| format!("starting tracked-input watcher: {error}"))?;
-        for path in tracked_watch_paths(worktree)? {
-            watcher
-                .watch(&path, notify::RecursiveMode::NonRecursive)
-                .map_err(|error| format!("watching tracked input {}: {error}", path.display()))?;
-        }
-        // PollWatcher establishes its own comparison baseline asynchronously.
-        // Let one complete interval pass before the final Git check; otherwise
-        // a fast overwrite can become the watcher's baseline and be diagnosed
-        // only after the replacement bytes already ran.
-        std::thread::sleep(Duration::from_millis(75));
-        if changed.is_cancelled() {
-            return Err("tracked preparation inputs changed while the watcher started".into());
-        }
-        verify_tracked_inputs(worktree, expected_tree)?;
-        Ok(Self {
-            _watcher: watcher,
-            changed,
-        })
-    }
-}
-
-fn tracked_watch_paths(worktree: &Path) -> Result<Vec<PathBuf>, String> {
-    let bytes = git_output_bytes(worktree, &["ls-files", "-z"])?;
-    let mut paths = bytes
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                Ok(worktree.join(std::ffi::OsStr::from_bytes(path)))
-            }
-            #[cfg(not(unix))]
-            {
-                std::str::from_utf8(path)
-                    .map(|path| worktree.join(path))
-                    .map_err(|_| "a tracked preparation path is not UTF-8".to_string())
-            }
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    for git_path in ["HEAD", "index"] {
-        let path = git_output(
-            worktree,
-            &[
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                git_path,
-            ],
-        )?;
-        paths.push(PathBuf::from(path));
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
 }
 
 /// Last-resort cleanup when the async preparation future itself is dropped
@@ -2366,6 +2717,37 @@ fn digest_bytes(bytes: &[u8]) -> String {
     hex(&hasher.finalize())
 }
 
+fn short_digest(digest: &str) -> &str {
+    &digest[..digest.len().min(12)]
+}
+
+fn approval_signing_bytes(approval: &Approval) -> Result<Vec<u8>, String> {
+    serde_json::to_vec(&(
+        "comet-checkout-preparation-approval-v1",
+        &approval.repository_id,
+        &approval.recipe_digest,
+        &approval.execution_digest,
+        &approval.recipe,
+        approval.approved_at,
+    ))
+    .map_err(|error| format!("serializing approval grant: {error}"))
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
+    if !value.len().is_multiple_of(2) {
+        return Err(());
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char).to_digit(16).ok_or(())?;
+            let low = (pair[1] as char).to_digit(16).ok_or(())?;
+            Ok(((high << 4) | low) as u8)
+        })
+        .collect()
+}
+
 fn git_command(worktree: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -2458,10 +2840,11 @@ version = 1
 [setup]
 run = "scripts/setup.sh"
 timeout = "20m"
+outputs = ["target"]
 [run]
 run = "cargo run"
 [archive]
-run = "cargo clean"
+paths = ["target"]
 [env]
 RUST_BACKTRACE = "1"
 [[link]]
@@ -2471,9 +2854,10 @@ to = ".env.local"
         )
         .expect("parses");
         assert_eq!(r.setup.as_ref().unwrap().run, "scripts/setup.sh");
+        assert_eq!(r.setup.as_ref().unwrap().outputs, ["target"]);
         assert_eq!(r.setup_timeout(), Duration::from_secs(1200));
         assert_eq!(r.run.as_ref().unwrap().run, "cargo run");
-        assert_eq!(r.archive_timeout(), DEFAULT_ARCHIVE_TIMEOUT);
+        assert_eq!(r.archive.as_ref().unwrap().paths, ["target"]);
         assert_eq!(r.env.get("RUST_BACKTRACE").unwrap(), "1");
         assert_eq!(r.links.len(), 1);
         assert!(r.requires_host_approval());
@@ -2494,7 +2878,7 @@ to = ".env.local"
                 .requires_host_approval()
         );
         assert!(
-            recipe("version = 1\n[archive]\nrun = \"cargo clean\"\n")
+            recipe("version = 1\n[archive]\npaths = [\"target\"]\n")
                 .unwrap()
                 .requires_host_approval()
         );
@@ -2524,9 +2908,14 @@ to = ".env.local"
     }
 
     #[test]
-    fn an_unparseable_timeout_names_the_step() {
-        let err = recipe("version = 1\n[archive]\nrun = \"x\"\ntimeout = \"soon\"\n").unwrap_err();
-        assert!(err.contains("[archive]") && err.contains("soon"), "{err}");
+    fn setup_and_archive_reach_is_top_level_and_bounded() {
+        for text in [
+            "version = 1\n[setup]\nrun = \"x\"\noutputs = [\"nested/out\"]\n",
+            "version = 1\n[archive]\npaths = [\"../outside\"]\n",
+            "version = 1\n[archive]\npaths = [\".git\"]\n",
+        ] {
+            assert!(recipe(text).is_err(), "{text}");
+        }
     }
 
     #[test]

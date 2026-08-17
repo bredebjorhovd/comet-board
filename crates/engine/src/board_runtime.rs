@@ -536,6 +536,9 @@ impl Runtime for CometRuntime {
                 log: None,
                 log_excerpt: None,
                 run_command: None,
+                setup_command: None,
+                setup_outputs: Vec::new(),
+                archive_paths: Vec::new(),
                 requires_approval: false,
                 projections: Vec::new(),
             }
@@ -581,7 +584,11 @@ impl Runtime for CometRuntime {
         Ok(())
     }
 
-    fn approve_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+    fn approve_checkout_preparation(
+        &self,
+        worktree: &str,
+        expected_execution_digest: &str,
+    ) -> anyhow::Result<()> {
         let parked = peek_parked(&self.prep, Path::new(worktree))
             .ok_or_else(|| anyhow::anyhow!("{} has no parked dispatch to approve", worktree))?;
         let repository_id = self
@@ -595,7 +602,11 @@ impl Runtime for CometRuntime {
         );
         let digest = self
             .prep
-            .approve(Path::new(worktree), &repository_id)
+            .approve(
+                Path::new(worktree),
+                &repository_id,
+                expected_execution_digest,
+            )
             .map_err(|error| anyhow::anyhow!(error))?;
         notice(
             &self.doc_host,
@@ -865,17 +876,15 @@ impl Runtime for CometRuntime {
     /// nothing.
     fn reclaim_build_output(&self, worktree: &str) -> anyhow::Result<comet_board::gc::Swept> {
         let path = Path::new(worktree);
-        // The repository's own `[archive]` first (gh#422), then the sweep.
+        // The repository's approved declarative `[archive]` paths first
+        // (gh#422), then the sweep.
         //
         // In that order and not instead of it. `BUILD_OUTPUT_DIRS` is a list of
-        // names the board knows; `[archive]` is what the *repository* knows —
-        // the generated directory nothing outside it could have guessed, the
-        // container it should stop, the cache its own tool is authoritative
-        // about. Neither subsumes the other, and a repo that runs `cargo clean`
-        // has simply left the sweep nothing to find in `target/`.
+        // names the board knows; `[archive]` is the bounded list the repository
+        // reviewed for its own generated output. Neither subsumes the other.
         //
         // Best-effort, because the caller is reclaiming a disk that is already
-        // the problem: a `clean` that fails or hangs must not keep the 36 GB.
+        // the problem: one refused path must not keep the 36 GB.
         match self.handle.block_on(self.repos.repository_identity(path)) {
             Ok(repository_id) => {
                 if let Some(said) = self
@@ -1105,7 +1114,8 @@ mod review_candidate_tests {
         .unwrap();
         let prep = core.checkout_prep.clone();
         let repository_id = "startup-reconcile-repository";
-        prep.approve(&repo, repository_id).unwrap();
+        let digest = prep.review_digest(&repo).unwrap().unwrap();
+        prep.approve(&repo, repository_id, &digest).unwrap();
         let record = prep
             .prepare(crate::checkout_prep::PrepareRequest {
                 worktree: &repo,

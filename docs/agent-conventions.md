@@ -249,11 +249,10 @@ is this board's `review`.
   is parked behind a failed setup, Retry re-runs the recipe in the same
   worktree and continues the same attempt, chat, branch, command id and billing
   allocation. It does not start an agent until setup succeeds. When the row
-  says host approval is required, use
-  `comet-board approve-preparation --task <id>`; that approves the current
-  committed tree and performs this same in-place retry. Approval must be run
-  interactively on the worktree host; it cannot be piped, relayed with
-  `--device`, or granted through the public localhost RPC.
+  says host approval is required, review and approve every listed effect in
+  the embedded Comet app on the worktree host. A shell, PTY, relay, and public
+  localhost RPC cannot grant approval; `comet-board approve-preparation`
+  intentionally refuses.
   Retrying a blocked row **discards
   the question its agent was waiting on**: read the chat first if the answer
   was the point.

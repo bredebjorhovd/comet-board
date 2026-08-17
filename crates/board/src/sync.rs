@@ -5877,6 +5877,9 @@ mod tests {
                 log: Some("/data/prep.log".into()),
                 log_excerpt: Some("installing".into()),
                 run_command: Some("cargo run".into()),
+                setup_command: Some("scripts/setup.sh".into()),
+                setup_outputs: vec!["target".into()],
+                archive_paths: vec!["target".into()],
                 requires_approval,
                 projections: Vec::new(),
             }

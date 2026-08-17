@@ -1221,6 +1221,7 @@ dependencies = [
  "comet-sync",
  "comet-update",
  "futures",
+ "hmac",
  "libc",
  "loro",
  "loro-protocol",

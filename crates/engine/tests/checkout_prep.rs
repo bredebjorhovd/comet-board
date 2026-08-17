@@ -21,6 +21,7 @@ struct Box_ {
     data: PathBuf,
     repository_id: String,
     worktree: PathBuf,
+    prep: CheckoutPrep,
 }
 
 fn a_box(recipe: Option<&str>) -> Box_ {
@@ -44,27 +45,40 @@ fn a_box(recipe: Option<&str>) -> Box_ {
     git(&worktree, &["add", "."]);
     git(&worktree, &["commit", "--allow-empty", "-m", "fixture"]);
     let repository_id = format!("test-device:{}", worktree.display());
+    let prep = CheckoutPrep::new(&data);
     Box_ {
         _tmp: tmp,
         data,
         repository_id,
         worktree,
+        prep,
     }
 }
 
 impl Box_ {
     fn prep(&self) -> CheckoutPrep {
-        CheckoutPrep::new(&self.data)
+        self.prep.clone()
     }
 
     fn request(&self) -> PrepareRequest<'_> {
-        let _ = self.prep().approve(&self.worktree, &self.repository_id);
+        if let Ok(Some(digest)) = self.prep().review_digest(&self.worktree) {
+            let _ = self
+                .prep()
+                .approve(&self.worktree, &self.repository_id, &digest);
+        }
         PrepareRequest {
             worktree: &self.worktree,
             repository_id: &self.repository_id,
             force: false,
             cancel: None,
         }
+    }
+
+    fn approve(&self) -> String {
+        let prep = self.prep();
+        let digest = prep.review_digest(&self.worktree).unwrap().unwrap();
+        prep.approve(&self.worktree, &self.repository_id, &digest)
+            .unwrap()
     }
 
     /// Put a machine-local file where a `[[link]]`'s `from` can reach it.
@@ -171,7 +185,7 @@ async fn a_setup_past_its_budget_is_killed_with_everything_it_started() {
     // sleep behind is the failure this exists to prevent, so the test asserts
     // on the grandchild rather than on the shell.
     let b = a_box(Some(
-        "version = 1\n[setup]\nrun = \"sh -c 'sleep 60' & echo $! > child.pid; wait\"\ntimeout = \"1s\"\n",
+        "version = 1\n[setup]\nrun = \"sh -c 'sleep 60' & echo child:$!; wait\"\ntimeout = \"1s\"\n",
     ));
     let record = b.prep().prepare(b.request()).await;
     assert_eq!(record.state, PrepState::Failed);
@@ -183,9 +197,11 @@ async fn a_setup_past_its_budget_is_killed_with_everything_it_started() {
 
     #[cfg(unix)]
     {
-        let pid: i32 = std::fs::read_to_string(b.worktree.join("child.pid"))
+        let log = std::fs::read_to_string(record.log.as_ref().unwrap()).unwrap();
+        let pid: i32 = log
+            .lines()
+            .find_map(|line| line.strip_prefix("child:"))
             .expect("the script recorded its grandchild")
-            .trim()
             .parse()
             .unwrap();
         // The kill is asynchronous to us; give the group a moment to go.
@@ -227,7 +243,7 @@ async fn checkout_owned_cancellation_stops_the_active_command_tree() {
         "version = 1\n[setup]\nrun = \"sleep 60\"\ntimeout = \"1h\"\n",
     ));
     let prep = b.prep();
-    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
     let runner = prep.clone();
     let worktree = b.worktree.clone();
     let repository_id = b.repository_id.clone();
@@ -259,10 +275,10 @@ async fn checkout_owned_cancellation_stops_the_active_command_tree() {
 #[tokio::test]
 async fn a_dropped_preparation_is_killed_and_reconciled_from_preparing_to_failed() {
     let b = a_box(Some(
-        "version = 1\n[setup]\nrun = \"echo $$ > setup.pid; sleep 60\"\ntimeout = \"1h\"\n",
+        "version = 1\n[setup]\nrun = \"echo setup:$$; sleep 60\"\ntimeout = \"1h\"\n",
     ));
     let prep = b.prep();
-    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
     let runner = prep.clone();
     let worktree = b.worktree.clone();
     let repository_id = b.repository_id.clone();
@@ -276,15 +292,21 @@ async fn a_dropped_preparation_is_killed_and_reconciled_from_preparing_to_failed
             })
             .await
     });
+    let log_path = prep.state_dir(&b.worktree).join("prep.log");
     for _ in 0..100 {
-        if b.worktree.join("setup.pid").exists() {
+        if std::fs::read_to_string(&log_path)
+            .ok()
+            .is_some_and(|log| log.lines().any(|line| line.starts_with("setup:")))
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    let pid: i32 = std::fs::read_to_string(b.worktree.join("setup.pid"))
+    let pid: i32 = std::fs::read_to_string(&log_path)
         .unwrap()
-        .trim()
+        .lines()
+        .find_map(|line| line.strip_prefix("setup:"))
+        .unwrap()
         .parse()
         .unwrap();
 
@@ -313,7 +335,7 @@ async fn cancellation_revokes_parked_work_before_a_late_setup_can_release_it() {
         "version = 1\n[setup]\nrun = \"sleep 60\"\ntimeout = \"1h\"\n",
     ));
     let prep = b.prep();
-    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
     prep.park(&b.worktree, "run this agent").unwrap();
 
     let runner = prep.clone();
@@ -354,12 +376,12 @@ async fn a_ready_checkout_is_not_prepared_twice_until_the_recipe_changes() {
     // What makes a retry cheap, and what makes an edited recipe take effect
     // without anybody remembering to force it.
     let b = a_box(Some(
-        "version = 1\n[setup]\nrun = \"echo one >> ran.txt\"\n",
+        "version = 1\n[setup]\nrun = \"echo one >> generated/ran.txt\"\noutputs = [\"generated\"]\n",
     ));
     let prep = b.prep();
     prep.prepare(b.request()).await;
     prep.prepare(b.request()).await;
-    let ran = std::fs::read_to_string(b.worktree.join("ran.txt")).unwrap();
+    let ran = std::fs::read_to_string(b.worktree.join("generated/ran.txt")).unwrap();
     assert_eq!(ran.lines().count(), 1, "the second visit re-ran setup");
 
     // Forced: the escape hatch after a half-finished setup.
@@ -368,13 +390,13 @@ async fn a_ready_checkout_is_not_prepared_twice_until_the_recipe_changes() {
         ..b.request()
     })
     .await;
-    let ran = std::fs::read_to_string(b.worktree.join("ran.txt")).unwrap();
+    let ran = std::fs::read_to_string(b.worktree.join("generated/ran.txt")).unwrap();
     assert_eq!(ran.lines().count(), 2);
 
     // Edited: the digest moved, so it prepares again on its own.
-    set_recipe(&b, "version = 1\n[setup]\nrun = \"echo two >> ran.txt\"\n");
+    set_recipe(&b, "version = 1\n[setup]\nrun = \"echo two >> generated/ran.txt\"\noutputs = [\"generated\"]\n");
     prep.prepare(b.request()).await;
-    let ran = std::fs::read_to_string(b.worktree.join("ran.txt")).unwrap();
+    let ran = std::fs::read_to_string(b.worktree.join("generated/ran.txt")).unwrap();
     assert_eq!(ran.lines().count(), 3);
     assert!(ran.contains("two"));
 }
@@ -384,13 +406,19 @@ async fn a_failed_checkout_is_prepared_again_on_the_next_visit() {
     // Only `ready` short-circuits. A retry of a failed preparation must
     // actually retry — that is the whole recovery path.
     let b = a_box(Some(
-        "version = 1\n[setup]\nrun = \"echo attempt >> tries.txt; exit 1\"\n",
+        "version = 1\n[setup]\nrun = \"echo attempt; exit 1\"\n",
     ));
     let prep = b.prep();
-    assert_eq!(prep.prepare(b.request()).await.state, PrepState::Failed);
-    assert_eq!(prep.prepare(b.request()).await.state, PrepState::Failed);
-    let tries = std::fs::read_to_string(b.worktree.join("tries.txt")).unwrap();
-    assert_eq!(tries.lines().count(), 2);
+    let first = prep.prepare(b.request()).await;
+    let second = prep.prepare(b.request()).await;
+    assert_eq!(first.state, PrepState::Failed);
+    assert_eq!(second.state, PrepState::Failed);
+    assert!(second.started_at >= first.started_at, "the failed setup ran again");
+    assert!(
+        std::fs::read_to_string(second.log.unwrap())
+            .unwrap()
+            .contains("attempt")
+    );
 }
 
 #[tokio::test]
@@ -498,9 +526,7 @@ async fn repository_code_cannot_execute_before_the_host_approves_its_exact_diges
     // development sandbox cannot nest Seatbelt, so its explicit test bypass is
     // used only by focused developer runs and skips this one assertion.
     if std::env::var_os("COMET_TEST_ASSUME_OUTER_SANDBOX").is_none() {
-        b.prep()
-            .approve(&b.worktree, &b.repository_id)
-            .expect("host approval");
+        b.approve();
         let record = b.prep().prepare(b.request()).await;
         assert_eq!(record.state, PrepState::Failed, "{:?}", record.detail);
         assert!(!b.worktree.join("stolen").exists());
@@ -532,7 +558,7 @@ async fn approval_follows_the_committed_script_not_only_the_recipe_file() {
     git(&b.worktree, &["commit", "-m", "add setup script"]);
 
     let prep = b.prep();
-    let approved_tree = prep.approve(&b.worktree, &b.repository_id).unwrap();
+    let approved_tree = b.approve();
 
     // The TOML stays byte-for-byte identical. Only what its command opens
     // changes, which was the hole in a recipe-only trust key.
@@ -567,7 +593,7 @@ async fn tracked_edits_cannot_borrow_their_heads_approval() {
     git(&b.worktree, &["add", "scripts/setup.sh"]);
     git(&b.worktree, &["commit", "-m", "add setup script"]);
     let prep = b.prep();
-    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
 
     std::fs::write(b.worktree.join("scripts/setup.sh"), "touch dirty\n").unwrap();
     let record = prep
@@ -591,20 +617,20 @@ async fn tracked_edits_cannot_borrow_their_heads_approval() {
 }
 
 #[tokio::test]
-async fn a_concurrent_script_switch_is_cancelled_before_the_replacement_runs() {
+async fn a_worktree_script_switch_cannot_replace_the_immutable_approved_script() {
     let b = a_box(Some(
         "version = 1\n[setup]\nrun = \"sleep 3; sh scripts/setup.sh\"\n",
     ));
     std::fs::create_dir_all(b.worktree.join("scripts")).unwrap();
     std::fs::write(
         b.worktree.join("scripts/setup.sh"),
-        "touch approved-script-ran\n",
+        "echo approved-tree-script\n",
     )
     .unwrap();
     git(&b.worktree, &["add", "scripts/setup.sh"]);
     git(&b.worktree, &["commit", "-m", "approved script"]);
     let prep = b.prep();
-    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
 
     let preparation = prep.prepare(PrepareRequest {
         worktree: &b.worktree,
@@ -616,7 +642,7 @@ async fn a_concurrent_script_switch_is_cancelled_before_the_replacement_runs() {
         tokio::time::sleep(Duration::from_millis(150)).await;
         std::fs::write(
             b.worktree.join("scripts/setup.sh"),
-            "touch replacement-script-ran\n",
+            "echo replacement-worktree-script\n",
         )
         .unwrap();
     };
@@ -631,7 +657,90 @@ async fn a_concurrent_script_switch_is_cancelled_before_the_replacement_runs() {
         "{:?}",
         record.detail
     );
-    assert!(!b.worktree.join("replacement-script-ran").exists());
+    let log = std::fs::read_to_string(record.log.unwrap()).unwrap();
+    assert!(log.contains("approved-tree-script"), "{log}");
+    assert!(!log.contains("replacement-worktree-script"), "{log}");
+}
+
+#[tokio::test]
+async fn displayed_digest_approval_refuses_a_switched_tree() {
+    let b = a_box(Some("version = 1\n[setup]\nrun = \"true\"\n"));
+    let prep = b.prep();
+    let displayed = prep.review_digest(&b.worktree).unwrap().unwrap();
+    set_recipe(&b, "version = 1\n[setup]\nrun = \"echo changed\"\n");
+
+    let error = prep
+        .approve(&b.worktree, &b.repository_id, &displayed)
+        .unwrap_err();
+    assert!(error.contains("changed after review"), "{error}");
+    let record = prep
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert!(record.requires_approval);
+}
+
+#[tokio::test]
+async fn forged_ready_record_cannot_bypass_a_live_approval() {
+    let b = a_box(Some("version = 1\n[setup]\nrun = \"echo must-not-run\"\n"));
+    let prep = b.prep();
+    let mut record = prep
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert!(record.requires_approval);
+    record.state = PrepState::Ready;
+    record.requires_approval = false;
+    record.detail = None;
+    let record_path = prep.state_dir(&b.worktree).join("prep.json");
+    std::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+
+    let refused = prep
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert_eq!(refused.state, PrepState::Failed);
+    assert!(refused.requires_approval);
+    assert!(
+        !std::fs::read_to_string(refused.log.unwrap_or_default())
+            .unwrap_or_default()
+            .contains("must-not-run")
+    );
+}
+
+#[tokio::test]
+async fn restart_expires_the_grant_and_the_persisted_ready_record() {
+    let b = a_box(Some("version = 1\n[setup]\nrun = \"true\"\n"));
+    let prep = b.prep();
+    prep.park(&b.worktree, "must remain parked").unwrap();
+    b.approve();
+    let ready = prep.prepare(b.request()).await;
+    assert_eq!(ready.state, PrepState::Ready);
+
+    let restarted = CheckoutPrep::new(&b.data);
+    assert!(restarted.ready_handoffs().is_empty());
+    let refused = restarted
+        .prepare(PrepareRequest {
+            worktree: &b.worktree,
+            repository_id: &b.repository_id,
+            force: false,
+            cancel: None,
+        })
+        .await;
+    assert_eq!(refused.state, PrepState::Failed);
+    assert!(refused.requires_approval);
 }
 
 #[tokio::test]
@@ -652,10 +761,10 @@ async fn repository_edits_cannot_broaden_machine_local_file_reach_without_approv
         .await;
     assert_eq!(record.state, PrepState::Failed);
     assert!(record.requires_approval);
-    assert!(record.links.is_empty());
+    assert_eq!(record.links[0].result, "requested");
     assert!(!b.worktree.join(".env.local").exists());
 
-    b.prep().approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
     let approved = b.prep().prepare(b.request()).await;
     assert_eq!(approved.state, PrepState::Ready);
     assert_eq!(approved.links[0].result, "copied");
@@ -844,20 +953,17 @@ async fn swapping_a_source_ancestor_cannot_import_a_file_outside_the_allowlist()
 }
 
 #[tokio::test]
-async fn setup_runs_from_the_worktree_root_with_the_recipes_environment() {
+async fn setup_runs_from_the_approved_snapshot_root_with_the_recipes_environment() {
     let b = a_box(Some(
-        "version = 1\n[setup]\nrun = \"pwd > where.txt; echo $WIDGET_MODE $COMET_WORKTREE > env.txt\"\n[env]\nWIDGET_MODE = \"dev\"\n",
+        "version = 1\n[setup]\nrun = \"pwd > generated/where.txt; echo $WIDGET_MODE $COMET_WORKTREE > generated/env.txt\"\noutputs = [\"generated\"]\n[env]\nWIDGET_MODE = \"dev\"\n",
     ));
     let record = b.prep().prepare(b.request()).await;
     assert_eq!(record.state, PrepState::Ready, "{:?}", record.detail);
-    let where_ = std::fs::read_to_string(b.worktree.join("where.txt")).unwrap();
-    assert_eq!(
-        Path::new(where_.trim()),
-        std::fs::canonicalize(&b.worktree).unwrap()
-    );
-    let env = std::fs::read_to_string(b.worktree.join("env.txt")).unwrap();
+    let where_ = std::fs::read_to_string(b.worktree.join("generated/where.txt")).unwrap();
+    assert!(where_.contains("execution-"), "{where_}");
+    let env = std::fs::read_to_string(b.worktree.join("generated/env.txt")).unwrap();
     assert!(env.starts_with("dev "), "{env}");
-    assert!(env.contains("board-gh-1"), "{env}");
+    assert!(env.contains("execution-"), "{env}");
 }
 
 #[tokio::test]
@@ -872,6 +978,22 @@ async fn setup_does_not_inherit_engine_credentials_or_ambient_values() {
     let record = b.prep().prepare(b.request()).await;
     unsafe { std::env::remove_var(SECRET) };
     assert_eq!(record.state, PrepState::Ready, "{:?}", record.detail);
+}
+
+#[tokio::test]
+async fn setup_cannot_see_or_write_git_metadata() {
+    if std::env::var_os("COMET_TEST_ASSUME_OUTER_SANDBOX").is_some() {
+        return;
+    }
+    let b = a_box(Some(
+        "version = 1\n[setup]\nrun = \"test ! -e .git; if mkdir .git 2>/dev/null; then exit 41; fi; echo ready > generated/result\"\noutputs = [\"generated\"]\n",
+    ));
+    let record = b.prep().prepare(b.request()).await;
+    assert_eq!(record.state, PrepState::Ready, "{:?}", record.detail);
+    assert_eq!(
+        std::fs::read_to_string(b.worktree.join("generated/result")).unwrap(),
+        "ready\n"
+    );
 }
 
 #[tokio::test]
@@ -917,7 +1039,7 @@ fn cancellation_after_claim_prevents_the_release_callback() {
 
 #[tokio::test]
 async fn a_fresh_engine_can_recover_a_ready_abandoned_claim() {
-    let b = a_box(Some("version = 1\n[setup]\nrun = \"true\"\n"));
+    let b = a_box(Some("version = 1\n[run]\nrun = \"cargo run\"\n"));
     let prep = b.prep();
     prep.park(&b.worktree, "run this agent").unwrap();
     let record = prep.prepare(b.request()).await;
@@ -959,20 +1081,18 @@ fn cancellation_reports_a_tombstone_write_failure() {
 }
 
 #[tokio::test]
-async fn archive_runs_the_repositorys_own_cleanup() {
+async fn archive_removes_the_repositorys_approved_paths() {
     let b = a_box(Some(
-        "version = 1\n[archive]\nrun = \"rm -rf build-output\"\n",
+        "version = 1\n[archive]\npaths = [\"build-output\"]\n",
     ));
     std::fs::create_dir_all(b.worktree.join("build-output")).unwrap();
-    b.prep()
-        .approve(&b.worktree, &b.repository_id)
-        .expect("approved");
+    b.approve();
     let said = b
         .prep()
         .archive(&b.worktree, &b.repository_id, None)
         .await
         .expect("ran");
-    assert!(said.contains("succeeded"), "{said}");
+    assert!(said.contains("removed archive paths build-output"), "{said}");
     assert!(!b.worktree.join("build-output").exists());
 
     // A repo with no `[archive]` says nothing, and the caller sweeps as before.
@@ -989,10 +1109,10 @@ async fn archive_runs_the_repositorys_own_cleanup() {
 #[tokio::test]
 async fn archive_uses_the_approved_contract_after_ordinary_agent_changes() {
     let b = a_box(Some(
-        "version = 1\n[archive]\nrun = \"rm -rf build-output\"\n",
+        "version = 1\n[archive]\npaths = [\"build-output\"]\n",
     ));
     let prep = b.prep();
-    prep.approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
     let ready = prep.prepare(b.request()).await;
     assert_eq!(ready.state, PrepState::Ready, "{:?}", ready.detail);
 
@@ -1004,25 +1124,26 @@ async fn archive_uses_the_approved_contract_after_ordinary_agent_changes() {
     // implementation approved before the agent started.
     std::fs::write(
         b.worktree.join(RECIPE_PATH),
-        "version = 1\n[archive]\nrun = \"touch replacement-ran\"\n",
+        "version = 1\n[archive]\npaths = [\"replacement-ran\"]\n",
     )
     .unwrap();
     git(&b.worktree, &["add", RECIPE_PATH]);
     git(&b.worktree, &["commit", "-m", "agent edits recipe"]);
+    std::fs::create_dir_all(b.worktree.join("replacement-ran")).unwrap();
 
     let said = prep
         .archive(&b.worktree, &b.repository_id, None)
         .await
         .expect("approved archive remains available");
-    assert!(said.contains("succeeded"), "{said}");
+    assert!(said.contains("removed archive paths build-output"), "{said}");
     assert!(!b.worktree.join("build-output").exists());
-    assert!(!b.worktree.join("replacement-ran").exists());
+    assert!(b.worktree.join("replacement-ran").exists());
 }
 
 #[tokio::test]
 async fn an_archive_only_recipe_is_approved_before_the_agent_can_edit_it() {
     let b = a_box(Some(
-        "version = 1\n[archive]\nrun = \"rm -rf build-output\"\n",
+        "version = 1\n[archive]\npaths = [\"build-output\"]\n",
     ));
     let unapproved = b
         .prep()
@@ -1036,24 +1157,25 @@ async fn an_archive_only_recipe_is_approved_before_the_agent_can_edit_it() {
     assert_eq!(unapproved.state, PrepState::Failed);
     assert!(unapproved.requires_approval);
 
-    b.prep().approve(&b.worktree, &b.repository_id).unwrap();
+    b.approve();
     let approved = b.prep().prepare(b.request()).await;
     assert_eq!(approved.state, PrepState::Ready);
     assert!(approved.command.is_none());
 }
 
 #[tokio::test]
-async fn an_unapproved_archive_command_is_never_executed() {
+async fn unapproved_archive_paths_are_never_removed() {
     let b = a_box(Some(
-        "version = 1\n[archive]\nrun = \"touch archive-ran\"\n",
+        "version = 1\n[archive]\npaths = [\"archive-output\"]\n",
     ));
+    std::fs::create_dir_all(b.worktree.join("archive-output")).unwrap();
     let said = b
         .prep()
         .archive(&b.worktree, &b.repository_id, None)
         .await
         .expect("archive refusal is visible");
     assert!(said.contains("not approved"), "{said}");
-    assert!(!b.worktree.join("archive-ran").exists());
+    assert!(b.worktree.join("archive-output").exists());
 }
 
 #[tokio::test]

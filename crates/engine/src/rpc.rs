@@ -260,6 +260,11 @@ struct PrepareCheckoutParams {
     /// see the handler for why a hand-pressed retry is never a cache read.
     #[serde(default)]
     force: Option<bool>,
+    /// Required by approval mutations: the exact digest the operator surface
+    /// displayed. The engine re-resolves the current immutable tree and
+    /// refuses if review and approval are no longer one compare-and-swap.
+    #[serde(default)]
+    expected_execution_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2152,10 +2157,11 @@ impl RpcService for EngineRpc {
                 #[serde(rename_all = "camelCase")]
                 struct P {
                     task_id: String,
+                    expected_execution_digest: String,
                 }
                 let p: P = parse_params(params)?;
                 self.board()?
-                    .approve_preparation(&p.task_id)
+                    .approve_preparation(&p.task_id, &p.expected_execution_digest)
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
@@ -2530,9 +2536,14 @@ impl RpcService for EngineRpc {
                     .repository_identity(&worktree)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let expected = p.expected_execution_digest.ok_or_else(|| {
+                    RpcError::BadParams(
+                        "expectedExecutionDigest is required for preparation approval".into(),
+                    )
+                })?;
                 let digest = self
                     .prep
-                    .approve(&worktree, &repository_id)
+                    .approve(&worktree, &repository_id, &expected)
                     .map_err(RpcError::Failed)?;
                 RpcReply::value(&serde_json::json!({ "executionDigest": digest }))
             }

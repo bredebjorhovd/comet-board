@@ -1927,9 +1927,9 @@ impl BoardPanel {
         .detach();
     }
 
-    /// Host-local trust decision for a failed preparation. A remote desktop
-    /// cannot relay approval by design; it gets the exact CLI recovery command
-    /// in the preparation card instead of a button which would always refuse.
+    /// Host-local trust decision for a failed preparation. Only the embedded
+    /// in-process operator client holds this authority; a shell, PTY, relayed
+    /// client, or dispatched agent receives no approval route.
     fn approve_preparation(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(row) = self.model.task(id) else { return };
         let Some(engine) = self.engine(cx) else {
@@ -1938,14 +1938,19 @@ impl BoardPanel {
         };
         if self.host.is_some() || engine.mode() != EngineMode::InProcess {
             self.set_notice(
-                format!(
-                    "Approve from an interactive terminal on the worktree host: comet-board approve-preparation --task {}",
-                    row.id
-                ),
+                "Preparation approval is available only in Comet on the worktree host",
                 cx,
             );
             return;
         }
+        let Some(expected_execution_digest) = row
+            .preparation
+            .as_ref()
+            .and_then(|preparation| preparation.execution_digest.clone())
+        else {
+            self.set_notice("Preparation has no review digest", cx);
+            return;
+        };
         let task_id = row.id.clone();
         let identifier = row.identifier.clone();
         cx.spawn(async move |this, cx| {
@@ -1953,7 +1958,10 @@ impl BoardPanel {
                 .client()
                 .call(
                     methods::APPROVE_TASK_PREPARATION,
-                    serde_json::json!({ "taskId": task_id }),
+                    serde_json::json!({
+                        "taskId": task_id,
+                        "expectedExecutionDigest": expected_execution_digest,
+                    }),
                 )
                 .await;
             this.update(cx, |panel, cx| match result {
@@ -4040,6 +4048,15 @@ impl BoardPanel {
             if let Some(digest) = &preparation.execution_digest {
                 lines.push(format!("Execution tree: {}", &digest[..digest.len().min(12)]));
             }
+            if let Some(command) = &preparation.setup_command {
+                lines.push(format!("Setup: {command}"));
+            }
+            for output in &preparation.setup_outputs {
+                lines.push(format!("Writable setup output: {output}/"));
+            }
+            for path in &preparation.archive_paths {
+                lines.push(format!("Archive removes: {path}/"));
+            }
             if let Some(command) = &preparation.run_command {
                 lines.push(format!("Run explicitly: {command}"));
             }
@@ -4060,10 +4077,7 @@ impl BoardPanel {
                 ));
             }
             if preparation.requires_approval {
-                lines.push(format!(
-                    "Recovery: comet-board approve-preparation --task {} (on the worktree host)",
-                    row.id
-                ));
+                lines.push("Recovery: review every effect above, then approve in Comet on the worktree host".to_string());
             } else if preparation.state == comet_proto::view::board::CheckoutPreparationState::Failed {
                 lines.push(format!("Recovery: comet-board retry --task {}", row.id));
             }
