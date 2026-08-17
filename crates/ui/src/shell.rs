@@ -1709,9 +1709,10 @@ impl Shell {
     /// Execute the typed New Session command. Menu items, ⌘T, and chooser rows
     /// all enter here; no input handler owns session-creation logic.
     fn new_session(&mut self, requested_space: Option<String>, cx: &mut Context<Self>) {
-        if self.new_session_task.is_some()
-            || (requested_space.is_none() && self.command_modal_open())
-        {
+        if !commands::NEW_SESSION.available(
+            requested_space.is_none() && self.command_modal_open(),
+            self.new_session_task.is_some(),
+        ) {
             return;
         }
         if self.new_session_intent.is_some() {

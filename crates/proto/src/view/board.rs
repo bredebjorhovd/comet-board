@@ -3646,6 +3646,7 @@ mod tests {
 
     fn chat(id: &str, branch: Option<&str>) -> crate::Chat {
         crate::Chat {
+            creation_state: crate::ChatCreationState::Ready,
             id: id.into(),
             device_id: "box".into(),
             title: Some("some title the agent wrote".into()),

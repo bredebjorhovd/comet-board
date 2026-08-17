@@ -318,6 +318,7 @@ mod tests {
 
     fn chat(id: &str, archived: bool) -> Chat {
         Chat {
+            creation_state: comet_proto::ChatCreationState::Ready,
             id: id.into(),
             device_id: "d".into(),
             title: None,

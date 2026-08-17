@@ -1,6 +1,6 @@
 //! Typed application commands shared by native menus, shortcuts, and controls.
 
-use gpui::{KeyBinding, Keystroke, actions};
+use gpui::{KeyBinding, Keystroke, MenuItem, actions};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -21,18 +21,40 @@ pub const NEW_SESSION: CommandDescriptor = CommandDescriptor {
     shortcut: crate::settings::ShortcutId::NewSession,
 };
 
+pub const COMMANDS: &[CommandDescriptor] = &[NEW_SESSION];
+
+impl CommandDescriptor {
+    pub fn effective_combo(self, keymap: &crate::settings::KeymapConfig) -> String {
+        let configured = crate::settings::platform_combo(keymap.get(self.shortcut));
+        if Keystroke::parse(&configured).is_ok() {
+            configured
+        } else {
+            crate::settings::platform_combo(self.shortcut.default_combo())
+        }
+    }
+
+    pub fn binding(self, keymap: &crate::settings::KeymapConfig) -> KeyBinding {
+        KeyBinding::new(&self.effective_combo(keymap), NewSession, None)
+    }
+
+    pub fn menu_item(self) -> MenuItem {
+        MenuItem::action(self.label, NewSession)
+    }
+
+    pub fn action(self) -> NewSession {
+        NewSession
+    }
+
+    pub fn available(self, modal_open: bool, in_flight: bool) -> bool {
+        !modal_open && !in_flight
+    }
+}
+
 /// The registry-owned binding for New Session. Menus and clickable controls
 /// dispatch the same action contained here; keymap conflict detection reads
 /// the descriptor's `ShortcutId`.
 pub fn new_session_binding(keymap: &crate::settings::KeymapConfig) -> KeyBinding {
-    let id = NEW_SESSION.shortcut;
-    let configured = crate::settings::platform_combo(keymap.get(id));
-    let combo = if Keystroke::parse(&configured).is_ok() {
-        configured
-    } else {
-        crate::settings::platform_combo(id.default_combo())
-    };
-    KeyBinding::new(&combo, NewSession, None)
+    NEW_SESSION.binding(keymap)
 }
 
 const INTENT_FILE: &str = "new-session-intent.json";
@@ -94,8 +116,8 @@ pub fn suppress_repeated_shortcut(
     if !is_held {
         return false;
     }
-    let configured = crate::settings::platform_combo(keymap.get(NEW_SESSION.shortcut));
-    Keystroke::parse(&configured).is_ok_and(|bound| bound == *keystroke)
+    Keystroke::parse(&NEW_SESSION.effective_combo(keymap))
+        .is_ok_and(|bound| bound == *keystroke)
 }
 
 pub fn intent_arrived(intent: &NewSessionIntent, state: &AppState) -> bool {
@@ -140,6 +162,7 @@ mod tests {
 
     fn chat(id: &str, space: &str) -> Chat {
         Chat {
+            creation_state: comet_proto::ChatCreationState::Ready,
             id: id.into(),
             device_id: "device".into(),
             title: None,
@@ -186,6 +209,20 @@ mod tests {
         let rebound = Keystroke::parse(&crate::settings::platform_combo("mod-n")).unwrap();
         assert!(!suppress_repeated_shortcut(&initial, true, &keymap));
         assert!(suppress_repeated_shortcut(&rebound, true, &keymap));
+
+        keymap.set(
+            crate::settings::ShortcutId::NewSession,
+            "mod-t mod-u".into(),
+        );
+        assert_eq!(
+            NEW_SESSION.effective_combo(&keymap),
+            crate::settings::platform_combo("mod-t")
+        );
+        assert!(suppress_repeated_shortcut(&initial, true, &keymap));
+        assert_eq!(
+            NEW_SESSION.binding(&keymap).keystrokes()[0].inner(),
+            &initial
+        );
     }
 
     #[test]

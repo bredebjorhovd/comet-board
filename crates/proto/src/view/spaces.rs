@@ -599,6 +599,7 @@ mod tests {
 
     fn chat(id: &str, space_id: Option<&str>) -> Chat {
         Chat {
+            creation_state: crate::ChatCreationState::Ready,
             id: id.into(),
             device_id: "mac".into(),
             title: Some(format!("chat {id}")),

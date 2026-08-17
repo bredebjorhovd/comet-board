@@ -723,11 +723,9 @@ impl AppState {
     /// Empty user-created sessions retain the draft checkout controls until
     /// their first run fixes cwd/worktree. Board-created attempts already have
     /// a Session row and are never drafts.
-    pub fn selected_chat_is_configurable(&self) -> bool {
+    pub fn selected_chat_is_draft(&self) -> bool {
         self.selected_chat_row().is_some_and(|chat| {
-            chat.last_message_at.is_none()
-                && chat.config.is_none()
-                && self.session_for(&chat.id).is_none()
+            chat.creation_state == comet_proto::ChatCreationState::Draft
         })
     }
 
@@ -1387,6 +1385,7 @@ mod tests {
             .unwrap()
             .to_utc();
         Chat {
+            creation_state: comet_proto::ChatCreationState::Ready,
             id: id.into(),
             device_id: "dev".into(),
             title: None,
@@ -1585,7 +1584,8 @@ mod tests {
         let mut state = AppState::new();
         state.chats = vec![chat("draft", 1, None)];
         state.selected_chat = Some("draft".into());
-        assert!(state.selected_chat_is_configurable());
+        state.chats[0].creation_state = comet_proto::ChatCreationState::Draft;
+        assert!(state.selected_chat_is_draft());
         state.chats[0].config = Some(
             serde_json::from_value(serde_json::json!({
                 "harness": "codex", "model": null, "reasoning": null,
@@ -1596,12 +1596,11 @@ mod tests {
             .unwrap(),
         );
         assert!(
-            !state.selected_chat_is_configurable(),
-            "a finalized draft must reuse its durable cwd/config on retry"
+            state.selected_chat_is_draft(),
+            "provenance, not nullable config, defines a draft"
         );
-        state.chats[0].config = None;
-        state.chats[0].last_message_at = Some(Utc::now());
-        assert!(!state.selected_chat_is_configurable());
+        state.chats[0].creation_state = comet_proto::ChatCreationState::Ready;
+        assert!(!state.selected_chat_is_draft());
     }
 
     #[test]

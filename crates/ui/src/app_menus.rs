@@ -130,7 +130,7 @@ pub fn app_menus() -> Vec<Menu> {
 
     let mut menus = vec![
         Menu::new("Comet").items(app_items),
-        Menu::new("File").items([MenuItem::action(NEW_SESSION.label, NewSession)]),
+        Menu::new("File").items([NEW_SESSION.menu_item()]),
         // Standard clipboard verbs tied to the composer's existing actions via
         // their native selectors (`OsAction` → cut:/copy:/paste:/selectAll:),
         // so the OS Edit menu routes through the responder chain to the focused

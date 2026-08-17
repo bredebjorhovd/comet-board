@@ -3424,7 +3424,7 @@ impl Composer {
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let draft_key = self.current_key.clone();
-        let configurable = self.state.read(cx).selected_chat_is_configurable();
+        let configurable = self.state.read(cx).selected_chat_is_draft();
         let selected_chat = self.state.read(cx).selected_chat.clone();
         let materialized_draft = selected_chat.is_some() && configurable;
         let (chat_id, is_new) = match selected_chat {

@@ -756,6 +756,7 @@ impl WorkspaceHost {
             branch: None,
             checkout_id: None,
             config: None,
+            creation_state: comet_proto::ChatCreationState::Ready,
             last_message_preview: None,
             last_message_at: None,
             created_at: Utc::now(),
@@ -964,6 +965,7 @@ impl WorkspaceHost {
             branch: None,
             checkout_id: None,
             config,
+            creation_state: comet_proto::ChatCreationState::Draft,
             last_message_preview: None,
             last_message_at: None,
             created_at: Utc::now(),
@@ -999,10 +1001,7 @@ impl WorkspaceHost {
                 "draft chat {chat_id} belongs to another space"
             )));
         }
-        if chat.config.is_some()
-            || chat.last_message_at.is_some()
-            || chat.harness_session_id.is_some()
-        {
+        if chat.creation_state != comet_proto::ChatCreationState::Draft {
             let already_final = chat.cwd.as_deref() == Some(cwd.as_str())
                 && chat.branch == branch
                 && chat.config.as_ref() == Some(&config);
@@ -1019,6 +1018,7 @@ impl WorkspaceHost {
         chat.cwd = Some(cwd);
         chat.branch = branch;
         chat.config = Some(config);
+        chat.creation_state = comet_proto::ChatCreationState::Ready;
         self.inner.doc().upsert_chat(&chat)?;
         let bytes = self.inner.doc().export_snapshot()?;
         self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
@@ -1690,6 +1690,10 @@ mod room_supervision_tests {
         let chat = restarted.doc().chat("draft").unwrap().unwrap();
         assert_eq!(chat.space_id.as_deref(), Some("space-1"));
         assert_eq!(chat.cwd.as_deref(), Some("/repo"));
+        assert_eq!(
+            chat.creation_state,
+            comet_proto::ChatCreationState::Draft
+        );
     }
 
     #[tokio::test]
@@ -1700,6 +1704,7 @@ mod room_supervision_tests {
         let chat: Chat = serde_json::from_value(serde_json::json!({
             "id": "draft", "deviceId": "host-1", "title": null, "archived": false,
             "cwd": "/base", "branch": null, "checkoutId": null, "config": null,
+            "creationState": "draft",
             "lastMessagePreview": null, "lastMessageAt": null,
             "createdAt": "2026-08-17T00:00:00Z", "harnessSessionId": null,
             "harnessSessionCwd": null, "spaceId": "space-1", "lastSeenAt": null,
@@ -1726,6 +1731,10 @@ mod room_supervision_tests {
         assert_eq!(finalized.cwd.as_deref(), Some("/worktree"));
         assert_eq!(finalized.branch.as_deref(), Some("feature"));
         assert_eq!(finalized.config, Some(config));
+        assert_eq!(
+            finalized.creation_state,
+            comet_proto::ChatCreationState::Ready
+        );
         host.finalize_chat_draft(
             "draft",
             "space-1",

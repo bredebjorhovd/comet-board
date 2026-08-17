@@ -322,6 +322,11 @@ pub struct Chat {
     /// Canonical id of the repo checkout/worktree this chat operates in.
     pub checkout_id: Option<String>,
     pub config: Option<ChatConfig>,
+    /// Explicit provenance for UI-created empty drafts. Existing/legacy rows
+    /// default to Ready; only CreateChat may introduce Draft, and the first
+    /// send atomically transitions it to Ready with cwd/branch/config.
+    #[serde(default)]
+    pub creation_state: ChatCreationState,
     pub last_message_preview: Option<String>,
     pub last_message_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -358,6 +363,14 @@ pub struct Chat {
     /// edits as one agent's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<crate::fork::ChatLineage>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ChatCreationState {
+    #[default]
+    Ready,
+    Draft,
 }
 
 impl Chat {

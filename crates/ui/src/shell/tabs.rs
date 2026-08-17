@@ -564,9 +564,7 @@ impl Shell {
             .role(gpui::Role::Button)
             .aria_label(crate::commands::NEW_SESSION.label)
             .aria_keyshortcuts(crate::settings::display_combo(
-                self.settings
-                    .keymap
-                    .get(crate::commands::NEW_SESSION.shortcut),
+                &crate::commands::NEW_SESSION.effective_combo(&self.settings.keymap),
             ))
             .size(px(28.0))
             .flex_none()
@@ -585,7 +583,7 @@ impl Shell {
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();
-                cx.dispatch_action(&crate::commands::NewSession);
+                cx.dispatch_action(&crate::commands::NEW_SESSION.action());
             }))
             .child(
                 icon(icons::PLUS)
