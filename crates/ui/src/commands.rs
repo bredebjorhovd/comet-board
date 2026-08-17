@@ -1,6 +1,6 @@
 //! Typed application commands shared by native menus, shortcuts, and controls.
 
-use gpui::actions;
+use gpui::{KeyBinding, Keystroke, actions};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -13,13 +13,27 @@ actions!(comet, [NewSession]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommandDescriptor {
     pub label: &'static str,
-    pub macos_shortcut: &'static str,
+    pub shortcut: crate::settings::ShortcutId,
 }
 
 pub const NEW_SESSION: CommandDescriptor = CommandDescriptor {
     label: "New Session",
-    macos_shortcut: "cmd-t",
+    shortcut: crate::settings::ShortcutId::NewSession,
 };
+
+/// The registry-owned binding for New Session. Menus and clickable controls
+/// dispatch the same action contained here; keymap conflict detection reads
+/// the descriptor's `ShortcutId`.
+pub fn new_session_binding(keymap: &crate::settings::KeymapConfig) -> KeyBinding {
+    let id = NEW_SESSION.shortcut;
+    let configured = crate::settings::platform_combo(keymap.get(id));
+    let combo = if Keystroke::parse(&configured).is_ok() {
+        configured
+    } else {
+        crate::settings::platform_combo(id.default_combo())
+    };
+    KeyBinding::new(&combo, NewSession, None)
+}
 
 const INTENT_FILE: &str = "new-session-intent.json";
 
@@ -72,14 +86,30 @@ pub fn clear_intent(data_dir: &Path) -> std::io::Result<()> {
     std::fs::rename(tmp, path)
 }
 
-pub fn suppress_repeated_shortcut(key: &str, command: bool, is_held: bool) -> bool {
-    key.eq_ignore_ascii_case("t") && command && is_held
+pub fn suppress_repeated_shortcut(
+    keystroke: &Keystroke,
+    is_held: bool,
+    keymap: &crate::settings::KeymapConfig,
+) -> bool {
+    if !is_held {
+        return false;
+    }
+    let configured = crate::settings::platform_combo(keymap.get(NEW_SESSION.shortcut));
+    Keystroke::parse(&configured).is_ok_and(|bound| bound == *keystroke)
 }
 
 pub fn intent_arrived(intent: &NewSessionIntent, state: &AppState) -> bool {
     state.chats.iter().any(|chat| {
         chat.id == intent.chat_id && chat.space_id.as_deref() == Some(intent.space_id.as_str())
     })
+}
+
+pub fn intent_acknowledged(
+    intent: &NewSessionIntent,
+    state: &AppState,
+    durable_rpc_success: bool,
+) -> bool {
+    durable_rpc_success && intent_arrived(intent, state)
 }
 
 pub fn step_chooser(selected: usize, count: usize, delta: isize) -> usize {
@@ -148,9 +178,14 @@ mod tests {
 
     #[test]
     fn held_cmd_t_is_suppressed_but_the_initial_press_is_not() {
-        assert!(!suppress_repeated_shortcut("t", true, false));
-        assert!(suppress_repeated_shortcut("t", true, true));
-        assert!(!suppress_repeated_shortcut("t", false, true));
+        let mut keymap = crate::settings::KeymapConfig::default();
+        let initial = Keystroke::parse(&crate::settings::platform_combo("mod-t")).unwrap();
+        assert!(!suppress_repeated_shortcut(&initial, false, &keymap));
+        assert!(suppress_repeated_shortcut(&initial, true, &keymap));
+        keymap.set(crate::settings::ShortcutId::NewSession, "mod-n".into());
+        let rebound = Keystroke::parse(&crate::settings::platform_combo("mod-n")).unwrap();
+        assert!(!suppress_repeated_shortcut(&initial, true, &keymap));
+        assert!(suppress_repeated_shortcut(&rebound, true, &keymap));
     }
 
     #[test]
@@ -189,6 +224,24 @@ mod tests {
         assert_eq!(state.selected_chat, None);
         state.chats.push(chat("new", "b"));
         assert!(intent_arrived(&intent, &state));
+        assert!(
+            !intent_acknowledged(&intent, &state, false),
+            "a delayed watch row cannot tombstone recovery before durable RPC success"
+        );
+        assert!(intent_acknowledged(&intent, &state, true));
+    }
+
+    #[test]
+    fn new_session_is_in_the_shared_shortcut_registry() {
+        use crate::settings::{KeymapConfig, ShortcutId, conflicted_shortcuts};
+
+        assert!(ShortcutId::ALL.contains(&NEW_SESSION.shortcut));
+        let mut keymap = KeymapConfig::default();
+        assert_eq!(keymap.get(NEW_SESSION.shortcut), "mod-t");
+        keymap.set(ShortcutId::ToggleTerminal, "mod-t".into());
+        let conflicts = conflicted_shortcuts(&keymap);
+        assert!(conflicts.contains(&ShortcutId::NewSession));
+        assert!(conflicts.contains(&ShortcutId::ToggleTerminal));
     }
 
     #[test]

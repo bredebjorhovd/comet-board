@@ -96,7 +96,6 @@ pub fn bind_keys(cx: &mut App) {
 /// (no `App`), so unit tests can inspect it directly.
 fn macos_key_bindings() -> Vec<KeyBinding> {
     vec![
-        KeyBinding::new(NEW_SESSION.macos_shortcut, NewSession, None),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
         KeyBinding::new("alt-cmd-h", HideOthers, None),
@@ -178,7 +177,10 @@ mod tests {
     fn about_is_disabled_placeholder() {
         let menus = app_menus();
         let first = &menus[0].items[0];
-        assert!(first.is_disabled(), "About stays disabled until implemented");
+        assert!(
+            first.is_disabled(),
+            "About stays disabled until implemented"
+        );
     }
 
     #[test]
@@ -236,10 +238,6 @@ mod tests {
         assert_eq!(find(Quit.name()), Some(combo("cmd-q")));
         assert_eq!(find(CloseWindow.name()), Some(combo("cmd-w")));
         assert_eq!(find(Minimize.name()), Some(combo("cmd-m")));
-        assert_eq!(
-            find(NewSession.name()),
-            Some(combo(NEW_SESSION.macos_shortcut))
-        );
     }
 
     #[test]
@@ -254,10 +252,15 @@ mod tests {
         };
         assert_eq!(name.as_ref(), NEW_SESSION.label);
         assert_eq!(action.name(), NewSession.name());
-        assert!(
-            macos_key_bindings()
-                .iter()
-                .any(|binding| binding.action().name() == action.name())
+        let binding =
+            crate::commands::new_session_binding(&crate::settings::KeymapConfig::default());
+        assert_eq!(binding.action().name(), action.name());
+        assert_eq!(
+            binding.keystrokes()[0].inner(),
+            &Keystroke::parse(&crate::settings::platform_combo(
+                NEW_SESSION.shortcut.default_combo()
+            ))
+            .unwrap()
         );
     }
 }

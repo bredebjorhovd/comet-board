@@ -131,6 +131,7 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     // re-application.
     crate::app_menus::bind_keys(cx);
     cx.bind_keys([
+        commands::new_session_binding(keymap),
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_sidebar, "mod-s"),
             ToggleSidebar,
@@ -566,6 +567,9 @@ pub struct Shell {
     /// Durable until the exact row returns through WATCH_CHATS.
     new_session_intent: Option<NewSessionIntent>,
     new_session_intent_attempted: bool,
+    /// True only after createChat returned from an exact durable workspace
+    /// snapshot. WATCH_CHATS alone is not a commit acknowledgement.
+    new_session_intent_confirmed: bool,
     /// Highlighted row in the keyboard-operable no-context chooser.
     new_session_chooser: Option<usize>,
     focus_composer_next_render: bool,
@@ -645,13 +649,12 @@ impl Shell {
         // The transcript's one outward verb: "fork this conversation here"
         // (gh#425). The menu it opens is shell chrome — a modal over the whole
         // window that ends by selecting another chat.
-        let transcript_events = cx.subscribe(&transcript, |this: &mut Shell, _, event, cx| {
-            match event {
+        let transcript_events =
+            cx.subscribe(&transcript, |this: &mut Shell, _, event, cx| match event {
                 transcript::TranscriptEvent::ForkAt { message_id } => {
                     this.open_fork(message_id.to_string(), cx)
                 }
-            }
-        });
+            });
         // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
@@ -817,6 +820,7 @@ impl Shell {
             new_session_task: None,
             new_session_intent: commands::load_intent(&data_dir),
             new_session_intent_attempted: false,
+            new_session_intent_confirmed: false,
             new_session_chooser: None,
             focus_composer_next_render: false,
             auth_task: None,
@@ -1499,6 +1503,21 @@ impl Shell {
             || self.board_open
     }
 
+    /// Surfaces that must block application commands. The board is a docked,
+    /// workspace-scoped screen, not a modal, so it deliberately is not here.
+    fn command_modal_open(&self) -> bool {
+        self.chat_menu.is_some()
+            || self.rename_dialog.is_some()
+            || self.fork_dialog.is_some()
+            || self.delete_confirm.is_some()
+            || self.space_menu.is_some()
+            || self.rename_space_dialog.is_some()
+            || self.delete_space_confirm.is_some()
+            || self.add_space.is_some()
+            || self.new_session_chooser.is_some()
+            || self.user_menu_open
+    }
+
     // ---- back/forward (route history) ----
 
     fn navigate_back(&mut self, cx: &mut Context<Self>) {
@@ -1690,24 +1709,22 @@ impl Shell {
     /// Execute the typed New Session command. Menu items, ⌘T, and chooser rows
     /// all enter here; no input handler owns session-creation logic.
     fn new_session(&mut self, requested_space: Option<String>, cx: &mut Context<Self>) {
-        if self.new_session_task.is_some() || (requested_space.is_none() && self.overlay_open()) {
+        if self.new_session_task.is_some()
+            || (requested_space.is_none() && self.command_modal_open())
+        {
             return;
         }
         if self.new_session_intent.is_some() {
-            if requested_space.is_some() {
-                if self.discard_new_session_intent().is_err() {
-                    return;
-                }
-            } else {
-                self.new_session_intent_attempted = false;
-                self.submit_new_session_intent(cx);
-                return;
-            }
+            // Resolve the durable idempotency key before any replacement. A
+            // delayed WATCH may still reveal a commit whose reply was lost.
+            self.new_session_intent_attempted = false;
+            self.submit_new_session_intent(cx);
+            return;
         }
         let space_id = requested_space.or_else(|| {
             commands::current_space(
                 self.state.read(cx),
-                matches!(self.route, Route::Chat) && !self.board_open,
+                matches!(self.route, Route::Chat) || self.board_open,
             )
         });
         let Some(space_id) = space_id else {
@@ -1728,6 +1745,7 @@ impl Shell {
         }
         self.new_session_intent = Some(intent);
         self.new_session_intent_attempted = false;
+        self.new_session_intent_confirmed = false;
         self.new_session_chooser = None;
         self.submit_new_session_intent(cx);
     }
@@ -1752,22 +1770,50 @@ impl Shell {
         });
         self.new_session_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::MUTATE, params).await;
+            let absence_proven = if result.as_ref().is_err_and(|err| {
+                !matches!(err, comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_))
+            }) {
+                engine
+                    .client()
+                    .call(
+                        methods::MUTATE,
+                        serde_json::json!({
+                            "op": "confirmChatAbsent", "chatId": intent.chat_id,
+                        }),
+                    )
+                    .await
+                    .is_ok()
+            } else {
+                false
+            };
             this.update(cx, |shell, cx| {
                 shell.new_session_task = None;
-                if let Err(err) = result {
+                if result.is_ok() {
+                    shell.new_session_intent_confirmed = true;
+                } else if let Err(err) = result {
                     // Keep the stable intent. A retry (or a recreated Shell)
                     // reuses its UUID, so commit-before-response-loss cannot
                     // strand a second empty session.
-                    let ambiguous = matches!(err, comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_));
-                    if ambiguous {
-                        shell.new_session_chooser = Some(0);
+                    shell.new_session_intent_confirmed = false;
+                    if absence_proven {
+                        match commands::clear_intent(&shell.data_dir) {
+                            Ok(()) => {
+                                shell.new_session_intent = None;
+                                shell.new_session_intent_attempted = false;
+                                shell.new_session_chooser = Some(0);
+                                shell.sidebar_notice = Some(format!(
+                                    "New Session was refused: {err}. Choose a workspace to try again."
+                                ).into());
+                            }
+                            Err(clear_err) => {
+                                shell.sidebar_notice = Some(format!(
+                                    "New Session was refused, but its recovery record could not be cleared ({clear_err}). Fix disk access and retry."
+                                ).into());
+                            }
+                        }
+                    } else {
                         shell.sidebar_notice = Some(format!(
-                            "Couldn't confirm New Session: {err}. Retry reuses it; choosing a workspace discards it and starts over."
-                        ).into());
-                    } else if shell.discard_new_session_intent().is_ok() {
-                        shell.new_session_chooser = Some(0);
-                        shell.sidebar_notice = Some(format!(
-                            "New Session was refused: {err}. Choose another workspace or press Escape to cancel."
+                            "Couldn't durably confirm New Session: {err}. Press New Session again to safely retry the same session."
                         ).into());
                     }
                 }
@@ -1779,14 +1825,20 @@ impl Shell {
         cx.notify();
     }
 
-    /// WATCH_CHATS is the commit acknowledgement. Selection waits for this
-    /// exact row, which closes the stale-frame race around selected_space.
+    /// Selection and recovery acknowledgement require both sides of the
+    /// transaction: durable RPC success and the exact WATCH_CHATS row.
     fn reconcile_new_session(&mut self, cx: &mut Context<Self>) {
         let Some(intent) = self.new_session_intent.clone() else {
             return;
         };
-        let arrived = commands::intent_arrived(&intent, self.state.read(cx));
-        if !arrived {
+        if !self.new_session_intent_confirmed {
+            return;
+        }
+        if !commands::intent_acknowledged(
+            &intent,
+            self.state.read(cx),
+            self.new_session_intent_confirmed,
+        ) {
             return;
         }
         if let Err(err) = commands::clear_intent(&self.data_dir) {
@@ -1797,6 +1849,7 @@ impl Shell {
         }
         self.new_session_intent = None;
         self.new_session_intent_attempted = false;
+        self.new_session_intent_confirmed = false;
         self.new_session_task = None;
         if matches!(self.route, Route::Review { .. }) {
             self.close_review(cx);
@@ -1806,18 +1859,6 @@ impl Shell {
         self.state
             .update(cx, |state, cx| state.select_chat(Some(intent.chat_id), cx));
         self.focus_composer_next_render = true;
-    }
-
-    fn discard_new_session_intent(&mut self) -> Result<(), ()> {
-        if let Err(err) = commands::clear_intent(&self.data_dir) {
-            self.sidebar_notice = Some(format!(
-                "Could not discard the failed New Session recovery record ({err}). Fix disk access and retry."
-            ).into());
-            return Err(());
-        }
-        self.new_session_intent = None;
-        self.new_session_intent_attempted = false;
-        Ok(())
     }
 
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
@@ -3367,11 +3408,7 @@ impl Shell {
     /// Absent when the chat is gone — there is no session to name, and a header
     /// over the "the session that wrote this is gone" line would be a frame
     /// around an absence.
-    fn render_review_session_header(
-        &self,
-        theme: &Theme,
-        cx: &App,
-    ) -> Option<AnyElement> {
+    fn render_review_session_header(&self, theme: &Theme, cx: &App) -> Option<AnyElement> {
         let state = self.state.read(cx);
         let chat = state.selected_chat_row()?;
         let now = Utc::now();
@@ -4598,9 +4635,9 @@ impl Render for Shell {
             // typed action binding, while menu and click actions are untouched.
             .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
                 if commands::suppress_repeated_shortcut(
-                    &event.keystroke.key,
-                    event.keystroke.modifiers.platform,
+                    &event.keystroke,
                     event.is_held,
+                    &this.settings.keymap,
                 ) {
                     cx.stop_propagation();
                     return;
@@ -4609,12 +4646,14 @@ impl Render for Shell {
                     let count = this.state.read(cx).spaces.len();
                     match event.keystroke.key.as_str() {
                         "up" if count > 0 => {
-                            this.new_session_chooser = Some(commands::step_chooser(selected, count, -1));
+                            this.new_session_chooser =
+                                Some(commands::step_chooser(selected, count, -1));
                             cx.stop_propagation();
                             cx.notify();
                         }
                         "down" if count > 0 => {
-                            this.new_session_chooser = Some(commands::step_chooser(selected, count, 1));
+                            this.new_session_chooser =
+                                Some(commands::step_chooser(selected, count, 1));
                             cx.stop_propagation();
                             cx.notify();
                         }

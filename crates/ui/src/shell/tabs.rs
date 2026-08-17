@@ -561,6 +561,13 @@ impl Shell {
         // `+` invokes the same typed command as File → New Session and ⌘T.
         let new_tab = div()
             .id("session-tab-new")
+            .role(gpui::Role::Button)
+            .aria_label(crate::commands::NEW_SESSION.label)
+            .aria_keyshortcuts(crate::settings::display_combo(
+                self.settings
+                    .keymap
+                    .get(crate::commands::NEW_SESSION.shortcut),
+            ))
             .size(px(28.0))
             .flex_none()
             .flex()
@@ -576,11 +583,15 @@ impl Shell {
             )
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();
-                this.new_session(None, cx);
+                cx.dispatch_action(&crate::commands::NewSession);
             }))
-            .child(icon(icons::PLUS).size(px(16.0)).text_color(theme.text_muted));
+            .child(
+                icon(icons::PLUS)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            );
 
         // Overflow: the tab region scrolls horizontally; edge fades appear on
         // whichever side has hidden tabs (offset from the LAST frame — a

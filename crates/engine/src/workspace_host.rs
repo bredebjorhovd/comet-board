@@ -938,8 +938,19 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
     ) -> Result<(), EngineError> {
-        if self.inner.doc().chat(chat_id)?.is_some() {
-            return Ok(()); // idempotent: optimistic client retries never duplicate
+        let _gate = lock(&self.inner.owner_gate);
+        if let Some(chat) = self.inner.doc().chat(chat_id)? {
+            if chat.space_id.as_deref() != Some(space_id) {
+                return Err(EngineError::Other(format!(
+                    "chat {chat_id} already belongs to another space"
+                )));
+            }
+            // A retry after response loss is the durable acknowledgement: even
+            // if the first save failed or the reply vanished, persist the exact
+            // currently observed document before returning success.
+            let bytes = self.inner.doc().export_snapshot()?;
+            self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
+            return Ok(());
         }
         let Some(space) = self.inner.doc().space(space_id)? else {
             return Err(EngineError::Other(format!("no such space: {space_id}")));
@@ -962,6 +973,8 @@ impl WorkspaceHost {
             last_seen_at: None,
             forked_from: None,
         })?;
+        let bytes = self.inner.doc().export_snapshot()?;
+        self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
         Ok(())
     }
 
@@ -994,6 +1007,8 @@ impl WorkspaceHost {
                 && chat.branch == branch
                 && chat.config.as_ref() == Some(&config);
             return if already_final {
+                let bytes = self.inner.doc().export_snapshot()?;
+                self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
                 Ok(())
             } else {
                 Err(EngineError::Other(format!(
@@ -1005,7 +1020,23 @@ impl WorkspaceHost {
         chat.branch = branch;
         chat.config = Some(config);
         self.inner.doc().upsert_chat(&chat)?;
+        let bytes = self.inner.doc().export_snapshot()?;
+        self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
         Ok(())
+    }
+
+    /// Prove under the workspace owner gate that a failed creation UUID never
+    /// committed. The UI may discard its durable recovery intent only after
+    /// this returns successfully.
+    pub fn confirm_chat_absent(&self, chat_id: &str) -> Result<(), EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        if self.inner.doc().chat(chat_id)?.is_some() {
+            Err(EngineError::Other(format!(
+                "chat {chat_id} exists and must be reconciled"
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     /// Publish one exact host-owned chat while holding the workspace document
@@ -1621,22 +1652,51 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
 mod room_supervision_tests {
     use super::*;
 
+    fn test_config() -> WorkspaceHostConfig {
+        WorkspaceHostConfig {
+            device_id: "host-1".into(),
+            device_name: "Host".into(),
+            platform: "test".into(),
+            org_id: "org".into(),
+            user_id: "user".into(),
+            edge: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_chat_acknowledges_only_after_the_exact_row_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(store.clone(), test_config()).unwrap();
+        host.doc()
+            .upsert_space(&Space {
+                id: "space-1".into(),
+                device_id: "host-1".into(),
+                path: "/repo".into(),
+                name: None,
+                git_detected: true,
+                git_checked_at: None,
+                checkout_id: None,
+                branch: Some("main".into()),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        host.confirm_chat_absent("draft").unwrap();
+        host.create_chat("draft", "space-1", None, None).unwrap();
+        assert!(host.confirm_chat_absent("draft").is_err());
+        drop(host);
+
+        let restarted = WorkspaceHost::open(store, test_config()).unwrap();
+        let chat = restarted.doc().chat("draft").unwrap().unwrap();
+        assert_eq!(chat.space_id.as_deref(), Some("space-1"));
+        assert_eq!(chat.cwd.as_deref(), Some("/repo"));
+    }
+
     #[tokio::test]
     async fn empty_draft_finalization_atomically_sets_first_run_cwd_branch_and_config() {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(DocsStore::open(dir.path()).unwrap());
-        let host = WorkspaceHost::open(
-            store,
-            WorkspaceHostConfig {
-                device_id: "host-1".into(),
-                device_name: "Host".into(),
-                platform: "test".into(),
-                org_id: "org".into(),
-                user_id: "user".into(),
-                edge: None,
-            },
-        )
-        .unwrap();
+        let host = WorkspaceHost::open(store.clone(), test_config()).unwrap();
         let chat: Chat = serde_json::from_value(serde_json::json!({
             "id": "draft", "deviceId": "host-1", "title": null, "archived": false,
             "cwd": "/base", "branch": null, "checkoutId": null, "config": null,
@@ -1691,6 +1751,12 @@ mod room_supervision_tests {
             .is_err(),
             "a finalized draft cannot be reconfigured"
         );
+        drop(host);
+        let restarted = WorkspaceHost::open(store, test_config()).unwrap();
+        let durable = restarted.doc().chat("draft").unwrap().unwrap();
+        assert_eq!(durable.cwd.as_deref(), Some("/worktree"));
+        assert_eq!(durable.branch.as_deref(), Some("feature"));
+        assert!(durable.config.is_some());
     }
 
     #[test]

@@ -30,7 +30,7 @@ use comet_doc::{
 use comet_proto::view::context as view_context;
 use comet_proto::view::skills as view_skills;
 use comet_proto::{
-    ContextMatch, ContextRef, ContextRefKind, ContextSearch, RunRequest, SandboxLevel,
+    ChatConfig, ContextMatch, ContextRef, ContextRefKind, ContextSearch, RunRequest, SandboxLevel,
     SkillDescriptor, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::methods;
@@ -49,6 +49,27 @@ use crate::theme::{Bed, ListRow as _, Theme};
 /// Expanded-mode textarea vertical padding: `pt-4 pb-1` (comet composer.tsx
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
+
+fn draft_mutate_params(
+    materialized: bool,
+    chat_id: &str,
+    space_id: &str,
+    cwd: &str,
+    branch: Option<&str>,
+    config: &ChatConfig,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "op": if materialized { "finalizeChatDraft" } else { "createChat" },
+        "chatId": chat_id,
+        "spaceId": space_id,
+        "cwd": cwd,
+        "config": config,
+    });
+    if let (Some(branch), Some(object)) = (branch, params.as_object_mut()) {
+        object.insert("branch".into(), serde_json::Value::String(branch.into()));
+    }
+    params
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContextSelection {
@@ -3591,26 +3612,14 @@ impl Composer {
                         "Send failed: choose an available harness before starting the session."
                             .to_string()
                     })?;
-                    let mut mutate = serde_json::json!({
-                        "op": if materialized_draft { "finalizeChatDraft" } else { "createChat" },
-                        "chatId": chat_id,
-                        "spaceId": space_id,
-                        "config": config,
-                    });
-                    if let Some(object) = mutate.as_object_mut() {
-                        if let Some(worktree_cwd) = &worktree_cwd {
-                            object.insert(
-                                "cwd".into(),
-                                serde_json::Value::String(worktree_cwd.clone()),
-                            );
-                        }
-                        if let Some(branch) = &chat_branch {
-                            object.insert(
-                                "branch".into(),
-                                serde_json::Value::String(branch.clone()),
-                            );
-                        }
-                    }
+                    let mutate = draft_mutate_params(
+                        materialized_draft,
+                        &chat_id,
+                        space_id,
+                        &cwd,
+                        chat_branch.as_deref(),
+                        &config,
+                    );
                     if let Err(err) = engine.client().call(methods::MUTATE, mutate).await {
                         // A freshly cut worktree belongs to this transaction.
                         // Roll it back only after a definitive engine refusal;
@@ -5150,6 +5159,33 @@ mod tests {
         );
     }
 
+    fn test_chat_config() -> ChatConfig {
+        serde_json::from_value(serde_json::json!({
+            "harness": "codex", "model": null, "reasoning": null,
+            "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+            "pushRepo": null, "pushContract": null, "gitAuthor": null,
+            "turnLimits": {}, "mcpServers": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn first_turn_checkout_plans_always_carry_an_exact_cwd() {
+        let config = test_chat_config();
+        let cases = [
+            ("/repo", None),
+            ("/existing-worktree", Some("existing")),
+            ("/fresh-worktree", Some("feature")),
+        ];
+        for (cwd, branch) in cases {
+            let params = draft_mutate_params(true, "chat", "space", cwd, branch, &config);
+            assert_eq!(params["op"], "finalizeChatDraft");
+            assert_eq!(params["cwd"], cwd);
+            assert_eq!(params["branch"].as_str(), branch);
+            assert_eq!(params["config"]["harness"], "codex");
+        }
+    }
+
     fn question(id: &str, options: &[&str], multi: bool) -> UserInputQuestion {
         UserInputQuestion {
             id: id.into(),
@@ -5873,6 +5909,7 @@ mod tests {
             branch: None,
             checkout_id: None,
             config: None,
+            creation_state: comet_proto::ChatCreationState::Ready,
             last_message_preview: None,
             last_message_at: None,
             created_at: chrono::Utc::now(),
