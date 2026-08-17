@@ -112,10 +112,10 @@ impl DeviceFrameHeader {
     /// The identity the relay stamped on this frame, as the RPC layer's
     /// [`Caller`]. All-unset for a frame that carries none.
     pub fn caller(&self) -> Caller {
-        Caller {
-            user: self.u.clone().filter(|v| !v.is_empty()),
-            org: self.o.clone().filter(|v| !v.is_empty()),
-        }
+        Caller::relayed(
+            self.u.clone().filter(|v| !v.is_empty()),
+            self.o.clone().filter(|v| !v.is_empty()),
+        )
     }
 }
 

@@ -8,8 +8,9 @@
 //! - on every doc change (local commit or remote import) the handle re-emits the joined
 //!   transcript to watchers, drains pending commands, and schedules a snapshot save;
 //! - command drain: evaluate via `evaluate_command` (with the DocsStore processed
-//!   ledger), mark processed BEFORE execute, execute through the sessions engine, then
-//!   write the outcome status back into the doc as the sole outcome writer.
+//!   ledger), execute `Run` commands before marking them processed so a crash cannot
+//!   strand a paid turn before spawn, retain mark-before-execute for non-Run side
+//!   effects, then write the outcome status back as the sole outcome writer.
 //!
 //! Chat ownership is gated on the workspace doc (`chats[chat_id].deviceId`), with
 //! claim-on-first-command for unknown chats. Queueing a command for a chat hosted on
@@ -72,6 +73,13 @@ const MAX_OPEN_CHATS: usize = 32;
 
 /// How often [`DocHost::spawn_idle_release`] sweeps.
 const RELEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Crash injection for the recoverable-Run protocol. It deliberately leaves
+/// the durable command Pending and the in-memory start claim held, exactly as
+/// abrupt process death would; a newly assembled host has no such claim and
+/// must therefore run the command.
+#[cfg(test)]
+static FAIL_BEFORE_RUN_DISPATCH: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
 /// Resident-memory estimate per compressed snapshot byte. Loro snapshots are
 /// columnar+compressed; the in-memory doc plus mirror runs well above the blob
@@ -190,6 +198,15 @@ struct DocHostInner {
     sessions: OnceLock<SessionsEngine>,
     workspace: OnceLock<WorkspaceHost>,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// Commands whose session snapshot must be durable before the executor may
+    /// see them. Checkout-preparation handoff is the only producer.
+    durable_pending: Mutex<HashSet<String>>,
+    /// Run commands between durable queueing and a successful
+    /// `SessionsEngine::dispatch`. They stay Pending in the document until the
+    /// sessions engine owns a live run; this in-process claim prevents two
+    /// drain tasks starting the same command while a crash simply clears it
+    /// and makes the durable Pending entry recoverable.
+    starting_runs: Mutex<HashSet<String>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -362,6 +379,54 @@ impl ChatDocHandle {
         })
     }
 
+    /// Write a notice into the transcript: something the *engine* did, in the
+    /// place a person is already looking.
+    ///
+    /// `System` rather than `User` because nobody typed it — the composers'
+    /// echo logic and the sidebar preview both key on `User`, so a notice that
+    /// borrowed that role would show up as a message the operator sent and
+    /// would displace the last real one in the sidebar. `is_error` picks the
+    /// part kind, which is what makes a failure read as one.
+    ///
+    /// Deduped by id like [`Self::write_user_message`], so a retried write —
+    /// or a second engine holding the same doc — leaves one entry.
+    ///
+    /// gh#422's visible surface: a checkout preparing, and a checkout that
+    /// could not be prepared, are both things the chat says out loud rather
+    /// than facts you find in a log on the box.
+    pub fn write_notice(
+        &self,
+        message_id: &str,
+        text: &str,
+        is_error: bool,
+        created_at: i64,
+    ) -> Result<(), DocError> {
+        let doc = self.doc();
+        if doc.read_entries()?.iter().any(|e| e.id == message_id) {
+            return Ok(());
+        }
+        let part = if is_error {
+            MessagePart::Error {
+                id: "e0".into(),
+                message: text.to_string(),
+            }
+        } else {
+            MessagePart::Text {
+                id: "t0".into(),
+                text: text.to_string(),
+            }
+        };
+        doc.push_message(&SessionMessageEntry {
+            id: message_id.to_string(),
+            role: MessageRole::System,
+            parts: vec![part],
+            created_at,
+            device_id: self.device_id.clone(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+    }
+
     /// Recovery sweep: stamp this device's abandoned `streaming` entries `aborted`, appending
     /// `note` as a visible error part so the transcript says WHY the turn
     /// ended (comet folded "Run interrupted by backend restart" the same
@@ -433,6 +498,8 @@ impl DocHost {
                 sessions: OnceLock::new(),
                 workspace: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
+                durable_pending: Mutex::new(HashSet::new()),
+                starting_runs: Mutex::new(HashSet::new()),
             }),
         }
     }
@@ -779,16 +846,32 @@ impl DocHost {
         chat_id: &str,
         payload: SessionCommandPayload,
     ) -> Result<String, EngineError> {
-        let handle = self.open(chat_id)?;
         let id = new_id();
+        self.queue_command_with_id(chat_id, &id, payload)?;
+        Ok(id)
+    }
+
+    /// Queue a command under a caller-owned id. Used by checkout preparation:
+    /// the id is parked durably before the chat exists, so retrying a release
+    /// after a crash cannot append a second billable run.
+    pub fn queue_command_with_id(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+    ) -> Result<(), EngineError> {
+        let handle = self.open(chat_id)?;
         let now = now_ms();
         handle.with_current(|doc| {
+            if doc.read_commands()?.iter().any(|command| command.id == id) {
+                return Ok(());
+            }
             let based_on = doc.read_entries()?.last().map(|m| CommandBasedOn {
                 turn_id: Some(m.id.clone()),
                 frontier: None,
             });
             doc.queue_command(&SessionCommandEntry {
-                id: id.clone(),
+                id: id.to_string(),
                 payload,
                 issued_by: self.inner.config.device_id.clone(),
                 issued_at: now,
@@ -803,7 +886,35 @@ impl DocHost {
         // the command is durable in the doc either way (a host that opens the chat
         // for any other reason still executes it).
         self.nudge_remote_host(chat_id);
-        Ok(id)
+        Ok(())
+    }
+
+    /// Queue under a stable id and force the containing session snapshot to
+    /// disk before returning. Checkout preparation keeps its parked command
+    /// until this acknowledgement: a crash between the in-memory append and
+    /// the normal debounce can therefore replay the same id, never lose the
+    /// only copy and never append a second run.
+    pub fn queue_command_with_id_durable(
+        &self,
+        chat_id: &str,
+        id: &str,
+        payload: SessionCommandPayload,
+    ) -> Result<(), EngineError> {
+        lock(&self.inner.durable_pending).insert(id.to_string());
+        if let Err(error) = self.queue_command_with_id(chat_id, id, payload) {
+            lock(&self.inner.durable_pending).remove(id);
+            return Err(error);
+        }
+        let handle = self.open(chat_id)?;
+        // A failed save deliberately leaves the id gated. The caller keeps its
+        // parked payload, and a retry persists this same command id before
+        // opening the gate. No run starts from an unacknowledged memory append.
+        self.persist_snapshot(&handle)?;
+        lock(&self.inner.durable_pending).remove(id);
+        // The notification raised by the append may already have drained while
+        // this id was gated. Raise another after the durable acknowledgement.
+        handle.changed_tx.send_modify(|value| *value = value.wrapping_add(1));
+        Ok(())
     }
 
     /// The device hosting `chat_id`, when anything says: the session doc's own
@@ -969,8 +1080,9 @@ impl DocHost {
             .unwrap_or(self.inner.config.default_harness)
     }
 
-    /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
-    /// execute → write the outcome as the sole outcome writer.
+    /// Drain pending commands (host-only). `Run` is claimed in memory, handed
+    /// to Sessions, and only then marked processed; non-Run side effects retain
+    /// the command plane's mark-before-execute ordering.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
         let Some(sessions) = self.inner.sessions.get() else {
             return; // executor not wired yet; the set_sessions kick re-drains
@@ -995,6 +1107,8 @@ impl DocHost {
                 .find(|c| {
                     c.status == SessionCommandStatus::Pending
                         && !skipped.contains(&c.id)
+                        && !lock(&self.inner.durable_pending).contains(&c.id)
+                        && !lock(&self.inner.starting_runs).contains(&c.id)
                         && !is_processed(&c.id)
                 })
                 .cloned()
@@ -1014,8 +1128,48 @@ impl DocHost {
                     turn_is_past: &turn_is_past,
                 },
             );
-            // Mark BEFORE executing: a crash mid-execution must never double-run a
-            // command whose side effect may already have happened.
+            // A Run is different from every other command side effect. The
+            // sessions engine installs its RunHandle before dispatch returns,
+            // and engine death tears that run down. Marking it processed
+            // *before* dispatch created a permanent processed -> spawn crash
+            // hole for checkout recovery. Keep the durable command Pending,
+            // claim it in-process, and mark only after Sessions owns the run.
+            let recoverable_run = matches!(disposition, CommandDisposition::Execute)
+                && matches!(&entry.payload, SessionCommandPayload::Run { .. });
+            if recoverable_run {
+                if !lock(&self.inner.starting_runs).insert(entry.id.clone()) {
+                    skipped.insert(entry.id.clone());
+                    continue;
+                }
+                #[cfg(test)]
+                {
+                    let failpoint = FAIL_BEFORE_RUN_DISPATCH.get_or_init(|| Mutex::new(None));
+                    let mut command = lock(failpoint);
+                    if command.as_deref() == Some(entry.id.as_str()) {
+                        command.take();
+                        return;
+                    }
+                }
+                let (status, resolution) = match self.execute(sessions, handle, &entry).await {
+                    Ok(outcome) => outcome,
+                    Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
+                };
+                if let Err(err) = self.inner.store.mark_processed(&entry.id) {
+                    // Retain the in-process claim. Re-running after Sessions
+                    // has accepted the prompt would duplicate a turn; restart
+                    // is the recovery point, when that run is gone and the
+                    // still-Pending command is safe to start again.
+                    tracing::error!(chat = %handle.chat_id, command = %entry.id, error = %err,
+                        "run-start ledger write failed; retaining command claim until restart");
+                    return;
+                }
+                lock(&self.inner.starting_runs).remove(&entry.id);
+                self.resolve_command(handle, &entry.id, status, resolution.as_deref());
+                continue;
+            }
+
+            // Non-Run commands retain the command plane's at-most-once rule:
+            // their arbitrary side effect may survive an engine crash.
             if let Err(err) = self.inner.store.mark_processed(&entry.id) {
                 tracing::error!(chat = %handle.chat_id, error = %err, "processed-ledger write failed; halting drain");
                 return;
@@ -1254,9 +1408,16 @@ impl DocHost {
         })
     }
 
+    fn persist_snapshot(&self, handle: &ChatDocHandle) -> Result<usize, EngineError> {
+        let bytes = handle.doc().export_snapshot()?;
+        self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+        handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
+        Ok(bytes.len())
+    }
+
     fn save_snapshot(&self, handle: &ChatDocHandle) {
-        if let Some(bytes) = self.save_doc(&handle.chat_id, &handle.doc()) {
-            handle.snapshot_bytes.store(bytes, Ordering::Relaxed);
+        if let Err(err) = self.persist_snapshot(handle) {
+            tracing::warn!(chat = %handle.chat_id, error = %err, "snapshot save failed");
         }
     }
 
@@ -1793,6 +1954,174 @@ mod tests {
             "boundary-command",
             "the owner swap must reconcile the final old-doc command delta"
         );
+    }
+
+    #[tokio::test]
+    async fn a_caller_owned_command_id_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        host.queue_command_with_id(
+            "chat-fixed-command",
+            "prep-release-1",
+            SessionCommandPayload::Interrupt {},
+        )
+        .unwrap();
+        host.queue_command_with_id(
+            "chat-fixed-command",
+            "prep-release-1",
+            SessionCommandPayload::Interrupt {},
+        )
+        .unwrap();
+        let commands = host
+            .open("chat-fixed-command")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.id == "prep-release-1")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_durable_command_is_in_a_fresh_hosts_snapshot_before_acknowledgement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = host(dir.path());
+        first
+            .queue_command_with_id_durable(
+                "chat-durable-command",
+                "prep-release-durable",
+                SessionCommandPayload::Interrupt {},
+            )
+            .expect("durable queue acknowledged");
+
+        // Do not flush or wait for the ordinary debounce. A new host reading
+        // only the store models a crash immediately after the acknowledgement.
+        let restarted = host(dir.path());
+        let commands = restarted
+            .open("chat-durable-command")
+            .unwrap()
+            .doc()
+            .read_commands()
+            .unwrap();
+        assert!(commands.iter().any(|command| {
+            command.id == "prep-release-durable"
+                && command.status == SessionCommandStatus::Pending
+        }));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_before_run_dispatch_leaves_the_durable_turn_for_restart() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().join("data");
+        let command_id = "run-crash-before-dispatch";
+        let chat_id = "chat-run-crash-before-dispatch";
+
+        let assemble = || {
+            let registry = crate::HarnessRegistry::new();
+            registry.register(Arc::new(comet_harness::mock::MockHarness {
+                script: vec![comet_proto::AgentEvent::Done {
+                    status: comet_proto::DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                }],
+            }));
+            crate::EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+                .expect("engine assembles")
+        };
+
+        let core = assemble();
+        *lock(FAIL_BEFORE_RUN_DISPATCH.get_or_init(|| Mutex::new(None))) = Some(command_id.into());
+        core.doc_host
+            .queue_command_with_id_durable(
+                chat_id,
+                command_id,
+                SessionCommandPayload::Run {
+                    request: comet_proto::RunRequest {
+                        prompt: "survive the crash".into(),
+                        model: None,
+                        reasoning: None,
+                        model_options: Default::default(),
+                        cwd: dir.path().to_string_lossy().into_owned(),
+                        sandbox: comet_proto::SandboxLevel::WorkspaceWrite,
+                        auto_approve: true,
+                        attachments: Vec::new(),
+                        resume: None,
+                    },
+                    message_id: "message-after-restart".into(),
+                },
+            )
+            .expect("durable Run is queued");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !lock(&core.doc_host.inner.starting_runs).contains(command_id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "crash point was never reached"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !core.doc_host.inner.store.is_processed(command_id).unwrap(),
+            "Run was made unrecoverable before Sessions owned it"
+        );
+        assert!(
+            core.doc_host
+                .open(chat_id)
+                .unwrap()
+                .doc()
+                .read_commands()
+                .unwrap()
+                .iter()
+                .any(|command| {
+                    command.id == command_id && command.status == SessionCommandStatus::Pending
+                })
+        );
+
+        core.shutdown().await;
+        drop(core);
+
+        let restarted = assemble();
+        let handle = restarted.doc_host.open(chat_id).expect("snapshot reopens");
+        restarted.doc_host.drain_commands(&handle).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let commands = handle.doc().read_commands().unwrap();
+            if commands.iter().any(|command| {
+                command.id == command_id && command.status == SessionCommandStatus::Applied
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "restarted host did not recover the Pending Run: {commands:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            restarted
+                .doc_host
+                .inner
+                .store
+                .is_processed(command_id)
+                .unwrap(),
+            "the recovered start was not claimed after Sessions accepted it"
+        );
+        let entries = handle.doc().read_entries().unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.role == MessageRole::User)
+                .count(),
+            1,
+            "the recovered command produced one paid turn"
+        );
+        restarted.shutdown().await;
     }
 
     #[tokio::test]

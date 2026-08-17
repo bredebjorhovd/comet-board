@@ -73,7 +73,7 @@ use tokio::sync::watch;
 
 use comet_doc::SessionCommandPayload;
 use comet_proto::view::stats::{
-    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsHostStatus, StatsProbe,
+    AggregateBoardStats, BoardStatsSnapshot, StatsDevice, StatsProbe,
     StatsProbeResult, aggregate_board_stats,
 };
 use comet_proto::{ChatConfig, HarnessId};
@@ -81,6 +81,7 @@ use comet_rpc::{Caller, LinkCache, RpcError, RpcReply, RpcService, methods, pars
 
 use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
+use crate::checkout_prep::CheckoutPrep;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
 use crate::registry::HarnessRegistry;
@@ -240,6 +241,30 @@ struct DeleteWorktreeParams {
     repo_path: String,
     #[serde(alias = "path")]
     worktree_path: String,
+}
+
+/// `PrepareCheckout` / `CheckoutPrep` params (gh#422).
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PrepareCheckoutParams {
+    /// The checkout. A chat's `cwd` is exactly this, which is what a frontend
+    /// has in hand.
+    #[serde(alias = "path", alias = "cwd")]
+    worktree_path: String,
+    /// Compatibility metadata for older callers. Authority is always derived
+    /// from `worktree_path`; when supplied this must resolve to the same Git
+    /// common directory or the request is refused.
+    #[serde(default)]
+    repo_path: Option<String>,
+    /// Prepare even if the record says ready. Defaults to *true* on this verb;
+    /// see the handler for why a hand-pressed retry is never a cache read.
+    #[serde(default)]
+    force: Option<bool>,
+    /// Required by approval mutations: the exact digest the operator surface
+    /// displayed. The engine re-resolves the current immutable tree and
+    /// refuses if review and approval are no longer one compare-and-swap.
+    #[serde(default)]
+    expected_execution_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +557,10 @@ pub struct EngineRpc {
     workspace: WorkspaceHost,
     registry: std::sync::Arc<HarnessRegistry>,
     repos: Repos,
+    /// The repository recipe primitive (gh#422) — the same object the board's
+    /// runtime holds, so `PrepareCheckout` from a laptop and an automatic
+    /// preparation from a dispatch read and write one record.
+    prep: CheckoutPrep,
     terminals: Terminals,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
@@ -558,6 +587,7 @@ impl EngineRpc {
         workspace: WorkspaceHost,
         registry: std::sync::Arc<HarnessRegistry>,
         repos: Repos,
+        prep: CheckoutPrep,
         terminals: Terminals,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
@@ -569,6 +599,7 @@ impl EngineRpc {
             workspace,
             registry,
             repos,
+            prep,
             terminals,
             diff_sync,
             uploads,
@@ -1629,6 +1660,13 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_FOLDERS
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
+            // A recipe is executed where the working tree is (gh#422), never
+            // where the button was pressed — the same rule as every other
+            // verb in this group, and the one that lets a laptop retry a
+            // failed preparation on the box.
+            | methods::PREPARE_CHECKOUT
+            | methods::CANCEL_CHECKOUT_PREPARATION
+            | methods::CHECKOUT_PREP
             // Checkout diffs are produced on the device holding the checkout.
             | methods::WATCH_CHECKOUT_DIFFS
             // Terminals live on the chat's host device.
@@ -2108,6 +2146,26 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
             }
+            methods::APPROVE_TASK_PREPARATION => {
+                if !caller.is_operator() {
+                    return Err(RpcError::Failed(
+                        "repository preparation approval requires the embedded operator surface on the worktree host"
+                            .to_string(),
+                    ));
+                }
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                    expected_execution_digest: String,
+                }
+                let p: P = parse_params(params)?;
+                self.board()?
+                    .approve_preparation(&p.task_id, &p.expected_execution_digest)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             // Throughput over a window (gh#143) — read when the page opens,
             // never streamed: a full aggregate on every board tick would cost
             // every connected viewport a recompute nobody is looking at.
@@ -2392,7 +2450,119 @@ impl RpcService for EngineRpc {
                     )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
+                self.prep.forget(std::path::Path::new(&p.worktree_path));
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            // gh#422. Deliberately a verb rather than something `CreateWorktree`
+            // does on its own: preparation runs the repository's code, and a
+            // checkout appearing in a sidebar is not a moment to start doing
+            // that behind somebody. A board dispatch prepares automatically
+            // because it is about to start an agent that would run that code
+            // anyway; a person gets asked.
+            methods::PREPARE_CHECKOUT => {
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let worktree = std::path::PathBuf::from(&p.worktree_path);
+                if !worktree.is_dir() {
+                    return Err(RpcError::Failed(format!(
+                        "{} is not a directory",
+                        worktree.display()
+                    )));
+                }
+                // Authority comes from the checkout's verified Git common dir,
+                // never from a caller-supplied `repoPath`. The optional legacy
+                // field is checked for consistency so a relayed caller cannot
+                // make repository B borrow A's approval or locals namespace.
+                let repository_id = self
+                    .repos
+                    .repository_identity(&worktree)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                if let Some(repo) = p.repo_path.as_deref() {
+                    let claimed_id = self
+                        .repos
+                        .repository_identity(std::path::Path::new(repo))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    if claimed_id != repository_id {
+                        return Err(RpcError::Failed(format!(
+                            "{} does not belong to repository {}",
+                            worktree.display(),
+                            repo
+                        )));
+                    }
+                }
+                let record = self
+                    .prep
+                    .prepare(crate::checkout_prep::PrepareRequest {
+                        worktree: &worktree,
+                        repository_id: &repository_id,
+                        // A retry is always a real retry: the caller pressed
+                        // this because the last answer was wrong, and handing
+                        // back the cached `ready` would be the one reply that
+                        // helps nobody. `force: false` is the automatic path's.
+                        force: p.force.unwrap_or(true),
+                        cancel: None,
+                    })
+                    .await;
+                // Same ending as the automatic path, by sharing its code: a
+                // preparation that succeeds releases the brief its failure was
+                // holding, so the attempt continues instead of being re-cut.
+                crate::board_runtime::settle_preparation(
+                    &self.prep,
+                    &self.doc_host,
+                    &worktree,
+                    &record,
+                );
+                RpcReply::value(&record)
+            }
+            methods::CANCEL_CHECKOUT_PREPARATION => {
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let cancelled = self
+                    .prep
+                    .cancel(std::path::Path::new(&p.worktree_path));
+                RpcReply::value(&serde_json::json!({ "cancelled": cancelled }))
+            }
+            methods::APPROVE_CHECKOUT_PREPARATION => {
+                if !caller.is_operator() {
+                    return Err(RpcError::Failed(
+                        "repository preparation approval requires the embedded operator surface"
+                            .to_string(),
+                    ));
+                }
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let worktree = std::path::PathBuf::from(&p.worktree_path);
+                let repository_id = self
+                    .repos
+                    .repository_identity(&worktree)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let expected = p.expected_execution_digest.ok_or_else(|| {
+                    RpcError::BadParams(
+                        "expectedExecutionDigest is required for preparation approval".into(),
+                    )
+                })?;
+                let digest = self
+                    .prep
+                    .approve(&worktree, &repository_id, &expected)
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&serde_json::json!({ "executionDigest": digest }))
+            }
+            methods::CHECKOUT_PREP => {
+                let p: PrepareCheckoutParams = parse_params(params)?;
+                let worktree = std::path::PathBuf::from(&p.worktree_path);
+                let recipe = self.prep.recipe(&worktree);
+                RpcReply::value(&serde_json::json!({
+                    "worktreePath": p.worktree_path,
+                    // Absent = this checkout has never been prepared, which is
+                    // a different answer from "prepared and ready".
+                    "prep": self.prep.status(&worktree),
+                    // Said out loud rather than left as an empty recipe: a
+                    // viewport offering nothing because the file is malformed
+                    // and one offering nothing because there is no file are
+                    // not the same thing to the person looking at it.
+                    "recipe": recipe.as_ref().ok().and_then(|r| r.as_ref()),
+                    "recipeError": recipe.as_ref().err(),
+                }))
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
@@ -2645,6 +2815,9 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::APPROVE_CHECKOUT_PREPARATION));
+        assert!(!forwardable(methods::APPROVE_TASK_PREPARATION));
+        assert!(forwardable(methods::CANCEL_CHECKOUT_PREPARATION));
         assert!(forwardable(methods::QUEUE_COMMAND));
         // Skills are files on the chat's host, and which files depends on the
         // agent account that chat names (gh#134).
@@ -2686,7 +2859,10 @@ mod tests {
             }],
         );
         assert!(!aggregate.complete);
-        assert_eq!(aggregate.hosts[0].status, StatsHostStatus::Unreadable);
+        assert_eq!(
+            aggregate.hosts[0].status,
+            comet_proto::view::stats::StatsHostStatus::Unreadable
+        );
     }
 
     /// gh#97: onboarding is three device-local effects behind one verb — a

@@ -13,6 +13,7 @@ path = "src/main.rs"
 comet-board.workspace = true
 comet-proto.workspace = true
 comet-rpc.workspace = true
+comet-engine.workspace = true
 # For the `UpdateStatus` frame doctor reports (gh#197).
 comet-update.workspace = true
 # For the presence verdict the board-host sweep gates its warning on (gh#195).

@@ -131,7 +131,7 @@ pub fn default_registry() -> HarnessRegistry {
                 text: "## Streaming pipeline\n\nEvery turn flows through the same path:\n\n".into(),
             },
             AgentEvent::TextDelta {
-                text: "1. **Doc command** — the composer queues a durable `run` entry\n2. **Host executor** — the chat's host device marks it processed, then dispatches\n3. **Fold** — events fold into parts and diff into the Loro doc every 120ms\n\n".into(),
+                text: "1. **Doc command** — the composer queues a durable `run` entry\n2. **Host executor** — the chat's host device dispatches it, then marks the accepted start processed\n3. **Fold** — events fold into parts and diff into the Loro doc every 120ms\n\n".into(),
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-1".into(),

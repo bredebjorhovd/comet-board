@@ -46,6 +46,7 @@ use comet_board::stats::Stats as BoardStats;
 use comet_board::sync::{SessionStatuses, SyncEngine};
 use comet_board::verdict::{VerdictKind, VerdictReceipt};
 use comet_proto::view::board::OrchestratorPin;
+use comet_proto::view::board::CheckoutPreparationState;
 use comet_proto::view::stats::StatsMergeBasis;
 use comet_proto::{Session, Space};
 use tokio::sync::{oneshot, watch};
@@ -76,6 +77,11 @@ enum Msg {
     },
     Cancel {
         task_id: String,
+        reply: oneshot::Sender<anyhow::Result<()>>,
+    },
+    ApprovePreparation {
+        task_id: String,
+        expected_execution_digest: String,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
     /// Read one task's issue text (gh#132). On the loop's thread like every
@@ -319,6 +325,25 @@ impl BoardService {
         overrides: DispatchOverrides,
     ) -> anyhow::Result<Dispatched> {
         self.dispatch_with(task_id, origin, overrides, true).await
+    }
+
+    /// Embedded-operator approval for the exact committed-tree digest blocking
+    /// this task.
+    pub async fn approve_preparation(
+        &self,
+        task_id: &str,
+        expected_execution_digest: &str,
+    ) -> anyhow::Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::ApprovePreparation {
+                task_id: task_id.to_string(),
+                expected_execution_digest: expected_execution_digest.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop stopped before approving preparation"))?
     }
 
     async fn dispatch_with(
@@ -617,6 +642,25 @@ fn run_loop(
                 publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
+            Ok(Msg::ApprovePreparation {
+                task_id,
+                expected_execution_digest,
+                reply,
+            }) => {
+                let result = handle_approve_preparation(
+                    &engine,
+                    runtime.as_ref(),
+                    &task_id,
+                    &expected_execution_digest,
+                );
+                if let Err(error) = &result {
+                    log.error(format!(
+                        "preparation approval for {task_id} failed: {error:#}"
+                    ));
+                }
+                publish_rows(&engine, &feeds.rows, &log);
+                let _ = reply.send(result);
+            }
             // A read, so it publishes nothing and logs nothing: opening a row
             // is not an event on the board.
             // A read like `Detail`: publishes nothing, logs nothing. Opening
@@ -773,6 +817,41 @@ fn handle_dispatch(
         .db
         .get_task(task_id)?
         .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+    if replace
+        && let Some(attempt) = task.live_attempt()
+        && let Some(preparation) = attempt.preparation.as_ref()
+        && preparation.state == CheckoutPreparationState::Failed
+    {
+        if preparation.requires_approval {
+            anyhow::bail!(
+                "{} preparation requires host approval — review and approve it in the embedded Comet app on the worktree host (task {})",
+                task.identifier,
+                task.identifier
+            );
+        }
+        let worktree = attempt
+            .worktree
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("attempt {} has no checkout to prepare", attempt.id))?;
+        let chat_id = attempt
+            .pane_id
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("attempt {} has no chat", attempt.id))?;
+        runtime.retry_checkout_preparation(worktree)?;
+        let mut preparing = preparation.clone();
+        preparing.state = CheckoutPreparationState::Preparing;
+        preparing.detail = Some("retrying preparation in this checkout".to_string());
+        engine.db.set_attempt_preparation(attempt.id, &preparing)?;
+        engine
+            .db
+            .set_attempt_status(attempt.id, AgentStatus::Working)?;
+        engine.rederive_all()?;
+        return Ok(Dispatched {
+            chat_id: chat_id.to_string(),
+            cwd: worktree.to_string(),
+            attempt: task.attempt_count(),
+        });
+    }
     if !replace && let Some(live) = task.live_attempt() {
         anyhow::bail!(
             "{} already has a live attempt (chat {})",
@@ -787,6 +866,9 @@ fn handle_dispatch(
         // reason `handle_cancel` reads them first (gh#151).
         engine.record_tokens(Some(runtime), attempt);
         engine.record_context(Some(runtime), attempt);
+        if let Some(worktree) = attempt.worktree.as_deref() {
+            runtime.cancel_checkout_preparation(worktree)?;
+        }
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {
@@ -1043,6 +1125,14 @@ fn handle_dispatch(
         Ok(handle) => {
             engine.db.set_attempt_pane(attempt_id, &handle.chat_id)?;
             engine.db.set_attempt_worktree(attempt_id, &handle.cwd)?;
+            if let Some(preparation) = &handle.preparation {
+                engine
+                    .db
+                    .set_attempt_preparation(attempt_id, preparation)?;
+                engine
+                    .db
+                    .set_attempt_status(attempt_id, AgentStatus::Working)?;
+            }
             // The checkout's own HEAD is the attempt's true starting point: for
             // a fresh branch it equals the repo HEAD, and for a reused one it
             // is the tip the agent builds on (herdr-board#10).
@@ -1109,6 +1199,55 @@ fn handle_dispatch(
     }
 }
 
+fn handle_approve_preparation(
+    engine: &SyncEngine,
+    runtime: &(dyn Runtime + Send + Sync),
+    task_id: &str,
+    expected_execution_digest: &str,
+) -> anyhow::Result<()> {
+    let task = engine
+        .db
+        .get_task(task_id)?
+        .ok_or_else(|| anyhow::anyhow!("{task_id} is not on the board"))?;
+    let attempt = task
+        .live_attempt()
+        .ok_or_else(|| anyhow::anyhow!("{} has no live attempt", task.identifier))?;
+    let preparation = attempt.preparation.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("{} has no recorded checkout preparation", task.identifier)
+    })?;
+    if !preparation.requires_approval {
+        anyhow::bail!(
+            "{} preparation is not waiting for host approval",
+            task.identifier
+        );
+    }
+    let displayed_digest = preparation.execution_digest.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("{} preparation has no execution digest", task.identifier)
+    })?;
+    anyhow::ensure!(
+        displayed_digest == expected_execution_digest,
+        "{} preparation changed after review (displayed {}, current {}); review the current effects before approving",
+        task.identifier,
+        &expected_execution_digest[..expected_execution_digest.len().min(12)],
+        &displayed_digest[..displayed_digest.len().min(12)],
+    );
+    let worktree = attempt
+        .worktree
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("attempt {} has no checkout", attempt.id))?;
+    runtime.approve_checkout_preparation(worktree, expected_execution_digest)?;
+    let mut preparing = preparation.clone();
+    preparing.state = CheckoutPreparationState::Preparing;
+    preparing.requires_approval = false;
+    preparing.detail = Some("approved; retrying preparation in this checkout".to_string());
+    engine.db.set_attempt_preparation(attempt.id, &preparing)?;
+    engine
+        .db
+        .set_attempt_status(attempt.id, AgentStatus::Working)?;
+    engine.rederive_all()?;
+    Ok(())
+}
+
 /// One cancel, on the loop thread. The chat may already be gone; that is not a
 /// reason to keep the attempt open. A row whose last attempt already closed
 /// `failed`/`orphaned` can be cancelled too: that is the panel's reset — the
@@ -1129,6 +1268,13 @@ fn handle_cancel(
         // to record what it spent (gh#151).
         engine.record_tokens(Some(runtime), attempt);
         engine.record_context(Some(runtime), attempt);
+        // The attempt owns the checkout identity. Chat cwd is mutable and the
+        // chat may already be deleted; revoking through it can tombstone the
+        // wrong checkout or no checkout at all. This write is fail-closed: a
+        // late successful setup must not release after the row says cancelled.
+        if let Some(worktree) = attempt.worktree.as_deref() {
+            runtime.cancel_checkout_preparation(worktree)?;
+        }
         if let Some(chat_id) = attempt.pane_id.as_deref()
             && let Err(e) = runtime.cancel(chat_id)
         {
@@ -1266,6 +1412,9 @@ mod tests {
     struct FakeRuntime {
         dispatched: std::sync::Mutex<Vec<DispatchSpec>>,
         cancelled: std::sync::Mutex<Vec<String>>,
+        preparation_cancellations: std::sync::Mutex<Vec<String>>,
+        fail_preparation_cancel: std::sync::atomic::AtomicBool,
+        fail_chat_cancel: std::sync::atomic::AtomicBool,
         /// Chat id → text, for the notices the board queues into a chat
         /// rather than the dispatches it starts.
         prompted: std::sync::Mutex<Vec<(String, String)>>,
@@ -1299,6 +1448,8 @@ mod tests {
         /// The actual askpass/gh handoff cannot be established. Unlike a
         /// dispatch failure, this must refuse before the attempt row exists.
         fail_push_handoff: std::sync::atomic::AtomicBool,
+        preparation_retries: std::sync::Mutex<Vec<String>>,
+        preparation_approvals: std::sync::Mutex<Vec<String>>,
     }
 
     impl Default for FakeRuntime {
@@ -1306,6 +1457,9 @@ mod tests {
             Self {
                 dispatched: Default::default(),
                 cancelled: Default::default(),
+                preparation_cancellations: Default::default(),
+                fail_preparation_cancel: std::sync::atomic::AtomicBool::new(false),
+                fail_chat_cancel: std::sync::atomic::AtomicBool::new(false),
                 prompted: Default::default(),
                 alive: std::sync::atomic::AtomicBool::new(true),
                 logins: Default::default(),
@@ -1314,6 +1468,8 @@ mod tests {
                 refuse_dispatch: std::sync::atomic::AtomicBool::new(false),
                 fail_dispatch: std::sync::atomic::AtomicBool::new(false),
                 fail_push_handoff: std::sync::atomic::AtomicBool::new(false),
+                preparation_retries: Default::default(),
+                preparation_approvals: Default::default(),
             }
         }
     }
@@ -1357,7 +1513,26 @@ mod tests {
             Ok(DispatchHandle {
                 chat_id: format!("chat-for-{}", spec.identifier),
                 cwd: format!("/worktrees/{}", spec.branch),
+                preparation: None,
             })
+        }
+        fn retry_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+            self.preparation_retries
+                .lock()
+                .unwrap()
+                .push(worktree.to_string());
+            Ok(())
+        }
+        fn approve_checkout_preparation(
+            &self,
+            worktree: &str,
+            _expected_execution_digest: &str,
+        ) -> anyhow::Result<()> {
+            self.preparation_approvals
+                .lock()
+                .unwrap()
+                .push(worktree.to_string());
+            Ok(())
         }
         fn prompt(&self, chat_id: &str, text: &str) -> anyhow::Result<()> {
             self.prompted
@@ -1366,8 +1541,27 @@ mod tests {
                 .push((chat_id.to_string(), text.to_string()));
             Ok(())
         }
+        fn cancel_checkout_preparation(&self, worktree: &str) -> anyhow::Result<()> {
+            self.preparation_cancellations
+                .lock()
+                .unwrap()
+                .push(worktree.to_string());
+            if self
+                .fail_preparation_cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("checkout tombstone could not be written");
+            }
+            Ok(())
+        }
         fn cancel(&self, chat_id: &str) -> anyhow::Result<()> {
             self.cancelled.lock().unwrap().push(chat_id.to_string());
+            if self
+                .fail_chat_cancel
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("chat was deleted or retargeted");
+            }
             Ok(())
         }
         fn session(&self, _chat_id: &str) -> anyhow::Result<Option<Session>> {
@@ -2803,6 +2997,95 @@ max_concurrent_per_workspace = 1
         service.shutdown();
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cancel_uses_the_attempt_checkout_and_fails_closed_on_tombstone_errors() {
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#422", "gh#422");
+        seed_attempt(
+            &paths,
+            "gh:owner/widget#422",
+            "deleted-or-retargeted-chat",
+        );
+        let db = Db::open(&paths.db()).unwrap();
+        let attempt = db
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap()
+            .live_attempt()
+            .unwrap()
+            .id;
+        db.set_attempt_worktree(attempt, "/worktrees/attempt-owned-checkout")
+            .unwrap();
+        drop(db);
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![]);
+        runtime
+            .fail_preparation_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = service
+            .cancel_task("gh:owner/widget#422")
+            .await
+            .expect_err("a non-durable tombstone must keep the attempt live");
+        assert!(error.to_string().contains("tombstone"), "{error:#}");
+        assert_eq!(
+            runtime
+                .preparation_cancellations
+                .lock()
+                .unwrap()
+                .as_slice(),
+            ["/worktrees/attempt-owned-checkout"]
+        );
+        assert!(
+            runtime.cancelled.lock().unwrap().is_empty(),
+            "chat interruption cannot race ahead of the tombstone"
+        );
+        assert!(
+            Db::open(&paths.db())
+                .unwrap()
+                .get_task("gh:owner/widget#422")
+                .unwrap()
+                .unwrap()
+                .live_attempt()
+                .is_some(),
+            "the attempt stays live when revocation is not durable"
+        );
+
+        // A missing or retargeted chat is no longer the preparation identity.
+        // Once the exact checkout is tombstoned, failure to interrupt that
+        // stale chat is best-effort and cannot keep the attempt open forever.
+        runtime
+            .fail_preparation_cancel
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        runtime
+            .fail_chat_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        service.cancel_task("gh:owner/widget#422").await.unwrap();
+        assert_eq!(
+            runtime
+                .preparation_cancellations
+                .lock()
+                .unwrap()
+                .as_slice(),
+            [
+                "/worktrees/attempt-owned-checkout",
+                "/worktrees/attempt-owned-checkout"
+            ]
+        );
+        let task = Db::open(&paths.db())
+            .unwrap()
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap();
+        assert!(task.live_attempt().is_none());
+        assert_eq!(
+            task.attempts.last().and_then(|attempt| attempt.outcome),
+            Some(Outcome::Cancelled)
+        );
+
+        service.shutdown();
+    }
+
     /// gh#194: a cancel is an ending like any other for the agent that released
     /// the work. The operator pressed the key and knows; the dispatcher is
     /// somewhere else waiting on a step that is now never finishing, and until
@@ -2980,6 +3263,81 @@ max_concurrent_per_workspace = 1
             "the replaced attempt is archived as cancelled"
         );
 
+        service.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn retry_of_failed_preparation_reuses_the_live_attempt_and_checkout() {
+        use comet_proto::view::board::{CheckoutPreparation, CheckoutPreparationState};
+
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#422", "gh#422");
+        seed_attempt_in(&paths, "gh:owner/widget#422", "chat-422", "widget");
+        let db = Db::open(&paths.db()).unwrap();
+        let attempt = db
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap()
+            .live_attempt()
+            .unwrap()
+            .id;
+        db.set_attempt_worktree(attempt, "/worktrees/widget-422")
+            .unwrap();
+        db.set_attempt_preparation(
+            attempt,
+            &CheckoutPreparation {
+                state: CheckoutPreparationState::Failed,
+                recipe_digest: Some("abc".into()),
+                execution_digest: Some("tree-abc".into()),
+                detail: Some("setup exited 7".into()),
+                log: Some("/logs/prep.log".into()),
+                log_excerpt: Some("setup failed".into()),
+                run_command: Some("cargo run".into()),
+                setup_command: Some("scripts/setup.sh".into()),
+                setup_outputs: vec!["target".into()],
+                archive_paths: vec!["target".into()],
+                requires_approval: false,
+                projections: Vec::new(),
+            },
+        )
+        .unwrap();
+        db.set_attempt_status(attempt, AgentStatus::Blocked).unwrap();
+        drop(db);
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![]);
+        let dispatched = service
+            .retry_task(
+                "gh:owner/widget#422",
+                DispatchOrigin::default(),
+                DispatchOverrides::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dispatched.attempt, 1);
+        assert_eq!(dispatched.chat_id, "chat-422");
+        assert_eq!(dispatched.cwd, "/worktrees/widget-422");
+        assert!(runtime.cancelled.lock().unwrap().is_empty());
+        assert_eq!(
+            runtime.preparation_retries.lock().unwrap().as_slice(),
+            ["/worktrees/widget-422"]
+        );
+
+        let task = Db::open(&paths.db())
+            .unwrap()
+            .get_task("gh:owner/widget#422")
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.attempt_count(), 1);
+        assert_eq!(
+            task.live_attempt()
+                .unwrap()
+                .preparation
+                .as_ref()
+                .unwrap()
+                .state,
+            CheckoutPreparationState::Preparing
+        );
         service.shutdown();
     }
 

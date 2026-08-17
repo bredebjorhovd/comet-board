@@ -150,6 +150,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
             .merged_sessions_watch(core.sessions.watch_sessions()),
         core.sessions.journal(),
         core.agent_accounts.clone(),
+        core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     ));
     runtime.set_push_credentials(push);
@@ -445,9 +446,17 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         std::fs::create_dir_all(checkout.join(cache)).unwrap();
         std::fs::write(checkout.join(cache).join("blob"), vec![b'x'; 4096]).unwrap();
     }
-    let swept = runtime
-        .reclaim_build_output(&handle.cwd)
-        .expect("the sweep runs");
+    // On `spawn_blocking` like every other trait call here (see the header):
+    // since gh#422 the sweep may run the repo's own `[archive]` step first,
+    // which blocks on the runtime handle exactly as `dispatch` does.
+    let swept = {
+        let rt = runtime.clone();
+        let cwd = handle.cwd.clone();
+        tokio::task::spawn_blocking(move || rt.reclaim_build_output(&cwd))
+            .await
+            .unwrap()
+            .expect("the sweep runs")
+    };
     assert_eq!(swept.dirs, 2, "target/ and the nested node_modules");
     assert_eq!(swept.bytes, 8192);
     assert!(swept.failed.is_empty());

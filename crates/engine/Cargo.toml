@@ -30,7 +30,12 @@ portable-pty.workspace = true
 base64 = "0.22"
 libc.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 reqwest.workspace = true
+# The repository recipe (gh#422) is TOML, like every other file an operator or
+# a repository writes for comet. Same version the board reads `routing.toml`
+# with, so a workspace holds one copy of it.
+toml = "1.1"
 
 [dev-dependencies]
 tempfile.workspace = true

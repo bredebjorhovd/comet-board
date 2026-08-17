@@ -99,6 +99,25 @@ pub mod methods {
     pub const LIST_FOLDERS: &str = "ListFolders";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
+    /// The repository's own recipe for a checkout, and its lifecycle (gh#422).
+    /// Device-addressed like every other checkout verb: a recipe is executed
+    /// where the working tree is, never where the button was pressed.
+    ///
+    /// `PrepareCheckout` is the verb a person presses after a preparation
+    /// failed — it re-runs the recipe against the same checkout and, if that
+    /// succeeds, releases whatever brief the failure was holding. That is the
+    /// retry that does not mint a second attempt.
+    pub const PREPARE_CHECKOUT: &str = "PrepareCheckout";
+    /// Stop an active setup command and its process group. Relay-forwardable;
+    /// cancellation must execute where the checkout lives.
+    pub const CANCEL_CHECKOUT_PREPARATION: &str = "CancelCheckoutPreparation";
+    /// Host-local trust mutation for an ordinary checkout. Approves the exact
+    /// repository + committed-tree execution digest; editing any committed
+    /// input invalidates it.
+    pub const APPROVE_CHECKOUT_PREPARATION: &str = "ApproveCheckoutPreparation";
+    /// Read-only: the last thing known about a checkout's preparation, plus the
+    /// recipe's `run` command so a viewport can offer it.
+    pub const CHECKOUT_PREP: &str = "CheckoutPrep";
     // Terminals (ControlRpc, relay-forwardable; SubscribeTerminal streams).
     pub const OPEN_TERMINAL: &str = "OpenTerminal";
     pub const SUBSCRIBE_TERMINAL: &str = "SubscribeTerminal";
@@ -171,6 +190,10 @@ pub mod methods {
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";
+    /// Approve the exact committed-tree digest blocking a live task, then retry its
+    /// preparation in place. Host-local only: repository code must not be able
+    /// to authorize itself through the relay. Params: `{taskId}`.
+    pub const APPROVE_TASK_PREPARATION: &str = "ApproveTaskPreparation";
     /// The issue text behind one row, for the detail surface (gh#132). Params:
     /// `{taskId}` → `{id, body}`.
     ///
@@ -424,12 +447,11 @@ impl RpcReply {
 /// `params` can reach it. A handler may therefore compare it against its own
 /// records; a handler may not accept a substitute for it.
 ///
-/// [`Caller::LOCAL`] — both fields unset — is the *absence* of a relay stamp,
-/// which is a fact of its own: the call came in over this device's own IPC
-/// port or its in-process transport, so whoever made it is already the person
-/// the device runs as. That is why "unverified" is never the same as
-/// "untrusted" here, and why a local dispatch must not be treated as a
-/// stranger's.
+/// [`Caller::LOCAL`] — both identity fields unset — is the *absence* of a relay
+/// stamp. It says the call reached the device over localhost IPC; it does not
+/// say a person pressed the button. A dispatched agent and repository setup
+/// process can both reach localhost, so security-sensitive host approval needs
+/// the separate, in-process [`Caller::OPERATOR`] authority.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Caller {
     /// The verified WorkOS user id the relay stamped, if this call came over
@@ -439,6 +461,11 @@ pub struct Caller {
     /// The verified org claim that rode with it, when the caller's session
     /// carried one.
     pub org: Option<String>,
+    /// True only for the embedded desktop's in-process transport. Never read
+    /// from a frame or request parameter, and never set by localhost or relay
+    /// transports: code running on the box cannot mint an operator click by
+    /// opening the public IPC port.
+    operator: bool,
 }
 
 impl Caller {
@@ -446,6 +473,17 @@ impl Caller {
     pub const LOCAL: Caller = Caller {
         user: None,
         org: None,
+        operator: false,
+    };
+
+    /// A person operating the embedded desktop on the checkout host. This is
+    /// deliberately not the caller used by [`memory_client`]; tests and other
+    /// in-process adapters remain ordinary local callers unless they opt into
+    /// the operator transport explicitly.
+    pub const OPERATOR: Caller = Caller {
+        user: None,
+        org: None,
+        operator: true,
     };
 
     /// The identity the edge verified, or `None` for a local call.
@@ -456,6 +494,22 @@ impl Caller {
     /// Did this call arrive over the relay with a verified identity on it?
     pub fn is_verified(&self) -> bool {
         self.user().is_some()
+    }
+
+    /// Can this caller make a host trust decision which repository code must
+    /// not be able to relay through localhost?
+    pub fn is_operator(&self) -> bool {
+        self.operator
+    }
+
+    /// A relay-authenticated caller. The transport owns construction so a
+    /// request body can never smuggle either identity or operator authority.
+    pub fn relayed(user: Option<String>, org: Option<String>) -> Caller {
+        Caller {
+            user,
+            org,
+            operator: false,
+        }
     }
 }
 
@@ -500,6 +554,22 @@ pub fn memory_client(service: Arc<dyn RpcService>) -> RpcClient {
     let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
     let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);
     tokio::spawn(serve_connection(service, server_out, server_in));
+    RpcClient::new(client_out, client_in)
+}
+
+/// The embedded desktop's transport. It speaks the same envelopes as every
+/// other client, but the server stamps the connection as a physical operator
+/// surface. Keeping this constructor separate makes the authority visible at
+/// the one place it is granted.
+pub fn operator_memory_client(service: Arc<dyn RpcService>) -> RpcClient {
+    let (client_out, server_in) = tokio::sync::mpsc::channel::<String>(256);
+    let (server_out, client_in) = tokio::sync::mpsc::channel::<String>(256);
+    tokio::spawn(serve_connection_as(
+        service,
+        server_out,
+        server_in,
+        Caller::OPERATOR,
+    ));
     RpcClient::new(client_out, client_in)
 }
 

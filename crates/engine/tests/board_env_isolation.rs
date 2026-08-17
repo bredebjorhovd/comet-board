@@ -77,6 +77,7 @@ async fn a_board_loop_under_a_dispatched_agents_environment_stays_in_its_tempdir
             .merged_sessions_watch(core.sessions.watch_sessions()),
         core.sessions.journal(),
         core.agent_accounts.clone(),
+        core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     ));
     let board = comet_engine::BoardService::spawn_at(

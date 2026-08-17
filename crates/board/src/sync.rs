@@ -44,6 +44,9 @@ use crate::sources::github::{
 };
 use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
+use comet_proto::view::board::CheckoutPreparationState;
+#[cfg(test)]
+use comet_proto::view::board::CheckoutPreparation;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Command;
@@ -1369,6 +1372,33 @@ impl SyncEngine {
         // invisible while every one of its casualties was reported.
         let mut interrupted: Vec<notify::Interrupted> = Vec::new();
         for attempt in self.db.live_attempts()? {
+            if let (Some(runtime), Some(worktree)) = (runtime, attempt.worktree.as_deref())
+                && let Some(preparation) = runtime.checkout_preparation(worktree)?
+            {
+                if attempt.preparation.as_ref() != Some(&preparation) {
+                    self.db.set_attempt_preparation(attempt.id, &preparation)?;
+                }
+                let gate_status = match preparation.state {
+                    CheckoutPreparationState::Preparing => Some(AgentStatus::Working),
+                    CheckoutPreparationState::Failed => Some(AgentStatus::Blocked),
+                    // The fixed-id command has been released, but the session
+                    // mirror may not have observed its first event yet.
+                    CheckoutPreparationState::Ready if !attempt.saw_working => {
+                        Some(AgentStatus::Working)
+                    }
+                    CheckoutPreparationState::Ready => None,
+                };
+                if let Some(status) = gate_status {
+                    if attempt.agent_status != Some(status) {
+                        self.db.set_attempt_status(attempt.id, status)?;
+                    }
+                    if preparation.state != CheckoutPreparationState::Ready {
+                        // No run exists yet. Session absence is expected and
+                        // must not orphan, resume, settle, or bill anything.
+                        continue;
+                    }
+                }
+            }
             let Some(chat_id) = attempt.pane_id.as_deref() else {
                 // Dispatch is still in flight; nothing to reconcile yet.
                 continue;
@@ -2293,15 +2323,21 @@ impl SyncEngine {
         age: i64,
         cap: u64,
     ) -> Result<()> {
-        if let (Some(runtime), Some(chat_id)) = (runtime, attempt.pane_id.as_deref())
-            && let Err(e) = runtime.cancel(chat_id)
-        {
-            // The attempt closes either way: a chat that cannot be interrupted
-            // is a reason to stop counting it as live, not to keep it.
-            self.log.warn(format!(
-                "{}: cancelling chat {chat_id} at the duration cap: {e:#}",
-                task.identifier
-            ));
+        if let Some(runtime) = runtime {
+            if let Some(worktree) = attempt.worktree.as_deref() {
+                runtime.cancel_checkout_preparation(worktree)?;
+            }
+            if let Some(chat_id) = attempt.pane_id.as_deref()
+                && let Err(e) = runtime.cancel(chat_id)
+            {
+                // The durable checkout tombstone above is the fail-closed
+                // boundary. A chat may already be gone; once late release is
+                // impossible, that is not a reason to keep an overrun live.
+                self.log.warn(format!(
+                    "{}: cancelling chat {chat_id} at the duration cap: {e:#}",
+                    task.identifier
+                ));
+            }
         }
         let note = format!(
             "timed out after {} (cap {})",
@@ -5794,6 +5830,95 @@ mod tests {
         let a = live(&e);
         assert!(a.saw_working, "the latch does not unlatch");
         assert_eq!(a.agent_status, Some(AgentStatus::Blocked));
+    }
+
+    /// A checkout preparing before its first session is expected absence, not
+    /// an orphan. The persisted preparation is what both board viewports read.
+    #[test]
+    fn preparation_is_visible_and_gates_session_reconciliation() {
+        struct PreparationRuntime(CheckoutPreparation);
+
+        impl Runtime for PreparationRuntime {
+            fn dispatch(&self, _: &DispatchSpec) -> anyhow::Result<DispatchHandle> {
+                unreachable!()
+            }
+            fn checkout_preparation(
+                &self,
+                _: &str,
+            ) -> anyhow::Result<Option<CheckoutPreparation>> {
+                Ok(Some(self.0.clone()))
+            }
+            fn prompt(&self, _: &str, _: &str) -> anyhow::Result<()> {
+                Ok(())
+            }
+            fn cancel(&self, _: &str) -> anyhow::Result<()> {
+                unreachable!()
+            }
+            fn session(&self, _: &str) -> anyhow::Result<Option<comet_proto::Session>> {
+                Ok(None)
+            }
+            fn chat_alive(&self, _: &str) -> anyhow::Result<bool> {
+                Ok(true)
+            }
+            fn chat_cwd(&self, _: &str) -> anyhow::Result<Option<String>> {
+                Ok(None)
+            }
+            fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
+                Ok(None)
+            }
+        }
+
+        fn prep(state: CheckoutPreparationState, requires_approval: bool) -> CheckoutPreparation {
+            CheckoutPreparation {
+                state,
+                detail: Some("installing toolchain".into()),
+                recipe_digest: Some("abc123".into()),
+                execution_digest: Some("tree123".into()),
+                log: Some("/data/prep.log".into()),
+                log_excerpt: Some("installing".into()),
+                run_command: Some("cargo run".into()),
+                setup_command: Some("scripts/setup.sh".into()),
+                setup_outputs: vec!["target".into()],
+                archive_paths: vec!["target".into()],
+                requires_approval,
+                projections: Vec::new(),
+            }
+        }
+
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let attempt = dispatch(&e, "linear:LIN-142", "chat-9");
+        e.db.set_attempt_worktree(attempt, "/worktree/lin-142").unwrap();
+
+        e.reconcile_sessions_with(
+            &statuses(&[]),
+            Some(&PreparationRuntime(prep(
+                CheckoutPreparationState::Preparing,
+                false,
+            ))),
+        )
+        .unwrap();
+        let preparing = live(&e);
+        assert_eq!(preparing.agent_status, Some(AgentStatus::Working));
+        assert_eq!(
+            preparing.preparation.as_ref().map(|p| p.state),
+            Some(CheckoutPreparationState::Preparing)
+        );
+        assert!(!preparing.saw_working, "setup is not billable agent work");
+        assert!(preparing.outcome.is_none());
+
+        e.reconcile_sessions_with(
+            &statuses(&[]),
+            Some(&PreparationRuntime(prep(
+                CheckoutPreparationState::Failed,
+                true,
+            ))),
+        )
+        .unwrap();
+        let failed = live(&e);
+        assert_eq!(failed.agent_status, Some(AgentStatus::Blocked));
+        assert!(failed.preparation.as_ref().unwrap().requires_approval);
+        assert!(failed.outcome.is_none(), "failure preserves the live attempt");
     }
 
     // ---- tokens on the attempt row (gh#151) ------------------------------

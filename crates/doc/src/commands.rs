@@ -116,7 +116,9 @@ pub enum CommandDisposition {
     Expired,
     /// Mark superseded.
     Superseded,
-    /// Mark processed BEFORE executing, then execute.
+    /// Execute. The host chooses the durable transition: arbitrary side
+    /// effects are marked first, while a `Run` stays recoverably Pending until
+    /// the sessions engine owns its live handle.
     Execute,
 }
 

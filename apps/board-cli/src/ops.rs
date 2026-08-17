@@ -1050,9 +1050,13 @@ pub async fn retry(board: &Board, task_id: &str, opts: DispatchOpts<'_>) -> Resu
         .ok_or_else(|| anyhow!("{task_id} is not on the board"))?;
     let replace = retry_replaces(&row.state);
     let dispatched = dispatch_checked(board, task_id, DispatchOpts { replace, ..opts }).await?;
+    // A failed checkout preparation is the deliberate in-place retry: the RPC
+    // returns the existing attempt number. Every ordinary blocked retry mints
+    // the next one after cancelling the live chat.
+    let replaced = replace && dispatched.attempt > row.attempts;
     Ok(Retried {
         dispatched,
-        replaced: replace,
+        replaced,
         was: row.state,
     })
 }
@@ -1987,6 +1991,7 @@ mod tests {
             workspace: None,
             runtime: None,
             chat_id: None,
+            preparation: None,
             review_chat_id: None,
             pr_url: None,
             pr_number: None,

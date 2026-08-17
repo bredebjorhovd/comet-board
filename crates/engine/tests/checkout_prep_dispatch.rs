@@ -1,0 +1,384 @@
+//! gh#422 end-to-end through a dispatch: a repository whose committed recipe
+//! fails setup gets a checkout, a chat, and **no run** — and the retry that
+//! fixes it releases the original brief into the same attempt.
+//!
+//! The trait is sync and `dispatch` blocks on async engine calls, so trait
+//! calls run on `spawn_blocking` — the same off-runtime placement the board
+//! loop gives them in production (see `board_runtime_e2e.rs`).
+
+use std::process::Command;
+use std::sync::Arc;
+use std::time::Duration;
+
+use comet_board::runtime::{DispatchSpec, Runtime};
+use comet_doc::{MessagePart, MessageRole};
+use comet_engine::checkout_prep::{PrepState, RECIPE_PATH};
+use comet_engine::{CometRuntime, EngineCore, HarnessRegistry};
+use comet_harness::mock::MockHarness;
+use comet_proto::{AgentEvent, DoneStatus, HarnessId, SessionStatus};
+use comet_rpc::{RpcService, methods};
+
+fn git(repo: &std::path::Path, args: &[&str]) {
+    let out = Command::new("git")
+        .args(["-C", &repo.to_string_lossy()])
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn mock_script() -> Vec<AgentEvent> {
+    vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-1".into(),
+            assistant_message_id: "a-1".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "done".into(),
+        },
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("hs-1".into()),
+        },
+    ]
+}
+
+async fn wait_for<F>(mut predicate: F, what: &str)
+where
+    F: FnMut() -> bool,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !predicate() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_setup_holds_the_brief_and_a_retry_releases_it() {
+    let dir = tempfile::tempdir().unwrap();
+    // Keep worktrees inside the tempdir. Safe to set: this binary has one test.
+    unsafe { std::env::set_var("COMET_WORKTREES_DIR", dir.path().join("worktrees")) };
+
+    // An origin whose default branch COMMITS the recipe — a fresh worktree has
+    // to arrive already carrying it, that being the whole point of the file.
+    // Its setup fails, and counts how often it ran.
+    let origin = dir.path().join("origin");
+    std::fs::create_dir_all(origin.join(".comet")).unwrap();
+    git(&origin, &["init", "-b", "main"]);
+    git(&origin, &["config", "user.email", "t@t"]);
+    git(&origin, &["config", "user.name", "t"]);
+    std::fs::write(
+        origin.join(RECIPE_PATH),
+        "version = 1\n[setup]\nrun = \"echo ran >> prep-output/count.txt; echo 'toolchain missing' >&2; exit 7\"\noutputs = [\"prep-output\"]\n",
+    )
+    .unwrap();
+    git(&origin, &["add", "."]);
+    git(&origin, &["commit", "-m", "recipe"]);
+    let repo = dir.path().join("widget");
+    git(
+        dir.path(),
+        &["clone", &origin.to_string_lossy(), &repo.to_string_lossy()],
+    );
+    git(&repo, &["config", "user.email", "t@t"]);
+    git(&repo, &["config", "user.name", "t"]);
+
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(MockHarness {
+        script: mock_script(),
+    }));
+    let core = EngineCore::assemble(
+        &dir.path().join("data"),
+        Arc::new(registry),
+        HarnessId::Mock,
+        None,
+    )
+    .unwrap();
+    core.workspace
+        .create_space(
+            "space-widget",
+            &core.device_id,
+            &repo.to_string_lossy(),
+            None,
+            true,
+        )
+        .unwrap();
+    let runtime = Arc::new(CometRuntime::new(
+        core.repos.clone(),
+        core.workspace.clone(),
+        core.doc_host.clone(),
+        core.workspace
+            .merged_sessions_watch(core.sessions.watch_sessions()),
+        core.sessions.journal(),
+        core.agent_accounts.clone(),
+        core.checkout_prep.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    let repository_id = core.repos.repository_identity(&repo).await.unwrap();
+    let digest = core
+        .checkout_prep
+        .review_digest(&repo)
+        .unwrap()
+        .unwrap();
+    core.checkout_prep
+        .approve(&repo, &repository_id, &digest)
+        .expect("host trusts the committed failing recipe");
+
+    let spec = DispatchSpec {
+        identifier: "gh#422".into(),
+        title: "Prepare before you spend".into(),
+        space_id: "space-widget".into(),
+        device_id: core.device_id.clone(),
+        repo_path: repo.to_string_lossy().into_owned(),
+        branch: "board/gh-422-widget".into(),
+        base: "origin/HEAD".into(),
+        worktree: true,
+        harness: HarnessId::Mock,
+        model: None,
+        account: None,
+        push_repo: None,
+        push_contract: None,
+        git_author: None,
+        turn_limits: Default::default(),
+        agent_instructions: false,
+        mcp_servers: Vec::new(),
+        prompt: "do the thing".into(),
+    };
+
+    // A durable park is a precondition, not a warning. Simulate a state-path
+    // collision before dispatch: the freshly created chat, worktree and branch
+    // must all be rolled back, and setup must never start without recovery.
+    let expected_worktree = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .join("worktrees")
+        .join("widget")
+        .join("board-gh-422-widget");
+    core.checkout_prep
+        .park(&expected_worktree, "occupied recovery state")
+        .unwrap();
+    let rt = runtime.clone();
+    let rejected = spec.clone();
+    let error = tokio::task::spawn_blocking(move || rt.dispatch(&rejected))
+        .await
+        .unwrap()
+        .expect_err("an unrecoverable dispatch must fail");
+    assert!(
+        error.to_string().contains("parking the dispatch"),
+        "{error:#}"
+    );
+    assert!(
+        !expected_worktree.exists(),
+        "the failed dispatch rolled its checkout back"
+    );
+    assert!(
+        core.workspace.watch_chats().borrow().is_empty(),
+        "the failed dispatch rolled its chat back"
+    );
+    assert!(
+        !core.checkout_prep.state_dir(&expected_worktree).exists(),
+        "the failed dispatch rolled its preparation state back"
+    );
+    let rt = runtime.clone();
+    let handle = tokio::task::spawn_blocking(move || rt.dispatch(&spec))
+        .await
+        .unwrap()
+        .expect("dispatch succeeds — preparation gates the run, not the checkout");
+
+    // Preparation fails; the checkout, chat and attempt all survive it.
+    let worktree = std::path::PathBuf::from(&handle.cwd);
+    let prep = core.checkout_prep.clone();
+    {
+        let (prep, worktree) = (prep.clone(), worktree.clone());
+        wait_for(
+            move || {
+                prep.status(&worktree)
+                    .is_some_and(|r| r.state == PrepState::Failed)
+            },
+            "the prep record to say failed",
+        )
+        .await;
+    }
+    let record = prep.status(&worktree).unwrap();
+    assert_eq!(record.exit_code, Some(7));
+    assert!(
+        worktree.exists(),
+        "a failed preparation preserves the checkout"
+    );
+    assert!(
+        !worktree.join("prep-output").exists(),
+        "failed immutable output is never promoted into the checkout"
+    );
+
+    // The one property the issue is named for: no run started, nothing billed.
+    // The brief is parked, not queued — the journal has no run and the session
+    // row never appeared.
+    assert!(prep.parked(&worktree).is_some(), "the brief is parked");
+    assert!(
+        core.sessions.session_status(&handle.chat_id).is_none(),
+        "no run may start in an unprepared checkout"
+    );
+    // And the chat says why, in a message nobody typed.
+    {
+        let doc_host = core.doc_host.clone();
+        let chat_id = handle.chat_id.clone();
+        wait_for(
+            move || {
+                doc_host
+                    .open(&chat_id)
+                    .ok()
+                    .and_then(|handle| handle.doc().read_entries().ok())
+                    .is_some_and(|entries| {
+                        entries.iter().any(|entry| {
+                            entry.parts.iter().any(|part| {
+                                matches!(
+                                    part,
+                                    MessagePart::Error { message, .. }
+                                        if message.contains("could not be prepared")
+                                )
+                            })
+                        })
+                    })
+            },
+            "the preparation failure notice",
+        )
+        .await;
+    }
+    let entries = core
+        .doc_host
+        .open(&handle.chat_id)
+        .unwrap()
+        .doc()
+        .read_entries()
+        .unwrap();
+    assert!(
+        entries.iter().any(|e| e.role == MessageRole::System
+            && e.parts.iter().any(|p| matches!(
+                p,
+                MessagePart::Error { message, .. } if message.contains("could not be prepared")
+            ))),
+        "the failure is written into the transcript"
+    );
+
+    // The operator fixes the recipe IN THE SAME CHECKOUT and retries over RPC
+    // — the ordinary-session verb, exercised here because it is also the
+    // board's recovery path.
+    std::fs::write(
+        worktree.join(RECIPE_PATH),
+        "version = 1\n[setup]\nrun = \"echo ran >> prep-output/count.txt\"\noutputs = [\"prep-output\"]\n",
+    )
+    .unwrap();
+    git(&worktree, &["add", RECIPE_PATH]);
+    git(&worktree, &["commit", "-m", "fix setup"]);
+    let client = comet_rpc::memory_client(core.rpc_service());
+    let mismatched = client
+        .call(
+            methods::PREPARE_CHECKOUT,
+            serde_json::json!({
+                "worktreePath": handle.cwd.clone(),
+                "repoPath": origin.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect_err("another repository cannot lend its trust namespace");
+    assert!(
+        mismatched.to_string().contains("does not belong"),
+        "{mismatched}"
+    );
+    let relayed = core
+        .rpc_service()
+        .handle_as(
+            methods::PREPARE_CHECKOUT,
+            serde_json::json!({
+                "worktreePath": handle.cwd.clone(),
+                "repoPath": origin.to_string_lossy(),
+            }),
+            &comet_rpc::Caller::relayed(Some("relayed-user".into()), Some("test-org".into())),
+        )
+        .await;
+    let relayed = match relayed {
+        Err(error) => error,
+        Ok(_) => panic!("relayed callers have the same repository boundary"),
+    };
+    assert!(relayed.to_string().contains("does not belong"), "{relayed}");
+    let local_refusal = client
+        .call(
+            methods::APPROVE_CHECKOUT_PREPARATION,
+            serde_json::json!({ "worktreePath": handle.cwd.clone() }),
+        )
+        .await
+        .expect_err("localhost alone is not operator authority");
+    assert!(
+        local_refusal.to_string().contains("operator surface"),
+        "{local_refusal}"
+    );
+    let operator = comet_rpc::operator_memory_client(core.rpc_service());
+    let reviewed_digest = core
+        .checkout_prep
+        .review_digest(std::path::Path::new(&handle.cwd))
+        .unwrap()
+        .unwrap();
+    operator
+        .call(
+            methods::APPROVE_CHECKOUT_PREPARATION,
+            serde_json::json!({
+                "worktreePath": handle.cwd.clone(),
+                "expectedExecutionDigest": reviewed_digest,
+            }),
+        )
+        .await
+        .expect("embedded operator approves the edited digest");
+    let prepared = operator
+        .call(
+            methods::PREPARE_CHECKOUT,
+            serde_json::json!({ "worktreePath": handle.cwd.clone() }),
+        )
+        .await
+        .expect("PrepareCheckout");
+    assert_eq!(prepared["state"], "ready", "{prepared}");
+
+    // The release: the SAME brief reaches the ledger, the mock run executes,
+    // and the parked copy is gone — a second retry has nothing to double-send.
+    assert!(prep.parked(&worktree).is_none(), "the brief was taken");
+    {
+        let (sessions, chat) = (core.sessions.clone(), handle.chat_id.clone());
+        wait_for(
+            move || {
+                sessions
+                    .session_status(&chat)
+                    .is_some_and(|s| s.status == SessionStatus::Idle)
+            },
+            "the released brief to run to completion",
+        )
+        .await;
+    }
+    let count = std::fs::read_to_string(worktree.join("prep-output/count.txt")).unwrap();
+    assert_eq!(
+        count.lines().count(),
+        1,
+        "only the successful immutable output is promoted into the checkout"
+    );
+
+    // Same worktree, same branch, same attempt-shaped world: the retry cut
+    // nothing new.
+    let head = Command::new("git")
+        .args(["-C", &handle.cwd, "rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&head.stdout).trim(),
+        "board/gh-422-widget"
+    );
+}
