@@ -399,21 +399,15 @@ async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
 /// The #464 boundary in one process tree: the harness emits its override, a
 /// real Codex app server merges it over a restrictive account config and runs
 /// a real `git push` through the thread's configured shell in a subdirectory.
-/// Hostile login profiles must not load, and git must choose askpass over an
-/// available ambient helper.
+/// Hostile noninteractive startup hooks must not load, and git must choose
+/// askpass over an available ambient helper. Both bash's lower-policy BASH_ENV
+/// and zsh's always-read .zshenv cross the real model-tool boundary.
 /// The stand-in board writes the same ledger event as `git-askpass`, so the
 /// final assertion is the settlement input rather than a marker invented by
 /// the test.
 #[cfg(unix)]
 #[tokio::test]
 async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
-    let git = match std::process::Command::new("git")
-        .arg("--exec-path")
-        .output()
-    {
-        Ok(output) if output.status.success() => PathBuf::from("git"),
-        _ => return,
-    };
     if !std::process::Command::new("codex")
         .arg("--version")
         .output()
@@ -429,6 +423,27 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
         );
         return;
     }
+    for shell_name in ["bash", "zsh"] {
+        let shell = std::env::var_os("PATH")
+            .into_iter()
+            .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .map(|dir| dir.join(shell_name))
+            .find(|candidate| candidate.is_file());
+        let Some(shell) = shell else {
+            assert_ne!(
+                std::env::var_os("COMET_REQUIRE_REAL_CODEX"),
+                Some("1".into()),
+                "CI requires {shell_name} for the startup-hook regression"
+            );
+            eprintln!("no {shell_name} on this developer box — skipping that startup hook");
+            continue;
+        };
+        restrictive_codex_tool_push_case(shell_name, &shell).await;
+    }
+}
+
+#[cfg(unix)]
+async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::Path) {
     let dir = tempfile::tempdir().expect("tempdir");
     let state = dir.path().join("state");
     let paths = Paths {
@@ -473,16 +488,16 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
         format!("[credential]\n\thelper = {}\n", ambient.display()),
     )
     .expect("ambient git config");
-    let hostile_profile = dir.path().join("login-profile-loaded");
+    let hostile_profile = dir.path().join(format!("{shell_name}-startup-loaded"));
     let profile = format!(
         "printf loaded > '{}'\n\
          unset GIT_ASKPASS COMET_BOARD_CHAT_ID COMET_BOARD_CREDENTIAL_LEDGER\n\
          export PATH=/usr/bin:/bin\n",
         hostile_profile.display()
     );
-    for name in [".profile", ".bash_profile", ".zprofile"] {
-        std::fs::write(home.join(name), &profile).expect("hostile login profile");
-    }
+    let bash_env = home.join("bash-env");
+    std::fs::write(&bash_env, &profile).expect("hostile BASH_ENV");
+    std::fs::write(home.join(".zshenv"), &profile).expect("hostile .zshenv");
 
     // Cargo starts this integration test in the crate directory, while the
     // app server below starts in the temporary account root. That differing
@@ -491,7 +506,13 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
     let model_listener = TcpListener::bind("127.0.0.1:0").expect("model listener");
     let model_base_url = format!("http://{}/v1", model_listener.local_addr().unwrap());
     let tool_arguments = serde_json::json!({
-        "cmd": format!("{} push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test", git.display()),
+        // Codex chooses the account's passwd shell. Invoke the target shell
+        // inside that real model-tool command so one CI host exercises both
+        // noninteractive startup mechanisms with the policy-built env.
+        "cmd": format!(
+            "{} -c 'git push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test'",
+            shell.display()
+        ),
         "workdir": tool_cwd.clone(),
         "yield_time_ms": 10_000
     })
@@ -593,6 +614,9 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
     let argv: Vec<&str> = argv.lines().collect();
     let policy = argv.get(1).expect("policy overlay");
     assert_eq!(argv.get(3), Some(&"allow_login_shell=false"), "{argv:?}");
+    assert!(policy.contains(r#""BASH_ENV" = """#), "{policy}");
+    assert!(policy.contains(r#""ENV" = """#), "{policy}");
+    assert!(policy.contains(r#""ZDOTDIR" = "/dev/null""#), "{policy}");
 
     let codex_home = dir.path().join("codex-home");
     std::fs::create_dir_all(&codex_home).expect("Codex home");
@@ -602,7 +626,11 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
             "model = \"gpt-5.4\"\nmodel_provider = \"mock\"\n\
              [model_providers.mock]\nname = \"mock\"\nbase_url = \"{model_base_url}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n\
              [features]\nunified_exec = true\nshell_snapshot = false\n\
-             [shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n"
+             [shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n\
+             [shell_environment_policy.set]\nBASH_ENV = {}\nENV = {}\nZDOTDIR = {}\n",
+            serde_json::to_string(&bash_env.display().to_string()).expect("BASH_ENV encodes"),
+            serde_json::to_string(&bash_env.display().to_string()).expect("ENV encodes"),
+            serde_json::to_string(&home.display().to_string()).expect("ZDOTDIR encodes")
         ),
     )
     .expect("restrictive lower config");
@@ -699,6 +727,11 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
     .await
     .expect("real Codex model-tool turn timed out");
     child.kill().await.ok();
+    assert!(
+        command_reply.contains(&shell.display().to_string()),
+        "Codex did not execute through requested {shell_name} shell {}: {command_reply}",
+        shell.display()
+    );
 
     let offered = seen.lock().unwrap().join("\n");
     let board = base64::Engine::encode(
@@ -720,7 +753,7 @@ async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
     );
     assert!(
         !hostile_profile.exists(),
-        "Codex sourced a login profile after constructing the protected environment"
+        "Codex sourced the hostile {shell_name} startup hook after constructing the protected environment"
     );
     let record = credential_ledger::for_chat(&paths, "chat-464");
     assert!(record.handed, "the attempt did not record its handoff");

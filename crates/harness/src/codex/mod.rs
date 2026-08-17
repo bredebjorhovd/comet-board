@@ -600,6 +600,16 @@ impl CodexPushEnvironment {
         if let Some(chat) = &controls.chat_id {
             values.push(("COMET_BOARD_CHAT_ID".into(), chat.clone()));
         }
+        #[cfg(unix)]
+        values.extend([
+            // `-c` only disables login profiles. Bash still sources BASH_ENV,
+            // POSIX shells may source ENV, and zsh always reads
+            // $ZDOTDIR/.zshenv. Override recursively merged account values;
+            // /dev/null cannot contain a zsh startup file.
+            ("BASH_ENV".into(), String::new()),
+            ("ENV".into(), String::new()),
+            ("ZDOTDIR".into(), "/dev/null".into()),
+        ]);
 
         let mut paths = Vec::new();
         if let Some(dir) = &push.bin_dir {
@@ -617,7 +627,10 @@ impl CodexPushEnvironment {
                 "cannot represent the required Codex push PATH: {error}"
             ))
         })?;
-        values.push(("PATH".into(), path.to_string_lossy().into_owned()));
+        let path = path.into_string().map_err(|_| {
+            HarnessError::Protocol("cannot represent the required Codex push PATH as UTF-8".into())
+        })?;
+        values.push(("PATH".into(), path));
         Ok(Some(Self { values }))
     }
 
@@ -1855,6 +1868,12 @@ mod tests {
             config.contains(r#""COMET_BOARD_CHAT_ID" = "chat-464""#),
             "{config}"
         );
+        #[cfg(unix)]
+        {
+            assert!(config.contains(r#""BASH_ENV" = """#), "{config}");
+            assert!(config.contains(r#""ENV" = """#), "{config}");
+            assert!(config.contains(r#""ZDOTDIR" = "/dev/null""#), "{config}");
+        }
         let path = config.find(r#""PATH" = "/board/bin:/engine/bin:/codex/bin:"#);
         assert!(
             path.is_some(),
@@ -1898,6 +1917,41 @@ mod tests {
             error
                 .to_string()
                 .contains("cannot represent the required Codex push PATH"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatched_push_refuses_a_non_utf8_wrapper_path() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (_steer_tx, steering) = tokio::sync::mpsc::channel(1);
+        let controls = RunControls {
+            request_input: Box::new(|_| {
+                let (_tx, rx) = tokio::sync::oneshot::channel();
+                rx
+            }),
+            steering,
+            interrupt: crate::CancellationToken::new(),
+            chat_id: Some("chat-464".into()),
+            account: None,
+            push: Some(crate::PushCredentials {
+                env: vec![("GIT_ASKPASS".into(), "/board/bin/askpass".into())],
+                bin_dir: Some(PathBuf::from(std::ffi::OsString::from_vec(
+                    b"/board/\xff/bin".to_vec(),
+                ))),
+            }),
+            bin_dirs: Vec::new(),
+            mcp_servers: Vec::new(),
+        };
+
+        let error = CodexPushEnvironment::new(&controls, Path::new("codex"))
+            .expect_err("a rewritten board wrapper path must fail the dispatch");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot represent the required Codex push PATH as UTF-8"),
             "{error}"
         );
     }
