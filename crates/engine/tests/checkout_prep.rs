@@ -162,6 +162,13 @@ async fn a_setup_that_fails_is_failed_with_the_exit_code_and_the_output() {
     assert_eq!(record.state, PrepState::Failed);
     assert_eq!(record.exit_code, Some(3));
     assert!(record.detail.as_deref().unwrap().contains("exited 3"));
+    assert!(
+        record
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("no such toolchain")
+    );
     // stderr is in the same file as the command that produced it — a setup log
     // read for "what went wrong" is unusable split across two.
     let log = std::fs::read_to_string(record.log.as_ref().unwrap()).unwrap();
@@ -213,6 +220,36 @@ async fn a_setup_past_its_budget_is_killed_with_everything_it_started() {
         }
         panic!("pid {pid} outlived the setup that started it");
     }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bubblewrap_owned_session_cancellation_kills_descendants() {
+    assert!(
+        std::env::var_os("COMET_TEST_ASSUME_OUTER_SANDBOX").is_none(),
+        "this regression must exercise bubblewrap"
+    );
+    let b = a_box(Some(
+        "version = 1\n[setup]\nrun = \"sh -c 'sleep 60' & echo child:$!; wait\"\ntimeout = \"1s\"\n",
+    ));
+    let record = b.prep().prepare(b.request()).await;
+    assert_eq!(record.state, PrepState::Failed);
+    assert!(record.detail.as_deref().unwrap().contains("1s budget"));
+
+    let log = std::fs::read_to_string(record.log.as_ref().unwrap()).unwrap();
+    let pid: i32 = log
+        .lines()
+        .find_map(|line| line.strip_prefix("child:"))
+        .expect("the confined shell recorded its descendant")
+        .parse()
+        .unwrap();
+    for _ in 0..50 {
+        if unsafe { libc::kill(pid, 0) } != 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("pid {pid} outlived its bubblewrap-owned session");
 }
 
 #[tokio::test]

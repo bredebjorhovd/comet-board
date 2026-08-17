@@ -12,8 +12,14 @@ use std::path::{Path, PathBuf};
 
 pub(crate) struct SandboxedCommand {
     pub(crate) command: tokio::process::Command,
-    /// The adapter creates a process group whose id is the spawned child's pid.
-    pub(crate) establishes_process_group: bool,
+    pub(crate) isolation: SpawnIsolation,
+}
+
+pub(crate) enum SpawnIsolation {
+    ProcessGroup,
+    /// Spawn as a session leader, making the child pid both SID and PGID.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    SessionLeader,
 }
 
 /// Build (but do not spawn) the confined command.
@@ -28,7 +34,7 @@ pub(crate) fn command(
         command.arg("-c").arg(script);
         return Ok(SandboxedCommand {
             command,
-            establishes_process_group: false,
+            isolation: SpawnIsolation::ProcessGroup,
         });
     }
 
@@ -167,7 +173,7 @@ fn macos_command(
         .arg(script);
     Ok(SandboxedCommand {
         command,
-        establishes_process_group: false,
+        isolation: SpawnIsolation::ProcessGroup,
     })
 }
 
@@ -191,7 +197,6 @@ fn linux_command(
     let mut command = tokio::process::Command::new(bwrap);
     command.args([
         "--die-with-parent",
-        "--new-session",
         "--unshare-all",
         "--share-net",
         "--tmpfs",
@@ -225,9 +230,10 @@ fn linux_command(
         .arg(script);
     Ok(SandboxedCommand {
         command,
-        // --new-session calls setsid(2). Making bwrap a process-group leader
-        // before it starts would make that call fail with EPERM.
-        establishes_process_group: true,
+        // The production spawner calls setsid(2) before exec. That preserves
+        // bwrap's terminal-isolation boundary while making the pid Comet owns
+        // the PGID it later kills; bwrap's cloned child inherits that group.
+        isolation: SpawnIsolation::SessionLeader,
     })
 }
 
@@ -296,18 +302,4 @@ mod tests {
         assert!(!allowed_path_root(Path::new("relative/bin"), Some(home)));
     }
 
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn bubblewrap_starts_a_real_confined_session() {
-        let source = tempfile::tempdir().unwrap();
-        let runtime = tempfile::tempdir().unwrap();
-        let mut sandboxed = linux_command("test ! -e .git", source.path(), runtime.path()).unwrap();
-        let argv = format!("{:?}", sandboxed.command.as_std());
-        let output = sandboxed.command.output().await.unwrap();
-        assert!(
-            output.status.success(),
-            "bubblewrap smoke failed\nargv: {argv}\nstderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
 }

@@ -70,16 +70,22 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
       # Noble confines unprofiled user namespaces through AppArmor by default.
-      # Checkout preparation deliberately needs one to construct its bwrap
-      # filesystem sandbox; this hosted VM is discarded after the job.
-      - name: allow the checkout-prep user namespace
+      # Grant only the distro bwrap executable the namespace permission it
+      # needs; keep the host-wide restriction in force for everything else.
+      - name: allow bubblewrap user namespaces
         run: |
-          sysctl kernel.apparmor_restrict_unprivileged_userns
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          sudo tee /etc/apparmor.d/comet-bwrap >/dev/null <<'EOF'
+          abi <abi/4.0>,
+          include <tunables/global>
+          /usr/bin/bwrap flags=(unconfined) {
+            userns,
+          }
+          EOF
+          sudo apparmor_parser -r /etc/apparmor.d/comet-bwrap
       - name: bubblewrap checkout-prep smoke
         run: >-
           cargo test -p comet-engine --lib
-          checkout_prep_sandbox::tests::bubblewrap_starts_a_real_confined_session
+          checkout_prep::tests::bubblewrap_starts_through_the_production_runner
           -- --exact --nocapture
       # No --all-targets here: it would silently drop doctests.
       - name: cargo test --workspace
