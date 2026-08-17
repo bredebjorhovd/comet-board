@@ -60,6 +60,7 @@ static WORKTREES_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 struct WorktreesEnvGuard {
     _lock: tokio::sync::MutexGuard<'static, ()>,
     prior: Option<std::ffi::OsString>,
+    prior_codex_home: Option<Option<std::ffi::OsString>>,
 }
 
 impl Drop for WorktreesEnvGuard {
@@ -69,6 +70,21 @@ impl Drop for WorktreesEnvGuard {
         } else {
             unsafe { std::env::remove_var("COMET_WORKTREES_DIR") };
         }
+        if let Some(prior) = self.prior_codex_home.take() {
+            if let Some(prior) = prior {
+                unsafe { std::env::set_var("CODEX_HOME", prior) };
+            } else {
+                unsafe { std::env::remove_var("CODEX_HOME") };
+            }
+        }
+    }
+}
+
+impl WorktreesEnvGuard {
+    #[cfg(target_os = "linux")]
+    fn set_codex_home(&mut self, path: &std::path::Path) {
+        self.prior_codex_home = Some(std::env::var_os("CODEX_HOME"));
+        unsafe { std::env::set_var("CODEX_HOME", path) };
     }
 }
 
@@ -79,6 +95,7 @@ async fn isolate_worktrees(path: &std::path::Path) -> WorktreesEnvGuard {
     WorktreesEnvGuard {
         _lock: lock,
         prior,
+        prior_codex_home: None,
     }
 }
 
@@ -703,7 +720,7 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let _worktrees_env = isolate_worktrees(&dir.path().join("worktrees")).await;
+    let mut worktrees_env = isolate_worktrees(&dir.path().join("worktrees")).await;
     let source = dir.path().join("widget");
     std::fs::create_dir_all(&source).unwrap();
     git(&source, &["init", "-b", "main"]);
@@ -765,6 +782,12 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
     let codex_home = dir.path().join("codex-home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({ "OPENAI_API_KEY": "fixture-key" }).to_string(),
+    )
+    .unwrap();
+    worktrees_env.set_codex_home(&codex_home);
     let hostile = dir.path().join("ambient-used");
     let ambient = dir.path().join("ambient-helper");
     std::fs::write(&ambient, format!("#!/bin/sh\nprintf used > '{}'\n[ \"$1\" = get ] && printf 'username=x-access-token\\npassword=ambient-token\\n'\n", hostile.display())).unwrap();
