@@ -462,11 +462,12 @@ impl Harness for CodexHarness {
         } else {
             Vec::new()
         };
+        let push_environment = CodexPushEnvironment::new(&controls, &exe);
         let mut cmd = Command::new(&exe);
         // Global `-c` overrides must precede the app-server subcommand. Each
         // value is one complete inline table, so a route cannot inherit stale
         // args from a same-named server in the reused CODEX_HOME (gh#273).
-        if let Some(config) = push_environment_override(&controls, &exe) {
+        if let Some(config) = push_environment.as_ref().map(CodexPushEnvironment::config) {
             cmd.arg("-c").arg(config);
         }
         for config in mcp_config_overrides(&controls.mcp_servers) {
@@ -474,16 +475,18 @@ impl Harness for CodexHarness {
         }
         cmd.arg("app-server");
         crate::prepend_exe_dir_to_path(&mut cmd, &exe);
-        if let Some(chat_id) = &controls.chat_id {
+        if push_environment.is_none()
+            && let Some(chat_id) = &controls.chat_id
+        {
             cmd.env("COMET_BOARD_CHAT_ID", chat_id);
         }
         if let Some(account) = &controls.account {
             account.apply(&mut cmd, HarnessId::Codex);
         }
-        // Before the push credentials, whose `gh` shim has to stay in front.
-        crate::prepend_dirs_to_path(&mut cmd, &controls.bin_dirs);
-        if let Some(push) = &controls.push {
-            push.apply(&mut cmd);
+        if let Some(environment) = &push_environment {
+            environment.apply(&mut cmd);
+        } else {
+            crate::prepend_dirs_to_path(&mut cmd, &controls.bin_dirs);
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
@@ -558,53 +561,73 @@ fn mcp_config_overrides(servers: &[comet_proto::McpServer]) -> Vec<String> {
         .collect()
 }
 
-/// Keep the board's credential handoff intact across Codex's second
-/// environment boundary.
+/// One projection of the board-owned environment across both Codex boundaries.
 ///
 /// Stamping these values on `codex app-server` is not enough: Codex rebuilds
 /// the environment for every shell command according to the account's
 /// `shell_environment_policy`. A restrictive policy can therefore leave the
 /// app server holding `GIT_ASKPASS` while the `git push` it launches inherits
-/// an ambient Keychain credential instead. `shell_environment_policy.set` is
-/// applied after that filtering and is the supported way for the launcher to
-/// force its non-secret handoff values into tool subprocesses.
+/// an ambient Keychain credential instead. A complete policy replaces any
+/// account/project allowlist rather than trying to merge through it: official
+/// Codex ordering applies the final include allowlist *after* `set`, so adding
+/// values alone is not a guarantee. The replacement inherits Codex's small
+/// `core` environment and adds only this non-secret projection.
 ///
 /// `PATH` is part of the contract because it puts the board's `gh` wrapper in
 /// front of the real CLI. `COMET_BOARD_CHAT_ID` is part of it because a mint
 /// without that attribution cannot attest which attempt performed the push.
 /// Ordinary, non-dispatched Codex chats keep their own policy untouched.
-fn push_environment_override(controls: &RunControls, exe: &Path) -> Option<String> {
-    let push = controls.push.as_ref()?;
-    let mut values = push.env.clone();
-    if let Some(chat) = &controls.chat_id {
-        values.push(("COMET_BOARD_CHAT_ID".into(), chat.clone()));
+struct CodexPushEnvironment {
+    values: Vec<(String, String)>,
+}
+
+impl CodexPushEnvironment {
+    fn new(controls: &RunControls, exe: &Path) -> Option<Self> {
+        let push = controls.push.as_ref()?;
+        let mut values = push.env.clone();
+        if let Some(chat) = &controls.chat_id {
+            values.push(("COMET_BOARD_CHAT_ID".into(), chat.clone()));
+        }
+
+        let mut paths = Vec::new();
+        if let Some(dir) = &push.bin_dir {
+            paths.push(dir.clone());
+        }
+        paths.extend(controls.bin_dirs.iter().cloned());
+        if let Some(dir) = exe.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+            paths.push(dir.to_path_buf());
+        }
+        if let Some(path) = std::env::var_os("PATH") {
+            paths.extend(std::env::split_paths(&path));
+        }
+        if let Ok(path) = std::env::join_paths(paths) {
+            values.push(("PATH".into(), path.to_string_lossy().into_owned()));
+        }
+        Some(Self { values })
     }
 
-    let mut paths = Vec::new();
-    if let Some(dir) = &push.bin_dir {
-        paths.push(dir.clone());
-    }
-    paths.extend(controls.bin_dirs.iter().cloned());
-    if let Some(dir) = exe.parent().filter(|dir| !dir.as_os_str().is_empty()) {
-        paths.push(dir.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    if let Ok(path) = std::env::join_paths(paths) {
-        values.push(("PATH".into(), path.to_string_lossy().into_owned()));
+    fn apply(&self, cmd: &mut Command) {
+        for (key, value) in &self.values {
+            cmd.env(key, value);
+        }
     }
 
-    let entries = values
-        .iter()
-        .map(|(key, value)| {
-            let key = serde_json::to_string(key).expect("a string serializes");
-            let value = serde_json::to_string(value).expect("a string serializes");
-            format!("{key} = {value}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    Some(format!("shell_environment_policy.set={{ {entries} }}"))
+    fn config(&self) -> String {
+        let entries = self
+            .values
+            .iter()
+            .map(|(key, value)| {
+                let key = serde_json::to_string(key).expect("a string serializes");
+                let value = serde_json::to_string(value).expect("a string serializes");
+                format!("{key} = {value}")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "shell_environment_policy={{ inherit = \"core\", \
+             ignore_default_excludes = false, set = {{ {entries} }} }}"
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1791,12 +1814,15 @@ mod tests {
             mcp_servers: Vec::new(),
         };
 
-        let config = push_environment_override(&controls, Path::new("/codex/bin/codex"))
+        let projection = CodexPushEnvironment::new(&controls, Path::new("/codex/bin/codex"))
             .expect("a dispatched push forces its environment");
+        let config = projection.config();
         assert!(
-            config.starts_with("shell_environment_policy.set={ "),
+            config.starts_with("shell_environment_policy={ inherit = \"core\""),
             "{config}"
         );
+        assert!(!config.contains("include_only"), "{config}");
+        assert!(!config.contains("filters"), "{config}");
         assert!(
             config.contains(r#""GIT_ASKPASS" = "/board/bin/askpass""#),
             "{config}"
@@ -1817,7 +1843,7 @@ mod tests {
 
         let mut ordinary = controls;
         ordinary.push = None;
-        assert!(push_environment_override(&ordinary, Path::new("codex")).is_none());
+        assert!(CodexPushEnvironment::new(&ordinary, Path::new("codex")).is_none());
     }
 
     #[test]

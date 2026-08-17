@@ -2,6 +2,12 @@
 //! `tests/fixtures/fake-codex.sh` (no real `codex` binary involved).
 
 use std::path::PathBuf;
+#[cfg(unix)]
+use std::io::{BufRead, BufReader, Write};
+#[cfg(unix)]
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +18,10 @@ use comet_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, PushCredentials, RunControls,
     SteerMessage,
 };
+#[cfg(unix)]
+use comet_board::config::Paths;
+#[cfg(unix)]
+use comet_board::{credential_ledger, git_credentials};
 use comet_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
     ToolCall, UserInputAnswer, UserInputQuestion,
@@ -356,9 +366,11 @@ async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
     assert_eq!(argv.first(), Some(&"-c"), "{argv:?}");
     let policy = argv.get(1).expect("credential policy override");
     assert!(
-        policy.starts_with("shell_environment_policy.set={ "),
+        policy.starts_with("shell_environment_policy={ inherit = \"core\""),
         "{policy}"
     );
+    assert!(!policy.contains("include_only"), "{policy}");
+    assert!(!policy.contains("filters"), "{policy}");
     assert!(
         policy.contains(r#""GIT_ASKPASS" = "/board/bin/comet-askpass""#),
         "{policy}"
@@ -372,6 +384,143 @@ async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
         "the gh shim must lead Codex's tool PATH: {policy}"
     );
     assert_eq!(argv.last(), Some(&"app-server"), "{argv:?}");
+}
+
+/// The #464 boundary in one process tree: the harness launches a Codex-shaped
+/// app server, that server applies the restrictive shell policy to a real
+/// `git push`, and git must choose askpass over an available ambient helper.
+/// The stand-in board writes the same ledger event as `git-askpass`, so the
+/// final assertion is the settlement input rather than a marker invented by
+/// the test.
+#[cfg(unix)]
+#[tokio::test]
+async fn restrictive_codex_tool_push_is_attested_to_the_dispatch_chat() {
+    let git = match std::process::Command::new("git").arg("--exec-path").output() {
+        Ok(output) if output.status.success() => PathBuf::from("git"),
+        _ => return,
+    };
+    let dir = tempfile::tempdir().expect("tempdir");
+    let state = dir.path().join("state");
+    let paths = Paths {
+        config_dir: dir.path().join("config"),
+        state_dir: state.clone(),
+    };
+    std::fs::create_dir_all(&state).expect("state dir");
+
+    let board = dir.path().join("board-helper");
+    let ledger = credential_ledger::path(&paths);
+    std::fs::write(
+        &board,
+        format!(
+            "#!/bin/sh\n\
+             [ \"$1\" = git-askpass ] || exit 2\n\
+             case \"$2\" in\n\
+               *sername*) echo x-access-token ;;\n\
+               *) printf '{{\"at\":\"test\",\"event\":\"minted\",\"tool\":\"git-askpass\",\"repo\":\"owner/repo\",\"chat\":\"%s\"}}\\n' \"$COMET_BOARD_CHAT_ID\" >> '{}'; echo board-token ;;\n\
+             esac\n",
+            ledger.display()
+        ),
+    )
+    .expect("fake board");
+    std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).expect("chmod board");
+    let askpass = git_credentials::install_askpass_shim(&dir.path().join("bin"), &board)
+        .expect("askpass shim");
+
+    // A credential the push could use if the board's empty helper override is
+    // filtered out. The server records which password actually reaches it.
+    let ambient = dir.path().join("ambient-helper");
+    std::fs::write(
+        &ambient,
+        "#!/bin/sh\n[ \"$1\" = get ] && printf 'username=x-access-token\\npassword=ambient-token\\n'\n",
+    )
+    .expect("ambient helper");
+    std::fs::set_permissions(&ambient, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod ambient helper");
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::write(
+        home.join(".gitconfig"),
+        format!("[credential]\n\thelper = {}\n", ambient.display()),
+    )
+    .expect("ambient git config");
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let url = format!("http://x-access-token@{}/owner/repo.git", listener.local_addr().unwrap());
+    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+    let recorded = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(3) {
+            let mut stream = stream.expect("request");
+            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+            let mut authorization = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line
+                    .strip_prefix("Authorization: ")
+                    .or_else(|| line.strip_prefix("authorization: "))
+                {
+                    authorization = value.trim().to_string();
+                }
+            }
+            recorded.lock().unwrap().push(authorization);
+            stream
+                .write_all(
+                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"GitHub\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .expect("challenge");
+        }
+    });
+
+    // This is the Codex subprocess boundary, not an argv recorder. It starts
+    // from an empty environment (stricter than any account policy), extracts
+    // the complete replacement policy's `set` values, and runs a real push.
+    let policy_codex = dir.path().join("policy-codex");
+    let fixture = fixture_path();
+    std::fs::write(
+        &policy_codex,
+        format!(
+            r#"#!/bin/sh
+policy="$2"
+get() {{ printf '%s' "$policy" | sed -n "s/.*\"$1\" = \"\([^\"]*\)\".*/\1/p"; }}
+env -i HOME='{}' PATH="$(get PATH)" GIT_ASKPASS="$(get GIT_ASKPASS)" GIT_TERMINAL_PROMPT="$(get GIT_TERMINAL_PROMPT)" GIT_CONFIG_COUNT="$(get GIT_CONFIG_COUNT)" GIT_CONFIG_KEY_0="$(get GIT_CONFIG_KEY_0)" GIT_CONFIG_VALUE_0="$(get GIT_CONFIG_VALUE_0)" COMET_BOARD_ASKPASS_REPO="$(get COMET_BOARD_ASKPASS_REPO)" COMET_BOARD_CHAT_ID="$(get COMET_BOARD_CHAT_ID)" '{}' push "$(get COMET_TEST_PUSH_URL)" HEAD:refs/heads/board-test >/dev/null 2>&1
+exec '{}' "$3"
+"#,
+            home.display(),
+            git.display(),
+            fixture.display(),
+        ),
+    )
+    .expect("policy Codex");
+    std::fs::set_permissions(&policy_codex, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod policy Codex");
+
+    let harness = CodexHarness::new().with_executable(policy_codex);
+    let (mut controls, _steer, _token) = controls("Yes");
+    controls.chat_id = Some("chat-464".into());
+    credential_ledger::handed(&paths, "owner/repo", Some("chat-464"));
+    let mut env = git_credentials::push_env(&askpass, "owner/repo");
+    env.push(("COMET_TEST_PUSH_URL".into(), url));
+    controls.push = Some(PushCredentials { env, bin_dir: None });
+    run_to_end(&harness, request("scenario:happy"), controls).await;
+
+    let offered = seen.lock().unwrap().join("\n");
+    let board = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        "x-access-token:board-token",
+    );
+    let ambient = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        "x-access-token:ambient-token",
+    );
+    assert!(offered.contains(&board), "board credential was not offered: {offered}");
+    assert!(!offered.contains(&ambient), "ambient credential escaped: {offered}");
+    let record = credential_ledger::for_chat(&paths, "chat-464");
+    assert!(record.handed, "the attempt did not record its handoff");
+    assert!(record.minted, "the push was not attributed to its dispatch");
+    assert!(!record.unsanctioned(), "an attested push settled as alternate");
 }
 
 #[tokio::test]
