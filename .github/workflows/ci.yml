@@ -211,3 +211,60 @@ jobs:
         if: steps.changed.outputs.changed == 'true'
         working-directory: edge
         run: npm run test:workerd
+
+  # The iOS app, compiled on the pull request — the check gh#501 showed was
+  # missing. apps/ios rides no other workflow: release.yml builds the macOS
+  # dmg and Linux tarballs only, and the phone installs straight from a
+  # checkout via scripts/ios-phone-install.sh. So when Xcode's closure
+  # type-inference tightened, main quietly stopped compiling for the phone and
+  # nothing went red until someone next ran the install script.
+  #
+  # This is a compile gate only: an unsigned Debug build against the device
+  # SDK — the same build ios-phone-install.sh does, minus the signature, which
+  # needs a development team and so cannot run here. The on-device spec
+  # scripts (ios-sync-spec.sh etc.) still need a paired phone.
+  #
+  # Same always-runs/conditional-steps shape as `edge`, for the same two
+  # reasons: a workflow-level `paths:` filter would drag the cargo jobs with
+  # it, and a required check that never runs blocks the PR forever. The gating
+  # matters more here — macOS minutes are metered at 10x Linux — so a PR that
+  # never touches apps/ios pays one checkout and a git diff.
+  #
+  # PR-only like `edge`, but without edge's deploy.yml backstop: a commit that
+  # reaches main without a PR is not compiled until the next PR that touches
+  # apps/ios builds its merge commit. Accepted — direct pushes are rare and
+  # macOS minutes are not.
+  ios:
+    if: github.event_name == 'pull_request'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: detect ios changes
+        id: changed
+        shell: bash
+        run: |
+          base="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$base" ] || ! git cat-file -e "$base" 2>/dev/null; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$base" "$GITHUB_SHA" \
+            | grep -qE "^(apps/ios/|\.github/workflows/ci\.yml)"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      # The version line is the first thing to read when this job breaks and
+      # the code did not change: inference drift arrives with the image.
+      - name: xcodebuild -version
+        if: steps.changed.outputs.changed == 'true'
+        run: xcodebuild -version
+      - name: build (device SDK, unsigned)
+        if: steps.changed.outputs.changed == 'true'
+        working-directory: apps/ios
+        run: >-
+          xcodebuild -project Comet.xcodeproj -scheme Comet
+          -configuration Debug -destination generic/platform=iOS
+          -derivedDataPath "$RUNNER_TEMP/comet-ios-dd"
+          CODE_SIGNING_ALLOWED=NO build

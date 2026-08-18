@@ -192,18 +192,18 @@ final class WorkspaceStore {
                          createdAt: m["createdAt"]?.i64Value ?? 0)
         }.sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }  // creation order, id tiebreak
 
-        chats = (root["chats"]?.mapValue ?? [:]).compactMap { _, v in
+        chats = (root["chats"]?.mapValue ?? [:]).compactMap { _, v -> Chat? in
             guard let m = v.mapValue, let id = m["id"]?.stringValue,
                   let deviceId = m["deviceId"]?.stringValue else { return nil }
             var chatConfig: ChatConfig?
             if let c = m["config"]?.mapValue {
-                let configContract = c["pushContract"]?.mapValue.flatMap { value in
+                let configContract = c["pushContract"]?.mapValue.flatMap { value -> GithubPushContract? in
                     guard let contents = value["contentsWrite"]?.boolValue,
                           let workflows = value["workflowsWrite"]?.boolValue else { return nil }
                     return GithubPushContract(contentsWrite: contents, workflowsWrite: workflows)
                 }
                 let shadow = m["boardPush"]?.mapValue
-                let shadowContract = shadow?["contract"]?.mapValue.flatMap { value in
+                let shadowContract = shadow?["contract"]?.mapValue.flatMap { value -> GithubPushContract? in
                     guard let contents = value["contentsWrite"]?.boolValue,
                           let workflows = value["workflowsWrite"]?.boolValue else { return nil }
                     return GithubPushContract(contentsWrite: contents, workflowsWrite: workflows)
