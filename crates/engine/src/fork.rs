@@ -27,7 +27,6 @@ use comet_proto::{
     RunRequest, SandboxLevel,
 };
 
-use crate::checkout_prep::{CheckoutPrep, PrepState, PrepareRequest};
 use crate::doc_host::DocHost;
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
@@ -242,7 +241,6 @@ impl ForkHandoff {
         workspace: &WorkspaceHost,
         doc_host: &DocHost,
         repos: &Repos,
-        checkout_prep: &CheckoutPrep,
     ) -> Result<usize, EngineError> {
         let mut recovered = 0;
         for intent in self.intents()? {
@@ -255,7 +253,6 @@ impl ForkHandoff {
                     (&intent.repo, &intent.worktree, intent.branch.as_deref())
                 {
                     repos.delete_worktree(repo, path, Some(branch)).await?;
-                    checkout_prep.forget(path)?;
                 }
                 workspace.flush_checked()?;
                 recovered += 1;
@@ -322,7 +319,6 @@ pub struct ForkDeps<'a> {
     pub workspace: &'a WorkspaceHost,
     pub doc_host: &'a DocHost,
     pub repos: &'a Repos,
-    pub checkout_prep: &'a CheckoutPrep,
     /// Where the carried transcript waits for the fork's first run. `None`
     /// disables copy-mode forks rather than silently making context-free ones.
     pub handoff: Option<&'a ForkHandoff>,
@@ -646,7 +642,7 @@ async fn rollback_fork(
         failures.push(format!("fork authority: {error}"));
     }
     if let Some(cut) = cut
-        && let Err(error) = reclaim(deps.repos, deps.checkout_prep, cut).await
+        && let Err(error) = reclaim(deps.repos, cut).await
     {
         failures.push(format!("worktree: {error}"));
     }
@@ -675,17 +671,12 @@ struct CutWorktree {
     branch: String,
 }
 
-async fn reclaim(
-    repos: &Repos,
-    checkout_prep: &CheckoutPrep,
-    cut: &CutWorktree,
-) -> Result<(), EngineError> {
+async fn reclaim(repos: &Repos, cut: &CutWorktree) -> Result<(), EngineError> {
     match repos
         .delete_worktree(&cut.repo, &cut.path, Some(&cut.branch))
         .await
     {
         Ok(()) => {
-            checkout_prep.forget(&cut.path)?;
             tracing::info!(
             worktree = %cut.path.display(),
             branch = %cut.branch,
@@ -779,25 +770,6 @@ async fn assemble_fork(
     };
 
     let chat_id = input.chat_id.to_string();
-
-    if request.checkout == ForkCheckout::Isolated {
-        let repository_id = deps.repos.repository_identity(Path::new(input.cwd)).await?;
-        let preparation = deps
-            .checkout_prep
-            .prepare(PrepareRequest {
-                worktree: Path::new(input.cwd),
-                repository_id: &repository_id,
-                force: false,
-                cancel: None,
-            })
-            .await;
-        if preparation.state != PrepState::Ready {
-            return Err(EngineError::Other(format!(
-                "isolated checkout preparation did not reach Ready: {}",
-                preparation.detail.as_deref().unwrap_or("no detail")
-            )));
-        }
-    }
 
     let checkout_id = deps.repos.checkout_identity(Path::new(input.cwd)).await?.id;
 

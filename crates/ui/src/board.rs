@@ -71,9 +71,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    actions, AnyElement, App, Context, Entity, FocusHandle, Focusable as _, IntoElement,
-    KeyDownEvent, MouseButton, Render, ScrollHandle, SharedString, Subscription, Task, Window,
-    div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, IntoElement, KeyDownEvent,
+    MouseButton, Render, ScrollHandle, SharedString, Subscription, Task, Window, actions, div,
+    prelude::*, px,
 };
 
 use comet_proto::view::board::{self, BoardState, Filter, RowAction, TaskDetail, TaskRow};
@@ -86,7 +86,7 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::popover;
-use crate::state::{AppState, EngineHandle, EngineMode};
+use crate::state::{AppState, EngineHandle};
 use crate::theme::{Bed, ListRow as _, Theme};
 
 // One runtime a dispatch can be pointed at, as the engine's `ListBoardRuntimes`
@@ -322,7 +322,10 @@ struct PendingBill {
 /// picker that offered every slot for every runtime would be offering dispatches
 /// that refuse themselves (gh#59). An unknown harness (the runtime list has not
 /// landed yet) matches nothing rather than everything.
-fn accounts_for_harness(accounts: &[AgentAccount], harness: Option<HarnessId>) -> Vec<&AgentAccount> {
+fn accounts_for_harness(
+    accounts: &[AgentAccount],
+    harness: Option<HarnessId>,
+) -> Vec<&AgentAccount> {
     let Some(harness) = harness else {
         return Vec::new();
     };
@@ -587,20 +590,6 @@ fn repo_cell(row: &TaskRow) -> String {
 /// A ready row has nothing running and so nothing to say here, and says
 /// nothing — the column stays a column either way.
 fn time_cell(row: &TaskRow, now: chrono::DateTime<Utc>) -> String {
-    if let Some(preparation) = &row.preparation {
-        use comet_proto::view::board::CheckoutPreparationState;
-        match preparation.state {
-            CheckoutPreparationState::Preparing => return "preparing".to_string(),
-            CheckoutPreparationState::Failed => {
-                return if preparation.requires_approval {
-                    "approval needed".to_string()
-                } else {
-                    "setup failed".to_string()
-                };
-            }
-            CheckoutPreparationState::Ready => {}
-        }
-    }
     match row.state() {
         BoardState::Working | BoardState::Blocked => row
             .started_at
@@ -736,9 +725,7 @@ impl BoardModel {
     pub fn on_group(&self) -> Option<(BoardState, Option<String>)> {
         let id = self.selected.as_deref()?;
         self.lines().into_iter().find_map(|line| match line {
-            BoardLine::Group(state, route)
-                if group_row_id(state, route.as_deref()) == id =>
-            {
+            BoardLine::Group(state, route) if group_row_id(state, route.as_deref()) == id => {
                 Some((state, route))
             }
             _ => None,
@@ -1026,13 +1013,13 @@ impl BoardPanel {
         let observe = cx.observe(&state, |this: &mut Self, _, cx| {
             this.ensure_watch(cx);
         });
-        let dispatch_search = cx.new(|cx| {
-            ComposerInput::with_context("Search models…", "PaletteSearch", cx)
-        });
+        let dispatch_search =
+            cx.new(|cx| ComposerInput::with_context("Search models…", "PaletteSearch", cx));
         // Type-to-filter: a fresh query re-homes the model highlight on the
         // first match (the Edited event fires on every keystroke).
-        let dispatch_search_events =
-            cx.subscribe(&dispatch_search, |this: &mut Self, _, event, cx| match event {
+        let dispatch_search_events = cx.subscribe(
+            &dispatch_search,
+            |this: &mut Self, _, event, cx| match event {
                 ComposerInputEvent::Edited(_) => {
                     if let Some(draft) = this.dispatch.as_mut() {
                         draft.active_model = 0;
@@ -1047,7 +1034,8 @@ impl BoardPanel {
                 | ComposerInputEvent::Submitted
                 | ComposerInputEvent::PastedImages(_)
                 | ComposerInputEvent::PastedPaths(_) => {}
-            });
+            },
+        );
         let ticker = cx.spawn(async move |this, cx| {
             // Whether the last tick found anything live. An unmanaged row's
             // membership is staleness-gated, and staleness passes with no frame
@@ -1254,8 +1242,7 @@ impl BoardPanel {
                     (state.devices.clone(), state.local_device_id.clone())
                 };
                 let candidates = board::host_candidates(&devices, local.as_deref());
-                if let Some(next) = board::next_host_candidate(&candidates, self.host.as_deref())
-                {
+                if let Some(next) = board::next_host_candidate(&candidates, self.host.as_deref()) {
                     // First held answer wins the fallback slot — it is the
                     // earliest in sweep order, which is the old tie-break.
                     if self.sweep_fallback.is_none() {
@@ -1391,7 +1378,8 @@ impl BoardPanel {
             loop {
                 // The sweep's current position, read fresh — the operator may
                 // have pinned a device while the last stream was running.
-                let Ok(params) = this.update(cx, |panel, _| panel.host_params(serde_json::json!({})))
+                let Ok(params) =
+                    this.update(cx, |panel, _| panel.host_params(serde_json::json!({})))
                 else {
                     return;
                 };
@@ -1399,7 +1387,11 @@ impl BoardPanel {
                 // The sweep held this host's answer and moved on (gh#125):
                 // drop the stream and re-subscribe at the new candidate now.
                 let mut advanced = false;
-                match engine.client().subscribe(methods::WATCH_BOARD, params).await {
+                match engine
+                    .client()
+                    .subscribe(methods::WATCH_BOARD, params)
+                    .await
+                {
                     Ok(mut rx) => {
                         while let Some(value) = rx.recv().await {
                             delivered = true;
@@ -1467,7 +1459,9 @@ impl BoardPanel {
             self.set_notice("Engine not connected", cx);
             return;
         };
-        let Some(row) = self.model.task(id) else { return };
+        let Some(row) = self.model.task(id) else {
+            return;
+        };
         if !row.dispatchable {
             self.set_notice(
                 format!("{} has no route — it cannot be dispatched", row.identifier),
@@ -1479,7 +1473,8 @@ impl BoardPanel {
         let identifier = row.identifier.clone();
         // A fresh picker starts with an empty model filter (the search input
         // persists across dispatches on the panel).
-        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+        self.dispatch_search
+            .update(cx, |input, cx| input.set_text("", cx));
         self.dispatch = Some(DispatchDraft {
             route_runtime: row.runtime.clone(),
             route_account: row.account.clone(),
@@ -1528,7 +1523,9 @@ impl BoardPanel {
                 .await;
             this.update(cx, |panel, cx| {
                 // A newer pick (or a cancel) replaced this one mid-flight.
-                let Some(draft) = panel.dispatch.as_mut() else { return };
+                let Some(draft) = panel.dispatch.as_mut() else {
+                    return;
+                };
                 if draft.task_id != task_id {
                     return;
                 }
@@ -1610,8 +1607,12 @@ impl BoardPanel {
     /// loaded yet. Idempotent per runtime: a catalog that landed stays cached,
     /// so highlighting back and forth never re-fetches.
     fn ensure_dispatch_models(&mut self, engine: EngineHandle, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.as_mut() else { return };
-        let Some(runtime) = draft.active_runtime_name() else { return };
+        let Some(draft) = self.dispatch.as_mut() else {
+            return;
+        };
+        let Some(runtime) = draft.active_runtime_name() else {
+            return;
+        };
         let slot = draft.catalogs.entry(runtime.clone()).or_default();
         if !matches!(slot, ModelCatalog::Idle) {
             return;
@@ -1631,16 +1632,16 @@ impl BoardPanel {
             let result = engine.client().call(methods::LIST_MODELS, params).await;
             this.update(cx, |panel, cx| {
                 // A newer pick (or a cancel) replaced this one mid-flight.
-                let Some(draft) = panel.dispatch.as_mut() else { return };
+                let Some(draft) = panel.dispatch.as_mut() else {
+                    return;
+                };
                 if draft.task_id != task_id {
                     return;
                 }
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<BoardModelInfo>>(value) {
                         Ok(models) => ModelCatalog::Ready(models),
-                        Err(err) => {
-                            ModelCatalog::Error(format!("Couldn't read models: {err}"))
-                        }
+                        Err(err) => ModelCatalog::Error(format!("Couldn't read models: {err}")),
                     },
                     Err(err) => ModelCatalog::Error(format!("Couldn't list models: {err}")),
                 };
@@ -1667,7 +1668,9 @@ impl BoardPanel {
     /// rows, and enter dispatches the highlighted match.
     fn confirm_dispatch(&mut self, cx: &mut Context<Self>) {
         let indices = self.dispatch_filtered_models(cx);
-        let Some(draft) = self.dispatch.take() else { return };
+        let Some(draft) = self.dispatch.take() else {
+            return;
+        };
         let catalog_ix = indices.get(draft.active_model).copied();
         let choice = draft.choice(catalog_ix);
         let billed_to = draft.billed_to();
@@ -1697,7 +1700,9 @@ impl BoardPanel {
     /// Clicking a runtime chip: select that runtime and load its models. A
     /// selection is never itself a release — the model row (or enter) is.
     fn select_runtime(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.as_mut() else { return };
+        let Some(draft) = self.dispatch.as_mut() else {
+            return;
+        };
         let Some(ix) = draft.runtimes.iter().position(|r| r.name == name) else {
             return;
         };
@@ -1711,11 +1716,14 @@ impl BoardPanel {
             // The runtime is settled; the next input belongs to the models.
             draft.row = PickerRow::Model;
         }
-        let Some(engine) = self.engine(cx) else { return };
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
         self.ensure_dispatch_models(engine, cx);
         // Typing after a click lands in the model filter, not nowhere; a query
         // that narrowed the old harness's catalog gets dropped for the new one.
-        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+        self.dispatch_search
+            .update(cx, |input, cx| input.set_text("", cx));
         self.focus_dispatch_model_search(window, cx);
         cx.notify();
     }
@@ -1725,7 +1733,9 @@ impl BoardPanel {
     /// strip. Whose limits a run burns is too consequential to be one click
     /// away from happening by accident.
     fn select_account(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.as_mut() else { return };
+        let Some(draft) = self.dispatch.as_mut() else {
+            return;
+        };
         if ix > draft.account_options().len() {
             return;
         }
@@ -1738,7 +1748,9 @@ impl BoardPanel {
     /// `catalog_ix` is the catalog row's own index (rows carry it through the
     /// filtered display).
     fn confirm_with_model(&mut self, catalog_ix: usize, cx: &mut Context<Self>) {
-        let Some(draft) = self.dispatch.take() else { return };
+        let Some(draft) = self.dispatch.take() else {
+            return;
+        };
         let choice = draft.choice(Some(catalog_ix));
         let billed_to = draft.billed_to();
         self.send_dispatch(&draft.task_id, &draft.identifier, choice, billed_to, cx);
@@ -1914,7 +1926,9 @@ impl BoardPanel {
             self.set_notice("Engine not connected", cx);
             return;
         };
-        let Some(row) = self.model.task(id) else { return };
+        let Some(row) = self.model.task(id) else {
+            return;
+        };
         let identifier = row.identifier.clone();
         let task_id = row.id.clone();
         let params = self.host_params(serde_json::json!({ "taskId": task_id }));
@@ -1923,91 +1937,6 @@ impl BoardPanel {
             this.update(cx, |panel, cx| match result {
                 Ok(_) => panel.set_notice(format!("Cancelled {identifier}"), cx),
                 Err(err) => panel.set_notice(format!("Couldn't cancel {identifier}: {err}"), cx),
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Host-local trust decision for a failed preparation. Only the embedded
-    /// in-process operator client holds this authority; a shell, PTY, relayed
-    /// client, or dispatched agent receives no approval route.
-    fn approve_preparation(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(row) = self.model.task(id) else { return };
-        let Some(engine) = self.engine(cx) else {
-            self.set_notice("Engine not connected", cx);
-            return;
-        };
-        if self.host.is_some() || engine.mode() != EngineMode::InProcess {
-            self.set_notice(
-                "Preparation approval is available only in Comet on the worktree host",
-                cx,
-            );
-            return;
-        }
-        let Some(expected_execution_digest) = row
-            .preparation
-            .as_ref()
-            .and_then(|preparation| preparation.execution_digest.clone())
-        else {
-            self.set_notice("Preparation has no review digest", cx);
-            return;
-        };
-        let task_id = row.id.clone();
-        let identifier = row.identifier.clone();
-        cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::APPROVE_TASK_PREPARATION,
-                    serde_json::json!({
-                        "taskId": task_id,
-                        "expectedExecutionDigest": expected_execution_digest,
-                    }),
-                )
-                .await;
-            this.update(cx, |panel, cx| match result {
-                Ok(_) => panel.set_notice(
-                    format!("Approved {identifier}'s committed preparation tree; retrying"),
-                    cx,
-                ),
-                Err(error) => panel.set_notice(
-                    format!("Couldn't approve {identifier}'s preparation: {error}"),
-                    cx,
-                ),
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Recovery for a failed recipe which needs no new trust decision. Unlike
-    /// an ordinary blocked-agent Retry, this preserves the live attempt and
-    /// has no runtime/account choice to make: the parked brief already owns
-    /// those facts.
-    fn retry_preparation(&mut self, id: &str, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            self.set_notice("Engine not connected", cx);
-            return;
-        };
-        let Some(row) = self.model.task(id) else { return };
-        let task_id = row.id.clone();
-        let identifier = row.identifier.clone();
-        let params = self.host_params(serde_json::json!({
-            "taskId": task_id,
-            "replace": true,
-        }));
-        cx.spawn(async move |this, cx| {
-            let result = engine.client().call(methods::DISPATCH_TASK, params).await;
-            this.update(cx, |panel, cx| match result {
-                Ok(_) => panel.set_notice(
-                    format!("Retrying {identifier}'s preparation in the same checkout"),
-                    cx,
-                ),
-                Err(error) => panel.set_notice(
-                    format!("Couldn't retry {identifier}'s preparation: {error}"),
-                    cx,
-                ),
             })
             .ok();
         })
@@ -2045,7 +1974,9 @@ impl BoardPanel {
     /// where the work is, and comet's answer to a pane is a chat. The board
     /// gives way — the chat is the destination.
     fn open_chat(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(row) = self.model.task(id) else { return };
+        let Some(row) = self.model.task(id) else {
+            return;
+        };
         let Some(chat_id) = row.chat_id.clone() else {
             self.set_notice(
                 format!("{} is running but has no chat to open", row.identifier),
@@ -2053,7 +1984,8 @@ impl BoardPanel {
             );
             return;
         };
-        self.state.update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
+        self.state
+            .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         window.dispatch_action(Box::new(ToggleBoard), cx);
     }
 
@@ -2170,9 +2102,8 @@ impl BoardPanel {
     fn open_find_field(&mut self, cx: &mut Context<Self>) {
         self.model.open_find();
         if self.find.is_none() {
-            let input = cx.new(|cx| {
-                ComposerInput::with_context("Search the board…", "PaletteSearch", cx)
-            });
+            let input =
+                cx.new(|cx| ComposerInput::with_context("Search the board…", "PaletteSearch", cx));
             let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
                 if matches!(event, ComposerInputEvent::Edited(_))
                     && let Some(q) = this.find.as_ref().map(|f| f.read(cx).text().to_string())
@@ -2342,7 +2273,8 @@ impl BoardPanel {
                     // model filter — the query that narrowed the old harness's
                     // catalog would otherwise read as "no matches" on the new.
                     if runtime_moved {
-                        self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+                        self.dispatch_search
+                            .update(cx, |input, cx| input.set_text("", cx));
                     }
                     // Either way keep the highlight in view.
                     self.reveal_model_chip();
@@ -2365,7 +2297,8 @@ impl BoardPanel {
                 }
                 "escape" => {
                     self.dispatch = None;
-                    self.dispatch_search.update(cx, |input, cx| input.set_text("", cx));
+                    self.dispatch_search
+                        .update(cx, |input, cx| input.set_text("", cx));
                     window.focus(&self.focus_handle, cx);
                     cx.notify();
                     cx.stop_propagation();
@@ -2632,7 +2565,11 @@ impl BoardPanel {
                     .px(px(Theme::SPACE_SM))
                     .rounded(px(Theme::RADIUS_CHIP))
                     .cursor_pointer()
-                    .bg(motion::hover_blend("board-route", theme.chip, theme.wash(0.14)))
+                    .bg(motion::hover_blend(
+                        "board-route",
+                        theme.chip,
+                        theme.wash(0.14),
+                    ))
                     .on_hover(motion::hover_listener("board-route"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         if let Some(message) = this.model.cycle_filter() {
@@ -2691,7 +2628,11 @@ impl BoardPanel {
         };
         // Registration order, matching the sweep and the settings switcher, so
         // rows never reshuffle on a heartbeat.
-        devices.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        devices.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let label = self.host_label(cx);
         let open = self.host_menu_open;
         let confirmed = self.host_confirmed;
@@ -2766,9 +2707,13 @@ impl BoardPanel {
                     popover::menu_row(theme, !pinned, "board-host-auto")
                         .id("board-host-auto")
                         .on_click(cx.listener(|this, _, _, cx| this.set_host(None, false, cx)))
-                        .child(div().flex_1().min_w_0().truncate().child(SharedString::from(
-                            "Automatic",
-                        )))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from("Automatic")),
+                        )
                         .when(!pinned, |el| el.child(popover::menu_check(theme))),
                 )
                 .children(devices.into_iter().enumerate().map(|(ix, d)| {
@@ -3037,12 +2982,7 @@ impl BoardPanel {
     ///
     /// The full title lives in the peek panel, which is what a click opens.
     #[allow(clippy::too_many_arguments)]
-    fn render_task(
-        &mut self,
-        row: &TaskRow,
-        selected: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_task(&mut self, row: &TaskRow, selected: bool, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let state = row.state();
         let color = state_color(state, &theme);
@@ -3312,7 +3252,10 @@ impl BoardPanel {
     /// Before the options load each strip is a single "Loading…" label.
     fn render_dispatch_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let draft = self.dispatch.clone().expect("picker renders only when open");
+        let draft = self
+            .dispatch
+            .clone()
+            .expect("picker renders only when open");
         let runtime_focused = draft.row == PickerRow::Runtime;
         let model_focused = draft.row == PickerRow::Model;
         let query = self.dispatch_search.read(cx).text().to_string();
@@ -3620,7 +3563,11 @@ impl BoardPanel {
             std::iter::once((0, default_label, default_bills.is_some()))
                 .chain(options.iter().enumerate().map(|(ix, account)| {
                     match draft.bills(Some(&account.id)) {
-                        Some(bills) => (ix + 1, format!("{} · {bills}", account_label(account)), true),
+                        Some(bills) => (
+                            ix + 1,
+                            format!("{} · {bills}", account_label(account)),
+                            true,
+                        ),
                         None => (ix + 1, account_label(account), false),
                     }
                 }))
@@ -4034,129 +3981,6 @@ impl BoardPanel {
                 .into_any_element()
         };
 
-        // Preparation is operational evidence, not a time-cell subtitle. Put
-        // its recovery, retained output and every credential projection in the
-        // opened row where both the state and the action are visible together.
-        let preparation_element: Option<AnyElement> = row.preparation.as_ref().map(|preparation| {
-            let state = match preparation.state {
-                comet_proto::view::board::CheckoutPreparationState::Preparing => "preparing",
-                comet_proto::view::board::CheckoutPreparationState::Ready => "ready",
-                comet_proto::view::board::CheckoutPreparationState::Failed => "failed",
-            };
-            let mut lines = vec![format!("Checkout preparation: {state}")];
-            if let Some(detail) = &preparation.detail {
-                lines.push(detail.clone());
-            }
-            if let Some(digest) = &preparation.execution_digest {
-                lines.push(format!("Execution tree: {}", &digest[..digest.len().min(12)]));
-            }
-            if let Some(command) = &preparation.setup_command {
-                lines.push(format!("Setup: {command}"));
-            }
-            for output in &preparation.setup_outputs {
-                lines.push(format!("Writable setup output: {output}/"));
-            }
-            for path in &preparation.archive_paths {
-                lines.push(format!("Archive removes: {path}/"));
-            }
-            if let Some(command) = &preparation.run_command {
-                lines.push(format!("Run explicitly: {command}"));
-            }
-            if let Some(path) = &preparation.log {
-                lines.push(format!("Retained output: {path}"));
-            }
-            for projection in &preparation.projections {
-                lines.push(format!(
-                    "{} -> {}: {}{}",
-                    projection.from,
-                    projection.to,
-                    projection.result,
-                    projection
-                        .mode
-                        .as_deref()
-                        .map(|mode| format!(" ({mode})"))
-                        .unwrap_or_default()
-                ));
-            }
-            if preparation.requires_approval {
-                lines.push("Recovery: review every effect above, then approve in Comet on the worktree host".to_string());
-            } else if preparation.state == comet_proto::view::board::CheckoutPreparationState::Failed {
-                lines.push(format!("Recovery: comet-board retry --task {}", row.id));
-            }
-            if let Some(excerpt) = &preparation.log_excerpt {
-                lines.push(format!("\nOutput head:\n{}", excerpt.trim_end()));
-            }
-            let approve = preparation.requires_approval;
-            let failed = preparation.state
-                == comet_proto::view::board::CheckoutPreparationState::Failed;
-            let local_operator = self.host.is_none()
-                && self
-                    .engine(cx)
-                    .is_some_and(|engine| engine.mode() == EngineMode::InProcess);
-            let approve_id = id.clone();
-            let retry_id = id.clone();
-            div()
-                .id(SharedString::from(format!("board-preparation-{id}")))
-                .flex_none()
-                .max_h(px(180.0))
-                .overflow_y_scroll()
-                .px(px(8.0))
-                .py(px(7.0))
-                .rounded(px(Theme::RADIUS_CHIP))
-                .bg(theme.wash(0.08))
-                .flex()
-                .flex_col()
-                .gap(px(5.0))
-                .child(
-                    div()
-                        .font_family(theme.font_mono.clone())
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(lines.join("\n"))),
-                )
-                .when(approve && local_operator, |element| {
-                    element.child(
-                        div()
-                            .id(SharedString::from(format!("board-prep-approve-{id}")))
-                            .h(px(22.0))
-                            .px(px(9.0))
-                            .rounded(px(Theme::RADIUS_CHIP))
-                            .bg(theme.wash(0.14))
-                            .flex()
-                            .items_center()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.text)
-                            .hover(|style| style.bg(theme.wash(0.2)))
-                            .child(SharedString::from("Approve committed tree and retry"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.approve_preparation(&approve_id, cx);
-                            })),
-                    )
-                })
-                .when(!approve && failed, |element| {
-                    element.child(
-                        div()
-                            .id(SharedString::from(format!("board-prep-retry-{id}")))
-                            .h(px(22.0))
-                            .px(px(9.0))
-                            .rounded(px(Theme::RADIUS_CHIP))
-                            .bg(theme.wash(0.14))
-                            .flex()
-                            .items_center()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.text)
-                            .hover(|style| style.bg(theme.wash(0.2)))
-                            .child(SharedString::from("Retry in this checkout"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.retry_preparation(&retry_id, cx);
-                            })),
-                    )
-                })
-                .into_any_element()
-        });
-
         let actions = board::detail_actions(&row);
         // The review (gh#180) leads the chip row on any row that has been
         // attempted, and it is spelled for what it opens rather than for what
@@ -4240,7 +4064,6 @@ impl BoardPanel {
             .children(facts)
             .children(stack_map)
             .children(labels)
-            .children(preparation_element)
             // The body is the only part that can outgrow the panel, so it is
             // the only part that scrolls — bounded here rather than on the card
             // (the model list next door is bounded the same way), so a short
@@ -4306,7 +4129,11 @@ impl BoardPanel {
             // The door, named (gh#132) — an affordance nobody can find is one
             // that does not exist.
             if selected_task.is_some() {
-                hints.push(if peek_open { "space close" } else { "space peek" });
+                hints.push(if peek_open {
+                    "space close"
+                } else {
+                    "space peek"
+                });
             }
             hints.push("/ find");
             hints.join(" · ").into()
@@ -4374,8 +4201,7 @@ impl Render for BoardPanel {
                             self.render_group(*state, route.clone(), cx)
                         }
                         BoardLine::Task(id) => {
-                            let selected =
-                                self.model.selected.as_deref() == Some(id.as_str());
+                            let selected = self.model.selected.as_deref() == Some(id.as_str());
                             match self.model.task(id).cloned() {
                                 Some(row) => self.render_task(&row, selected, cx),
                                 None => gpui::Empty.into_any_element(),
@@ -4444,9 +4270,7 @@ impl Render for BoardPanel {
             // The peek sits between the list and the footer: the list keeps the
             // top of the panel (it is what you are navigating), and the row you
             // opened reads directly under it.
-            .when(self.peek, |el| {
-                el.child(self.render_peek(window, cx))
-            })
+            .when(self.peek, |el| el.child(self.render_peek(window, cx)))
             .child(self.render_footer(cx))
             .into_any_element()
     }
@@ -4472,7 +4296,6 @@ mod tests {
             workspace: Some("offhand".into()),
             runtime: Some("claude-code".into()),
             chat_id: None,
-            preparation: None,
             review_chat_id: None,
             pr_url: None,
             pr_number: None,
@@ -4656,7 +4479,10 @@ mod tests {
 
     #[test]
     fn a_single_routed_group_keeps_the_section_flat() {
-        let m = model(vec![row("1", BoardState::Working), row("2", BoardState::Working)]);
+        let m = model(vec![
+            row("1", BoardState::Working),
+            row("2", BoardState::Working),
+        ]);
         let lines = m.lines();
         assert!(
             !lines.iter().any(|l| matches!(l, BoardLine::Group(..))),
@@ -4684,10 +4510,16 @@ mod tests {
 
     #[test]
     fn selection_survives_refresh_by_id() {
-        let mut m = model(vec![row("1", BoardState::Ready), row("2", BoardState::Ready)]);
+        let mut m = model(vec![
+            row("1", BoardState::Ready),
+            row("2", BoardState::Ready),
+        ]);
         m.selected = Some("2".into());
         // A later frame with the same row keeps the cursor.
-        m.set_rows(vec![row("1", BoardState::Ready), row("2", BoardState::Ready)]);
+        m.set_rows(vec![
+            row("1", BoardState::Ready),
+            row("2", BoardState::Ready),
+        ]);
         assert_eq!(m.selected.as_deref(), Some("2"));
         // A frame where the row left the board re-clamps.
         m.set_rows(vec![row("1", BoardState::Ready)]);
@@ -4732,7 +4564,10 @@ mod tests {
             dispatch_picker_owns_key(key, true),
             "the focused search owns the letter"
         );
-        let mut m = model(vec![row("a", BoardState::Ready), row("b", BoardState::Ready)]);
+        let mut m = model(vec![
+            row("a", BoardState::Ready),
+            row("b", BoardState::Ready),
+        ]);
         let before = m.filter.clone();
         if !dispatch_picker_owns_key(key, true) {
             // The buggy fall-through: the frame handler runs cycle_filter.
@@ -4747,7 +4582,10 @@ mod tests {
             !dispatch_picker_owns_key(key, false),
             "frame-focused f still cycles"
         );
-        let mut frame = model(vec![row("a", BoardState::Ready), row("b", BoardState::Ready)]);
+        let mut frame = model(vec![
+            row("a", BoardState::Ready),
+            row("b", BoardState::Ready),
+        ]);
         frame.cycle_filter();
         assert_eq!(frame.filter, Filter::Route("offhand".into()));
 
@@ -4759,7 +4597,10 @@ mod tests {
     #[test]
     fn empty_board_filter_cycle_clears_and_says_so() {
         let mut m = model(vec![]);
-        assert_eq!(m.cycle_filter(), Some("nothing on the board to filter".into()));
+        assert_eq!(
+            m.cycle_filter(),
+            Some("nothing on the board to filter".into())
+        );
         assert_eq!(m.filter, Filter::All);
     }
 
@@ -4783,7 +4624,10 @@ mod tests {
 
     #[test]
     fn selection_skips_folded_sections_and_clamps() {
-        let mut m = model(vec![row("1", BoardState::Ready), row("2", BoardState::Ready)]);
+        let mut m = model(vec![
+            row("1", BoardState::Ready),
+            row("2", BoardState::Ready),
+        ]);
         m.selected = Some("1".into());
         m.select_delta(1);
         assert_eq!(m.selected.as_deref(), Some("2"));
@@ -4802,7 +4646,10 @@ mod tests {
     fn section_header_ids_cannot_collide_with_task_ids() {
         for state in BoardState::SECTION_ORDER {
             let id = section_row_id(state);
-            assert!(id.starts_with('\u{0}'), "NUL prefix keeps headers out of the task space");
+            assert!(
+                id.starts_with('\u{0}'),
+                "NUL prefix keeps headers out of the task space"
+            );
             assert_ne!(id, "anything");
         }
     }
@@ -5053,11 +4900,13 @@ mod tests {
     fn a_picked_model_is_the_override_and_the_effective_model() {
         let catalog = models();
         assert_eq!(
-            catalog[1].id,
-            "opencode/deepseek-v4-flash",
+            catalog[1].id, "opencode/deepseek-v4-flash",
             "deepseek-v4-flash is selectable, one row past the default"
         );
-        assert_eq!(override_model_id(&catalog, 1), Some("opencode/deepseek-v4-flash"));
+        assert_eq!(
+            override_model_id(&catalog, 1),
+            Some("opencode/deepseek-v4-flash")
+        );
     }
 
     #[test]
@@ -5172,7 +5021,11 @@ mod tests {
         let mut anonymous = account("slot-x", "", HarnessId::ClaudeCode);
         anonymous.email = None;
         assert_eq!(
-            account_label(&account("slot-ana", "ana@example.com", HarnessId::ClaudeCode)),
+            account_label(&account(
+                "slot-ana",
+                "ana@example.com",
+                HarnessId::ClaudeCode
+            )),
             "ana@example.com"
         );
         anonymous.display_name = Some("Ana".into());

@@ -86,7 +86,6 @@ pub fn task_row(
             .map(|a| a.runtime.clone())
             .or_else(|| route.map(|r| r.runtime.clone())),
         chat_id: live.and_then(|a| a.pane_id.clone()),
-        preparation: live.and_then(|a| a.preparation.clone()),
         review_chat_id: last.and_then(|a| a.pane_id.clone()),
         pr_url: task.pr_url.clone(),
         pr_number: task.pr_number,

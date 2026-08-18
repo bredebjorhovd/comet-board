@@ -236,61 +236,6 @@ impl RuntimeUnavailable {
 /// whole point of drawing it.
 pub const ORCHESTRATOR_GLYPH: &str = "◆";
 
-/// The worktree gate in front of a board-dispatched run (gh#422).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CheckoutPreparationState {
-    Preparing,
-    Ready,
-    Failed,
-}
-
-/// One explicitly allowlisted machine-local file projection. Carried on the
-/// board row so credential reach is visible before the agent starts.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CheckoutProjection {
-    pub from: String,
-    pub to: String,
-    pub result: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<String>,
-}
-
-/// Persisted preparation state for the live attempt's checkout.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CheckoutPreparation {
-    pub state: CheckoutPreparationState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub recipe_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_digest: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log: Option<String>,
-    /// Bounded output head for operators who cannot read the host path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub log_excerpt: Option<String>,
-    /// Canonical development command, offered explicitly and never auto-run.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run_command: Option<String>,
-    /// Exact setup command reviewed for this immutable tree.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setup_command: Option<String>,
-    /// Top-level writable directories granted to setup.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub setup_outputs: Vec<String>,
-    /// Top-level reproducible directories the engine may remove at archive.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub archive_paths: Vec<String>,
-    #[serde(default)]
-    pub requires_approval: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub projections: Vec<CheckoutProjection>,
-}
-
 /// Which chat, if any, is pinned as this board's orchestrator (gh#104).
 ///
 /// A frame of its own rather than a field on [`TaskRow`], and a *stream* rather
@@ -449,10 +394,6 @@ pub struct TaskRow {
     pub runtime: Option<String>,
     /// The live attempt's chat (herdr-board's `pane_id`).
     pub chat_id: Option<String>,
-    /// `preparing → ready | failed` for the live checkout. Absent on ordinary
-    /// repositories and attempts made before recipes existed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub preparation: Option<CheckoutPreparation>,
     /// The chat that authored the latest reviewable attempt, including after
     /// that attempt has settled. Kept separate from `chat_id`: a finished chat
     /// is review context, not a live agent consuming a concurrency slot.
@@ -1922,9 +1863,7 @@ pub const NO_BODY: &str = "No description on the issue.";
 pub enum RowAction {
     /// Release a ready task. The account picker rides this on every surface.
     Dispatch,
-    /// Release again. On an agent-blocked row this ends the live attempt first;
-    /// a preparation-blocked row retries its existing checkout and attempt
-    /// instead (gh#422).
+    /// Release again. On an agent-blocked row this ends the live attempt first.
     Retry,
     /// End the live attempt. The issue stays open.
     Cancel,
@@ -2824,7 +2763,6 @@ mod tests {
             workspace: Some("offhand".into()),
             runtime: Some("claude-code".into()),
             chat_id: None,
-            preparation: None,
             review_chat_id: None,
             pr_url: None,
             pr_number: None,
@@ -3355,7 +3293,11 @@ mod tests {
     fn the_stack_map_is_every_layer_bottom_first_and_empty_for_an_unstacked_row() {
         let r = stacked("s", 2, 3, "board/gh-11-lexer");
         let map: Vec<String> = stack_map(&r).iter().map(layer_label).collect();
-        assert_eq!(map, ["#11", "#12", "#13"], "bottom first, this row included");
+        assert_eq!(
+            map,
+            ["#11", "#12", "#13"],
+            "bottom first, this row included"
+        );
 
         // A layer with no pull request yet is still on the map, by name.
         let mut r = stacked("s", 2, 3, "board/gh-11-lexer");

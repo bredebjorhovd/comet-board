@@ -16,8 +16,6 @@ pub mod agent_accounts;
 pub mod auth;
 pub mod board;
 pub mod board_runtime;
-pub mod checkout_prep;
-mod checkout_prep_sandbox;
 pub mod context_files;
 pub mod crash_shield;
 pub mod diff_sync;
@@ -134,11 +132,6 @@ pub struct EngineCore {
     pub workspace: WorkspaceHost,
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
-    /// The repository recipe primitive (gh#422). On the core rather than built
-    /// per caller so that the board's runtime and the RPC surface share one
-    /// view of every checkout's lifecycle — a `PrepareCheckout` from a laptop
-    /// has to be able to release a brief a dispatch parked.
-    pub checkout_prep: checkout_prep::CheckoutPrep,
     pub terminals: Terminals,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -241,7 +234,6 @@ impl EngineCore {
             },
         )?;
         let repos = Repos::new(data_dir, &device_id);
-        let checkout_prep = checkout_prep::CheckoutPrep::new(data_dir);
         sessions.set_repos(repos.clone());
         doc_host.set_workspace(workspace.clone());
         doc_host.set_repos(repos.clone());
@@ -255,17 +247,11 @@ impl EngineCore {
             let workspace = workspace.clone();
             let doc_host = doc_host.clone();
             let repos = repos.clone();
-            let checkout_prep = checkout_prep.clone();
             std::thread::spawn(move || -> Result<usize, EngineError> {
                 tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(handoff.recover_pending(
-                        &workspace,
-                        &doc_host,
-                        &repos,
-                        &checkout_prep,
-                    ))
+                    .block_on(handoff.recover_pending(&workspace, &doc_host, &repos))
             })
             .join()
             .map_err(|_| EngineError::Other("fork recovery thread panicked".into()))??
@@ -333,7 +319,6 @@ impl EngineCore {
             doc_host,
             workspace,
             registry,
-            checkout_prep,
             repos,
             terminals,
             diff_sync,
@@ -503,7 +488,6 @@ impl EngineCore {
             self.workspace.clone(),
             self.registry.clone(),
             self.repos.clone(),
-            self.checkout_prep.clone(),
             self.terminals.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
@@ -745,7 +729,6 @@ impl Engine {
                 sessions_watch.clone(),
                 core.sessions.journal(),
                 core.agent_accounts.clone(),
-                core.checkout_prep.clone(),
                 tokio::runtime::Handle::current(),
             ));
             // A dispatched agent pushes as the board's GitHub App rather than
@@ -758,16 +741,6 @@ impl Engine {
                     let push = Arc::new(push_credentials::PushCredentials::detect(paths));
                     core.sessions.set_push_credentials(push.clone());
                     runtime.set_push_credentials(push);
-
-                    // A crash can land after preparation persisted `ready`
-                    // but before its parked brief reached the command ledger.
-                    // Recover only after the credential resolver is installed:
-                    // a GitHub Run drained one line earlier is durably rejected
-                    // for missing credentials and can never start on retry.
-                    board_runtime::reconcile_prepared_checkouts(
-                        &core.checkout_prep,
-                        &core.doc_host,
-                    );
                 }
                 Err(err) => tracing::warn!(
                     error = %err,

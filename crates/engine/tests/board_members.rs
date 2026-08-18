@@ -52,7 +52,6 @@ fn box_with_a_board(dir: &std::path::Path) -> (EngineCore, Paths) {
             .merged_sessions_watch(core.sessions.watch_sessions()),
         core.sessions.journal(),
         core.agent_accounts.clone(),
-        core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     ));
     let board = comet_engine::BoardService::spawn_at(

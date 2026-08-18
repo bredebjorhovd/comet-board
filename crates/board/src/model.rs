@@ -651,9 +651,6 @@ pub struct Attempt {
     /// Refreshed on every reconcile while the attempt is live, so an attempt
     /// that is cancelled or orphaned keeps the last level it was seen at.
     pub context: Option<comet_proto::ContextUsage>,
-    /// Worktree preparation lifecycle (gh#422), persisted as one JSON value so
-    /// the board can publish it even when no agent session exists yet.
-    pub preparation: Option<comet_proto::view::board::CheckoutPreparation>,
     /// The model the harness said it was running, recorded beside the tokens
     /// (gh#151). Not the route's override — see
     /// [`crate::runtime::RunTokens`] for why that is nearly always `None` and
@@ -809,7 +806,6 @@ pub(crate) mod tests {
             token_models: None,
             token_agents: None,
             context: None,
-            preparation: None,
             model: None,
             claims: Vec::new(),
             claims_at: None,

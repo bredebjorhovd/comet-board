@@ -24,7 +24,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
      cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
      context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on, resumes, \
-     token_models, token_agents, preparation";
+     token_models, token_agents";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -117,9 +117,6 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         token_agents: r
             .get::<_, Option<String>>(51)?
             .and_then(|j| serde_json::from_str(&j).ok()),
-        preparation: r
-            .get::<_, Option<String>>(52)?
-            .and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -381,10 +378,7 @@ impl Db {
               -- its own chat (gh#390). Not a retry and not a second attempt:
               -- the chat, the branch and the checkout are the same ones, and
               -- the count exists to bound the restarting, not to number it.
-              resumes INTEGER NOT NULL DEFAULT 0,
-              -- Engine-owned worktree lifecycle (gh#422), retained for board
-              -- rows even before the first agent session exists.
-              preparation TEXT
+              resumes INTEGER NOT NULL DEFAULT 0
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -613,9 +607,6 @@ impl Db {
                 // which is what they are: the board could not restart a run
                 // then, it closed the attempt instead.
                 ("resumes", "INTEGER NOT NULL DEFAULT 0"),
-                // Worktree readiness (gh#422). One JSON value because this is
-                // an engine-owned lifecycle record, not board query state.
-                ("preparation", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -1522,18 +1513,6 @@ impl Db {
         self.conn.execute(
             "UPDATE attempts SET agent_status = ?2 WHERE id = ?1",
             params![attempt_id, status.as_str()],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_attempt_preparation(
-        &self,
-        attempt_id: i64,
-        preparation: &comet_proto::view::board::CheckoutPreparation,
-    ) -> Result<()> {
-        self.conn.execute(
-            "UPDATE attempts SET preparation = ?2 WHERE id = ?1",
-            params![attempt_id, serde_json::to_string(preparation)?],
         )?;
         Ok(())
     }

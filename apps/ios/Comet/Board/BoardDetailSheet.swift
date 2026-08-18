@@ -102,7 +102,6 @@ struct BoardDetailSheet: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 head(row)
-                preparationCard(row)
                 reviewCard(row)
                 bodyCard
                 actionCard(row)
@@ -110,98 +109,6 @@ struct BoardDetailSheet: View {
             .padding(.horizontal, 16)
             .padding(.top, 8)
             .padding(.bottom, 24)
-        }
-    }
-
-    /// The checkout gate as evidence and recovery, not merely a status word:
-    /// bounded output, the host path retaining all output, every projected
-    /// machine-local file, and the exact next action.
-    @ViewBuilder
-    private func preparationCard(_ row: TaskRow) -> some View {
-        if let preparation = row.preparation {
-            VStack(alignment: .leading, spacing: 8) {
-                SheetLabel("Checkout preparation")
-                SheetCard {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text(preparation.state.rawValue)
-                            .font(Theme.sans(Theme.textTitle, weight: .medium))
-                            .foregroundStyle(preparation.state == .failed ? Theme.danger : Theme.text)
-                        if let detail = preparation.detail {
-                            Text(detail)
-                                .font(Theme.sans(Theme.textDense))
-                                .foregroundStyle(Theme.textSubtle)
-                        }
-                        if let digest = preparation.executionDigest {
-                            Text("Execution tree · \(String(digest.prefix(12)))")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textMuted)
-                        }
-                        if let command = preparation.runCommand {
-                            Text("Run explicitly · \(command)")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textMuted)
-                                .textSelection(.enabled)
-                        }
-                        if let command = preparation.setupCommand {
-                            Text("Setup · \(command)")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textMuted)
-                                .textSelection(.enabled)
-                        }
-                        ForEach(preparation.setupOutputs, id: \.self) { output in
-                            Text("Writable setup output · \(output)/")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textMuted)
-                        }
-                        ForEach(preparation.archivePaths, id: \.self) { path in
-                            Text("Archive removes · \(path)/")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textMuted)
-                        }
-                        if let log = preparation.log {
-                            Text("Retained output · \(log)")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textMuted)
-                                .textSelection(.enabled)
-                        }
-                        ForEach(Array(preparation.projections.enumerated()), id: \.offset) { _, projection in
-                            Text("\(projection.from) → \(projection.to) · \(projection.result)\(projection.mode.map { " · \($0)" } ?? "")")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textMuted)
-                                .textSelection(.enabled)
-                        }
-                        if let excerpt = preparation.logExcerpt, !excerpt.isEmpty {
-                            ScrollView(.vertical) {
-                                Text(excerpt)
-                                    .font(Theme.mono(Theme.textCaption))
-                                    .foregroundStyle(Theme.textMuted)
-                                    .textSelection(.enabled)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(maxHeight: 160)
-                        }
-                        if preparation.requiresApproval {
-                            Text("Review every effect above, then approve in Comet on the worktree host.")
-                                .font(Theme.mono(Theme.textCaption))
-                                .foregroundStyle(Theme.textSubtle)
-                        } else if preparation.state == .failed {
-                            Button("Retry preparation in this checkout") {
-                                Task {
-                                    if let error = await model.retryBoardPreparation(taskId: row.id) {
-                                        onResult("Couldn't retry \(row.identifier): \(error)")
-                                    } else {
-                                        onResult("Retrying \(row.identifier)'s preparation")
-                                    }
-                                }
-                            }
-                            .buttonStyle(.bordered)
-                        }
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
         }
     }
 
