@@ -256,6 +256,16 @@ pub mod meta {
     pub fn settle_announced(attempt: i64) -> String {
         format!("settled:{attempt}")
     }
+    /// What origin held for an attempt's branch when the attempt began
+    /// (gh#489) — the commit the settle's credential check compares against,
+    /// so an attempt that changed nothing on origin is never accused over a
+    /// branch a previous attempt pushed. Absent when the branch was not on
+    /// origin at dispatch, when nothing could answer, or when the attempt
+    /// predates the stamp — all of which read the same way: any work on
+    /// origin at settle is new, which is the accusation's old footing.
+    pub fn origin_at_start(attempt: i64) -> String {
+        format!("origin_start:{attempt}")
+    }
 }
 
 /// Which `routing.toml` sections differ, for the reload's log line: an
@@ -1311,6 +1321,72 @@ impl SyncEngine {
             worktree,
             &["merge-base", "--is-ancestor", &head, &remote_head],
         )
+    }
+
+    /// The commit origin's copy of `branch` points at right now, by the
+    /// strongest evidence on hand: GitHub asked directly when the board has a
+    /// client, else the checkout's remote-tracking ref. GitHub first because
+    /// the tracking ref can be stale in exactly the direction that matters —
+    /// a push made straight to a URL (what gh#68's credential path can hand
+    /// an agent) moves origin and no local ref at all.
+    ///
+    /// `None` is "no answer": the branch is not on origin, or nothing could
+    /// say. The two callers — the start-of-attempt stamp and the settle's
+    /// credential check — both treat that as a fact to leave unrecorded
+    /// rather than one to invent.
+    fn origin_branch_oid(
+        &self,
+        task: &Task,
+        worktree: Option<&str>,
+        branch: &str,
+    ) -> Option<String> {
+        let worktree = worktree.filter(|w| std::path::Path::new(w).exists());
+        if let Some(gh) = self.github.as_ref()
+            && let Some(repo) = crate::model::gh_repo(&task.id)
+                .map(str::to_string)
+                .or_else(|| task.pr_url.as_deref().and_then(crate::model::pr_repo))
+                .or_else(|| worktree.and_then(crate::git_credentials::repo_for_checkout))
+            && let Some(oid) = gh.branch_head(&repo, branch)
+        {
+            return Some(oid);
+        }
+        git_out(
+            worktree?,
+            &["rev-parse", &format!("refs/remotes/origin/{branch}")],
+        )
+        .filter(|oid| !oid.is_empty())
+    }
+
+    /// Record what origin already holds for this attempt's branch, as the
+    /// attempt begins (gh#489).
+    ///
+    /// A retry or repair run lands on a branch a previous attempt pushed, so
+    /// "the branch is on origin" is true before its agent types a word.
+    /// Without this stamp the settle read that pre-existing state as proof
+    /// the run pushed — and, finding no mint in the ledger, accused a
+    /// credential path that was rightly never used. The stamp is what lets
+    /// [`SyncEngine::note_credential_path`] bind its accusation to an origin
+    /// that *moved* during the attempt.
+    ///
+    /// Best effort, like the ledger itself: a stamp that cannot be taken or
+    /// written costs the quiet path, never the dispatch — the settle falls
+    /// back to its old, loud footing.
+    pub fn stamp_origin_at_start(
+        &self,
+        task: &Task,
+        attempt_id: i64,
+        worktree: &str,
+        branch: &str,
+    ) {
+        let Some(oid) = self.origin_branch_oid(task, Some(worktree), branch) else {
+            return;
+        };
+        if let Err(e) = self.db.meta_set(&meta::origin_at_start(attempt_id), &oid) {
+            self.log.warn(format!(
+                "{}: stamping origin's {branch} at attempt start: {e:#}",
+                task.identifier
+            ));
+        }
     }
 
     /// Map live attempts onto the sessions the engine currently reports.
@@ -3631,6 +3707,35 @@ impl SyncEngine {
             ));
         }
         if !record.unsanctioned() {
+            return None;
+        }
+        // The accusation binds to an origin that *moved* during this attempt
+        // (gh#489). A repair or review-only re-run lands on a branch a
+        // previous attempt already pushed, and every artifact the settle
+        // rests on — the open pull request, the remote branch — predates it;
+        // a run that pushed nothing had no reason to mint, and reading its
+        // inherited branch as "work on origin" accused exactly the runs that
+        // used the credential path correctly by not using it. Origin still
+        // where the attempt found it means nothing was pushed by anybody, so
+        // there is no push to account for. A branch that moved — pushed by
+        // this run, force-pushed, or changed by another actor entirely —
+        // stays on the old, loud footing: the board cannot account for the
+        // credential that moved it. So does an attempt with no stamp, or one
+        // whose origin cannot be read now: unproven reads as accused, never
+        // as excused.
+        if let (Ok(Some(start)), Some(branch)) = (
+            self.db.meta_get(&meta::origin_at_start(attempt.id)),
+            attempt.branch.as_deref(),
+        ) && self
+            .origin_branch_oid(task, attempt.worktree.as_deref(), branch)
+            .is_some_and(|now| now == start)
+        {
+            self.log.info(format!(
+                "{}: {branch} sits exactly where origin held it when this \
+                 attempt began — nothing was pushed, so the unused credential \
+                 path is in order",
+                task.identifier
+            ));
             return None;
         }
         let reason = record
@@ -7372,6 +7477,158 @@ mod tests {
     fn a_box_that_never_issues_credentials_is_not_accused_of_losing_one() {
         let (e, _) = settle_with_ledger(|_| {});
         assert!(credential_writebacks(&e).is_empty());
+    }
+
+    // ---- the accusation binds to an origin that moved (gh#489) ------------
+
+    /// Settle a dispatched attempt on a pull request, on a real checkout
+    /// whose remote-tracking ref for the attempt's branch sits at the
+    /// checkout's HEAD — with the stamp taken at attempt start resolved from
+    /// `then_rev` in that same repo. `"HEAD"` is a branch origin has held,
+    /// unmoved, since before the attempt; anything older is a branch that
+    /// moved while the attempt ran. What the settle then says about the
+    /// credential is the whole test.
+    fn settle_with_origin_stamp(e: &TestEngine, then_rev: &str) -> tempfile::TempDir {
+        seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(e, "linear:LIN-142", "chat-9");
+        credential_ledger::handed(&e.paths, "owner/widget", Some("chat-9"));
+        let (repo, work) = repo_ahead_of_its_remote();
+        let wt = work.to_string_lossy().into_owned();
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        let now = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let then = git_out(&wt, &["rev-parse", then_rev]).unwrap();
+        git_in(
+            &work,
+            &["update-ref", "refs/remotes/origin/board/lin-142", &now],
+        );
+        e.db.meta_set(&meta::origin_at_start(a), &then).unwrap();
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(e).outcome, Some(Outcome::Done), "the attempt settled");
+        repo
+    }
+
+    /// gh#489, as it happened to gh#468's attempt 3: a repair run dispatched
+    /// onto a branch a previous attempt had already pushed, whose journal
+    /// holds no push at all. The branch being on origin is the *old* push,
+    /// not this run's — origin has not moved since the attempt began, so
+    /// there is no push to account for and nothing to accuse.
+    #[test]
+    fn a_repair_run_that_pushed_nothing_is_not_accused_over_the_old_push() {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        let _repo = settle_with_origin_stamp(&e, "HEAD");
+
+        assert!(
+            credential_writebacks(&e).is_empty(),
+            "no comment lands on the issue"
+        );
+        assert_eq!(
+            hook.posts.lock().unwrap()[0].1["note"],
+            Value::Null,
+            "and the settle notice carries no accusation"
+        );
+    }
+
+    /// The inverse must not soften (gh#489's second half): a branch that
+    /// *moved* during the attempt still demands a same-chat mint, whoever
+    /// moved it. A wrapper-made push and a push by another actor entirely
+    /// read the same from here — origin changed on a run whose credential
+    /// was never asked — and the board says, honestly, that it cannot
+    /// account for the credential that did it.
+    #[test]
+    fn a_branch_that_moved_without_a_mint_is_still_said_out_loud() {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        let _repo = settle_with_origin_stamp(&e, "HEAD~1");
+
+        let notices = credential_writebacks(&e);
+        assert_eq!(notices.len(), 1, "one comment upstream: {notices:?}");
+        assert!(
+            hook.posts.lock().unwrap()[0].1["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("did not push this")),
+        );
+    }
+
+    /// A force-push is a move like any other: the tracking ref pointing at a
+    /// commit that is no descendant of the stamp is still `now != then`, and
+    /// the check compares identity, not ancestry — a branch rewound and
+    /// rewritten under the attempt does not slip past as "already there".
+    #[test]
+    fn a_force_pushed_branch_reads_as_moved() {
+        let (e, _) = engine_with_webhook("https://hooks.example.com/x", false);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        credential_ledger::handed(&e.paths, "owner/widget", Some("chat-9"));
+        let (_repo, work) = repo_ahead_of_its_remote();
+        let wt = work.to_string_lossy().into_owned();
+        let then = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        // The rewrite: same tree, different commit — what a force-push leaves.
+        git_in(&work, &["commit", "--amend", "-m", "rewritten"]);
+        let rewritten = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(then, rewritten);
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        git_in(
+            &work,
+            &[
+                "update-ref",
+                "refs/remotes/origin/board/lin-142",
+                &rewritten,
+            ],
+        );
+        e.db.meta_set(&meta::origin_at_start(a), &then).unwrap();
+        e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
+            .unwrap();
+        let rt = JournalFact::ending(None);
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(credential_writebacks(&e).len(), 1);
+    }
+
+    /// A moved branch with the board's own mint beside it is every normal
+    /// push, stamp or no stamp: the mint answers the question before the
+    /// origin comparison is ever asked.
+    #[test]
+    fn a_moved_branch_the_boards_credential_pushed_stays_quiet() {
+        let (e, hook) = engine_with_webhook("https://hooks.example.com/x", false);
+        credential_ledger::minted(&e.paths, "git-askpass", "owner/widget", Some("chat-9"));
+        let _repo = settle_with_origin_stamp(&e, "HEAD~1");
+
+        assert!(credential_writebacks(&e).is_empty());
+        assert_eq!(hook.posts.lock().unwrap()[0].1["note"], Value::Null);
+    }
+
+    /// The stamp itself: at dispatch the engine records the tracking ref's
+    /// answer for the attempt's branch, and records nothing for a branch
+    /// origin does not hold — absence at settle then reads as "any work on
+    /// origin is new", the old footing, rather than as a spent alibi.
+    #[test]
+    fn the_dispatch_stamp_records_origin_and_only_origin() {
+        let e = engine(None);
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
+        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+        let (_repo, work) = repo_ahead_of_its_remote();
+        let wt = work.to_string_lossy().into_owned();
+        let tip = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        // A branch origin never heard of leaves no stamp.
+        e.stamp_origin_at_start(&task, a, &wt, "board/lin-142");
+        assert_eq!(e.db.meta_get(&meta::origin_at_start(a)).unwrap(), None);
+
+        // One origin holds is stamped exactly as origin holds it.
+        git_in(
+            &work,
+            &["update-ref", "refs/remotes/origin/board/lin-142", &tip],
+        );
+        e.stamp_origin_at_start(&task, a, &wt, "board/lin-142");
+        assert_eq!(
+            e.db.meta_get(&meta::origin_at_start(a)).unwrap().as_deref(),
+            Some(tip.as_str())
+        );
     }
 
     /// A notification is best effort by construction. An endpoint that is down
