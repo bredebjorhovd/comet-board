@@ -331,6 +331,22 @@ fn links(relay_url: &str, user: &str, org: &str) -> Arc<LinkCache> {
     LinkCache::new(config)
 }
 
+/// The peer version one released minor line behind this build — the only line
+/// `supported_n_minus_one` accepts. Derived from the workspace version so a
+/// release bump moves the fixture with it instead of silently aging it out of
+/// the compatibility window (gh#507). Patch `.1` on purpose: patch releases
+/// within the N-1 line stay compatible.
+fn n_minus_one_version() -> String {
+    let parts = comet_update::release_version_parts(env!("CARGO_PKG_VERSION"))
+        .expect("workspace version is dotted-numeric");
+    assert!(
+        parts.len() == 3 && parts[1] > 0,
+        "workspace version {} has no previous minor line to be N-1 against",
+        env!("CARGO_PKG_VERSION")
+    );
+    format!("{}.{}.1", parts[0], parts[1] - 1)
+}
+
 /// A real relay-hosted N-1 protocol seam: no BoardStatsSnapshot until its
 /// update mutation tears the relay-shaped answer down and returns upgraded.
 struct LegacyStatsPeer {
@@ -402,10 +418,11 @@ impl RpcService for LegacyStatsPeer {
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(
                 futures::stream::once(async {
                     serde_json::to_value(comet_update::UpdateStatus {
-                        current_version: "0.7.1".into(),
-                        // The incident's six-hour cache predates v0.8. ApplyUpdate
-                        // refreshes the manifest, so this is deliberately stale.
-                        latest_version: Some("0.7.1".into()),
+                        current_version: n_minus_one_version(),
+                        // The incident's six-hour cache predates this line's
+                        // successor. ApplyUpdate refreshes the manifest, so
+                        // this is deliberately stale.
+                        latest_version: Some(n_minus_one_version()),
                         update_available: false,
                         checked_at: Some(1),
                         error: None,
@@ -613,7 +630,7 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     // N-1 protocol cannot prove which executable is running, so this tree must
     // never be enough to advertise ApplyUpdate.
     let managed_home = dirs.path().join("legacy-home");
-    let managed_version = managed_home.join(".comet-native/app/0.7.1");
+    let managed_version = managed_home.join(format!(".comet-native/app/{}", n_minus_one_version()));
     std::fs::create_dir_all(&managed_version).expect("managed version directory");
     std::fs::write(managed_version.join("comet"), b"fixture").expect("managed executable");
     #[cfg(unix)]
@@ -655,7 +672,7 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
             platform: "linux".into(),
             last_seen_at: None,
             created_at: None,
-            version: Some("0.7.1".into()),
+            version: Some(n_minus_one_version()),
         });
     let local = comet_rpc::memory_client(core.rpc_service());
     let refusal = local
@@ -770,7 +787,7 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "source-shaped Linux peer incorrectly offered an update"
+            "never saw a can_apply=false upgrade offer for the legacy peer within the deadline"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -809,7 +826,7 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
         .find(|host| host.device.device_id == "legacy-peer")
         .and_then(|host| host.upgrade.as_ref())
         .expect("upgrade details");
-    assert_eq!(upgrade.current_version, "0.7.1");
+    assert_eq!(upgrade.current_version, n_minus_one_version());
     assert!(
         !upgrade.can_apply,
         "a stale managed tree cannot prove the running process is managed"
