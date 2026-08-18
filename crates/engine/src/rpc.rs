@@ -1951,6 +1951,9 @@ fn forwardable(method: &str) -> bool {
             // needs a repo routed is an ssh account on the box.
             | methods::READ_BOARD_CONFIG
             | methods::WRITE_BOARD_CONFIG
+            // The rules live in that same file; their health and history live
+            // in `board.db`. Both are the box's, read from laptops (gh#490).
+            | methods::READ_BOARD_AUTOMATIONS
             // Onboarding is three device-local effects behind one verb — a
             // clone on the box's disk, a space owned by the box, and the box's
             // routing.toml — plus a GitHub round trip that has to happen with
@@ -2567,6 +2570,17 @@ impl RpcService for EngineRpc {
                 // than up to a sync interval later.
                 self.board()?.note_config(&view);
                 RpcReply::value(&self.config_reply(view).await?)
+            }
+            // The auto-pick rules, with health and history (gh#490). Refused
+            // by a device that hosts no board, like every board method — that
+            // is what makes the host sweep work.
+            methods::READ_BOARD_AUTOMATIONS => {
+                let view = self
+                    .board()?
+                    .automations()
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&view)
             }
             // Clone + space + adopt, all on this device (gh#97). Slow by
             // nature — it is a `git clone` — and unary, so a caller that gives

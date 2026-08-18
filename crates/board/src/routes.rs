@@ -216,6 +216,35 @@ pub enum Edit {
         #[serde(default)]
         value: Option<String>,
     },
+    /// Set (or, with `value: null`, remove) one key on the `[[automation]]`
+    /// named `automation` (gh#490) — pause and resume are `enabled` through
+    /// here, so the settings page, the board popover and an ssh session all
+    /// move the same key.
+    ///
+    /// Addressed by *name* rather than by index, unlike [`Edit::Route`]:
+    /// automations are created and deleted from surfaces that race each
+    /// other, and an index is the one address a concurrent delete silently
+    /// re-points at a different rule.
+    Automation {
+        automation: String,
+        key: String,
+        #[serde(default)]
+        value: Option<String>,
+    },
+    /// Create a rule (gh#490): a disabled skeleton named `name`, or — with
+    /// `from` — a copy of that rule's block, renamed and **disabled**. A
+    /// duplicate never starts enabled, whatever its source said: enabling is
+    /// the authorization, and it is given to a rule, not inherited by its
+    /// copies.
+    AutomationAdd {
+        name: String,
+        #[serde(default)]
+        from: Option<String>,
+    },
+    /// Delete a rule's whole block (gh#490). Its history in `board.db` keeps
+    /// itself until retention prunes it; work already running is untouched —
+    /// deleting a rule prevents future dispatches, never cancels attempts.
+    AutomationRemove { name: String },
 }
 
 /// The keys [`Edit::Route`] may set, and the TOML each writes.
@@ -281,11 +310,34 @@ const ACCOUNT_KEYS: &[(&str, Kind)] = &[
     ("monthly_usd", Kind::Money),
 ];
 
+/// The keys [`Edit::Automation`] may set (gh#490). `name` is deliberately
+/// absent: it is the rule's identity — its history and its live attempts are
+/// keyed on it — so renaming is a whole-file edit somebody does knowingly.
+const AUTOMATION_KEYS: &[(&str, Kind)] = &[
+    ("enabled", Kind::Bool),
+    ("owner", Kind::Str),
+    ("source", Kind::Str),
+    ("labels", Kind::StrList),
+    ("exclude_labels", Kind::StrList),
+    ("route", Kind::Str),
+    ("runtime", Kind::Str),
+    ("model", Kind::Str),
+    ("account", Kind::Str),
+    ("max_per_eval", Kind::Int),
+    ("max_concurrent", Kind::Int),
+    ("daily_budget", Kind::Int),
+    ("cooldown", Kind::Str),
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Str,
     Int,
     Bool,
+    /// A comma-separated list of words, written as a TOML string array —
+    /// `auto, approved` becomes `["auto", "approved"]`. What a text field has
+    /// where the config wants a list (gh#490's labels).
+    StrList,
     /// An amount in US dollars. Its own kind because money is neither an
     /// integer (`monthly_usd = 17.50` is a real plan) nor free text, and
     /// because a negative subscription is the one value the config validator
@@ -312,6 +364,15 @@ impl Kind {
                 "false" | "no" | "off" | "0" => Ok("false".into()),
                 _ => bail!("`{value}` is not true or false"),
             },
+            Kind::StrList => {
+                let items: Vec<String> = v
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(adopt::toml_string)
+                    .collect();
+                Ok(format!("[{}]", items.join(", ")))
+            }
             // `$200`, `200`, `17.50`, `1,200` — what a person writes when asked
             // what a plan costs. The currency is dollars because the rate table
             // is; a board on another currency writes the converted figure, and
@@ -369,6 +430,11 @@ pub fn route_keys() -> Vec<&'static str> {
 /// The `[defaults]` keys a caller may set.
 pub fn default_keys() -> Vec<&'static str> {
     DEFAULT_KEYS.iter().map(|(k, _)| *k).collect()
+}
+
+/// The `[[automation]]` keys a caller may set (gh#490).
+pub fn automation_keys() -> Vec<&'static str> {
+    AUTOMATION_KEYS.iter().map(|(k, _)| *k).collect()
 }
 
 /// Apply one edit and return the file as it now stands.
@@ -460,9 +526,113 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
             let header = account_header(&before, slot);
             set_in_table(&before, &header, key, rendered(kind, value.as_deref())?)
         }
+        Edit::Automation {
+            automation,
+            key,
+            value,
+        } => {
+            let kind = kind_of(AUTOMATION_KEYS, key, "automation")?;
+            let (at, end) = automation_block(&before, automation)?;
+            set_between(&before, at, end, key, rendered(kind, value.as_deref())?)
+        }
+        Edit::AutomationAdd { name, from } => add_automation(&before, name, from.as_deref())?,
+        Edit::AutomationRemove { name } => {
+            let (at, end) = automation_block(&before, name)?;
+            let lines: Vec<&str> = before.lines().collect();
+            let mut out: Vec<String> = Vec::new();
+            for (i, line) in lines.iter().enumerate() {
+                if i < at || i >= end {
+                    out.push((*line).to_string());
+                }
+            }
+            adopt::join(&out, &before)
+        }
     };
     adopt::apply(&path, &before, &after)?;
     read(paths)
+}
+
+/// The line range of the `[[automation]]` block whose `name` is `name` —
+/// header line to the line the next header starts on (or EOF). Matched
+/// case-insensitively and unquoted, the way every other name in this file is
+/// read back.
+fn automation_block(text: &str, name: &str) -> Result<(usize, usize)> {
+    let name = name.trim();
+    let headers = adopt::header_lines(text);
+    let total = text.lines().count();
+    let lines: Vec<&str> = text.lines().collect();
+    for (i, (at, header)) in headers.iter().enumerate() {
+        if header != "[[automation]]" {
+            continue;
+        }
+        let end = headers
+            .get(i + 1)
+            .map(|(next, _)| *next)
+            .unwrap_or(total);
+        let named = lines[*at..end].iter().any(|line| {
+            let Some((key, value)) = line.split_once('=') else {
+                return false;
+            };
+            key.trim() == "name" && value.trim().trim_matches(['"', '\'']).eq_ignore_ascii_case(name)
+        });
+        if named {
+            return Ok((*at, end));
+        }
+    }
+    bail!("there is no automation named `{name}`");
+}
+
+/// Append a new `[[automation]]` block: a disabled skeleton, or — with `from`
+/// — a disabled copy of that rule. The copy keeps everything but the name and
+/// the enablement, comments included: duplicating is how a working rule
+/// becomes the starting point for the next one.
+fn add_automation(text: &str, name: &str, from: Option<&str>) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        bail!("an automation needs a name");
+    }
+    if automation_block(text, name).is_ok() {
+        bail!("there is already an automation named `{name}`");
+    }
+    let mut block: Vec<String> = match from {
+        Some(from) => {
+            let (at, end) = automation_block(text, from)?;
+            let lines: Vec<&str> = text.lines().collect();
+            let mut copied: Vec<String> = Vec::new();
+            let mut had_enabled = false;
+            for line in &lines[at..end] {
+                let key = line.split_once('=').map(|(k, _)| k.trim());
+                match key {
+                    Some("name") => copied.push(format!("name = {}", adopt::toml_string(name))),
+                    Some("enabled") => {
+                        had_enabled = true;
+                        copied.push("enabled = false".to_string());
+                    }
+                    _ => copied.push((*line).to_string()),
+                }
+            }
+            if !had_enabled {
+                copied.insert(1, "enabled = false".to_string());
+            }
+            // Trim the trailing blank lines a mid-file block carries; the
+            // append below re-adds exactly one separator.
+            while copied.last().is_some_and(|l| l.trim().is_empty()) {
+                copied.pop();
+            }
+            copied
+        }
+        None => vec![
+            "[[automation]]".to_string(),
+            format!("name = {}", adopt::toml_string(name)),
+            "enabled = false".to_string(),
+        ],
+    };
+    let mut out: Vec<String> = text.lines().map(str::to_string).collect();
+    if out.last().is_some_and(|l| !l.trim().is_empty()) {
+        out.push(String::new());
+    }
+    out.append(&mut block);
+    Ok(adopt::join(&out, text))
 }
 
 fn rendered(kind: Kind, value: Option<&str>) -> Result<Option<String>> {
@@ -1305,5 +1475,169 @@ max_duration = "banana"
             .to_string();
         assert!(err.contains("is not an account"), "{err}");
         assert_eq!(read(&paths).unwrap().text, SAMPLE, "the file moved");
+    }
+
+    // ---- automation ops (gh#490) ----------------------------------------
+
+    fn automation_edit(
+        paths: &Paths,
+        name: &str,
+        key: &str,
+        value: Option<&str>,
+    ) -> Result<RoutingView> {
+        edit(
+            paths,
+            &Edit::Automation {
+                automation: name.into(),
+                key: key.into(),
+                value: value.map(str::to_string),
+            },
+        )
+    }
+
+    /// The whole lifecycle through the ops the settings page sends: created
+    /// paused, filled in key by key, enabled, copied (disabled), removed.
+    #[test]
+    fn automations_are_added_edited_duplicated_and_removed_by_name() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let view = edit(
+            &paths,
+            &Edit::AutomationAdd {
+                name: "approved".into(),
+                from: None,
+            },
+        )
+        .unwrap();
+        let rule = &view.config.as_ref().unwrap().automations[0];
+        assert_eq!(rule.name, "approved");
+        assert!(!rule.enabled, "a fresh rule never starts enabled");
+
+        // A second rule with the same name is one history for two rules, and
+        // is refused before anything is written.
+        let err = edit(
+            &paths,
+            &Edit::AutomationAdd {
+                name: "Approved".into(),
+                from: None,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("already an automation"), "{err}");
+
+        automation_edit(&paths, "approved", "owner", Some("Brede")).unwrap();
+        // The list spelling a text field has, written as a TOML array.
+        automation_edit(&paths, "approved", "labels", Some("auto, approved")).unwrap();
+        automation_edit(&paths, "approved", "account", Some("slot-1")).unwrap();
+        let view = automation_edit(&paths, "approved", "enabled", Some("true")).unwrap();
+        let rule = &view.config.as_ref().unwrap().automations[0];
+        assert!(rule.enabled);
+        assert_eq!(rule.labels, vec!["auto", "approved"]);
+        assert_eq!(rule.owner.as_deref(), Some("Brede"));
+
+        // Duplicate: everything copied, name replaced, enablement dropped —
+        // authorization is given to a rule, never inherited by its copies.
+        let view = edit(
+            &paths,
+            &Edit::AutomationAdd {
+                name: "approved-docs".into(),
+                from: Some("approved".into()),
+            },
+        )
+        .unwrap();
+        let copy = view
+            .config
+            .as_ref()
+            .unwrap()
+            .automations
+            .iter()
+            .find(|a| a.name == "approved-docs")
+            .unwrap();
+        assert!(!copy.enabled);
+        assert_eq!(copy.labels, vec!["auto", "approved"]);
+        assert_eq!(copy.owner.as_deref(), Some("Brede"));
+
+        let view = edit(
+            &paths,
+            &Edit::AutomationRemove {
+                name: "approved-docs".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(view.config.as_ref().unwrap().automations.len(), 1);
+        // And the routes around the rules never moved.
+        assert_eq!(view.config.as_ref().unwrap().routes.len(), 2);
+        assert!(view.text.contains("# Offhand's own work."));
+    }
+
+    /// Enabling a rule that cannot run is refused by the validating writer —
+    /// with the config's own sentence — and the file does not move. This is
+    /// the write behind the settings page's Enable, so the refusal is the
+    /// confirmation dialog's error.
+    #[test]
+    fn enabling_a_half_written_rule_is_refused_and_changes_nothing() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        edit(
+            &paths,
+            &Edit::AutomationAdd {
+                name: "hasty".into(),
+                from: None,
+            },
+        )
+        .unwrap();
+        let before = read(&paths).unwrap().text;
+        // The whole chain: `apply` wraps the validator's sentence, and the
+        // RPC layer prints the chain (`{e:#}`), so the page reads both.
+        let err = format!("{:#}", automation_edit(&paths, "hasty", "enabled", Some("true")).unwrap_err());
+        assert!(err.contains("no owner") || err.contains("no required labels"), "{err}");
+        assert_eq!(read(&paths).unwrap().text, before, "the file moved");
+    }
+
+    /// The ops address rules by name, and an unknown name or key is refused
+    /// by name rather than written and ignored.
+    #[test]
+    fn automation_ops_refuse_unknown_names_and_keys() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let err = automation_edit(&paths, "ghost", "owner", Some("x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no automation named `ghost`"), "{err}");
+
+        edit(
+            &paths,
+            &Edit::AutomationAdd {
+                name: "real".into(),
+                from: None,
+            },
+        )
+        .unwrap();
+        let err = automation_edit(&paths, "real", "onwer", Some("x"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`onwer` is not a automation key"), "{err}");
+        assert!(err.contains("owner"), "it names the set: {err}");
+    }
+
+    /// The ops as the RPC sends them — the page writes JSON, and a renamed
+    /// tag would strand it.
+    #[test]
+    fn automation_edits_round_trip_through_json() {
+        let add: Edit = serde_json::from_value(serde_json::json!({
+            "op": "automationAdd", "name": "approved", "from": "other"
+        }))
+        .unwrap();
+        assert!(matches!(add, Edit::AutomationAdd { ref name, ref from }
+            if name == "approved" && from.as_deref() == Some("other")));
+        let set: Edit = serde_json::from_value(serde_json::json!({
+            "op": "automation", "automation": "approved", "key": "enabled", "value": "true"
+        }))
+        .unwrap();
+        assert!(matches!(set, Edit::Automation { ref automation, ref key, ref value }
+            if automation == "approved" && key == "enabled" && value.as_deref() == Some("true")));
+        let remove: Edit = serde_json::from_value(serde_json::json!({
+            "op": "automationRemove", "name": "approved"
+        }))
+        .unwrap();
+        assert!(matches!(remove, Edit::AutomationRemove { ref name } if name == "approved"));
     }
 }

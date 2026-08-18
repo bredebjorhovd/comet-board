@@ -132,6 +132,13 @@ enum Msg {
         task_id: String,
         reply: oneshot::Sender<anyhow::Result<String>>,
     },
+    /// The auto-pick rules with their health and history (gh#490). A read
+    /// like `Detail`, on this thread because it walks `board.db` — and
+    /// answered by the loop because only the loop knows when its next
+    /// periodic evaluation runs.
+    Automations {
+        reply: oneshot::Sender<anyhow::Result<comet_board::autopick::AutomationsView>>,
+    },
     Shutdown,
 }
 
@@ -490,6 +497,17 @@ impl BoardService {
             .map_err(|_| anyhow::anyhow!("board loop went away mid-merge"))?
     }
 
+    /// The auto-pick rules with their health and recent history (gh#490) —
+    /// what `ReadBoardAutomations` answers.
+    pub async fn automations(&self) -> anyhow::Result<comet_board::autopick::AutomationsView> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::Automations { reply })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
+    }
+
     /// Stop the loop and wait for the in-flight cycle to finish, so shutdown
     /// never truncates a SQLite write mid-transaction.
     pub fn shutdown(&self) {
@@ -563,7 +581,14 @@ fn run_loop(
             match engine.sync_once_with(statuses.as_ref(), Some(runtime.as_ref())) {
                 // Review delivery rides the cycle's own PR poll, and runs
                 // after it so the `review` states it keys on are this tick's.
-                Ok(pulls) => engine.deliver_reviews(runtime.as_ref(), &pulls),
+                Ok(pulls) => {
+                    engine.deliver_reviews(runtime.as_ref(), &pulls);
+                    // Auto-pick (gh#490) runs after reconciliation for the
+                    // same reason review delivery does: the `ready` states it
+                    // keys on are this tick's. This is the periodic half —
+                    // what catches up after a restart or a missed event.
+                    run_auto_pick(&engine, runtime.as_ref(), &spaces, &log);
+                }
                 Err(e) => log.error(format!("sync cycle failed: {e}")),
             }
             publish_rows(&engine, &feeds.rows, &log);
@@ -577,8 +602,18 @@ fn run_loop(
                 // settle/reopen — the clocked lifecycle (orphaning) stays on
                 // the interval.
                 match engine.refresh_statuses_with(&mapped, Some(runtime.as_ref())) {
-                    Ok(true) => publish_rows(&engine, &feeds.rows, &log),
-                    Ok(false) => {}
+                    Ok(changed) => {
+                        // The reactive half of auto-pick (gh#490): a session
+                        // change that moved a row (a settle frees capacity, a
+                        // failed run puts a task back to ready) is exactly the
+                        // moment eligibility shifts. Evaluation is idempotent,
+                        // so overlapping with the interval costs nothing.
+                        let picked =
+                            changed && run_auto_pick(&engine, runtime.as_ref(), &spaces, &log);
+                        if changed || picked {
+                            publish_rows(&engine, &feeds.rows, &log);
+                        }
+                    }
                     Err(e) => log.warn(format!("refreshing agent statuses: {e}")),
                 }
                 statuses = Some(mapped);
@@ -598,6 +633,7 @@ fn run_loop(
                     &origin,
                     &overrides,
                     replace,
+                    None,
                 );
                 match &result {
                     Ok(d) => log.info(format!(
@@ -702,6 +738,12 @@ fn run_loop(
                 publish_rows(&engine, &feeds.rows, &log);
                 let _ = reply.send(result);
             }
+            // A read like `Detail`: publishes nothing, logs nothing. Opening
+            // the automations page is not an event on the board.
+            Ok(Msg::Automations { reply }) => {
+                let next = next_sync.saturating_duration_since(Instant::now()).as_secs();
+                let _ = reply.send(engine.automations_view(Some(next)));
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Ok(Msg::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 log.info("board loop stopping");
@@ -709,6 +751,82 @@ fn run_loop(
             }
         }
     }
+}
+
+/// Evaluate every enabled auto-pick rule and release what they ask for
+/// (gh#490). On the loop thread beside `deliver_reviews`, so evaluation and
+/// dispatch share the one `board.db` writer — two evaluators cannot race, and
+/// the one-live-attempt index backstops even a duplicate that slipped one in.
+///
+/// Refusals are recorded rather than retried: `note_automation_refusal`
+/// writes the pipeline's own sentence into the rule's history, and the
+/// planner's cooldown reads that row — which is what keeps a standing refusal
+/// (billing guard, missing credential) from hot-looping on every tick.
+///
+/// Returns whether anything was dispatched, so the caller knows to republish.
+fn run_auto_pick(
+    engine: &SyncEngine,
+    runtime: &(dyn Runtime + Send + Sync),
+    spaces: &watch::Receiver<Vec<Space>>,
+    log: &Logger,
+) -> bool {
+    let plans = match engine.auto_pick_plan() {
+        Ok(plans) => plans,
+        Err(e) => {
+            log.error(format!("auto-pick evaluation failed: {e:#}"));
+            return false;
+        }
+    };
+    let mut dispatched = false;
+    for plan in plans {
+        let rule = &plan.rule;
+        let owner = rule.owner.clone().unwrap_or_default();
+        // The rule's dispatch configuration. `bill` acknowledges the account
+        // the rule names (gh#101): enabling the rule was the human's consent
+        // to spend it, given once, when there is nobody at a confirm dialog.
+        let overrides = DispatchOverrides {
+            runtime: rule.runtime.clone(),
+            model: rule.model.clone(),
+            account: rule.account.clone(),
+            bill: rule.account.clone(),
+            ..DispatchOverrides::default()
+        };
+        // The owner rides as the claimed user — the same claim a frontend
+        // sends — while the rule itself is the `automation` parameter below:
+        // provenance no RPC caller can fabricate.
+        let origin = DispatchOrigin {
+            user: rule.owner.clone(),
+            ..DispatchOrigin::default()
+        };
+        let result = handle_dispatch(
+            engine,
+            runtime,
+            spaces,
+            &plan.task_id,
+            &origin,
+            &overrides,
+            false,
+            Some((&rule.name, &owner)),
+        );
+        match result {
+            Ok(d) => {
+                dispatched = true;
+                engine.note_automation_dispatch(&plan, &d.chat_id);
+                log.info(format!(
+                    "auto-pick `{}` dispatched {} → chat {} (attempt {})",
+                    rule.name, plan.identifier, d.chat_id, d.attempt
+                ));
+            }
+            Err(e) => {
+                engine.note_automation_refusal(&plan, &format!("{e:#}"));
+                log.warn(format!(
+                    "auto-pick `{}` could not dispatch {}: {e:#}",
+                    rule.name, plan.identifier
+                ));
+            }
+        }
+    }
+    dispatched
 }
 
 /// Publish the pinned orchestrator to `WatchBoardOrchestrator` subscribers
@@ -768,6 +886,12 @@ fn handle_dispatch(
     origin: &DispatchOrigin,
     overrides: &DispatchOverrides,
     replace: bool,
+    // The auto-pick rule releasing this, and its human owner (gh#490).
+    // `None` on every dispatch a person or an orchestrating agent asked for.
+    // A parameter rather than a field on `DispatchOrigin` because no RPC
+    // caller may claim it: automation provenance exists only on the path the
+    // board's own evaluator drives.
+    automation: Option<(&str, &str)>,
 ) -> anyhow::Result<Dispatched> {
     let task = engine
         .db
@@ -999,6 +1123,12 @@ fn handle_dispatch(
     // The duplicate-dispatch guard: a second concurrent dispatch fails on the
     // partial unique index here, before a worktree or chat exists.
     let attempt_id = engine.db.insert_attempt(&NewAttempt {
+        // Automation provenance (gh#490), written with the insert for
+        // `stacked_on`'s reason: the rule is decided before anything is
+        // created, and a crash must not leave an autonomous attempt looking
+        // like somebody's keypress.
+        automation: automation.map(|(rule, _)| rule.to_string()),
+        automation_owner: automation.map(|(_, owner)| owner.to_string()),
         // The stacking edge (gh#285), written with the insert because it is
         // known before anything is created — and as the parent *attempt*, not
         // its branch: the branch is deleted when the parent merges, and the
@@ -1067,7 +1197,13 @@ fn handle_dispatch(
             // one gh#232 found. Plain, without gh#161's strength marker: this
             // one is a public issue comment, and the audience for "the box
             // checked this" is the operator and the orchestrator, not the repo.
-            let by = dispatcher_name(&engine.db, &dispatcher, by.name());
+            let by = match automation {
+                // An automated release names the rule and its human owner —
+                // the comment is the surface a repo reader sees, and "who
+                // pressed dispatch" has a different kind of answer here.
+                Some((rule, owner)) => Some(format!("auto-pick rule `{rule}` (owned by {owner})")),
+                None => dispatcher_name(&engine.db, &dispatcher, by.name()),
+            };
             engine.enqueue_dispatch(
                 &task,
                 // What ran, not what the route would have run: an attempt
@@ -1489,6 +1625,8 @@ mod tests {
         let db = Db::open(&paths.db()).unwrap();
         let a = db
             .insert_attempt(&NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: task_id.into(),
                 pane_id: None,
@@ -1514,6 +1652,8 @@ mod tests {
         let db = Db::open(&paths.db()).unwrap();
         let a = db
             .insert_attempt(&NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: task_id.into(),
                 pane_id: None,
@@ -3094,6 +3234,8 @@ max_concurrent_per_workspace = 1
             let db = Db::open(&paths.db()).unwrap();
             let id = db
                 .insert_attempt(&NewAttempt {
+                    automation: None,
+                    automation_owner: None,
                     stacked_on: None,
                     task_id: "gh:owner/widget#12".into(),
                     pane_id: None,

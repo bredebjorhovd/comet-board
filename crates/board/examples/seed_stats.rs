@@ -116,6 +116,8 @@ fn main() -> Result<()> {
         })?;
 
         let attempt = db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             task_id: task_id.clone(),
             pane_id: None,

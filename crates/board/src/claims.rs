@@ -432,6 +432,15 @@ pub struct AttemptReview {
     /// read" rather than as five clean results.
     #[serde(default)]
     pub effects: crate::effects::Effects,
+    /// The auto-pick rule that released this attempt, and its human owner
+    /// (gh#490). Both `None` on every attempt a person or an orchestrating
+    /// agent dispatched. On the review because that is where an autonomous
+    /// attempt meets its human: the reviewer is entitled to know nobody
+    /// pressed dispatch, and who answers for the rule that did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_owner: Option<String>,
 }
 
 impl AttemptReview {
@@ -1052,6 +1061,8 @@ pub fn review(
         evidence,
         sandbox,
         effects,
+        automation: attempt.automation.clone(),
+        automation_owner: attempt.automation_owner.clone(),
     }
 }
 
@@ -1113,6 +1124,9 @@ pub fn pull_request_review(
         evidence: RunEvidence::default(),
         sandbox: None,
         effects: crate::effects::Effects::default(),
+        // Nothing dispatched it, so no automation did either.
+        automation: None,
+        automation_owner: None,
     }
 }
 

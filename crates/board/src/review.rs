@@ -1618,6 +1618,8 @@ pub(crate) mod tests {
         .unwrap();
         let a =
             e.db.insert_attempt(&crate::db::NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: "gh:o/r#13".into(),
                 pane_id: None,
@@ -2038,6 +2040,8 @@ pub(crate) mod tests {
         .unwrap();
         let a =
             e.db.insert_attempt(&crate::db::NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: Some(parent),
                 task_id: "gh:o/r#20".into(),
                 pane_id: None,
@@ -2092,6 +2096,8 @@ pub(crate) mod tests {
         .unwrap();
         let a =
             e.db.insert_attempt(&crate::db::NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: Some(parent),
                 task_id: "gh:o/r#21".into(),
                 pane_id: None,

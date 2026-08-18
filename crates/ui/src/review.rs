@@ -1904,6 +1904,20 @@ impl ReviewPanel {
             },
             None,
         ));
+        // Automation provenance (gh#490): nobody pressed dispatch, and the
+        // reviewer is told so — with the human who answers for the rule that
+        // did. Absent on every attempt a person released.
+        if let Some(rule) = review.automation.as_deref().filter(|r| !r.trim().is_empty()) {
+            facts.push(Self::fact(
+                theme,
+                Some(icons::MAGIC_STICK),
+                match review.automation_owner.as_deref().filter(|o| !o.trim().is_empty()) {
+                    Some(owner) => format!("dispatched by “{rule}” · owned by {owner}"),
+                    None => format!("dispatched by “{rule}” · unowned"),
+                },
+                None,
+            ));
+        }
         let mut row: Vec<AnyElement> = Vec::new();
         for (ix, fact) in facts.into_iter().enumerate() {
             if ix > 0 {
@@ -2735,6 +2749,8 @@ mod tests {
             symbols: vec![],
         };
         AttemptReview {
+            automation: None,
+            automation_owner: None,
             // gh#236's field, defaulted: read = false, so this fixture claims
             // nothing about effects it does not exercise.
             effects: Default::default(),

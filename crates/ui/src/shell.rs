@@ -39,6 +39,7 @@ use crate::settings::appearance::{AppearanceEvent, AppearancePage};
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::members::MembersPage;
+use crate::settings::automations::AutomationsPage;
 use crate::settings::routing::RoutingPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::stats::StatsPage;
@@ -164,6 +165,11 @@ pub enum SettingsSection {
     /// The board's `routing.toml` (gh#75) — a comet-board addition, and the
     /// only settings section whose subject lives on another device.
     Routing,
+    /// The board's auto-pick rules (gh#490) — a comet-board addition, board-
+    /// hosted like [`Self::Routing`]: the rules are `routing.toml`, the
+    /// history is `board.db`, and both live on whichever device hosts the
+    /// board.
+    Automations,
     /// What the board did with the work it was given (gh#143) — a
     /// comet-board addition, and like [`Self::Routing`] its subject lives on
     /// whichever device hosts the board.
@@ -182,13 +188,14 @@ impl SettingsSection {
     /// behaves, and Routing/Stats are about a board that may live on another
     /// machine entirely. Archived closes the list, as the tail of it always
     /// has.
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Agents,
         SettingsSection::Members,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
         SettingsSection::Routing,
+        SettingsSection::Automations,
         SettingsSection::Stats,
         SettingsSection::Archived,
     ];
@@ -208,6 +215,7 @@ impl SettingsSection {
             // gh#76 — the workspace roster and its invitations.
             SettingsSection::Members => "Members",
             SettingsSection::Routing => "Routing",
+            SettingsSection::Automations => "Automations",
             SettingsSection::Stats => "Stats",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
@@ -485,6 +493,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     members_page: Option<Entity<MembersPage>>,
     routing_page: Option<Entity<RoutingPage>>,
+    automations_page: Option<Entity<AutomationsPage>>,
     stats_page: Option<Entity<StatsPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
@@ -677,6 +686,15 @@ impl Shell {
                     BoardEvent::OpenReview { task_id, chat_id } => {
                         this.open_review(task_id.clone(), chat_id.clone(), cx)
                     }
+                    // The popover's deep link (gh#490): the panel is the
+                    // operational surface, the editor lives in Settings.
+                    BoardEvent::OpenAutomations => {
+                        this.board_open = false;
+                        this.route = Route::Settings(SettingsSection::Automations);
+                        this.nav
+                            .push(NavEntry::Settings(SettingsSection::Automations));
+                        cx.notify();
+                    }
                 },
             );
         let data_dir = boot.data_dir.clone();
@@ -693,6 +711,7 @@ impl Shell {
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/members") => Route::Settings(SettingsSection::Members),
             Some("settings/routing") => Route::Settings(SettingsSection::Routing),
+            Some("settings/automations") => Route::Settings(SettingsSection::Automations),
             Some("settings/stats") => Route::Settings(SettingsSection::Stats),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -750,6 +769,7 @@ impl Shell {
             devices_page: None,
             members_page: None,
             routing_page: None,
+            automations_page: None,
             stats_page: None,
             archived_page: None,
             shortcuts_page: None,
@@ -1544,6 +1564,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Automations => {
+                if self.automations_page.is_none() {
+                    let state = self.state.clone();
+                    self.automations_page = Some(cx.new(|cx| AutomationsPage::new(state, cx)));
+                }
+                match &self.automations_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Stats => {
                 if self.stats_page.is_none() {
                     let state = self.state.clone();
@@ -2233,6 +2263,9 @@ impl Shell {
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Routing => icons::CHECKLIST,
+            // The rules run the board unattended; the wand is the closest
+            // glyph the embedded set has to "it happens by itself".
+            SettingsSection::Automations => icons::MAGIC_STICK,
             SettingsSection::Stats => icons::CHART,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -4618,7 +4651,7 @@ mod tests {
 
     /// The settings nav, in the order the supplied design file lists it
     /// (gh#258). Order is the only thing the rail communicates beyond the
-    /// eight labels, so it is worth a test: it groups this device (Devices,
+    /// nine labels, so it is worth a test: it groups this device (Devices,
     /// Agents, Members), then this app (Appearance, Shortcuts), then the board
     /// — which may be on another machine entirely — and closes with Archived.
     #[test]
@@ -4632,6 +4665,7 @@ mod tests {
                 "Appearance",
                 "Shortcuts",
                 "Routing",
+                "Automations",
                 "Stats",
                 "Archived",
             ]

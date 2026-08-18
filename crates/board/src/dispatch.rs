@@ -2064,6 +2064,8 @@ mod tests {
         .unwrap();
         let a = db
             .insert_attempt(&NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: task_id.into(),
                 pane_id: None,
@@ -2321,6 +2323,8 @@ mod tests {
         .unwrap();
         let id = db
             .insert_attempt(&NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: task_id.into(),
                 pane_id: None,

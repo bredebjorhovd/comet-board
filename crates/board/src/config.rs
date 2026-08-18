@@ -460,6 +460,14 @@ pub struct RoutingConfig {
     /// the one line of this file no amount of probing could fill in.
     #[serde(default, rename = "account")]
     pub accounts: BTreeMap<String, AccountConfig>,
+    /// Auto-pick rules (gh#490): saved, enableable policies that dispatch
+    /// eligible labeled tasks without a keypress. In this file rather than in
+    /// `board.db` because a rule is *policy* — the same kind of decision a
+    /// route is — and everything that edits policy here (the settings page,
+    /// `$EDITOR` over ssh, the validating writer) already exists. Enabling one
+    /// is the explicit human authorization for every dispatch it later makes.
+    #[serde(default, rename = "automation")]
+    pub automations: Vec<Automation>,
 }
 
 /// One agent account's plan, as its operator wrote it down (gh#182).
@@ -1437,6 +1445,103 @@ impl RouteMatch {
     }
 }
 
+/// One auto-pick rule (gh#490): which ready tasks it matches, what a dispatch
+/// under it runs as, how much it may do at once, and whose automation it is.
+///
+/// Deliberately deterministic — a label match, never a model call. The board's
+/// existing policies (one live attempt, routes, capacity, billing guard,
+/// credentials) stay authoritative at dispatch; the rule only decides *that*
+/// a dispatch is asked for, and records why when it is not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Automation {
+    /// The rule's name — how its dispatches are attributed, how its history is
+    /// keyed, and how the settings page addresses it. Required and unique.
+    pub name: String,
+    /// Off is paused: the rule is kept, its history is kept, and nothing new
+    /// is dispatched. Off by default, because enabling is the authorization.
+    #[serde(default)]
+    pub enabled: bool,
+    /// The human responsible for this automation, named on every attempt it
+    /// releases. Required to *enable* — an automation nobody answers for is
+    /// the thing this field exists to prevent — but a rule being drafted may
+    /// not have one yet.
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Match only tasks from this source (`github` / `linear`). Unset matches
+    /// both.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Labels a task must carry — all of them. At least one is required to
+    /// enable: a rule with no required label would match every ready task on
+    /// the board, and "dispatch everything" is a decision nobody makes by
+    /// leaving a list empty.
+    #[serde(default)]
+    pub labels: Vec<String>,
+    /// Labels that exclude a task even when the required ones match.
+    #[serde(default)]
+    pub exclude_labels: Vec<String>,
+    /// Only dispatch tasks whose resolved route is this one (by display name).
+    /// Unset takes whatever route the task resolves to — the rule never
+    /// invents a route of its own, so an unrouted task is skipped either way.
+    #[serde(default)]
+    pub route: Option<String>,
+    /// Runtime override for the rule's dispatches. Unset runs the route's.
+    #[serde(default)]
+    pub runtime: Option<String>,
+    /// Model override for the rule's dispatches. Unset runs the harness default.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The agent-account slot the rule's dispatches spend — **explicit**, and
+    /// consent: an unattended dispatch has nobody at a confirm dialog, so the
+    /// account is acknowledged here, once, when a human writes it down. A rule
+    /// without one refuses its candidates with `billing account missing`
+    /// rather than silently spending the box's own login.
+    #[serde(default)]
+    pub account: Option<String>,
+    /// Most dispatches one evaluation may make. Evaluations run per sync cycle
+    /// and per eligibility change, so this is a rate more than a ceiling.
+    #[serde(default = "default_automation_per_eval")]
+    pub max_per_eval: usize,
+    /// Most live attempts this rule may have running at once — its own cap,
+    /// inside the workspace capacity that still applies on top.
+    #[serde(default = "default_automation_concurrent")]
+    pub max_concurrent: usize,
+    /// Most dispatches per rolling 24 hours. Unset is unbounded — the
+    /// concurrency cap above still holds.
+    #[serde(default)]
+    pub daily_budget: Option<usize>,
+    /// How long a task waits after this rule's attempt on it failed, or after
+    /// a dispatch was refused, before the rule considers it again. What keeps
+    /// a refusal from hot-looping: the reason is recorded and the task is
+    /// deferred, never retried inside the window.
+    #[serde(default = "default_automation_cooldown")]
+    pub cooldown: String,
+}
+
+fn default_automation_per_eval() -> usize {
+    1
+}
+
+fn default_automation_concurrent() -> usize {
+    1
+}
+
+fn default_automation_cooldown() -> String {
+    "30m".into()
+}
+
+impl Automation {
+    /// The failure/refusal cooldown in seconds. `None` is "off" — reconsider
+    /// on the next evaluation. An unparseable value has been refused by
+    /// validation; a config that got here with one reads as the default,
+    /// never as "no cooldown" — the wrong way to fail is the one that
+    /// hot-loops a refusal.
+    pub fn cooldown_secs(&self) -> Option<u64> {
+        parse_retention(&self.cooldown)
+            .unwrap_or_else(|_| parse_retention(&default_automation_cooldown()).ok().flatten())
+    }
+}
+
 /// The reverse of [`expand_tilde`], for display: a home-relative path fits on a
 /// terminal row where an absolute one gets truncated exactly where the useful
 /// part is.
@@ -1682,6 +1787,69 @@ impl RoutingConfig {
                      be used, so the second is settings that do nothing",
                     r.name
                 ));
+            }
+        }
+        // Auto-pick rules (gh#490). A *disabled* rule may be half-written —
+        // that is what the settings page creates and fills in — so the
+        // enable-gated requirements (owner, labels, account is checked at
+        // dispatch) only bite on `enabled = true`. What is checked on every
+        // rule is what would misbehave silently: a duplicate name would make
+        // one history out of two rules, and an unparseable cooldown would
+        // read as the default while somebody believes they set it.
+        for (i, a) in self.automations.iter().enumerate() {
+            let name = a.name.trim();
+            if name.is_empty() {
+                out.push(format!(
+                    "automation {} has no name; the name is how its dispatches \
+                     are attributed and its history is kept",
+                    i + 1
+                ));
+            }
+            if self.automations[..i]
+                .iter()
+                .any(|earlier| earlier.name.trim().eq_ignore_ascii_case(name) && !name.is_empty())
+            {
+                out.push(format!(
+                    "automation `{name}` appears twice; two rules with one name \
+                     would share one history and one concurrency cap"
+                ));
+            }
+            if let Some(source) = &a.source
+                && crate::model::Source::parse(source).is_none()
+            {
+                out.push(format!(
+                    "automation `{name}` matches source `{source}`, which is not \
+                     a board source. Write `github` or `linear`, or drop the key \
+                     to match both."
+                ));
+            }
+            if let Some(runtime) = &a.runtime
+                && harness_for_runtime(runtime).is_none()
+            {
+                out.push(format!(
+                    "automation `{name}` has runtime `{runtime}`, which is not a \
+                     comet harness. Known runtimes: {}",
+                    RUNTIME_NAMES.join(", ")
+                ));
+            }
+            if let Err(e) = parse_retention(&a.cooldown) {
+                out.push(format!("automation `{name}` has cooldown {e}"));
+            }
+            if a.enabled {
+                if a.owner.as_deref().map(str::trim).unwrap_or("").is_empty() {
+                    out.push(format!(
+                        "automation `{name}` is enabled with no owner; an \
+                         automation that dispatches agents must name the human \
+                         responsible for it"
+                    ));
+                }
+                if a.labels.iter().all(|l| l.trim().is_empty()) {
+                    out.push(format!(
+                        "automation `{name}` is enabled with no required labels; \
+                         it would match every ready task on the board. Name the \
+                         label that means \"approved for autonomous execution\"."
+                    ));
+                }
             }
         }
         // A `[users]` value that is not an address is worse than no entry: the
@@ -3356,5 +3524,91 @@ runtime = "claude"
         let c = creds("GITHUB_APP_PRIVATE_KEY_PATH=/etc/comet/app.pem\n");
         assert_eq!(c.github_auth(), GithubAuth::None);
         assert_eq!(c.github_app_half_configured(), Some("GITHUB_APP_ID"));
+    }
+
+    // ---- auto-pick rules (gh#490) --------------------------------------
+
+    /// A full `[[automation]]` block parses into the rule the planner reads,
+    /// with the defaults where nothing was written.
+    #[test]
+    fn an_automation_block_parses_with_its_defaults() {
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [[automation]]
+            name = "approved-maintenance"
+            enabled = true
+            owner = "Brede"
+            labels = ["auto"]
+            exclude_labels = ["blocked-on-human"]
+            account = "slot-1"
+            "#,
+        )
+        .unwrap();
+        let a = &cfg.automations[0];
+        assert_eq!(a.name, "approved-maintenance");
+        assert!(a.enabled);
+        assert_eq!(a.owner.as_deref(), Some("Brede"));
+        assert_eq!(a.labels, vec!["auto"]);
+        assert_eq!(a.max_per_eval, 1);
+        assert_eq!(a.max_concurrent, 1);
+        assert_eq!(a.daily_budget, None);
+        assert_eq!(a.cooldown, "30m");
+        assert_eq!(a.cooldown_secs(), Some(30 * 60));
+        assert!(cfg.problems().is_empty(), "{:?}", cfg.problems());
+    }
+
+    /// Enabling is gated on the facts an unattended dispatch cannot do
+    /// without: a named owner and at least one required label. A *disabled*
+    /// rule may be half-written — that is what the settings page creates.
+    #[test]
+    fn an_enabled_rule_without_owner_or_labels_is_refused() {
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [[automation]]
+            name = "hasty"
+            enabled = true
+            "#,
+        )
+        .unwrap();
+        let problems = cfg.problems();
+        assert!(problems.iter().any(|p| p.contains("no owner")), "{problems:?}");
+        assert!(
+            problems.iter().any(|p| p.contains("no required labels")),
+            "{problems:?}"
+        );
+
+        let drafted: RoutingConfig = toml::from_str(
+            r#"
+            [[automation]]
+            name = "drafted"
+            "#,
+        )
+        .unwrap();
+        assert!(drafted.problems().is_empty(), "{:?}", drafted.problems());
+    }
+
+    /// The always-on checks: names must be unique (case-insensitively — one
+    /// history per rule), a cooldown typo must not read as the default, and a
+    /// runtime or source that means nothing is said now rather than at 02:00.
+    #[test]
+    fn automation_names_cooldowns_runtimes_and_sources_are_checked() {
+        let cfg: RoutingConfig = toml::from_str(
+            r#"
+            [[automation]]
+            name = "dup"
+            cooldown = "shortly"
+            runtime = "codx"
+            source = "jira"
+
+            [[automation]]
+            name = "DUP"
+            "#,
+        )
+        .unwrap();
+        let problems = cfg.problems();
+        assert!(problems.iter().any(|p| p.contains("appears twice")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("cooldown")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("`codx`")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("`jira`")), "{problems:?}");
     }
 }

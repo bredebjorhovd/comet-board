@@ -272,6 +272,19 @@ pub mod methods {
     /// made on the web is what moves it, so the board never records a merge
     /// GitHub can still reject.
     pub const MERGE_TASK: &str = "MergeTask";
+    /// The board's auto-pick rules with their derived health and recent
+    /// history (gh#490). Params: `{}` →
+    /// `comet_board::autopick::AutomationsView`.
+    ///
+    /// A call and not a stream, like [`BOARD_STATS`]: the page and the board
+    /// header's popover read it when opened, and history rows are not worth a
+    /// republish to every viewport per sync tick. The rules themselves are
+    /// `routing.toml` — created, edited, paused and deleted through
+    /// [`WRITE_BOARD_CONFIG`]'s `automation*` ops, one writer discipline —
+    /// so this carries what the config cannot: live counts, budget meters,
+    /// health, and why each considered task was or was not dispatched. Never
+    /// credentials or webhook material.
+    pub const READ_BOARD_AUTOMATIONS: &str = "ReadBoardAutomations";
     /// The board's `routing.toml` as it stands on its host: the text, its
     /// parse, and everything wrong with it — plus the repos that have a space
     /// on that device but nothing on the board watching them (gh#75). Params:

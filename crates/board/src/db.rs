@@ -24,7 +24,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
      cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
      context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on, resumes, \
-     token_models, token_agents";
+     token_models, token_agents, automation, automation_owner";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -117,6 +117,8 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
         token_agents: r
             .get::<_, Option<String>>(51)?
             .and_then(|j| serde_json::from_str(&j).ok()),
+        automation: r.get(52)?,
+        automation_owner: r.get(53)?,
     })
 }
 
@@ -378,7 +380,13 @@ impl Db {
               -- its own chat (gh#390). Not a retry and not a second attempt:
               -- the chat, the branch and the checkout are the same ones, and
               -- the count exists to bound the restarting, not to number it.
-              resumes INTEGER NOT NULL DEFAULT 0
+              resumes INTEGER NOT NULL DEFAULT 0,
+              -- The auto-pick rule that released this attempt, and the human
+              -- who owns that rule (gh#490). NULL on every attempt a person
+              -- (or an orchestrating agent) released — automation provenance
+              -- is the exception, and its absence is the ordinary case.
+              automation TEXT,
+              automation_owner TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -411,6 +419,34 @@ impl Db {
             CREATE TABLE IF NOT EXISTS meta (
               key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
+
+            -- What each auto-pick rule did and declined to do (gh#490): one
+            -- row per (rule, task, decision, reason) streak, not per look —
+            -- an unchanged answer bumps `last_at`/`count` on its latest row
+            -- instead of appending, so thirty seconds of "at capacity" is one
+            -- line and not a hundred. Its own table rather than `meta` rows
+            -- because operators *list* this: the run/history view is the
+            -- point, and a keyed blob store cannot answer "what happened
+            -- lately" without walking every key. Never carries credentials or
+            -- webhook material — reasons are the board's own sentences.
+            CREATE TABLE IF NOT EXISTS automation_log (
+              id         INTEGER PRIMARY KEY,
+              rule       TEXT NOT NULL,
+              -- NULL for a note about the rule itself rather than one task.
+              task_id    TEXT,
+              -- Denormalized so history stays legible after a task is reaped.
+              identifier TEXT,
+              -- dispatched | skipped | deferred | refused.
+              decision   TEXT NOT NULL,
+              reason     TEXT NOT NULL,
+              attempt_id INTEGER,
+              first_at   TEXT NOT NULL,
+              last_at    TEXT NOT NULL,
+              count      INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE INDEX IF NOT EXISTS automation_log_recent
+              ON automation_log(rule, last_at);
             "#,
         )?;
 
@@ -607,6 +643,10 @@ impl Db {
                 // which is what they are: the board could not restart a run
                 // then, it closed the attempt instead.
                 ("resumes", "INTEGER NOT NULL DEFAULT 0"),
+                // gh#490. NULL on every attempt a person released, which is
+                // what they are: automation provenance marks the exception.
+                ("automation", "TEXT"),
+                ("automation_owner", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -1013,8 +1053,8 @@ impl Db {
                 dispatched_by, dispatched_by_pane, started_at, base_sha, account,
                 repo_path,
                 dispatched_by_device, dispatched_by_user, dispatched_by_verified,
-                billed_to, board_managed, stacked_on)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                billed_to, board_managed, stacked_on, automation, automation_owner)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
             params![
                 a.task_id,
                 a.pane_id,
@@ -1033,7 +1073,9 @@ impl Db {
                 a.dispatched_by_verified as i64,
                 a.billed_to,
                 board_managed as i64,
-                a.stacked_on
+                a.stacked_on,
+                a.automation,
+                a.automation_owner
             ],
         );
         match res {
@@ -1790,6 +1832,159 @@ impl Db {
         Ok(n as usize)
     }
 
+    // ---- automation log (gh#490) ----------------------------------------
+
+    /// Live attempts released by one auto-pick rule — what the rule's own
+    /// `max_concurrent` counts.
+    pub fn live_count_for_automation(&self, rule: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attempts
+              WHERE outcome IS NULL AND automation = ?1",
+            params![rule],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Attempts one rule released since `since` — what its `daily_budget`
+    /// counts. Off the attempts table rather than the log, because the attempt
+    /// row is the record of a dispatch that *happened* and survives a pruned
+    /// log.
+    pub fn automation_dispatches_since(&self, rule: &str, since: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM attempts
+              WHERE automation = ?1 AND started_at >= ?2",
+            params![rule, since],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
+    /// Record what a rule decided about a task — or, with no task, about
+    /// itself. An answer identical to the latest one for the same subject
+    /// bumps that row's `last_at` and `count` instead of appending, so a
+    /// standing condition is one legible streak rather than a page of
+    /// repeats. A changed answer appends: history is the point.
+    pub fn record_automation_decision(&self, d: &AutomationDecision) -> Result<()> {
+        let latest = self
+            .conn
+            .query_row(
+                "SELECT id, decision, reason, attempt_id FROM automation_log
+                  WHERE rule = ?1 AND (task_id = ?2 OR (task_id IS NULL AND ?2 IS NULL))
+                  ORDER BY id DESC LIMIT 1",
+                params![d.rule, d.task_id],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((id, decision, reason, attempt_id)) = latest
+            && decision == d.decision
+            && reason == d.reason
+            && attempt_id == d.attempt_id
+        {
+            self.conn.execute(
+                "UPDATE automation_log SET last_at = ?2, count = count + 1 WHERE id = ?1",
+                params![id, now()],
+            )?;
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO automation_log
+               (rule, task_id, identifier, decision, reason, attempt_id, first_at, last_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",
+            params![
+                d.rule,
+                d.task_id,
+                d.identifier,
+                d.decision,
+                d.reason,
+                d.attempt_id,
+                now()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// When a rule last *refused* a task — a dispatch that was asked for and
+    /// did not happen. What the refusal half of the cooldown is measured from;
+    /// the failure half comes off the attempts table.
+    pub fn automation_last_refusal(&self, rule: &str, task_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT last_at FROM automation_log
+                  WHERE rule = ?1 AND task_id = ?2 AND decision = 'refused'
+                  ORDER BY last_at DESC LIMIT 1",
+                params![rule, task_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// When one rule's attempt on a task last *failed* — the other half of
+    /// the cooldown.
+    pub fn automation_last_failure(&self, rule: &str, task_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT ended_at FROM attempts
+                  WHERE automation = ?1 AND task_id = ?2
+                    AND outcome = 'failed' AND ended_at IS NOT NULL
+                  ORDER BY ended_at DESC LIMIT 1",
+                params![rule, task_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The most recent log rows, newest first — the run/history view. `rule`
+    /// scopes to one rule; `None` reads across all of them.
+    pub fn automation_log_recent(
+        &self,
+        rule: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<AutomationLogRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, rule, task_id, identifier, decision, reason, attempt_id,
+                    first_at, last_at, count
+               FROM automation_log
+              WHERE (?1 IS NULL OR rule = ?1)
+              ORDER BY last_at DESC, id DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![rule, limit as i64], |r| {
+            Ok(AutomationLogRow {
+                id: r.get(0)?,
+                rule: r.get(1)?,
+                task_id: r.get(2)?,
+                identifier: r.get(3)?,
+                decision: r.get(4)?,
+                reason: r.get(5)?,
+                attempt_id: r.get(6)?,
+                first_at: r.get(7)?,
+                last_at: r.get(8)?,
+                count: r.get(9)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Drop log rows whose streak last moved before `before`. The log is an
+    /// operator's view, not an audit archive; the attempts it led to are the
+    /// durable record and keep themselves.
+    pub fn prune_automation_log(&self, before: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM automation_log WHERE last_at < ?1",
+            params![before],
+        )?;
+        Ok(())
+    }
+
     // ---- writeback queue ------------------------------------------------
 
     /// Enqueue a writeback. Returns `false` when this exact effect is already
@@ -1938,6 +2133,46 @@ pub struct NewAttempt {
     /// decided *before* anything is created, so a row that exists at all knows
     /// what it was cut from.
     pub stacked_on: Option<i64>,
+    /// The auto-pick rule releasing this attempt, and that rule's human owner
+    /// (gh#490). Both `None` on every dispatch a person or an orchestrating
+    /// agent made — automation provenance marks the exception. Written with
+    /// the insert, like `stacked_on`: the rule is decided before anything is
+    /// created, and a crash must not leave an autonomous attempt unattributed.
+    pub automation: Option<String>,
+    pub automation_owner: Option<String>,
+}
+
+/// One decision to record in the automation log (gh#490) — see
+/// [`Db::record_automation_decision`] for the streak semantics.
+pub struct AutomationDecision {
+    pub rule: String,
+    /// `None` is a note about the rule itself rather than about one task.
+    pub task_id: Option<String>,
+    pub identifier: Option<String>,
+    /// `dispatched` | `skipped` | `deferred` | `refused`.
+    pub decision: String,
+    pub reason: String,
+    pub attempt_id: Option<i64>,
+}
+
+/// One row of the automation history, as the run view lists it (gh#490).
+/// Serialized camelCase because it rides `ReadBoardAutomations` to viewports.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutomationLogRow {
+    pub id: i64,
+    pub rule: String,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub identifier: Option<String>,
+    pub decision: String,
+    pub reason: String,
+    #[serde(default)]
+    pub attempt_id: Option<i64>,
+    pub first_at: String,
+    pub last_at: String,
+    pub count: i64,
 }
 
 pub struct NewWriteback {
@@ -1995,6 +2230,8 @@ mod tests {
 
     fn attempt(task: &str) -> NewAttempt {
         NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             task_id: task.into(),
             pane_id: None,
@@ -2021,6 +2258,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed(&db, "linear:LIN-142");
         db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             dispatched_by_device: Some("laptop-ana".into()),
             dispatched_by_user: Some("ana@example.com".into()),
@@ -2582,5 +2821,103 @@ mod tests {
         assert_eq!(t.attempts[0].outcome, Some(Outcome::Cancelled));
         assert_eq!(t.attempts[0].pane_id.as_deref(), Some("w1:p4"));
         assert!(t.live_attempt().is_some());
+    }
+
+    // ---- automation provenance and the automation log (gh#490) ----------
+
+    /// Provenance rides the attempt row from the insert, and the two meters
+    /// the rule's limits read — live count and dispatches-since — count it.
+    #[test]
+    fn automation_provenance_rides_the_attempt() {
+        let db = db();
+        seed(&db, "linear:LIN-142");
+        let a = db
+            .insert_attempt(&NewAttempt {
+                automation: Some("approved".into()),
+                automation_owner: Some("Brede".into()),
+                ..attempt("linear:LIN-142")
+            })
+            .unwrap();
+        let t = db.get_task("linear:LIN-142").unwrap().unwrap();
+        assert_eq!(t.attempts[0].automation.as_deref(), Some("approved"));
+        assert_eq!(t.attempts[0].automation_owner.as_deref(), Some("Brede"));
+        assert_eq!(db.live_count_for_automation("approved").unwrap(), 1);
+        assert_eq!(db.live_count_for_automation("other").unwrap(), 0);
+        assert_eq!(
+            db.automation_dispatches_since("approved", "2000-01-01T00:00:00Z")
+                .unwrap(),
+            1
+        );
+        db.close_attempt(a, Outcome::Failed).unwrap();
+        assert_eq!(db.live_count_for_automation("approved").unwrap(), 0);
+        assert!(
+            db.automation_last_failure("approved", "linear:LIN-142")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// The log collapses an unchanged answer into one streak and appends when
+    /// the answer changes — thirty seconds of "at capacity" is one line, and
+    /// the moment it becomes something else is a new one.
+    #[test]
+    fn the_automation_log_collapses_streaks_and_appends_changes() {
+        let db = db();
+        let decision = |reason: &str, decision: &str| AutomationDecision {
+            rule: "approved".into(),
+            task_id: Some("gh:o/r#1".into()),
+            identifier: Some("gh#1".into()),
+            decision: decision.into(),
+            reason: reason.into(),
+            attempt_id: None,
+        };
+        db.record_automation_decision(&decision("at capacity", "deferred"))
+            .unwrap();
+        db.record_automation_decision(&decision("at capacity", "deferred"))
+            .unwrap();
+        db.record_automation_decision(&decision("at capacity", "deferred"))
+            .unwrap();
+        let log = db.automation_log_recent(Some("approved"), 10).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].count, 3);
+
+        db.record_automation_decision(&decision("cooldown active", "deferred"))
+            .unwrap();
+        let log = db.automation_log_recent(Some("approved"), 10).unwrap();
+        assert_eq!(log.len(), 2, "a changed reason appends");
+
+        // Streaks are per subject: a different task's identical answer is its
+        // own row, and a rule-level note (no task) is its own subject too.
+        db.record_automation_decision(&AutomationDecision {
+            task_id: Some("gh:o/r#2".into()),
+            ..decision("at capacity", "deferred")
+        })
+        .unwrap();
+        db.record_automation_decision(&AutomationDecision {
+            task_id: None,
+            identifier: None,
+            ..decision("evaluated", "skipped")
+        })
+        .unwrap();
+        assert_eq!(db.automation_log_recent(Some("approved"), 10).unwrap().len(), 4);
+
+        // Refusals are what the cooldown reads.
+        db.record_automation_decision(&decision("billing guard refused", "refused"))
+            .unwrap();
+        assert!(
+            db.automation_last_refusal("approved", "gh:o/r#1")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            db.automation_last_refusal("approved", "gh:o/r#2")
+                .unwrap()
+                .is_none()
+        );
+
+        // Retention: everything older than the cutoff goes; the attempts a
+        // rule released are the durable record, not this.
+        db.prune_automation_log("2999-01-01T00:00:00Z").unwrap();
+        assert!(db.automation_log_recent(None, 10).unwrap().is_empty());
     }
 }

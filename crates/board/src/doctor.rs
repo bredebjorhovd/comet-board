@@ -4616,6 +4616,8 @@ mod tests {
         .unwrap();
         let a = db
             .insert_attempt(&crate::db::NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: "linear:LIN-142".into(),
                 pane_id: None,
@@ -5744,6 +5746,8 @@ mod tests {
             .unwrap();
         }
         db.insert_attempt(&crate::db::NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             task_id: task.into(),
             pane_id: None,
