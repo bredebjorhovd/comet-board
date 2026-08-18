@@ -25,6 +25,8 @@ use comet_board::config::{Credentials, GithubAuth, Paths};
 use comet_board::git_credentials;
 use std::path::{Path, PathBuf};
 
+use crate::workspace_host::WorkspaceHost;
+
 /// Where the `gh` shim is installed, under the board's state dir. One per
 /// device rather than one per run: its contents depend on nothing but the two
 /// binaries' paths, and PATH entries are cheap while directories are not.
@@ -98,6 +100,49 @@ impl PushCredentials {
             false,
         )
         .map(|_| ())
+    }
+
+    /// Resolve the push state for a chat, lazily upgrading rows dispatched
+    /// before `GithubPushContract` existed. The old row proves only repository
+    /// ownership, so recovery persists the minimum useful promise (contents
+    /// write, no workflow write) after the current board handoff proves it.
+    /// Failure leaves the row untouched and therefore fail-closed.
+    pub fn resolve_chat_state(
+        &self,
+        workspace: &WorkspaceHost,
+        chat_id: &str,
+    ) -> anyhow::Result<Option<comet_proto::GithubPushState>> {
+        match workspace.github_push_state(chat_id) {
+            Ok(state) => Ok(state),
+            Err(original) => {
+                let Some(repo) = workspace.legacy_github_push_repo(chat_id)? else {
+                    return Err(anyhow::anyhow!(original.to_string()));
+                };
+                let contract = comet_proto::GithubPushContract {
+                    contents_write: true,
+                    workflows_write: false,
+                };
+                self.verify_for_repo(&repo, contract).map_err(|error| {
+                    anyhow::anyhow!(
+                        "legacy board chat {chat_id} could not establish a replacement push contract for {repo}: {error:#}"
+                    )
+                })?;
+                let recovered = comet_proto::GithubPushState { repo, contract };
+                if workspace.upgrade_legacy_github_push_state(chat_id, &recovered)? {
+                    tracing::info!(
+                        chat = chat_id,
+                        repo = %recovered.repo,
+                        "upgraded legacy board chat to a proven contents-write push contract"
+                    );
+                    return Ok(Some(recovered));
+                }
+                // A remote write won the probe race. Re-read its authoritative
+                // result; never overwrite it with the stale proof above.
+                workspace
+                    .github_push_state(chat_id)
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))
+            }
+        }
     }
 
     #[cfg(test)]

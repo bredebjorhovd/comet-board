@@ -95,7 +95,15 @@ impl CometRuntime {
     }
 
     fn verify_chat_push_credentials(&self, chat_id: &str) -> anyhow::Result<()> {
-        let Some(push) = self.workspace.github_push_state(chat_id)? else {
+        let push = match self.workspace.github_push_state(chat_id) {
+            Ok(state) => state,
+            Err(original) => self
+                .push
+                .get()
+                .ok_or_else(|| anyhow::anyhow!(original.to_string()))?
+                .resolve_chat_state(&self.workspace, chat_id)?,
+        };
+        let Some(push) = push else {
             return Ok(());
         };
         self.verify_push_credentials(&push.repo, push.contract)
