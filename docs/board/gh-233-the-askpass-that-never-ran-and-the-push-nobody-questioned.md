@@ -70,7 +70,10 @@ anything odd.
   for the credential that pushed, and asks for the branch to be looked at.
 - **What stays quiet is as important.** A run whose helper minted is silent, and
   so is a box with no board credential at all — it never claimed to be the thing
-  that pushes, and every device pushed that way before §gh#68.
+  that pushes, and every device pushed that way before §gh#68. So, since gh#489,
+  is a repair or review-only run on a branch a previous attempt pushed: the
+  accusation binds to an origin that moved during the attempt, not to the
+  branch merely being there.
 - **`doctor` runs the path** rather than counting its parts. The old check —
   a credential exists, a binary resolves — is exactly the check gh#233 passed.
   It also surfaces the last recorded failure, because a failure that happened
