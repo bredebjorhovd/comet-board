@@ -606,6 +606,15 @@ pub struct UpdateStatus {
     pub checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Whether [`Updater::apply`] would accept on this device — the running
+    /// process's own answer from the same [`detect_install`] boundary the
+    /// apply path refuses on (gh#486). `None` is a frame from a peer that
+    /// predates the field (≤ v0.10) and proves nothing: from outside, a stale
+    /// managed tree beside a source build is indistinguishable from a managed
+    /// process, so callers must fail closed rather than offer a mutation that
+    /// may refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_apply: Option<bool>,
 }
 
 impl UpdateStatus {
@@ -616,8 +625,17 @@ impl UpdateStatus {
             update_available: false,
             checked_at: None,
             error: None,
+            can_apply: Some(apply_would_accept()),
         }
     }
+}
+
+/// The install-kind half of [`Updater::apply`]'s acceptance: true exactly for
+/// the managed layout, the only kind `apply` proceeds for. Published on every
+/// [`UpdateStatus`] frame so remote surfaces offer Update only where the
+/// mutation would be accepted, without guessing from the filesystem.
+pub fn apply_would_accept() -> bool {
+    matches!(detect_install(), InstallKind::Managed { .. })
 }
 
 /// `COMET_AUTO_UPDATE=1|true|yes` — headless daemons apply updates themselves.
@@ -725,6 +743,7 @@ impl Updater {
                     latest_version: Some(manifest.version),
                     checked_at: Some(now_ms()),
                     error: None,
+                    can_apply: Some(apply_would_accept()),
                 };
                 if status.update_available {
                     tracing::info!(
@@ -844,6 +863,36 @@ mod tests {
             detect_install_from(Path::new("/src/target/release/comet"), Some(Path::new("/home/u"))),
             InstallKind::Unmanaged
         );
+    }
+
+    /// The N-1 seam gh#486 exists for: a frame from a peer that predates
+    /// `canApply` decodes with `None` (never a false claim either way), and a
+    /// frame that carries it round-trips — while old decoders simply ignore
+    /// the extra key.
+    #[test]
+    fn update_status_capability_survives_the_version_skew_both_ways() {
+        let legacy: UpdateStatus = serde_json::from_str(
+            r#"{"currentVersion":"0.7.1","latestVersion":"0.7.1","updateAvailable":false,"checkedAt":1}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.can_apply, None);
+        // Absent stays absent on the wire — "didn't say" must not re-serialize
+        // as an answer.
+        let echoed = serde_json::to_value(&legacy).unwrap();
+        assert!(echoed.get("canApply").is_none());
+
+        let status = UpdateStatus {
+            can_apply: Some(true),
+            ..UpdateStatus::initial()
+        };
+        let wire = serde_json::to_value(&status).unwrap();
+        assert_eq!(wire["canApply"], serde_json::json!(true));
+        let back: UpdateStatus = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.can_apply, Some(true));
+
+        // Every locally produced frame answers the question; a test process is
+        // not a managed install, so the answer here is an honest "no".
+        assert_eq!(UpdateStatus::initial().can_apply, Some(apply_would_accept()));
     }
 
     #[test]

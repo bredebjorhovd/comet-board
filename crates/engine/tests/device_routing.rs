@@ -353,6 +353,10 @@ struct LegacyStatsPeer {
     phase: Arc<AtomicU8>,
     has_board: Arc<AtomicBool>,
     probe_delay_ms: Arc<AtomicU64>,
+    /// When set, UpdateStatus frames carry `canApply: true` — the shape of a
+    /// peer new enough for gh#486 whose running process is a managed install.
+    /// Unset frames are v0.7-shaped: no capability field at all.
+    advertises_can_apply: Arc<AtomicBool>,
     managed_home: std::path::PathBuf,
     restart: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -415,22 +419,26 @@ impl RpcService for LegacyStatsPeer {
                 }))
             }
             methods::LIST_FOLDERS => Err(RpcError::Failed("could not read that folder".into())),
-            methods::UPDATE_STATUS => Ok(RpcReply::Stream(
-                futures::stream::once(async {
-                    serde_json::to_value(comet_update::UpdateStatus {
-                        current_version: n_minus_one_version(),
-                        // The incident's six-hour cache predates this line's
-                        // successor. ApplyUpdate refreshes the manifest, so
-                        // this is deliberately stale.
-                        latest_version: Some(n_minus_one_version()),
-                        update_available: false,
-                        checked_at: Some(1),
-                        error: None,
+            methods::UPDATE_STATUS => {
+                let advertises = self.advertises_can_apply.load(Ordering::SeqCst);
+                Ok(RpcReply::Stream(
+                    futures::stream::once(async move {
+                        serde_json::to_value(comet_update::UpdateStatus {
+                            current_version: n_minus_one_version(),
+                            // The incident's six-hour cache predates this line's
+                            // successor. ApplyUpdate refreshes the manifest, so
+                            // this is deliberately stale.
+                            latest_version: Some(n_minus_one_version()),
+                            update_available: false,
+                            checked_at: Some(1),
+                            error: None,
+                            can_apply: advertises.then_some(true),
+                        })
+                        .unwrap()
                     })
-                    .unwrap()
-                })
-                .boxed(),
-            )),
+                    .boxed(),
+                ))
+            }
             methods::APPLY_UPDATE => {
                 self.phase.store(1, Ordering::SeqCst);
                 if let Some(restart) = self.restart.lock().unwrap().take() {
@@ -640,10 +648,12 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
     )
     .expect("managed current symlink");
     let (restart_tx, restart_rx) = oneshot::channel();
+    let advertises_can_apply = Arc::new(AtomicBool::new(false));
     let legacy_peer = Arc::new(LegacyStatsPeer {
         phase: phase.clone(),
         has_board: has_board.clone(),
         probe_delay_ms: probe_delay_ms.clone(),
+        advertises_can_apply: advertises_can_apply.clone(),
         managed_home,
         restart: Mutex::new(Some(restart_tx)),
     });
@@ -832,6 +842,43 @@ async fn all_board_stats_supports_n_minus_one_and_reconnects_after_update() {
         "a stale managed tree cannot prove the running process is managed"
     );
     assert!(upgrade.error.contains("BoardStatsSnapshot"));
+
+    // The same peer, now shaped like a release that carries `canApply`
+    // (gh#486): the field alone — the running process's own detect_install
+    // answer — is what turns the upgradeRequired row into an offer.
+    advertises_can_apply.store(true, Ordering::SeqCst);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let offered = operator
+            .call(
+                methods::AGGREGATE_BOARD_STATS,
+                serde_json::json!({ "sinceDays": 7 }),
+            )
+            .await
+            .ok()
+            .and_then(|value| {
+                serde_json::from_value::<comet_proto::view::stats::AggregateBoardStats>(value).ok()
+            })
+            .is_some_and(|aggregate| {
+                aggregate.hosts.iter().any(|host| {
+                    host.device.device_id == "legacy-peer"
+                        && host.status
+                            == comet_proto::view::stats::StatsHostStatus::UpgradeRequired
+                        && host
+                            .upgrade
+                            .as_ref()
+                            .is_some_and(|upgrade| upgrade.can_apply)
+                })
+            });
+        if offered {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a peer reporting canApply over UpdateStatus never became an update offer"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 
     let update_service = core.rpc_service();
     let mut apply = tokio::spawn(async move {

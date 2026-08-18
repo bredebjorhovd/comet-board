@@ -1194,11 +1194,13 @@ impl EngineRpc {
                         let required = env!("CARGO_PKG_VERSION");
                         if supported_n_minus_one(&status.current_version, required) {
                             StatsProbeResult::UpgradeRequired {
-                                // v0.7 exposes version facts but not its running
-                                // executable/install kind. A stale managed tree
-                                // beside a source build is not proof that
-                                // ApplyUpdate will accept, so fail closed.
-                                can_apply: false,
+                                // The peer's own report of the detect_install
+                                // boundary ApplyUpdate refuses on (gh#486).
+                                // Frames that predate the field say nothing —
+                                // a stale managed tree beside a source build
+                                // is not proof that ApplyUpdate will accept,
+                                // so absent fails closed.
+                                can_apply: status.can_apply.unwrap_or(false),
                                 current_version: status.current_version,
                                 required_version: required.to_string(),
                                 error: underlying,

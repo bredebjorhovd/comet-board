@@ -1292,9 +1292,12 @@ pub struct StatsUpgradeDetails {
     pub required_version: String,
     /// The rejected snapshot call, retained separately from the diagnosis.
     pub error: String,
-    /// The peer proved an installer-managed layout through compatible,
-    /// read-only probes. This deliberately does not depend on its possibly
-    /// stale release-check cache.
+    /// The peer itself reported over the compatible `UpdateStatus` stream
+    /// that `ApplyUpdate` would accept (`canApply`, gh#486) — the running
+    /// process's own `detect_install` answer, so it does not depend on the
+    /// peer's possibly stale release-check cache. Peers that predate the
+    /// field prove nothing and stay `false`: a stale managed tree beside a
+    /// source build is not the running executable, so no button is offered.
     #[serde(default)]
     pub can_apply: bool,
 }
