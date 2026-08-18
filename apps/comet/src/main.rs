@@ -9,7 +9,11 @@ mod update_cli;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "comet", about = "Multi-device controller for coding agents")]
+#[command(
+    name = "comet",
+    version,
+    about = "Multi-device controller for coding agents"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -116,6 +120,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::Headless) => {
+            comet_update::validate_running_managed_release()?;
             warn_on_stale_board_cli();
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
@@ -180,15 +185,20 @@ fn main() -> anyhow::Result<()> {
 /// Say once, at boot, when the `comet-board` on this box is not the one this
 /// engine shipped with (gh#156).
 ///
+/// Managed installs have already passed the synchronous, fail-closed sibling
+/// check above (gh#496). This remaining warning covers an explicit override or
+/// PATH copy that would answer instead in an unmanaged environment; managed
+/// resolution is pinned to the validated sibling.
+///
 /// The one place the drift can be reported without anybody having gone looking
 /// for it. `comet-board doctor` reports it too, but only from a CLI new enough
 /// to carry the check — which the drifted ones are not, by definition. The
 /// service restarts on every install, so this fires exactly when the gap opens,
 /// into the journal somebody reads when the box misbehaves.
 ///
-/// A warn and nothing more: a stale CLI does not stop the engine hosting the
-/// board, and refusing to boot over it would turn a reporting bug into an
-/// outage.
+/// A warn and nothing more here: the managed payload cannot reach this point
+/// incomplete, while an unmanaged source engine remains useful without a board
+/// CLI installed beside it.
 ///
 /// On its own thread for the same reason. The probe shells out to
 /// `comet-board --version`, and the whole point is that the binary it runs is

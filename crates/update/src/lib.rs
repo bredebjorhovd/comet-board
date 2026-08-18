@@ -14,15 +14,17 @@
 //!   the symlink, restart the service. Same flow the installer script performs,
 //!   natively. The tarball carries `comet-board` beside `comet` (gh#156), and
 //!   `~/.local/bin` links point at `current` rather than at a version, so the
-//!   symlink flip moves both binaries at once — nothing here needs to know
-//!   there are two.
+//!   symlink flip moves both binaries at once. Every stage, activation, and
+//!   managed boot proves the pair is complete and version-matched (gh#496).
 //! - **MacApp** (running out of `Comet.app`): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, bail};
 use futures::StreamExt as _;
@@ -30,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use tokio::sync::watch;
+use wait_timeout::ChildExt as _;
 
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
@@ -45,6 +48,9 @@ const CHECK_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(
 /// While an auto-apply is deferred behind active sessions, re-probe idleness
 /// this often.
 const IDLE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+/// A release binary's `--version` is local and immediate. Bound the probe so a
+/// corrupt or replaced executable cannot wedge an update or daemon boot.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------------------
 // Release metadata
@@ -188,6 +194,107 @@ pub fn detect_install() -> InstallKind {
     detect_install_from(&exe, home.as_deref())
 }
 
+/// Prove that an installer-managed payload contains the two executable
+/// siblings that make one Comet release, and that both report the version the
+/// caller is about to activate.
+///
+/// This is deliberately a runtime invariant rather than another tarball-list
+/// check. Emergency/manual hotfixes and an interrupted old installer can create
+/// a version directory without ever traversing the packaging workflow.
+pub fn validate_managed_release(dir: &Path, expected_version: &str) -> anyhow::Result<()> {
+    let dir_metadata = std::fs::symlink_metadata(dir)
+        .with_context(|| format!("managed release directory {} is missing", dir.display()))?;
+    if !dir_metadata.file_type().is_dir() {
+        bail!(
+            "managed release {} must be a real directory (symlinks are refused)",
+            dir.display()
+        );
+    }
+    for name in ["comet", "comet-board"] {
+        let path = dir.join(name);
+        validate_release_binary(&path, name, expected_version)?;
+    }
+    Ok(())
+}
+
+/// A managed daemon must not advertise a healthy device when the release next
+/// to the running engine is incomplete. Standard activation checks before the
+/// symlink moves; this catches manual/hotfix activation that bypassed it.
+pub fn validate_running_managed_release() -> anyhow::Result<()> {
+    if !matches!(detect_install(), InstallKind::Managed { .. }) {
+        return Ok(());
+    }
+    let exe = std::env::current_exe().context("resolving the running managed executable")?;
+    let dir = exe
+        .parent()
+        .context("managed executable has no release directory")?;
+    validate_managed_release(dir, current_version()).with_context(|| {
+        format!(
+            "managed Comet release {} is incomplete; refusing to start instead of serving a device whose agents cannot use comet-board. Re-run the installer; the previous complete release remains safe to reactivate",
+            dir.display()
+        )
+    })
+}
+
+fn validate_release_binary(path: &Path, name: &str, expected_version: &str) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("managed release is missing {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!(
+            "managed release {} must be a regular file (symlinks are refused)",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            bail!("managed release {} is not executable", path.display());
+        }
+    }
+
+    let mut child = Command::new(path)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {} --version", path.display()))?;
+    let Some(_) = child
+        .wait_timeout(VERSION_PROBE_TIMEOUT)
+        .with_context(|| format!("waiting for {} --version", path.display()))?
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!(
+            "managed release {} did not answer --version within {}s",
+            path.display(),
+            VERSION_PROBE_TIMEOUT.as_secs()
+        );
+    };
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("reading {} --version", path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "managed release {} rejected --version ({})",
+            path.display(),
+            output.status
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let actual = stdout.lines().next().map(str::trim).unwrap_or_default();
+    let expected = format!("{name} {expected_version}");
+    if actual != expected {
+        bail!(
+            "managed release {} reports '{}', expected '{expected}'",
+            path.display(),
+            if actual.is_empty() { "nothing" } else { actual }
+        );
+    }
+    Ok(())
+}
+
 /// The directory an installer-managed service exposes through its `current`
 /// symlink. Kept beside install detection so compatibility probes and the
 /// updater derive the layout from one production definition.
@@ -298,7 +405,13 @@ pub async fn stage_headless(
 ) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dest = app_root.join(version);
-    if dest.join("comet").exists() {
+    if dest.exists() {
+        validate_managed_release(&dest, version).with_context(|| {
+            format!(
+                "refusing to reuse incomplete staged release {}",
+                dest.display()
+            )
+        })?;
         return Ok(dest);
     }
     let file = headless_artifact(version);
@@ -323,13 +436,13 @@ pub async fn stage_headless(
                 "--strip-components=1",
             ],
         )?;
-        if !unpacked.join("comet").is_file() {
-            bail!("tarball {file} did not contain a comet binary");
-        }
+        validate_managed_release(&unpacked, version)
+            .with_context(|| format!("tarball {file} is not a complete Comet release"))?;
         match std::fs::rename(&unpacked, &dest) {
             Ok(()) => {}
             // Lost a race with another stager — the staged copy is equivalent.
-            Err(_) if dest.join("comet").exists() => {}
+            Err(_) if dest.exists() => validate_managed_release(&dest, version)
+                .context("concurrent stager left an incomplete release")?,
             Err(err) => {
                 return Err(err).with_context(|| format!("moving {} into place", dest.display()));
             }
@@ -347,9 +460,12 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         let target = app_root.join(version);
-        if !target.join("comet").exists() {
-            bail!("{} is not a staged install", target.display());
-        }
+        validate_managed_release(&target, version).with_context(|| {
+            format!(
+                "refusing to activate incomplete managed release {}",
+                target.display()
+            )
+        })?;
         let tmp = app_root.join(format!(".current-{}", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         std::os::unix::fs::symlink(&target, &tmp).context("creating current symlink")?;
@@ -665,6 +781,22 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn fake_release(dir: &Path, version: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        std::fs::create_dir_all(dir).unwrap();
+        for name in ["comet", "comet-board"] {
+            let path = dir.join(name);
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nprintf '%s\\n' '{name} {version}'\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
     #[test]
     fn version_compare() {
         assert!(version_newer("0.1.1", "0.1.0"));
@@ -743,8 +875,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let app_root = tmp.path().join("app");
         for ver in ["0.1.0", "0.1.1"] {
-            std::fs::create_dir_all(app_root.join(ver)).unwrap();
-            std::fs::write(app_root.join(ver).join("comet"), ver).unwrap();
+            fake_release(&app_root.join(ver), ver);
         }
         apply_headless(&app_root, "0.1.0").unwrap();
         assert_eq!(
@@ -759,5 +890,136 @@ mod tests {
         );
         // Unstaged version refuses.
         assert!(apply_headless(&app_root, "0.2.0").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_activation_refuses_an_engine_only_release() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("app");
+        let complete = app_root.join("0.8.0");
+        let engine_only = app_root.join("0.8.0-hotfix");
+        fake_release(&complete, "0.8.0");
+        fake_release(&engine_only, "0.8.0-hotfix");
+        std::fs::remove_file(engine_only.join("comet-board")).unwrap();
+
+        apply_headless(&app_root, "0.8.0").unwrap();
+        let before = std::fs::read_link(app_root.join("current")).unwrap();
+
+        let error = apply_headless(&app_root, "0.8.0-hotfix").unwrap_err();
+        assert!(format!("{error:#}").contains("comet-board"), "{error:#}");
+        assert_eq!(
+            std::fs::read_link(app_root.join("current")).unwrap(),
+            before,
+            "a refused payload must not move current"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_activation_refuses_version_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app_root = tmp.path().join("app");
+        fake_release(&app_root.join("0.8.0"), "0.8.0");
+        fake_release(&app_root.join("0.8.1"), "0.8.1");
+        let board = app_root.join("0.8.1/comet-board");
+        std::fs::write(&board, "#!/bin/sh\necho 'comet-board 0.8.0'\n").unwrap();
+
+        apply_headless(&app_root, "0.8.0").unwrap();
+        let before = std::fs::read_link(app_root.join("current")).unwrap();
+        let error = apply_headless(&app_root, "0.8.1").unwrap_err();
+        assert!(
+            format!("{error:#}").contains("comet-board 0.8.0"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_link(app_root.join("current")).unwrap(),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_release_refuses_non_executable_binary() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        fake_release(tmp.path(), "0.8.0");
+        let board = tmp.path().join("comet-board");
+        std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let error = validate_managed_release(tmp.path(), "0.8.0").unwrap_err();
+        assert!(error.to_string().contains("not executable"), "{error:#}");
+    }
+
+    /// The curl|sh path used to move `current` after checking only `comet`.
+    /// Exercise the real installer so its shell implementation cannot drift
+    /// away from the Rust updater's pair invariant.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installer_leaves_current_on_engine_only_tarball() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let app_root = home.join(".comet-native/app");
+        let old = app_root.join("0.8.0");
+        fake_release(&old, "0.8.0");
+        std::fs::create_dir_all(&app_root).unwrap();
+        std::os::unix::fs::symlink(&old, app_root.join("current")).unwrap();
+
+        let payload_root = tmp.path().join("comet-0.8.1-linux-x86_64");
+        fake_release(&payload_root, "0.8.1");
+        std::fs::remove_file(payload_root.join("comet-board")).unwrap();
+        let tarball = tmp.path().join("release.tar.gz");
+        let status = Command::new("tar")
+            .args([
+                "-czf",
+                tarball.to_str().unwrap(),
+                "-C",
+                tmp.path().to_str().unwrap(),
+                payload_root.file_name().unwrap().to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        let fake_bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&fake_bin).unwrap();
+        let curl = fake_bin.join("curl");
+        std::fs::write(
+            &curl,
+            r#"#!/bin/sh
+case "$*" in
+  *latest.txt*) printf '0.8.1'; exit 0 ;;
+esac
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then cp "$FAKE_TARBALL" "$2"; exit 0; fi
+  shift
+done
+exit 2
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path = format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let output = Command::new("sh")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../edge/src/install.sh"))
+            .env("HOME", &home)
+            .env("PATH", path)
+            .env("COMET_BASE_URL", "https://fixture.invalid")
+            .env("FAKE_TARBALL", &tarball)
+            .env_remove("XDG_RUNTIME_DIR")
+            .output()
+            .unwrap();
+
+        assert!(!output.status.success(), "installer unexpectedly succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("comet-board"), "{stderr}");
+        assert_eq!(std::fs::read_link(app_root.join("current")).unwrap(), old);
     }
 }

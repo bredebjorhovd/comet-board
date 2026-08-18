@@ -21,7 +21,8 @@ whose agents were supposed to use them.
   `Contents/MacOS` is stat'd. An omission that ships is exactly what happened
   the first time, and it cost nothing to make it impossible to repeat quietly.
 - **One lookup was already written for this layout.** `resolve_board_exe`
-  (§gh#68's askpass helper) tries `COMET_BOARD_EXECUTABLE`, then *beside the
+  (§gh#68's askpass helper) uses the validated sibling for a managed release;
+  source/unmanaged layouts try `COMET_BOARD_EXECUTABLE`, then *beside the
   running binary* — "how it is installed next to the engine" — then PATH. The
   middle step could never hit, because nothing ever put the two side by side; a
   dispatched agent's `GIT_ASKPASS` resolved through PATH to whatever stale
@@ -31,6 +32,12 @@ whose agents were supposed to use them.
   ~/.comet-native/app/current/comet-board`, so a later `comet update` flips one
   symlink and both binaries follow it. That is also precisely why an unmanaged
   binary in the way matters: it is the one thing the flip cannot move.
+- **The runtime now proves the pair before that flip.** gh#496 found the seam
+  left by this work: an emergency engine-only directory could bypass packaging
+  and still become `current`, leaving the engine healthy and every dispatched
+  agent without the CLI. Staging, activation, the curl installer, and managed
+  daemon boot now require two executable, version-matched siblings; refusal
+  preserves the previous `current` target.
 - **A hand-placed binary is not silently replaced.** Both installers take over
   `~/.local/bin/<name>` only when it is missing or already theirs — a symlink
   into the app root for the curl|sh installer, a regular file for the copying

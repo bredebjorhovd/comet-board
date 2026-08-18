@@ -686,23 +686,46 @@ pub fn install_gh_shim(_dir: &Path, _board_exe: &Path, _gh: &Path) -> Result<Pat
     anyhow::bail!("the gh shim is a shell script; only unix boxes dispatch agents")
 }
 
-/// Find `comet-board`: an explicit override, then beside the running binary
-/// (how it is installed next to the engine), then PATH (how it is run by hand).
+/// Find `comet-board`. A managed release always uses the sibling that its boot
+/// fence validated (gh#496); no environment override may redirect the engine
+/// after that proof. Unmanaged/source layouts retain the explicit override,
+/// then sibling, then PATH lookup used by tests and hand-run binaries.
 pub fn resolve_board_exe() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os(BOARD_EXE_ENV).filter(|p| !p.is_empty()) {
-        let p = PathBuf::from(p);
-        return p.exists().then_some(p);
-    }
     let name = if cfg!(windows) {
         "comet-board.exe"
     } else {
         "comet-board"
     };
-    std::env::current_exe()
+    let sibling = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(|dir| dir.join(name)))
-        .filter(|p| p.exists())
-        .or_else(|| in_path(name, None))
+        .filter(|p| p.exists());
+    let explicit = std::env::var_os(BOARD_EXE_ENV)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.exists());
+    choose_board_exe(
+        matches!(
+            comet_update::detect_install(),
+            comet_update::InstallKind::Managed { .. }
+        ),
+        explicit,
+        sibling,
+        in_path(name, None),
+    )
+}
+
+fn choose_board_exe(
+    managed: bool,
+    explicit: Option<PathBuf>,
+    sibling: Option<PathBuf>,
+    path: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if managed {
+        sibling
+    } else {
+        explicit.or(sibling).or(path)
+    }
 }
 
 /// Naming the helper binary outright, for a layout neither lookup above finds.
@@ -802,6 +825,36 @@ mod tests {
         // agent's own cwd on the front of its PATH.
         assert_eq!(bin_dir_of(None), None);
         assert_eq!(bin_dir_of(Some(PathBuf::from("comet-board"))), None);
+    }
+
+    #[test]
+    fn a_managed_release_cannot_be_redirected_after_its_sibling_was_validated() {
+        let sibling = PathBuf::from("/home/comet/.comet-native/app/0.8.0/comet-board");
+        let override_exe = PathBuf::from("/tmp/comet-board");
+        let path_exe = PathBuf::from("/usr/local/bin/comet-board");
+        assert_eq!(
+            choose_board_exe(
+                true,
+                Some(override_exe.clone()),
+                Some(sibling.clone()),
+                Some(path_exe.clone())
+            ),
+            Some(sibling)
+        );
+        assert_eq!(
+            choose_board_exe(
+                false,
+                Some(override_exe.clone()),
+                None,
+                Some(path_exe)
+            ),
+            Some(override_exe)
+        );
+        assert_eq!(
+            choose_board_exe(true, Some(PathBuf::from("/tmp/comet-board")), None, None),
+            None,
+            "a missing managed sibling fails closed instead of taking the override"
+        );
     }
 
     #[test]

@@ -22,8 +22,8 @@ use crate::git_credentials::resolve_board_exe;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliState {
     /// Nothing named `comet-board` beside the engine, on PATH, or under the
-    /// app root. Not a failure by itself — a machine that only runs the engine
-    /// has no use for the CLI.
+    /// app root. Managed releases are rejected before boot in this state
+    /// (gh#496); this variant remains valid for unmanaged/source engines.
     Missing,
     /// It answered, and this is what it said.
     Found { exe: PathBuf, version: String },
@@ -67,7 +67,7 @@ impl CliState {
         match self {
             CliState::Missing => (
                 true,
-                "not installed on this box (the engine does not need it)".into(),
+                "not installed beside this unmanaged/source engine".into(),
             ),
             CliState::Found { exe, version } if version == engine_version => {
                 (true, format!("v{version}, same as this engine · {}", shown(exe)))
