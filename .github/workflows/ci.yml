@@ -96,11 +96,6 @@ jobs:
           }
           EOF
           sudo apparmor_parser -r /etc/apparmor.d/comet-bwrap
-      - name: bubblewrap checkout-prep smoke
-        run: >-
-          cargo test -p comet-engine --lib
-          checkout_prep::tests::bubblewrap_starts_through_the_production_runner
-          -- --exact --nocapture
       # No --all-targets here: it would silently drop doctests.
       - name: cargo test --workspace
         env:
