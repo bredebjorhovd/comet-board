@@ -29,7 +29,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use comet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
-    fold_event_into_parts, sanitize_tool_call,
+    SessionMessageEntry, fold_event_into_parts, sanitize_tool_call,
 };
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
@@ -612,7 +612,7 @@ impl SessionsEngine {
             run_id.clone(),
             harness,
             request,
-            handle.doc_arc(),
+            handle,
             controls,
             engine_rx,
             cancel_rx,
@@ -752,6 +752,22 @@ impl SessionsEngine {
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
 
+        // The journal append is deliberately before the document projection
+        // in `drive_run`: the event must be durable before anything observes
+        // it. That leaves a tiny but real crash window where the journal ends
+        // in Done while the doc still says Streaming. Reconcile every journal,
+        // not just stale ones, before deciding which runs need revival.
+        for chat_id in self.inner.journal.session_ids()? {
+            if lock(&self.inner.runs).contains_key(&chat_id) {
+                continue;
+            }
+            let handle = self.doc_handle(&chat_id)?;
+            let repaired = self.repair_journal_projection(&chat_id, &handle)?;
+            if repaired > 0 {
+                tracing::warn!(chat = %chat_id, repaired, "repaired transcript projection from run journal");
+            }
+        }
+
         let stale = self.inner.journal.stale_sessions()?;
         let mut recovered = 0usize;
         for chat_id in stale {
@@ -865,6 +881,66 @@ impl SessionsEngine {
             });
         }
         Ok(recovered)
+    }
+
+    fn repair_journal_projection(
+        &self,
+        chat_id: &str,
+        handle: &ChatDocHandle,
+    ) -> Result<usize, EngineError> {
+        let records = self.inner.journal.replay_timed(chat_id)?;
+        let segments = completed_journal_segments(records);
+        handle.with_current(|doc| -> Result<usize, DocError> {
+            let mut current = doc.read_entries()?;
+            let mut repaired = 0;
+            for segment in segments {
+                let rendered = render_parts(&segment.parts);
+                if let Some(existing) = current.iter_mut().find(|entry| entry.id == segment.id) {
+                    if existing.parts == rendered && existing.status == Some(segment.status) {
+                        continue;
+                    }
+                    SegmentWriter::resume_or_begin(
+                        doc,
+                        &segment.id,
+                        &self.inner.device_id,
+                        segment.created_at.unwrap_or_else(now_ms),
+                    )?
+                    .finish(&rendered, segment.status)?;
+                    existing.parts = rendered;
+                    existing.status = Some(segment.status);
+                    repaired += 1;
+                    continue;
+                }
+
+                // Old journals did not carry time. Their content remains
+                // available for operator recovery, but blindly appending an
+                // unanchored legacy segment could duplicate the pre-gh#483
+                // random document id or put an answer after later phone turns.
+                let Some(created_at) = segment.created_at else {
+                    tracing::warn!(chat = %chat_id, message = %segment.id,
+                        "legacy journal segment missing from transcript; no timestamp anchor, leaving for explicit recovery");
+                    continue;
+                };
+                let entry = SessionMessageEntry {
+                    id: segment.id,
+                    role: MessageRole::Assistant,
+                    parts: rendered,
+                    created_at,
+                    device_id: self.inner.device_id.clone(),
+                    status: Some(segment.status),
+                    continuation_of: None,
+                };
+                let index = current
+                    .iter()
+                    .position(|present| present.created_at > created_at)
+                    .unwrap_or(current.len());
+                doc.insert_message(index, &entry)?;
+                current.insert(index, entry);
+                repaired += 1;
+            }
+            Ok(repaired)
+        })
+        .map_err(EngineError::from)
     }
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
@@ -1420,9 +1496,112 @@ fn folded_text(parts: &[MessagePart]) -> String {
         .join("\n")
 }
 
-fn sync_segment<'a>(
-    doc: &'a SessionDoc,
-    writer: &mut Option<SegmentWriter<'a>>,
+fn unique_segment_id(handle: &ChatDocHandle, requested: &str, run_id: &str) -> String {
+    let already_present = handle.with_current(|doc| {
+        doc.read_entries()
+            .is_ok_and(|entries| entries.iter().any(|entry| entry.id == requested))
+    });
+    if already_present {
+        format!("{requested}-{run_id}")
+    } else {
+        requested.to_string()
+    }
+}
+
+struct CompletedJournalSegment {
+    id: String,
+    created_at: Option<i64>,
+    parts: Vec<MessagePart>,
+    status: MessageStatus,
+}
+
+/// Fold the journal with the same turn boundaries as `drive_run`, retaining
+/// only segments that reached a durable terminal event. An unfinished tail is
+/// still handled by the ordinary interrupted-run recovery path.
+fn completed_journal_segments(
+    records: Vec<(u64, Option<i64>, AgentEvent)>,
+) -> Vec<CompletedJournalSegment> {
+    let mut completed = Vec::new();
+    let mut entry_id: Option<String> = None;
+    let mut created_at = None;
+    let mut folded = Vec::new();
+
+    for (_, at, event) in records {
+        if let AgentEvent::Steered {
+            assistant_message_id,
+            next_assistant_message_id,
+        } = &event
+        {
+            let previous = entry_id.take().or_else(|| assistant_message_id.clone());
+            if let Some(id) = previous
+                && !folded.is_empty()
+            {
+                completed.push(CompletedJournalSegment {
+                    id,
+                    created_at,
+                    parts: std::mem::take(&mut folded),
+                    status: MessageStatus::Complete,
+                });
+            } else {
+                folded.clear();
+            }
+            entry_id = next_assistant_message_id.clone();
+            created_at = at;
+            continue;
+        }
+
+        if let AgentEvent::SessionStarted {
+            assistant_message_id,
+            ..
+        } = &event
+            && folded.is_empty()
+        {
+            entry_id = Some(assistant_message_id.clone());
+            created_at = at;
+        }
+
+        // Match the live writer's guard: SDKs may repeat SessionStarted while
+        // a background continuation is still extending the same segment.
+        let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
+        if !skip_fold {
+            fold_event_into_parts(&mut folded, &event);
+        }
+
+        if let AgentEvent::Done { status, .. } = event {
+            for part in folded.iter_mut() {
+                if let MessagePart::Input { resolved, .. } = part {
+                    *resolved = true;
+                }
+            }
+            if let Some(id) = entry_id.take()
+                && !folded.is_empty()
+            {
+                completed.push(CompletedJournalSegment {
+                    id,
+                    created_at,
+                    parts: std::mem::take(&mut folded),
+                    status: match status {
+                        DoneStatus::Interrupted => MessageStatus::Aborted,
+                        DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
+                    },
+                });
+            } else {
+                folded.clear();
+            }
+            created_at = None;
+        }
+    }
+    completed
+}
+
+struct LiveSegment {
+    owner: Arc<SessionDoc>,
+    writer: SegmentWriter,
+}
+
+fn sync_segment(
+    handle: &ChatDocHandle,
+    writer: &mut Option<LiveSegment>,
     entry_id: &str,
     device_id: &str,
     started_at: i64,
@@ -1432,18 +1611,31 @@ fn sync_segment<'a>(
         return Ok(());
     }
     let rendered = render_parts(folded);
-    if writer.is_none() {
-        *writer = Some(SegmentWriter::begin(doc, entry_id, device_id, started_at)?);
-    }
-    if let Some(w) = writer.as_mut() {
-        w.sync(&rendered)?;
-    }
-    Ok(())
+    handle.with_current_arc(|owner| {
+        let needs_rebind = writer
+            .as_ref()
+            .is_none_or(|active| !Arc::ptr_eq(&active.owner, owner));
+        if needs_rebind {
+            *writer = Some(LiveSegment {
+                owner: owner.clone(),
+                writer: SegmentWriter::resume_or_begin(
+                    owner.as_ref(),
+                    entry_id,
+                    device_id,
+                    started_at,
+                )?,
+            });
+        }
+        if let Some(active) = writer.as_mut() {
+            active.writer.sync(&rendered)?;
+        }
+        Ok(())
+    })
 }
 
-fn finish_segment<'a>(
-    doc: &'a SessionDoc,
-    writer: Option<SegmentWriter<'a>>,
+fn finish_segment(
+    handle: &ChatDocHandle,
+    writer: Option<LiveSegment>,
     entry_id: &str,
     device_id: &str,
     started_at: i64,
@@ -1451,13 +1643,18 @@ fn finish_segment<'a>(
     status: MessageStatus,
 ) -> Result<(), DocError> {
     let rendered = render_parts(folded);
-    match writer {
-        Some(w) => w.finish(&rendered, status),
+    handle.with_current_arc(|owner| match writer {
+        Some(active) if Arc::ptr_eq(&active.owner, owner) => {
+            active.writer.finish(&rendered, status)
+        }
+        Some(_) => SegmentWriter::resume_or_begin(owner.as_ref(), entry_id, device_id, started_at)?
+            .finish(&rendered, status),
         None if !folded.is_empty() => {
-            SegmentWriter::begin(doc, entry_id, device_id, started_at)?.finish(&rendered, status)
+            SegmentWriter::resume_or_begin(owner.as_ref(), entry_id, device_id, started_at)?
+                .finish(&rendered, status)
         }
         None => Ok(()),
-    }
+    })
 }
 
 /// Resume bookkeeping for one run task: which user entry the run answers (so a
@@ -1496,7 +1693,7 @@ async fn drive_run(
     run_id: String,
     harness: Arc<dyn Harness>,
     request: RunRequest,
-    doc: Arc<SessionDoc>,
+    handle: Arc<ChatDocHandle>,
     controls: RunControls,
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
@@ -1541,11 +1738,10 @@ async fn drive_run(
         }
     };
 
-    let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
-    let mut writer: Option<SegmentWriter<'_>> = None;
+    let mut writer: Option<LiveSegment> = None;
     let mut dirty = false;
     let mut flush_at = tokio::time::Instant::now();
     // Set when the engine interrupts the run: the harness gets this long to end its own
@@ -1609,7 +1805,7 @@ async fn drive_run(
     let mut spin = comet_board::spin::Watch::new(inner.turn_limits(&chat_id));
 
     let final_status = loop {
-        let event: AgentEvent = tokio::select! {
+        let mut event: AgentEvent = tokio::select! {
             biased;
             changed = cancel_rx.changed(), if !interrupted => {
                 let _ = changed;
@@ -1717,7 +1913,7 @@ async fn drive_run(
             _ = tokio::time::sleep_until(flush_at), if dirty => {
                 // Coalesced STREAM_COMMIT_MS tick: one doc commit per window.
                 if let Err(err) = sync_segment(
-                    doc_ref, &mut writer, &entry_id, &device_id, segment_started, &folded,
+                    &handle, &mut writer, &entry_id, &device_id, segment_started, &folded,
                 ) {
                     tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
                 }
@@ -1898,14 +2094,23 @@ async fn drive_run(
         }
 
         // A steer boundary splits the assistant entry exactly where the fold resets.
-        if let AgentEvent::Steered {
-            next_assistant_message_id,
-            ..
-        } = &event
-        {
+        if matches!(&event, AgentEvent::Steered { .. }) {
+            let next_assistant_message_id = match &mut event {
+                AgentEvent::Steered {
+                    next_assistant_message_id,
+                    ..
+                } => {
+                    if let Some(requested) = next_assistant_message_id.as_deref() {
+                        *next_assistant_message_id =
+                            Some(unique_segment_id(&handle, requested, &run_id));
+                    }
+                    next_assistant_message_id.clone()
+                }
+                _ => unreachable!("matched Steered"),
+            };
             inner.publish(&chat_id, &event);
             if let Err(err) = finish_segment(
-                doc_ref,
+                &handle,
                 writer.take(),
                 &entry_id,
                 &device_id,
@@ -1918,16 +2123,32 @@ async fn drive_run(
             inner.note_message(&chat_id, &folded_text(&folded));
             folded.clear();
             dirty = false;
-            entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
+            entry_id = next_assistant_message_id.unwrap_or_else(new_id);
             segment_started = now_ms();
             continue;
         }
 
+        if let AgentEvent::SessionStarted {
+            assistant_message_id,
+            ..
+        } = &mut event
+            && writer.is_none()
+            && folded.is_empty()
+        {
+            *assistant_message_id = unique_segment_id(&handle, assistant_message_id, &run_id);
+        }
+
         match &event {
             AgentEvent::SessionStarted {
-                session_id, cwd, ..
+                session_id,
+                cwd,
+                assistant_message_id,
+                ..
             } => {
                 saw_session_started = true;
+                if writer.is_none() && folded.is_empty() {
+                    entry_id = assistant_message_id.clone();
+                }
                 // The event's own cwd (where the harness actually created the
                 // session) scopes the stored id, not the request's.
                 inner.remember_harness_session(&chat_id, session_id, cwd);
@@ -2003,7 +2224,7 @@ async fn drive_run(
             let nothing_streamed = writer.is_none() && folded.is_empty();
             if !nothing_streamed {
                 if let Err(err) = finish_segment(
-                    doc_ref,
+                    &handle,
                     writer.take(),
                     &entry_id,
                     &device_id,
@@ -2070,7 +2291,7 @@ async fn drive_run(
         });
         tracing::warn!(chat = %chat_id, "run ended with an unfinalized segment; stamping aborted");
         if let Err(err) = finish_segment(
-            doc_ref,
+            &handle,
             writer.take(),
             &entry_id,
             &device_id,

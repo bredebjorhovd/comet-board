@@ -1,7 +1,8 @@
 //! Per-session on-disk event journal (port of comet's `run-journal.ts`, JSONL-shaped).
 //!
 //! One append-only JSONL file per chat under `{data_dir}/journals/{chat_id}.jsonl`; each
-//! line is `{"seq": n, "event": AgentEvent}` with a monotonically increasing `seq`. The
+//! line is `{"seq": n, "at": epoch_ms, "event": AgentEvent}` with a monotonically
+//! increasing `seq`. Older lines without `at` remain readable. The
 //! journal is the durable replay source for live streams (`Subscribe` = replay then tail
 //! the broadcast hub) and the crash-recovery gauge: a journal whose LAST event is not
 //! `Done` belongs to a run that died mid-stream — boot recovery stamps its doc entry
@@ -55,6 +56,10 @@ pub enum JournalError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct JournalLine {
     seq: u64,
+    /// Wall-clock ordering anchor for rebuilding a transcript projection.
+    /// Absent on journals written before gh#483.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    at: Option<i64>,
     event: AgentEvent,
 }
 
@@ -189,6 +194,7 @@ impl RunJournal {
         let seq = journal.next_seq;
         let line = serde_json::to_string(&JournalLine {
             seq,
+            at: Some(chrono::Utc::now().timestamp_millis()),
             event: event.clone(),
         })?;
         let mut buf = Vec::with_capacity(line.len() + 2);
@@ -219,6 +225,50 @@ impl RunJournal {
         let last_seq = all.last().map(|(seq, _)| *seq).unwrap_or(0);
         let from = if after_seq > last_seq { 0 } else { after_seq };
         Ok(all.into_iter().filter(|(seq, _)| *seq > from).collect())
+    }
+
+    /// Full replay with the durable timestamp carried by new journal lines.
+    /// `None` means a pre-gh#483 line; callers must preserve content but cannot
+    /// claim an exact cross-device position from it.
+    pub(crate) fn replay_timed(
+        &self,
+        chat_id: &str,
+    ) -> Result<Vec<(u64, Option<i64>, AgentEvent)>, JournalError> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(path)?;
+        let mut out = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<JournalLine>(&line) {
+                Ok(parsed) => out.push((parsed.seq, parsed.at, parsed.event)),
+                Err(err) => tracing::warn!(error = %err, "journal: skipping malformed line"),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every chat with a journal, including cleanly completed runs. Startup
+    /// transcript repair must inspect those too: `Done` can be durable one
+    /// instruction before the document projection is.
+    pub(crate) fn session_ids(&self) -> Result<Vec<String>, JournalError> {
+        let mut ids = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                ids.push(id.to_string());
+            }
+        }
+        ids.sort();
+        Ok(ids)
     }
 
     /// Everything a chat has spent, summed off its journal (gh#151).

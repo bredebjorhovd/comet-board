@@ -26,6 +26,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 use futures::{SinkExt, StreamExt};
 use loro::awareness::EphemeralStore;
 use loro::{ExportMode, LoroDoc, VersionVector};
@@ -40,7 +42,11 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 
 use comet_engine::{EdgeConfig, EngineCore, HarnessRegistry, default_registry};
-use comet_proto::HarnessId;
+use comet_harness::{Harness, HarnessError, RunControls};
+use comet_proto::{
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    SteeringMode,
+};
 
 const ORG: &str = "org-edge";
 const USER: &str = "alice";
@@ -150,6 +156,49 @@ impl FakeEdge {
         self.redeploy();
     }
 
+    /// Advance a session room by one server-only message, trim its history to
+    /// a shallow snapshot, and cycle its sockets. A connected stale full
+    /// client must replace its document owner when it rejoins.
+    fn shallow_session_room(&self, room_id: &str) {
+        let current = self
+            .state
+            .lock()
+            .expect("lock")
+            .docs
+            .get(room_id)
+            .cloned()
+            .expect("session room exists");
+        comet_doc::SessionDoc::from_doc(current.clone())
+            .push_message(&comet_doc::SessionMessageEntry {
+                id: "phone-followup".into(),
+                role: comet_doc::MessageRole::User,
+                parts: vec![comet_doc::MessagePart::Text {
+                    id: "phone-followup-text".into(),
+                    text: "did the overnight work finish?".into(),
+                }],
+                created_at: chrono::Utc::now().timestamp_millis() + 1,
+                device_id: "device-phone".into(),
+                status: None,
+                continuation_of: None,
+            })
+            .expect("append server-only follow-up");
+        let shallow_bytes = current
+            .export(ExportMode::shallow_snapshot(&current.oplog_frontiers()))
+            .expect("export shallow session snapshot");
+        let shallow = LoroDoc::new();
+        let status = shallow
+            .import(&shallow_bytes)
+            .expect("import shallow session snapshot");
+        assert!(status.pending.is_none());
+        assert!(shallow.is_shallow());
+        self.state
+            .lock()
+            .expect("lock")
+            .docs
+            .insert(room_id.into(), shallow);
+        self.redeploy();
+    }
+
     /// Read a room's SERVER-side doc as a workspace doc — what a device that
     /// has never seen this workspace before would be backfilled with.
     fn room_chat_ids(&self, room_id: &str) -> Vec<String> {
@@ -166,6 +215,17 @@ impl FakeEdge {
         comet_doc::WorkspaceDoc::from_doc(mirror)
             .read_chats()
             .map(|chats| chats.into_iter().map(|chat| chat.id).collect())
+            .unwrap_or_default()
+    }
+
+    fn room_session_entries(&self, room_id: &str) -> Vec<comet_doc::SessionMessageEntry> {
+        self.state
+            .lock()
+            .expect("lock")
+            .docs
+            .get(room_id)
+            .cloned()
+            .and_then(|doc| comet_doc::SessionDoc::from_doc(doc).read_entries().ok())
             .unwrap_or_default()
     }
 }
@@ -506,11 +566,20 @@ fn assemble(dir: &std::path::Path, edge_url: &str) -> EngineCore {
 }
 
 fn assemble_as(dir: &std::path::Path, edge_url: &str, device_id: &str) -> EngineCore {
+    assemble_with_registry(dir, edge_url, device_id, registry())
+}
+
+fn assemble_with_registry(
+    dir: &std::path::Path,
+    edge_url: &str,
+    device_id: &str,
+    registry: Arc<HarnessRegistry>,
+) -> EngineCore {
     std::fs::create_dir_all(dir).expect("create data dir");
     std::fs::write(dir.join("device-id"), device_id).expect("write device id");
     EngineCore::assemble_with_identity(
         dir,
-        registry(),
+        registry,
         HarnessId::Mock,
         Some(EdgeConfig::with_static_token(
             edge_url,
@@ -520,6 +589,91 @@ fn assemble_as(dir: &std::path::Path, edge_url: &str, device_id: &str) -> Engine
         USER,
     )
     .expect("engine assembles")
+}
+
+struct GatedHarness {
+    partial_tx: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release_rx: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl Harness for GatedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+
+    fn display_name(&self) -> &str {
+        "Gated"
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(Vec::new())
+    }
+
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let partial_tx = self.partial_tx.lock().expect("lock").take();
+        let release_rx = self.release_rx.lock().expect("lock").take();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(async move {
+            let events = [
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: Vec::new(),
+                    cwd: request.cwd,
+                    session_id: "gated-session".into(),
+                    assistant_message_id: "gated-assistant".into(),
+                },
+                AgentEvent::TextDelta {
+                    text: "before recovery".into(),
+                },
+            ];
+            for event in events {
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+            if let Some(partial_tx) = partial_tx {
+                let _ = partial_tx.send(());
+            }
+            if let Some(release_rx) = release_rx {
+                let _ = release_rx.await;
+            }
+            let _ = tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: " after recovery".into(),
+                }))
+                .await;
+            let _ = tx
+                .send(Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some("gated-session".into()),
+                }))
+                .await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
+    }
 }
 
 async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
@@ -533,6 +687,104 @@ async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// gh#483 — an overnight auto-resume can overlap shallow-history recovery.
+/// The run used to keep the pre-recovery `Arc<SessionDoc>` forever, so its
+/// journal reached Done while the document owner watched by Mac and iPhone
+/// stayed on the partial entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_run_finishes_on_the_reseeded_session_document() {
+    let edge = fake_edge().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(GatedHarness {
+        partial_tx: Mutex::new(Some(partial_tx)),
+        release_rx: Mutex::new(Some(release_rx)),
+    }));
+    let core = assemble_with_registry(dir.path(), &edge.url, "device-box", Arc::new(registry));
+    core.workspace
+        .create_space("space-race", "device-box", "/tmp", None, false)
+        .expect("create space");
+    core.workspace
+        .create_chat("chat-race", "space-race", None, None)
+        .expect("create chat");
+    core.workspace
+        .rename_chat("chat-race", "Reseed race")
+        .expect("pre-title chat");
+    let handle = core.doc_host.open("chat-race").expect("open chat");
+    wait_until("the session room to join", || edge.joins("chat-race") >= 1).await;
+
+    core.sessions
+        .dispatch(
+            "chat-race",
+            HarnessId::Mock,
+            RunRequest {
+                prompt: "finish overnight work".into(),
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: "/tmp".into(),
+                sandbox: SandboxLevel::WorkspaceWrite,
+                auto_approve: true,
+                attachments: Vec::new(),
+                resume: None,
+            },
+            Some("race-user".into()),
+        )
+        .await
+        .expect("dispatch gated run");
+    partial_rx.await.expect("harness reached recovery gate");
+    wait_until("the partial assistant entry to reach the edge", || {
+        edge.room_session_entries("chat-race").iter().any(|entry| {
+            entry.role == comet_doc::MessageRole::Assistant
+                && entry.parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        comet_doc::MessagePart::Text { text, .. } if text == "before recovery"
+                    )
+                })
+        })
+    })
+    .await;
+
+    edge.shallow_session_room("chat-race");
+    wait_until("the handle to install the shallow replacement", || {
+        handle.doc().doc().is_shallow()
+            && handle
+                .doc()
+                .read_entries()
+                .is_ok_and(|entries| entries.iter().any(|entry| entry.id == "phone-followup"))
+    })
+    .await;
+
+    release_tx.send(()).expect("release gated harness");
+    wait_until("the run to report idle", || {
+        core.sessions
+            .watch_sessions()
+            .borrow()
+            .iter()
+            .find(|session| session.chat_id == "chat-race")
+            .is_some_and(|session| session.status == comet_proto::SessionStatus::Idle)
+    })
+    .await;
+
+    let assistant = handle
+        .doc()
+        .read_entries()
+        .expect("read final transcript")
+        .into_iter()
+        .find(|entry| entry.role == comet_doc::MessageRole::Assistant)
+        .expect("assistant entry survives reseed");
+    assert_eq!(assistant.id, "gated-assistant");
+    assert_eq!(assistant.status, Some(comet_doc::MessageStatus::Complete));
+    assert!(assistant.parts.iter().any(|part| matches!(
+        part,
+        comet_doc::MessagePart::Text { text, .. }
+            if text == "before recovery after recovery"
+    )));
 }
 
 // ---------------------------------------------------------------------------

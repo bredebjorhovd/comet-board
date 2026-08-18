@@ -678,6 +678,122 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
 }
 
 #[tokio::test]
+async fn completed_journal_repairs_a_streaming_projection_on_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("device-id"), "dev-crash").unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    {
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-user-1".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "user-text".into(),
+                text: "finish the overnight task".into(),
+            }],
+            created_at: now - 2,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "msg-assistant-1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "partial".into(),
+            }],
+            created_at: now - 1,
+            device_id: "dev-crash".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+
+        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        for event in [
+            AgentEvent::SessionStarted {
+                harness: HarnessId::Mock,
+                model: "mock-1".into(),
+                tools: vec![],
+                cwd: "/tmp".into(),
+                session_id: "hs-complete".into(),
+                assistant_message_id: "msg-assistant-1".into(),
+            },
+            AgentEvent::TextDelta {
+                text: "partial".into(),
+            },
+            AgentEvent::TextDelta {
+                text: " answer".into(),
+            },
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("hs-complete".into()),
+            },
+        ] {
+            journal.append(CHAT, &event).unwrap();
+        }
+    }
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        &dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "must-not-run".into(),
+            fail_on_resume: false,
+        },
+    );
+    let assistant = entries_now(&core)
+        .into_iter()
+        .find(|entry| entry.id == "msg-assistant-1")
+        .expect("assistant projection remains present");
+    assert_eq!(assistant.status, Some(MessageStatus::Complete));
+    assert!(assistant.parts.iter().any(|part| matches!(
+        part,
+        MessagePart::Text { text, .. } if text == "partial answer"
+    )));
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a completed journal is repaired, never auto-resumed"
+    );
+    let before = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .export_snapshot()
+        .unwrap();
+    core.sessions
+        .recover_stale()
+        .expect("a second recovery pass succeeds");
+    let after = core
+        .doc_host
+        .open(CHAT)
+        .unwrap()
+        .doc()
+        .export_snapshot()
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "journal projection repair must be idempotent after the first pass"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn resume_is_cwd_scoped() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path().join("data");

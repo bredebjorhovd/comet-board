@@ -36,8 +36,8 @@ use tokio::sync::watch;
 
 use comet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
-    MessagePart, MessageRole, MessageStatus, QueueView, SessionCommandEntry, SessionCommandPayload,
-    SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
+    MessagePart, MessageRole, MessageStatus, QueueView, SegmentWriter, SessionCommandEntry,
+    SessionCommandPayload, SessionCommandStatus, SessionDoc, SessionMessageEntry, evaluate_command,
     join_continuation_entries, queue,
 };
 use comet_proto::{ContextRef, HarnessId, UserInputAnswer, UserInputQuestion};
@@ -285,6 +285,115 @@ fn reconcile_device_commands(
     Ok(replayed)
 }
 
+/// Carry semantic transcript rows across a shallow-history owner swap.
+///
+/// The replacement is causally authoritative, but it is not allowed to erase
+/// entries that exist only in the device's durable snapshot. Message ids are
+/// stable deduplication keys. Missing rows are inserted by their semantic
+/// timestamp so an answer that completed locally still precedes a later phone
+/// follow-up already present in the server snapshot.
+fn reconcile_transcript(stale: &SessionDoc, replacement: &SessionDoc) -> Result<usize, DocError> {
+    let mut current = replacement.read_entries()?;
+    let mut replayed = 0;
+    for entry in stale.read_entries()? {
+        if let Some(index) = current.iter().position(|present| present.id == entry.id) {
+            if transcript_entry_advances(&entry, &current[index]) {
+                let mut writer = SegmentWriter::resume_or_begin(
+                    replacement,
+                    &entry.id,
+                    &entry.device_id,
+                    entry.created_at,
+                )?;
+                match entry.status {
+                    Some(MessageStatus::Complete) => {
+                        writer.finish(&entry.parts, MessageStatus::Complete)?
+                    }
+                    Some(MessageStatus::Aborted) => {
+                        writer.finish(&entry.parts, MessageStatus::Aborted)?
+                    }
+                    Some(MessageStatus::Streaming) | None => writer.sync(&entry.parts)?,
+                }
+                current[index] = entry;
+                replayed += 1;
+            }
+            continue;
+        }
+        let index = current
+            .iter()
+            .position(|present| present.created_at > entry.created_at)
+            .unwrap_or(current.len());
+        replacement.insert_message(index, &entry)?;
+        current.insert(index, entry);
+        replayed += 1;
+    }
+    Ok(replayed)
+}
+
+/// True when `candidate` is a monotonic extension of the same assistant row.
+/// Recovery may enrich a server-side prefix, but must never replace a more
+/// complete server row with a stale local prefix.
+fn transcript_entry_advances(
+    candidate: &SessionMessageEntry,
+    present: &SessionMessageEntry,
+) -> bool {
+    if candidate.role != MessageRole::Assistant
+        || present.role != MessageRole::Assistant
+        || candidate.parts.len() < present.parts.len()
+    {
+        return false;
+    }
+    let status_advances = match (candidate.status, present.status) {
+        (
+            Some(MessageStatus::Complete | MessageStatus::Aborted),
+            Some(MessageStatus::Streaming),
+        ) => true,
+        (candidate, present) => candidate == present,
+    };
+    status_advances
+        && candidate
+            .parts
+            .iter()
+            .zip(&present.parts)
+            .all(|(candidate, present)| match (candidate, present) {
+                (
+                    MessagePart::Text {
+                        id: candidate_id,
+                        text: candidate_text,
+                    },
+                    MessagePart::Text {
+                        id: present_id,
+                        text: present_text,
+                    },
+                ) => candidate_id == present_id && candidate_text.starts_with(present_text),
+                (
+                    MessagePart::Tool {
+                        id: candidate_id,
+                        resolved: candidate_resolved,
+                        ..
+                    },
+                    MessagePart::Tool {
+                        id: present_id,
+                        resolved: present_resolved,
+                        ..
+                    },
+                ) => candidate_id == present_id && (!present_resolved || *candidate_resolved),
+                (
+                    MessagePart::Input {
+                        request_id: candidate_id,
+                        resolved: candidate_resolved,
+                        ..
+                    },
+                    MessagePart::Input {
+                        request_id: present_id,
+                        resolved: present_resolved,
+                        ..
+                    },
+                ) => candidate_id == present_id && (!present_resolved || *candidate_resolved),
+                (candidate, present) => candidate == present,
+            })
+        && candidate != present
+}
+
 impl ChatDocHandle {
     pub fn chat_id(&self) -> &str {
         &self.chat_id
@@ -321,9 +430,17 @@ impl ChatDocHandle {
         self.doc()
     }
 
-    fn with_current<R>(&self, operation: impl FnOnce(&SessionDoc) -> R) -> R {
+    pub(crate) fn with_current<R>(&self, operation: impl FnOnce(&SessionDoc) -> R) -> R {
         let owner = self.doc.read().unwrap_or_else(PoisonError::into_inner);
         operation(owner.as_ref())
+    }
+
+    /// Run a mutation against the current owner while holding the ownership
+    /// read gate. A reseed therefore happens wholly before or wholly after the
+    /// mutation, and can reconcile any write that landed on the old owner.
+    pub(crate) fn with_current_arc<R>(&self, operation: impl FnOnce(&Arc<SessionDoc>) -> R) -> R {
+        let owner = self.doc.read().unwrap_or_else(PoisonError::into_inner);
+        operation(&owner)
     }
 
     fn reseed(&self, raw: loro::LoroDoc) -> Result<usize, DocError> {
@@ -333,7 +450,8 @@ impl ChatDocHandle {
         // command either finishes on the old owner and is copied below, or
         // starts after the replacement is visible and writes there directly.
         let mut owner = self.doc.write().unwrap_or_else(PoisonError::into_inner);
-        let replayed =
+        let replayed_transcript = reconcile_transcript(owner.as_ref(), replacement.as_ref())?;
+        let replayed_commands =
             reconcile_device_commands(owner.as_ref(), replacement.as_ref(), &self.device_id)?;
         let changed_tx = self.changed_tx.clone();
         let sub = replacement.doc().subscribe_root(Arc::new(move |_diff| {
@@ -346,7 +464,7 @@ impl ChatDocHandle {
         // subscription existed. Publish the ownership swap itself so mirrors
         // and disk persistence immediately read the replacement.
         self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
-        Ok(replayed)
+        Ok(replayed_transcript + replayed_commands)
     }
 
     /// Joined transcript watch — re-sent on every doc change (WatchDocMessages).
@@ -2276,7 +2394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_reseed_moves_the_handle_and_its_watch_to_the_replacement() {
+    async fn a_reseed_moves_the_handle_and_watch_without_erasing_local_rows() {
         let dir = tempfile::tempdir().expect("tempdir");
         let host = host(dir.path());
         let handle = host.open("chat-reseed").expect("open");
@@ -2309,8 +2427,20 @@ mod tests {
             .await
             .expect("replacement is published")
             .expect("watch stays open");
-        assert_eq!(handle.doc().read_entries().unwrap()[0].id, "server");
-        assert_eq!(messages.borrow_and_update()[0].id, "server");
+        let ids: Vec<_> = handle
+            .doc()
+            .read_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(ids, ["old", "server"]);
+        let watched_ids: Vec<_> = messages
+            .borrow_and_update()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(watched_ids, ["old", "server"]);
 
         // The reseed also rebinds the root subscription: later writes through
         // the stable handle still wake transcript consumers.
@@ -2321,7 +2451,115 @@ mod tests {
             .await
             .expect("post-reseed commit is published")
             .expect("watch stays open");
-        assert_eq!(messages.borrow().len(), 2);
+        assert_eq!(messages.borrow().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_reseed_preserves_the_local_transcript_suffix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let host = host(dir.path());
+        let handle = host.open("chat-reseed-transcript").expect("open");
+        handle
+            .write_user_message("local-user", "queued while the room was stale", 2)
+            .expect("write local user entry");
+        handle
+            .doc()
+            .push_message(&SessionMessageEntry {
+                id: "local-assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "local-assistant-text".into(),
+                    text: "finished locally".into(),
+                }],
+                device_id: "dev-test".into(),
+                created_at: 3,
+                status: Some(MessageStatus::Complete),
+                continuation_of: None,
+            })
+            .expect("write local assistant entry");
+        let mut messages = handle.watch_messages();
+        messages.borrow_and_update();
+
+        // A validated shallow server snapshot can be causally newer while
+        // missing semantic entries the local device has not uploaded yet.
+        let replacement = SessionDoc::init("chat-reseed-transcript").expect("replacement doc");
+        replacement
+            .push_message(&SessionMessageEntry {
+                id: "server-prefix".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "server-prefix-text".into(),
+                    text: "known by the edge".into(),
+                }],
+                device_id: "phone".into(),
+                created_at: 1,
+                status: None,
+                continuation_of: None,
+            })
+            .expect("write server prefix");
+        replacement
+            .push_message(&SessionMessageEntry {
+                id: "local-assistant".into(),
+                role: MessageRole::Assistant,
+                parts: vec![MessagePart::Text {
+                    id: "local-assistant-text".into(),
+                    text: "finished".into(),
+                }],
+                device_id: "dev-test".into(),
+                created_at: 3,
+                status: Some(MessageStatus::Streaming),
+                continuation_of: None,
+            })
+            .expect("write server-side assistant prefix");
+        replacement
+            .push_message(&SessionMessageEntry {
+                id: "server-followup".into(),
+                role: MessageRole::User,
+                parts: vec![MessagePart::Text {
+                    id: "server-followup-text".into(),
+                    text: "sent from the phone after the missing answer".into(),
+                }],
+                device_id: "phone".into(),
+                created_at: 4,
+                status: None,
+                continuation_of: None,
+            })
+            .expect("write later server entry");
+
+        handle
+            .reseed(replacement.doc().clone())
+            .expect("reseed owner");
+        tokio::time::timeout(Duration::from_secs(1), messages.changed())
+            .await
+            .expect("replacement is published")
+            .expect("watch stays open");
+
+        let ids: Vec<_> = messages
+            .borrow_and_update()
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "server-prefix",
+                "local-user",
+                "local-assistant",
+                "server-followup"
+            ],
+            "shallow-history recovery must not discard locally durable transcript entries"
+        );
+        let assistant = messages
+            .borrow()
+            .iter()
+            .find(|entry| entry.id == "local-assistant")
+            .cloned()
+            .expect("assistant entry remains");
+        assert_eq!(assistant.status, Some(MessageStatus::Complete));
+        assert!(assistant.parts.iter().any(|part| matches!(
+            part,
+            MessagePart::Text { text, .. } if text == "finished locally"
+        )));
     }
 
     #[tokio::test]

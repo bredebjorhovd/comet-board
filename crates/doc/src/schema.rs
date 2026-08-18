@@ -216,7 +216,20 @@ impl SessionDoc {
     /// Streaming assistant entries go through [`SegmentWriter`].
     pub fn push_message(&self, entry: &SessionMessageEntry) -> Result<(), DocError> {
         let messages = self.doc.get_list("messages");
-        let map = messages.push_container(LoroMap::new())?;
+        self.insert_message(messages.len(), entry)
+    }
+
+    /// Insert a complete message entry at a semantic transcript position.
+    ///
+    /// Shallow-snapshot recovery uses this to restore a locally durable entry
+    /// before a later message that already exists in the replacement doc.
+    pub fn insert_message(
+        &self,
+        index: usize,
+        entry: &SessionMessageEntry,
+    ) -> Result<(), DocError> {
+        let messages = self.doc.get_list("messages");
+        let map = messages.insert_container(index, LoroMap::new())?;
         write_entry_scalar_fields(&map, entry)?;
         let parts = map.insert_container("parts", LoroList::new())?;
         for part in &entry.parts {
@@ -611,23 +624,27 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
 ///
 /// Invariant relied upon: the fold only ever APPENDS parts or grows the trailing text; earlier
 /// text never mutates. Tool/input parts may update fields in place.
-pub struct SegmentWriter<'a> {
-    doc: &'a SessionDoc,
+pub struct SegmentWriter {
+    // `LoroDoc::clone` is another handle to the same CRDT, not a deep copy.
+    // Owning the handle lets an engine stream rebind this writer when shallow
+    // recovery replaces the application-level `SessionDoc` owner.
+    doc: LoroDoc,
     /// Index of this entry in the `messages` list.
     entry_index: usize,
     /// Mirror of what we've written so far (part id → app part).
     written: Vec<MessagePart>,
 }
 
-impl<'a> SegmentWriter<'a> {
+impl SegmentWriter {
     /// Begin a streaming assistant entry: pushes the entry with `status: streaming`, no parts.
     pub fn begin(
-        doc: &'a SessionDoc,
+        doc: &SessionDoc,
         entry_id: &str,
         device_id: &str,
         created_at: i64,
     ) -> Result<Self, DocError> {
-        let messages = doc.doc.get_list("messages");
+        let owned = doc.doc.clone();
+        let messages = owned.get_list("messages");
         let entry_index = messages.len();
         let map = messages.push_container(LoroMap::new())?;
         write_entry_scalar_fields(
@@ -645,14 +662,48 @@ impl<'a> SegmentWriter<'a> {
         map.insert_container("parts", LoroList::new())?;
         doc.doc.commit();
         Ok(Self {
-            doc,
+            doc: owned,
             entry_index,
             written: Vec::new(),
         })
     }
 
+    /// Resume an entry by its stable message id, or create it when the
+    /// replacement snapshot does not contain it yet.
+    pub fn resume_or_begin(
+        doc: &SessionDoc,
+        entry_id: &str,
+        device_id: &str,
+        created_at: i64,
+    ) -> Result<Self, DocError> {
+        let owned = doc.doc.clone();
+        let messages = owned.get_list("messages");
+        for entry_index in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(entry_index)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                map.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(id)))
+                    if id.as_str() == entry_id
+            );
+            if !id_matches {
+                continue;
+            }
+            let entry = entry_from_json(map.get_deep_value().to_json_value())?;
+            return Ok(Self {
+                doc: owned,
+                entry_index,
+                written: entry.parts,
+            });
+        }
+        Self::begin(doc, entry_id, device_id, created_at)
+    }
+
     fn entry_map(&self) -> Result<LoroMap, DocError> {
-        let messages = self.doc.doc.get_list("messages");
+        let messages = self.doc.get_list("messages");
         match messages.get(self.entry_index) {
             Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) => Ok(map),
             _ => Err(DocError::Schema("streaming entry map missing".into())),
@@ -722,7 +773,7 @@ impl<'a> SegmentWriter<'a> {
         }
 
         if dirty {
-            self.doc.doc.commit();
+            self.doc.commit();
         }
         Ok(())
     }
@@ -732,7 +783,7 @@ impl<'a> SegmentWriter<'a> {
         self.sync(folded)?;
         let map = self.entry_map()?;
         map.insert("status", status_str(status))?;
-        self.doc.doc.commit();
+        self.doc.commit();
         Ok(())
     }
 }
