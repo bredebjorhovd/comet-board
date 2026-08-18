@@ -1184,6 +1184,12 @@ fn handle_dispatch(
                     task.identifier, handle.cwd
                 )),
             }
+            // And what origin already holds for the branch (gh#489): a retry
+            // or repair run reuses a branch a previous attempt pushed, and
+            // without this stamp the settle reads that pre-existing remote
+            // branch as proof *this* run pushed — and accuses its rightly
+            // untouched credential path.
+            engine.stamp_origin_at_start(&task, attempt_id, &handle.cwd, &spec.branch);
             // The upstream comment names the parent legibly: the issue
             // identifier when the board dispatched it too, the human who
             // released it next (gh#74), and a bare chat id only when it has

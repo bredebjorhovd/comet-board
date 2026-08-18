@@ -3034,6 +3034,29 @@ mod tests {
         assert!(!supported_n_minus_one("1.7.1", "0.8.0"));
     }
 
+    /// gh#507: the legacy-peer fixture in tests/device_routing.rs derives its
+    /// version as "same major, minor − 1" from CARGO_PKG_VERSION. Pin that
+    /// derivation here so a release bump that breaks it (say, a major bump to
+    /// x.0.0) fails at this rule, not as a probe-deadline timeout over there.
+    #[test]
+    fn current_build_accepts_a_derived_n_minus_one_peer() {
+        let collector = env!("CARGO_PKG_VERSION");
+        let parts = comet_update::release_version_parts(collector)
+            .expect("workspace version is dotted-numeric");
+        assert_eq!(
+            parts.len(),
+            3,
+            "workspace version {collector} is not three-part"
+        );
+        assert!(
+            parts[1] > 0,
+            "workspace version {collector} has no previous minor line; the N-1 fixture derivation needs a new rule"
+        );
+        let peer = format!("{}.{}.1", parts[0], parts[1] - 1);
+        assert!(supported_n_minus_one(&peer, collector));
+        assert!(!supported_n_minus_one(collector, collector));
+    }
+
     /// gh#97: onboarding is three device-local effects behind one verb — a
     /// clone on the box's disk, a space the box owns, and the box's
     /// routing.toml — and the laptop asking for it usually has none of the

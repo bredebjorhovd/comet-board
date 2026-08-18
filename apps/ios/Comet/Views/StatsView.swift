@@ -124,7 +124,7 @@ struct StatsView: View {
             if !scopeWasPicked {
                 let sweptHost = model.boardHostDeviceId
                 boardId = read.boards.first { $0.host.deviceId == sweptHost }?.boardId
-                    ?? read.boards.first { $0.stats.dispatched }?.boardId
+                    ?? read.boards.first { $0.stats.dispatched == true }?.boardId
                     ?? read.boards.first?.boardId
             } else if !selectedStillExists {
                 boardId = nil
