@@ -102,6 +102,8 @@ fn main() -> Result<()> {
     let base = build_checkout(&checkout)?;
 
     let attempt = db.insert_attempt(&NewAttempt {
+        automation: None,
+        automation_owner: None,
         stacked_on: None,
         task_id: TASK_ID.into(),
         pane_id: Some(CHAT_ID.into()),

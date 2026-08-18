@@ -198,6 +198,9 @@ parent that has not pushed refuses the release rather than cutting from trunk. `
 somebody else's subscription, which `billing_guard = "require-own"` wants
 instead of a refusal — see §gh#97. `via`/`viaDevice`/`viaUser` are provenance,
 never authority — see §gh#73.
+`ReadBoardAutomations` → the auto-pick rules with their derived health, live
+and daily meters, and recent run history (§gh#490); the rules themselves are
+`routing.toml` and are edited through `WriteBoardConfig`'s `automation*` ops.
 
 The write-ups for the three that needed one — per-run agent accounts (gh#59),
 a teammate's view of the board (gh#66), GitHub App auth (gh#58) — are in

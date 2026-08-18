@@ -1977,6 +1977,8 @@ mod tests {
 
     fn row(id: &str, state: &str) -> TaskRow {
         TaskRow {
+            automation: None,
+            automation_owner: None,
             id: id.into(),
             identifier: id.into(),
             title: format!("task {id}"),
@@ -2396,6 +2398,8 @@ mod tests {
 
     fn review_of(remainder: Remainder, changed_files: Vec<ChangedFile>) -> AttemptReview {
         AttemptReview {
+            automation: None,
+            automation_owner: None,
             task_id: "gh:o/r#183".into(),
             attempt: 7,
             attempt_number: 2,

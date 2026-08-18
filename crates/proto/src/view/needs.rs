@@ -393,6 +393,8 @@ mod tests {
 
     fn attempt(id: &str, chat_id: &str, state: BoardState) -> TaskRow {
         TaskRow {
+            automation: None,
+            automation_owner: None,
             id: id.into(),
             identifier: format!("gh#{id}"),
             title: format!("task {id}"),

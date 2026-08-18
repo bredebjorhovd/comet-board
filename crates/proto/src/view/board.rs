@@ -560,6 +560,16 @@ pub struct TaskRow {
     /// empty context is a very different claim from a silent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<crate::ContextUsage>,
+    /// The auto-pick rule that released this row's attempt (gh#490), and the
+    /// human who owns that rule. Both absent on every row a person or an
+    /// orchestrating agent dispatched — automation provenance marks the
+    /// exception, and [`automation_line`] is the sentence both viewports
+    /// render from it. Defaulted on the wire so a row from an older box
+    /// simply reads as nobody's automation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_owner: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2117,6 +2127,30 @@ pub fn history_line(row: &TaskRow, now: DateTime<Utc>) -> Option<String> {
     Some(parts.join(" · "))
 }
 
+/// The automation provenance sentence (gh#490), for the detail's facts block:
+/// `dispatched by “Approved maintenance” · owned by Brede`. `None` for every
+/// row no rule released — which is most of them — so a surface can append it
+/// beside [`history_line`] without guarding.
+///
+/// One derivation rather than two fields rendered ad hoc, for [`landing`]'s
+/// reason: the rule name and its owner must never be shown apart. A rule name
+/// alone is provenance nobody answers for.
+pub fn automation_line(row: &TaskRow) -> Option<String> {
+    let rule = row.automation.as_deref().map(str::trim).filter(|r| !r.is_empty())?;
+    match row
+        .automation_owner
+        .as_deref()
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+    {
+        Some(owner) => Some(format!("dispatched by “{rule}” · owned by {owner}")),
+        // An owner should always be there — enabling requires one — but a
+        // hand-edited config can say otherwise, and unowned must be said out
+        // loud rather than rendered as a person named "".
+        None => Some(format!("dispatched by “{rule}” · unowned")),
+    }
+}
+
 /// Where this row's work is happening, for the detail's facts block: the route,
 /// the space, the runtime and the branch, each named only when it is known.
 ///
@@ -2786,7 +2820,31 @@ mod tests {
             billed_to: None,
             max_duration_secs: None,
             context: None,
+            automation: None,
+            automation_owner: None,
         }
+    }
+
+    /// gh#490: the provenance sentence names the rule and its owner together
+    /// — never the rule alone, because a rule name alone is provenance nobody
+    /// answers for — and says nothing at all on a row a person dispatched.
+    #[test]
+    fn the_automation_line_names_rule_and_owner_together() {
+        let mut r = row("1", BoardState::Working);
+        assert_eq!(automation_line(&r), None);
+        r.automation = Some("Approved maintenance".into());
+        r.automation_owner = Some("Brede".into());
+        assert_eq!(
+            automation_line(&r).unwrap(),
+            "dispatched by “Approved maintenance” · owned by Brede"
+        );
+        // A hand-edited config can drop the owner; unowned is said out loud
+        // rather than rendered as a person named "".
+        r.automation_owner = Some("  ".into());
+        assert_eq!(
+            automation_line(&r).unwrap(),
+            "dispatched by “Approved maintenance” · unowned"
+        );
     }
 
     #[test]

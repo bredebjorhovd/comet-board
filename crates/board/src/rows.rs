@@ -149,6 +149,11 @@ pub fn task_row(
         // describe the work. A finished attempt's last reading stays on its
         // row in the database for the stats page; it is not row furniture.
         context: live.and_then(|a| a.context),
+        // Which rule released it and whose automation that is (gh#490) — same
+        // live-then-last shape as `runtime`, because a settled autonomous
+        // attempt is exactly the one whose provenance a reviewer asks about.
+        automation: live.or(last).and_then(|a| a.automation.clone()),
+        automation_owner: live.or(last).and_then(|a| a.automation_owner.clone()),
     };
     // The verdict, from the row that was just built — one implementation of the
     // AND across a stack, shared with both viewports (gh#283). Every reader of
@@ -246,6 +251,8 @@ mod tests {
         seed(&db, "gh:o/r#1", "gh#1");
         let a = db
             .insert_attempt(&NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: "gh:o/r#1".into(),
                 pane_id: None,
@@ -292,6 +299,8 @@ mod tests {
         let db = Db::open_in_memory().unwrap();
         seed(&db, "gh:o/r#74", "gh#74");
         db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             task_id: "gh:o/r#74".into(),
             pane_id: None,
@@ -328,6 +337,8 @@ mod tests {
         seed(&db, "gh:o/r#2", "gh#2");
         let first = db
             .insert_attempt(&NewAttempt {
+                automation: None,
+                automation_owner: None,
                 stacked_on: None,
                 task_id: "gh:o/r#2".into(),
                 pane_id: None,
@@ -348,6 +359,8 @@ mod tests {
             .unwrap();
         db.close_attempt(first, Outcome::Cancelled).unwrap();
         db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             task_id: "gh:o/r#2".into(),
             pane_id: None,
@@ -413,6 +426,8 @@ mod tests {
         // Once an attempt exists, the row reports what it actually ran under —
         // here a per-dispatch override of the route's default.
         db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             task_id: "gh:o/r#5".into(),
             pane_id: None,
@@ -469,6 +484,45 @@ mod tests {
         assert_eq!(rows[0].max_duration_secs, Some(6 * 3600));
     }
 
+    /// Automation provenance rides the row (gh#490) — live first, then the
+    /// latest attempt, because a settled autonomous attempt is exactly the one
+    /// whose provenance a reviewer asks about.
+    #[test]
+    fn rows_carry_automation_provenance() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#490", "gh#490");
+        let a = db
+            .insert_attempt(&NewAttempt {
+                automation: Some("approved".into()),
+                automation_owner: Some("Brede".into()),
+                stacked_on: None,
+                task_id: "gh:o/r#490".into(),
+                pane_id: None,
+                workspace: "ws".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: None,
+                dispatched_by: None,
+                dispatched_by_pane: None,
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })
+            .unwrap();
+        let rows = board_rows(&db, &RoutingConfig::default()).unwrap();
+        assert_eq!(rows[0].automation.as_deref(), Some("approved"));
+        assert_eq!(rows[0].automation_owner.as_deref(), Some("Brede"));
+
+        // A settled autonomous attempt keeps its provenance on the row.
+        db.close_attempt(a, Outcome::Done).unwrap();
+        let rows = board_rows(&db, &RoutingConfig::default()).unwrap();
+        assert_eq!(rows[0].automation.as_deref(), Some("approved"));
+    }
+
     /// An attempt from before the route named an account keeps saying so: the
     /// route's default must not be back-filled onto a run that did not use it.
     #[test]
@@ -486,6 +540,8 @@ mod tests {
         )
         .unwrap();
         db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
             stacked_on: None,
             task_id: "gh:o/r#6".into(),
             pane_id: None,

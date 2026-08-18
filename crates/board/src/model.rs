@@ -683,6 +683,12 @@ pub struct Attempt {
     /// `Some` is the one state that has to be loud: the agent did say what it
     /// did, and the board could not read it.
     pub claims_error: Option<String>,
+    /// The auto-pick rule that released this attempt (gh#490), and the human
+    /// who owns that rule. Both `None` on every attempt a person or an
+    /// orchestrating agent dispatched — which is what makes the provenance
+    /// legible: an automation's work always says whose automation it is.
+    pub automation: Option<String>,
+    pub automation_owner: Option<String>,
 }
 
 impl Attempt {
@@ -763,6 +769,8 @@ pub(crate) mod tests {
     /// literals are what makes adding a column a day's work.
     pub(crate) fn blank_attempt() -> Attempt {
         Attempt {
+            automation: None,
+            automation_owner: None,
             id: 1,
             task_id: "gh:o/r#1".into(),
             pane_id: Some("chat-1".into()),

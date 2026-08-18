@@ -40,7 +40,8 @@ on an isolated engine (`COMET_IPC_PORT`, scratch data dir).
   `--text` at weight 500, **and its icon goes `--text` too** — the icon moves
   with the label, not one tone behind it.
 - **B6** The order is Devices, Agents, Members, Appearance, Shortcuts, Routing,
-  Stats, Archived.
+  Automations, Stats, Archived. (Automations arrived with gh#490, placed with
+  the board-hosted pair it belongs to: after Routing, before Stats.)
 - **B7** The nav ends at Back: a flex spacer, a 1px `--line` divider inset 8px
   inside the nav's own 8px gutter, then the row.
 - **B8** Back is the same row shape at a 7px gap — a 16px chevron-left

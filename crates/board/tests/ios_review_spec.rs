@@ -140,6 +140,8 @@ fn check(command: &str, runs: u32, failed: u32) -> Check {
 
 fn blank(task_id: &str, identifier: &str) -> AttemptReview {
     AttemptReview {
+        automation: None,
+        automation_owner: None,
         task_id: task_id.into(),
         attempt: 1,
         attempt_number: 1,

@@ -76,6 +76,7 @@ use gpui::{
     prelude::*, px,
 };
 
+use comet_board::autopick::AutomationsView;
 use comet_proto::view::board::{self, BoardState, Filter, RowAction, TaskDetail, TaskRow};
 use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AgentAccount, AgentAccountsSnapshot, HarnessId};
@@ -913,6 +914,10 @@ pub enum BoardEvent {
         task_id: String,
         chat_id: Option<String>,
     },
+    /// Open Settings → Automations (gh#490) — the popover's "Manage
+    /// automations…" deep link. A route change, so the shell's, exactly as
+    /// opening a review is.
+    OpenAutomations,
 }
 
 /// The board dock, and the shell's standing source of board rows.
@@ -974,6 +979,13 @@ pub struct BoardPanel {
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
     host_menu_dismissed_at: Option<std::time::Instant>,
+    /// The Automations popover (gh#490): whether it is open, the same
+    /// dismissal guard the host menu carries, the last view the host answered
+    /// with, and the in-flight fetch or pause/resume write.
+    automations_open: bool,
+    automations_dismissed_at: Option<std::time::Instant>,
+    automations: Option<AutomationsView>,
+    automations_task: Option<Task<()>>,
     /// An open runtime picker for a dispatch (ready row → enter). `None` =
     /// no dispatch is being confirmed.
     dispatch: Option<DispatchDraft>,
@@ -1098,6 +1110,10 @@ impl BoardPanel {
             review_on_boot_done: false,
             host_menu_open: false,
             host_menu_dismissed_at: None,
+            automations_open: false,
+            automations_dismissed_at: None,
+            automations: None,
+            automations_task: None,
             dispatch: None,
             pending_bill: None,
             peek: false,
@@ -2540,6 +2556,11 @@ impl BoardPanel {
                     ),
             );
         } else {
+            // The Automations indicator (gh#490): quiet until opened, tinted
+            // when a rule is unhealthy. Before the route chip so the header's
+            // rightmost pair stays filter-then-find.
+            let automations_chip = self.render_automations_chip(&theme, cx);
+            header = header.child(automations_chip);
             // The route chip (E3): the word "route" in `--subtle`, then what
             // the board is showing in `--text`. It is the filter — clicking it
             // steps the routes exactly as `f` does — said as the state it puts
@@ -2744,6 +2765,250 @@ impl BoardPanel {
             chip = chip.child(popover::anchored_menu("board-host-menu", menu));
         }
         chip.into_any_element()
+    }
+
+    // ---- the Automations indicator (gh#490) ----
+
+    /// Read the rules' health and history off the board host. Called when the
+    /// popover opens and after a pause/resume, never on a timer: the popover
+    /// is a glance, not a stream.
+    fn fetch_automations(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let params = self.host_params(serde_json::json!({}));
+        self.automations_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::READ_BOARD_AUTOMATIONS, params)
+                .await;
+            this.update(cx, |panel, cx| {
+                match result {
+                    Ok(value) => {
+                        if let Ok(view) = serde_json::from_value::<AutomationsView>(value) {
+                            panel.automations = Some(view);
+                        }
+                    }
+                    // A host with no board method (an older box) or no board
+                    // at all: the popover says the rules could not be read.
+                    Err(err) => panel.notice = Some(format!("{err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Pause or resume one rule from the popover — `enabled` through the same
+    /// validating writer the settings page uses, so a resume the config does
+    /// not support (no owner, no labels) is refused with the writer's words.
+    fn set_automation_enabled(&mut self, rule: String, enabled: bool, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let params = self.host_params(serde_json::json!({
+            "op": "automation",
+            "automation": rule,
+            "key": "enabled",
+            "value": if enabled { "true" } else { "false" },
+        }));
+        self.automations_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::WRITE_BOARD_CONFIG, params)
+                .await;
+            this.update(cx, |panel, cx| {
+                if let Err(err) = result {
+                    panel.notice = Some(format!("{err}").into());
+                    cx.notify();
+                } else {
+                    panel.fetch_automations(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    /// The compact indicator: a wand at 24px, with the popover under it. The
+    /// popover is the operational surface — health counts, the next
+    /// reconciliation, the latest action, per-rule pause/resume — and the full
+    /// editor deliberately is not (§gh#490): it deep-links to Settings.
+    fn render_automations_chip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.automations_open;
+        let unhealthy = self
+            .automations
+            .as_ref()
+            .is_some_and(|v| v.unhealthy_count() > 0);
+        let mut chip = div()
+            .id("board-automations")
+            .size(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(Theme::RADIUS_CHIP))
+            .cursor_pointer()
+            .bg(if open { theme.wash(0.14) } else { theme.wash(0.0) })
+            .when(!open, |el| el.hover(|s| s.bg(theme.wash(0.1))))
+            .on_click(cx.listener(|this, _, _, cx| {
+                let just_dismissed = this
+                    .automations_dismissed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                this.automations_open = !this.automations_open && !just_dismissed;
+                this.automations_dismissed_at = None;
+                if this.automations_open {
+                    this.fetch_automations(cx);
+                }
+                cx.notify();
+            }))
+            .child(icon(icons::MAGIC_STICK).size(px(14.0)).text_color(
+                // The one glance the chip owes the header: an unhealthy rule
+                // tints the wand, so trouble is visible without the popover.
+                if unhealthy {
+                    theme.warning
+                } else {
+                    theme.text_muted
+                },
+            ));
+
+        if open {
+            let menu = self.render_automations_menu(theme, cx);
+            chip = chip.child(popover::anchored_menu("board-automations-menu", menu));
+        }
+        chip.into_any_element()
+    }
+
+    fn render_automations_menu(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut card = popover::popover_card(theme)
+            .w(px(280.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.automations_open = false;
+                this.automations_dismissed_at = Some(std::time::Instant::now());
+                cx.notify();
+            }))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(popover::menu_heading(theme, "Automations"));
+
+        match &self.automations {
+            None => {
+                card = card.child(
+                    div()
+                        .px(px(10.0))
+                        .py(px(6.0))
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from("Reading…")),
+                );
+            }
+            Some(view) => {
+                let active = view.enabled_count();
+                let unhealthy = view.unhealthy_count();
+                let mut summary = format!("{active} active");
+                if unhealthy > 0 {
+                    summary.push_str(&format!(" · {unhealthy} unhealthy"));
+                }
+                if let Some(next) = view.next_eval_secs {
+                    summary.push_str(&format!(
+                        " · next check in {}",
+                        board::format_age(next as i64)
+                    ));
+                }
+                card = card.child(
+                    div()
+                        .px(px(10.0))
+                        .pb(px(4.0))
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(summary)),
+                );
+                // The most recent action or refusal, in the log's own words.
+                if let Some(latest) = view.recent.first() {
+                    let line = format!(
+                        "{} {} — {}",
+                        latest.identifier.as_deref().unwrap_or(&latest.rule),
+                        latest.decision,
+                        latest.reason
+                    );
+                    card = card.child(
+                        div()
+                            .px(px(10.0))
+                            .pb(px(6.0))
+                            .max_w_full()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(line)),
+                    );
+                }
+                if view.rules.is_empty() {
+                    card = card.child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(4.0))
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from("No rules yet.")),
+                    );
+                }
+                for (ix, status) in view.rules.iter().enumerate() {
+                    let name = status.rule.name.clone();
+                    let enabled = status.rule.enabled;
+                    let verb: SharedString = if enabled { "pause".into() } else { "resume".into() };
+                    let state_tone = match status.state.as_str() {
+                        "enabled" => theme.settled,
+                        "unhealthy" => theme.warning,
+                        _ => theme.text_faint,
+                    };
+                    card = card.child(
+                        popover::menu_row(theme, false, format!("board-automation-{ix}"))
+                            .id(("board-automation", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_automation_enabled(name.clone(), !enabled, cx);
+                            }))
+                            .child(
+                                div()
+                                    .size(px(5.0))
+                                    .flex_none()
+                                    // round-ok: status dot
+                                    .rounded_full()
+                                    .bg(state_tone),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(status.rule.name.clone())),
+                            )
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(theme.text_subtle)
+                                    .child(verb),
+                            ),
+                    );
+                }
+            }
+        }
+
+        card = card.child(
+            popover::menu_row(theme, false, "board-automations-manage")
+                .id("board-automations-manage")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.automations_open = false;
+                    cx.emit(BoardEvent::OpenAutomations);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(SharedString::from("Manage automations…")),
+                ),
+        );
+        card.into_any_element()
     }
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -3908,6 +4173,9 @@ impl BoardPanel {
             // rather than about what has been tried on it.
             board::stack_line(&row),
             board::history_line(&row, now),
+            // Automation provenance (gh#490): which rule released this and
+            // whose automation that is. Nothing on rows a person dispatched.
+            board::automation_line(&row),
         ]
         .into_iter()
         .flatten()
@@ -4283,6 +4551,8 @@ mod tests {
 
     fn row(id: &str, state: BoardState) -> TaskRow {
         TaskRow {
+            automation: None,
+            automation_owner: None,
             id: id.into(),
             identifier: format!("gh#{id}"),
             title: format!("task {id}"),
