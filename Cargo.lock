@@ -1164,6 +1164,7 @@ dependencies = [
  "comet-update",
  "mimalloc",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1372,6 +1373,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "wait-timeout",
 ]
 
 [[package]]

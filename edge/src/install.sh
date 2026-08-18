@@ -51,23 +51,77 @@ esac
 # --- download ----------------------------------------------------------------
 ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
 [ -n "$ver" ] || { echo "comet install: could not resolve latest version" >&2; exit 1; }
+case "$ver" in
+  *[!0-9A-Za-z._-]* | .*)
+    echo "comet install: release service returned an invalid version '$ver'" >&2
+    exit 1
+    ;;
+esac
 file="comet-$ver-$plat-$arch.tar.gz"
 data_root="$HOME/.comet-native"
 app_root="$data_root/app"
 dest="$app_root/$ver"
+mkdir -p "$app_root"
 
-if [ -x "$dest/comet" ]; then
+# A managed release is one indivisible pair. Validate the files themselves —
+# not merely the tar listing — before reusing a stage or moving `current`.
+validate_release() {
+  release_dir="$1"
+  expected="$2"
+  [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || {
+    echo "comet install: $release_dir must be a real release directory" >&2
+    return 1
+  }
+  for name in comet comet-board; do
+    binary="$release_dir/$name"
+    [ -f "$binary" ] && [ ! -L "$binary" ] && [ -x "$binary" ] || {
+      echo "comet install: incomplete release: $binary must be a regular executable" >&2
+      return 1
+    }
+    if command -v timeout >/dev/null 2>&1; then
+      line="$(timeout 5 "$binary" --version 2>/dev/null | sed -n '1p')" || line=""
+    else
+      line="$("$binary" --version 2>/dev/null | sed -n '1p')" || line=""
+    fi
+    [ "$line" = "$name $expected" ] || {
+      echo "comet install: $binary reported '${line:-nothing}', expected '$name $expected'" >&2
+      return 1
+    }
+  done
+}
+
+if [ -d "$dest" ] && validate_release "$dest" "$ver"; then
   echo "comet $ver already downloaded — relinking."
 else
-  tmp="$(mktemp -d)"
+  if [ -e "$dest" ] || [ -L "$dest" ]; then
+    active="$(readlink -f "$app_root/current" 2>/dev/null || true)"
+    existing="$(readlink -f "$dest" 2>/dev/null || true)"
+    if [ -n "$active" ] && [ "$active" = "$existing" ]; then
+      echo "comet install: the active release is incomplete; refusing to remove it in place." >&2
+      echo "Restore the previous current symlink, then re-run this installer." >&2
+      exit 1
+    fi
+    rm -rf "$dest"
+  fi
+  tmp="$(mktemp -d "$app_root/.stage-$ver.XXXXXX")"
   trap 'rm -rf "$tmp"' EXIT
   echo "downloading comet $ver ($plat-$arch)…"
   curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
-  mkdir -p "$dest"
-  tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
+  mkdir -p "$tmp/unpacked"
+  tar -xzf "$tmp/$file" -C "$tmp/unpacked" --strip-components=1
+  validate_release "$tmp/unpacked" "$ver" || {
+    echo "comet install: refusing to activate an incomplete release; current was not changed" >&2
+    exit 1
+  }
+  mv "$tmp/unpacked" "$dest"
 fi
 
-ln -sfn "$dest" "$app_root/current"
+# Same-filesystem rename: there is never a window without `current`, and every
+# failure above leaves its previous target untouched.
+next="$app_root/.current-$$"
+rm -f "$next"
+ln -s "$dest" "$next"
+mv -Tf "$next" "$app_root/current"
 mkdir -p "$HOME/.local/bin"
 
 # --- PATH links ---------------------------------------------------------------
