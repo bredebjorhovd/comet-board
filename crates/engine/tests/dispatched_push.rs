@@ -453,9 +453,9 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         "a chat the board never dispatched was handed credentials"
     );
 
-    // Chats created before the durable contract existed are not allowed to
-    // infer one from whatever credential happens to be configured now. That
-    // would silently replace the capability promise the original brief made.
+    // A repo-only replacement that disagrees with the immutable shadow remains
+    // corruption. Recovery is limited to a matching shadow or a true legacy
+    // row whose minimum contract the host proves separately.
     let valid = chat_config(Some("owner/widget"), None);
     core.workspace
         .create_chat(
@@ -467,6 +467,7 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         .unwrap();
     let mut inconsistent = valid;
     inconsistent.push_contract = None;
+    inconsistent.push_repo = Some("other/widget".into());
     replace_raw_config(&core, "chat-missing-contract", &inconsistent);
     let error = core
         .sessions
@@ -480,7 +481,7 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         .expect_err("an inconsistent GitHub push tuple reached the harness")
         .to_string();
     assert!(
-        error.contains("repository but no capability contract"),
+        error.contains("conflicts with the board-owned push tuple"),
         "{error}"
     );
     assert!(
@@ -660,6 +661,123 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         "credential preflight succeeded and the recovered prompt became a real turn"
     );
     restarted.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pre_contract_chat_is_upgraded_before_the_turn_and_never_uses_ambient_auth() {
+    let tmp = tempfile::Builder::new()
+        .prefix("comet-gh494-legacy-push-")
+        .tempdir()
+        .expect("scratch dir");
+    let dir = tmp.path();
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+
+    let board_exe = dir.join("comet-board");
+    std::fs::write(
+        &board_exe,
+        "#!/bin/sh\n[ \"$1\" = git-askpass ] || exit 2\necho x-access-token\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&board_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let paths = Paths {
+        config_dir: data.join("board"),
+        state_dir: data.join("board/state"),
+    };
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=ghp_secret\n").unwrap();
+
+    let harness = Arc::new(RecordingHarness::default());
+    let registry = HarnessRegistry::new();
+    registry.register(harness.clone());
+    let core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles");
+    core.sessions
+        .set_push_credentials(Arc::new(PushCredentials::with_board_exe(
+            paths.clone(),
+            Some(board_exe),
+        )));
+    core.workspace
+        .create_space(
+            "space-legacy",
+            &core.device_id,
+            "/tmp",
+            Some("widget".into()),
+            true,
+        )
+        .unwrap();
+    core.workspace
+        .create_chat(
+            "chat-legacy",
+            "space-legacy",
+            Some(chat_config(None, None)),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let mut legacy = chat_config(None, None);
+    legacy.push_repo = Some("owner/widget".into());
+    replace_raw_config(&core, "chat-legacy", &legacy);
+
+    core.sessions
+        .dispatch("chat-legacy", HarnessId::Mock, run_request("/tmp"), None)
+        .await
+        .expect("a proven legacy chat dispatches");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if harness
+            .seen
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|run| run.chat_id.as_deref() == Some("chat-legacy") && run.push.is_some())
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "legacy run never reached the harness with board credentials"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let recovered = core
+        .workspace
+        .github_push_state("chat-legacy")
+        .unwrap()
+        .expect("legacy state persisted");
+    assert!(recovered.contract.contents_write);
+    assert!(!recovered.contract.workflows_write);
+
+    core.workspace
+        .create_chat(
+            "chat-unproved",
+            "space-legacy",
+            Some(chat_config(None, None)),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    replace_raw_config(&core, "chat-unproved", &legacy);
+    std::fs::remove_file(paths.config_dir.join(".env")).unwrap();
+    let error = core
+        .sessions
+        .dispatch("chat-unproved", HarnessId::Mock, run_request("/tmp"), None)
+        .await
+        .expect_err("an unproved legacy chat fell through to ambient auth")
+        .to_string();
+    assert!(error.contains("replacement push contract"), "{error}");
+    assert_eq!(
+        core.workspace
+            .legacy_github_push_repo("chat-unproved")
+            .unwrap()
+            .as_deref(),
+        Some("owner/widget")
+    );
+    core.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

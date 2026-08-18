@@ -114,8 +114,9 @@ pub struct ChatConfig {
     /// it again when `git` or `gh` asks for a token.
     ///
     /// `None` is every ordinary chat and every board chat created before this
-    /// contract existed. A chat with `push_repo` but no contract fails closed:
-    /// there is no durable evidence of what its initial brief promised.
+    /// contract existed. The raw tuple still rejects `push_repo` without a
+    /// contract; the owning engine may upgrade that legacy shape only after
+    /// its current board credential proves a replacement promise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_contract: Option<GithubPushContract>,
     /// Who this chat's commits are *by* (comet-board `git_identity`, gh#107).

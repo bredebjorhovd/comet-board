@@ -28,7 +28,7 @@ use chrono::Utc;
 use tokio::sync::watch;
 
 use comet_doc::{DeletedSpace, WorkspaceDoc};
-use comet_proto::{Chat, ChatConfig, Device, Session, Space};
+use comet_proto::{Chat, ChatConfig, Device, GithubPushStateError, Session, Space};
 use comet_sync::{DocRecovery, DocsStore, RoomClient};
 
 use crate::doc_host::EdgeConfig;
@@ -784,12 +784,36 @@ impl WorkspaceHost {
     }
 
     /// The board-owned push tuple, independent of the replaceable config map.
-    /// A malformed half-state is an error so every turn can fail closed.
+    /// A true pre-contract half-state remains an error until the host proves
+    /// and persists its replacement contract; every other malformed state is
+    /// permanently fail-closed.
     pub fn github_push_state(
         &self,
         chat_id: &str,
     ) -> Result<Option<comet_proto::GithubPushState>, EngineError> {
         Ok(self.inner.doc().github_push_state(chat_id)?)
+    }
+
+    /// Repository retained by a board chat from before push contracts were
+    /// persisted. This is evidence of board ownership, not permission: the
+    /// caller must prove a contract before upgrading the row.
+    pub fn legacy_github_push_repo(&self, chat_id: &str) -> Result<Option<String>, EngineError> {
+        Ok(self.inner.doc().legacy_github_push_repo(chat_id)?)
+    }
+
+    /// Commit a host-proven contract onto one legacy row. The document method
+    /// rechecks the exact half-state under the owner gate, so a capability
+    /// probe racing a remote config write cannot overwrite newer authority.
+    pub fn upgrade_legacy_github_push_state(
+        &self,
+        chat_id: &str,
+        state: &comet_proto::GithubPushState,
+    ) -> Result<bool, EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        Ok(self
+            .inner
+            .doc()
+            .upgrade_legacy_github_push_state(chat_id, state)?)
     }
 
     /// The whole chat row, when the workspace doc has one.
@@ -1151,6 +1175,11 @@ impl WorkspaceHost {
             match config.github_push_state() {
                 Ok(None) => config.apply_github_push_state(&push),
                 Ok(Some(incoming)) if incoming == push => {}
+                Err(GithubPushStateError::RepositoryWithoutContract)
+                    if config.push_repo.as_deref() == Some(push.repo.as_str()) =>
+                {
+                    config.apply_github_push_state(&push)
+                }
                 Ok(Some(_)) => {
                     return Err(EngineError::Other(
                         "a config edit cannot change the board-owned GitHub push tuple".into(),

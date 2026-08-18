@@ -1138,6 +1138,30 @@ impl Inner {
     /// A chat with the board-owned push tuple is fail-closed: an inconsistent
     /// tuple or broken handoff refuses the run instead of inheriting ambient
     /// auth.
+    fn push_state_for_chat(
+        &self,
+        chat_id: &str,
+        authority: Option<&ChatConfig>,
+    ) -> Result<Option<comet_proto::GithubPushState>, EngineError> {
+        if let Some(config) = authority {
+            return config
+                .github_push_state()
+                .map_err(|error| EngineError::Other(error.to_string()));
+        }
+        let Some(workspace) = self.workspace() else {
+            return Ok(None);
+        };
+        match workspace.github_push_state(chat_id) {
+            Ok(state) => Ok(state),
+            Err(original) => self
+                .push
+                .get()
+                .ok_or(original)?
+                .resolve_chat_state(workspace, chat_id)
+                .map_err(|error| EngineError::Other(format!("{error:#}"))),
+        }
+    }
+
     fn push_for(
         &self,
         chat_id: &str,
@@ -1149,12 +1173,7 @@ impl Inner {
         let config = authority
             .cloned()
             .or_else(|| workspace.chat_config(chat_id));
-        let push_state = match config.as_ref() {
-            Some(config) => config
-                .github_push_state()
-                .map_err(|error| EngineError::Other(error.to_string()))?,
-            None => None,
-        };
+        let push_state = self.push_state_for_chat(chat_id, authority)?;
         let mut creds = match push_state {
             Some(push) => Some(
                 self.push
@@ -1195,16 +1214,7 @@ impl Inner {
         chat_id: &str,
         authority: Option<&ChatConfig>,
     ) -> Result<(), EngineError> {
-        let push = if let Some(config) = authority {
-            config
-                .github_push_state()
-                .map_err(|error| EngineError::Other(error.to_string()))?
-        } else {
-            let Some(workspace) = self.workspace() else {
-                return Ok(());
-            };
-            workspace.github_push_state(chat_id)?
-        };
+        let push = self.push_state_for_chat(chat_id, authority)?;
         let Some(push) = push else {
             return Ok(());
         };

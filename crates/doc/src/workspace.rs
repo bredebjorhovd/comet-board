@@ -30,7 +30,9 @@ use chrono::{DateTime, Utc};
 use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
-use comet_proto::{Chat, ChatConfig, Device, GithubPushState, Session, SessionStatus, Space};
+use comet_proto::{
+    Chat, ChatConfig, Device, GithubPushState, GithubPushStateError, Session, SessionStatus, Space,
+};
 
 use crate::schema::DocError;
 
@@ -404,10 +406,9 @@ impl WorkspaceDoc {
         Ok(true)
     }
 
-    /// The authoritative board-owned push tuple for one chat. The shadow wins
-    /// only when the replaceable config omitted both fields; a half-state or a
-    /// conflicting full tuple is corruption and is returned as an error so the
-    /// engine refuses the turn.
+    /// The authoritative board-owned push tuple for one chat. The shadow also
+    /// repairs the predecessor schema's `push_repo`-only config when its repo
+    /// agrees. A different repo or any other half-state remains corruption.
     pub fn github_push_state(&self, chat_id: &str) -> Result<Option<GithubPushState>, DocError> {
         let Some(row) = self.existing_row("chats", chat_id) else {
             return Ok(None);
@@ -421,23 +422,100 @@ impl WorkspaceDoc {
         let configured = config
             .as_ref()
             .map(ChatConfig::github_push_state)
-            .transpose()
-            .map_err(|error| DocError::Schema(error.to_string()))?
-            .flatten();
+            .unwrap_or(Ok(None));
         let shadow = board_push_from_value(&value)?;
         match (shadow, configured) {
-            (Some(shadow), Some(configured)) if shadow != configured => Err(DocError::Schema(
+            (Some(shadow), Ok(Some(configured))) if shadow != configured => Err(DocError::Schema(
                 "GitHub push config conflicts with the board-owned push tuple".into(),
             )),
-            (Some(shadow), _) => Ok(Some(shadow)),
-            (None, configured) => Ok(configured),
+            (Some(shadow), Err(GithubPushStateError::RepositoryWithoutContract))
+                if config
+                    .as_ref()
+                    .and_then(|config| config.push_repo.as_deref())
+                    == Some(shadow.repo.as_str()) =>
+            {
+                Ok(Some(shadow))
+            }
+            (Some(_), Err(GithubPushStateError::RepositoryWithoutContract)) => {
+                Err(DocError::Schema(
+                    "GitHub push config conflicts with the board-owned push tuple".into(),
+                ))
+            }
+            (Some(shadow), Ok(_)) => Ok(Some(shadow)),
+            (_, Err(error)) => Err(DocError::Schema(error.to_string())),
+            (None, Ok(configured)) => Ok(configured),
         }
     }
 
-    /// Backfill the atomic shadow for legacy rows and repair config replacements
-    /// that omitted both push fields. Called on boot and after local or remote
-    /// CRDT changes; malformed half-states are left untouched so per-chat reads
-    /// fail closed instead of guessing.
+    /// The repository on a pre-contract board chat, when no authoritative
+    /// shadow exists yet. Callers must prove a replacement contract before
+    /// upgrading it; this method never turns the half-state into ambient auth.
+    pub fn legacy_github_push_repo(&self, chat_id: &str) -> Result<Option<String>, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(None);
+        };
+        let value = row.get_deep_value().to_json_value();
+        if board_push_from_value(&value)?.is_some() {
+            return Ok(None);
+        }
+        let Some(config) = value
+            .get("config")
+            .cloned()
+            .map(serde_json::from_value::<ChatConfig>)
+            .transpose()?
+        else {
+            return Ok(None);
+        };
+        match config.github_push_state() {
+            Err(GithubPushStateError::RepositoryWithoutContract) => Ok(config.push_repo),
+            _ => Ok(None),
+        }
+    }
+
+    /// Persist a host-proven contract onto one pre-contract chat. Rechecks the
+    /// exact legacy shape so a concurrent config/shadow change cannot be
+    /// overwritten by a stale capability probe.
+    pub fn upgrade_legacy_github_push_state(
+        &self,
+        chat_id: &str,
+        state: &GithubPushState,
+    ) -> Result<bool, DocError> {
+        state
+            .validate()
+            .map_err(|error| DocError::Schema(error.to_string()))?;
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        let value = row.get_deep_value().to_json_value();
+        if board_push_from_value(&value)?.is_some() {
+            return Ok(false);
+        }
+        let Some(mut config) = value
+            .get("config")
+            .cloned()
+            .map(serde_json::from_value::<ChatConfig>)
+            .transpose()?
+        else {
+            return Ok(false);
+        };
+        if !matches!(
+            config.github_push_state(),
+            Err(GithubPushStateError::RepositoryWithoutContract)
+        ) || config.push_repo.as_deref() != Some(state.repo.as_str())
+        {
+            return Ok(false);
+        }
+        config.apply_github_push_state(state);
+        write_board_push(&row, state)?;
+        row.insert("config", LoroValue::from(serde_json::to_value(config)?))?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// Backfill the atomic shadow and repair config replacements that omitted
+    /// push fields. Called on boot and after local or remote CRDT changes. A
+    /// known pre-contract repo-only row is left quietly for the host credential
+    /// resolver; other malformed states remain fail-closed and visible.
     pub fn reconcile_github_push_states(&self) -> Result<usize, DocError> {
         let chats = self.doc.get_map("chats");
         let ids: Vec<String> = chats.keys().map(|key| key.to_string()).collect();
@@ -453,26 +531,34 @@ impl WorkspaceDoc {
             let Ok(mut config) = serde_json::from_value::<ChatConfig>(config_value) else {
                 continue;
             };
-            let configured = match config.github_push_state() {
-                Ok(state) => state,
-                Err(error) => {
-                    tracing::warn!(chat = %chat_id, error = %error, "refusing to reconcile inconsistent GitHub push state");
-                    continue;
-                }
-            };
             let shadow = board_push_from_value(&value)?;
+            let configured = config.github_push_state();
             match (shadow, configured) {
-                (None, Some(state)) => {
+                (None, Ok(Some(state))) => {
                     write_board_push(&row, &state)?;
                     repaired += 1;
                 }
-                (Some(shadow), None) => {
+                (Some(shadow), Ok(None)) => {
                     config.apply_github_push_state(&shadow);
                     row.insert("config", LoroValue::from(serde_json::to_value(config)?))?;
                     repaired += 1;
                 }
-                (Some(shadow), Some(configured)) if shadow != configured => {
+                (Some(shadow), Err(GithubPushStateError::RepositoryWithoutContract))
+                    if config.push_repo.as_deref() == Some(shadow.repo.as_str()) =>
+                {
+                    config.apply_github_push_state(&shadow);
+                    row.insert("config", LoroValue::from(serde_json::to_value(config)?))?;
+                    repaired += 1;
+                }
+                // A pre-contract row has no durable permission promise. Leave
+                // it for the host credential resolver instead of warning on
+                // every 15-second publish tick.
+                (None, Err(GithubPushStateError::RepositoryWithoutContract)) => {}
+                (Some(shadow), Ok(Some(configured))) if shadow != configured => {
                     tracing::warn!(chat = %chat_id, "refusing to reconcile conflicting GitHub push tuples");
+                }
+                (_, Err(error)) => {
+                    tracing::warn!(chat = %chat_id, error = %error, "refusing to reconcile inconsistent GitHub push state");
                 }
                 _ => {}
             }
@@ -676,19 +762,28 @@ fn write_board_push(row: &LoroMap, state: &GithubPushState) -> Result<(), DocErr
 /// the credential tuple once the board has stamped one.
 fn reconcile_config_write(row: &LoroMap, config: &ChatConfig) -> Result<ChatConfig, DocError> {
     let mut config = config.clone();
-    let configured = config
-        .github_push_state()
-        .map_err(|error| DocError::Schema(error.to_string()))?;
+    let configured = config.github_push_state();
     let value = row.get_deep_value().to_json_value();
     let shadow = board_push_from_value(&value)?;
     match (shadow, configured) {
-        (Some(shadow), Some(configured)) if shadow != configured => {
+        (Some(shadow), Ok(Some(configured))) if shadow != configured => {
             return Err(DocError::Schema(
                 "a config edit cannot change the board-owned GitHub push tuple".into(),
             ));
         }
-        (Some(shadow), None) => config.apply_github_push_state(&shadow),
-        (None, Some(configured)) => write_board_push(row, &configured)?,
+        (Some(shadow), Err(GithubPushStateError::RepositoryWithoutContract))
+            if config.push_repo.as_deref() == Some(shadow.repo.as_str()) =>
+        {
+            config.apply_github_push_state(&shadow)
+        }
+        (Some(_), Err(GithubPushStateError::RepositoryWithoutContract)) => {
+            return Err(DocError::Schema(
+                "a config edit cannot change the board-owned GitHub push tuple".into(),
+            ));
+        }
+        (Some(shadow), Ok(None)) => config.apply_github_push_state(&shadow),
+        (None, Ok(Some(configured))) => write_board_push(row, &configured)?,
+        (_, Err(error)) => return Err(DocError::Schema(error.to_string())),
         _ => {}
     }
     Ok(config)
@@ -829,7 +924,11 @@ impl From<RawChat> for Chat {
     fn from(raw: RawChat) -> Self {
         let mut config = raw.config;
         if let (Some(config), Some(shadow)) = (&mut config, raw.board_push.as_ref())
-            && matches!(config.github_push_state(), Ok(None))
+            && (matches!(config.github_push_state(), Ok(None))
+                || (matches!(
+                    config.github_push_state(),
+                    Err(GithubPushStateError::RepositoryWithoutContract)
+                ) && config.push_repo.as_deref() == Some(shadow.repo.as_str())))
         {
             config.apply_github_push_state(shadow);
         }
@@ -1067,6 +1166,45 @@ mod tests {
     }
 
     #[test]
+    fn repo_only_config_is_repaired_from_the_board_push_shadow() {
+        let ws = WorkspaceDoc::new();
+        let mut dispatched = chat("chat-1", "dev-a");
+        let original = GithubPushState {
+            repo: "owner/widget".into(),
+            contract: comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: true,
+            },
+        };
+        dispatched
+            .config
+            .as_mut()
+            .unwrap()
+            .apply_github_push_state(&original);
+        ws.upsert_chat(&dispatched).unwrap();
+
+        // A predecessor schema retained pushRepo but knew no pushContract.
+        // The immutable shadow is the authority, so this is recoverable rather
+        // than a reason to brick the chat forever.
+        let chats = ws.doc().get_map("chats");
+        let row = match chats.get("chat-1") {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row,
+            other => panic!("missing chat row: {other:?}"),
+        };
+        let mut predecessor = dispatched.config.unwrap();
+        predecessor.push_contract = None;
+        row.insert(
+            "config",
+            LoroValue::from(serde_json::to_value(predecessor).unwrap()),
+        )
+        .unwrap();
+        ws.doc().commit();
+
+        assert_eq!(ws.reconcile_github_push_states().unwrap(), 1);
+        assert_eq!(ws.github_push_state("chat-1").unwrap(), Some(original));
+    }
+
+    #[test]
     fn inconsistent_push_half_state_fails_closed_without_shadow_guessing() {
         let ws = WorkspaceDoc::new();
         let mut dispatched = chat("chat-1", "dev-a");
@@ -1085,6 +1223,7 @@ mod tests {
         };
         let mut inconsistent = dispatched.config.unwrap();
         inconsistent.push_contract = None;
+        inconsistent.push_repo = Some("other/widget".into());
         row.insert(
             "config",
             LoroValue::from(serde_json::to_value(&inconsistent).unwrap()),
@@ -1094,7 +1233,7 @@ mod tests {
 
         let error = ws.github_push_state("chat-1").unwrap_err().to_string();
         assert!(
-            error.contains("repository but no capability contract"),
+            error.contains("conflicts with the board-owned push tuple"),
             "{error}"
         );
         assert_eq!(ws.reconcile_github_push_states().unwrap(), 0);
@@ -1116,6 +1255,46 @@ mod tests {
             "{error}"
         );
         assert_eq!(ws.reconcile_github_push_states().unwrap(), 0);
+    }
+
+    #[test]
+    fn host_proven_contract_upgrades_a_true_legacy_row_once() {
+        let ws = WorkspaceDoc::new();
+        ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        let chats = ws.doc().get_map("chats");
+        let row = match chats.get("chat-1") {
+            Some(loro::ValueOrContainer::Container(loro::Container::Map(row))) => row,
+            other => panic!("missing chat row: {other:?}"),
+        };
+        let mut legacy = chat("chat-1", "dev-a").config.unwrap();
+        legacy.push_repo = Some("owner/widget".into());
+        legacy.push_contract = None;
+        row.insert(
+            "config",
+            LoroValue::from(serde_json::to_value(legacy).unwrap()),
+        )
+        .unwrap();
+        ws.doc().commit();
+
+        assert_eq!(
+            ws.legacy_github_push_repo("chat-1").unwrap().as_deref(),
+            Some("owner/widget")
+        );
+        assert_eq!(ws.reconcile_github_push_states().unwrap(), 0);
+
+        let recovered = GithubPushState {
+            repo: "owner/widget".into(),
+            contract: comet_proto::GithubPushContract {
+                contents_write: true,
+                workflows_write: false,
+            },
+        };
+        assert!(
+            ws.upgrade_legacy_github_push_state("chat-1", &recovered)
+                .unwrap()
+        );
+        assert_eq!(ws.github_push_state("chat-1").unwrap(), Some(recovered));
+        assert_eq!(ws.legacy_github_push_repo("chat-1").unwrap(), None);
     }
 
     #[test]
