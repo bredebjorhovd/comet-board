@@ -377,11 +377,21 @@ impl Repos {
 
     /// Stable identity shared by the main checkout and every linked worktree
     /// of one repository. Unlike [`Self::checkout_identity`], this hashes the
-    /// common git directory; machine-local projections and recipe approvals
-    /// must follow the repository, not whichever branch happened to ask.
+    /// common git directory, so it follows the repository rather than
+    /// whichever branch happened to ask.
     pub async fn repository_identity(&self, path: &Path) -> Result<String, EngineError> {
-        crate::checkout_prep::repository_identity(path, &self.inner.device_id)
-            .map_err(EngineError::Other)
+        let common = self
+            .git(
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+                Some(path),
+            )
+            .await?;
+        let common = std::fs::canonicalize(&common).unwrap_or_else(|_| PathBuf::from(common));
+        let mut hasher = Sha256::new();
+        hasher.update(self.inner.device_id.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(common.to_string_lossy().as_bytes());
+        Ok(hex(&hasher.finalize()))
     }
 
     async fn to_repo(&self, path: &Path) -> Result<Repo, EngineError> {

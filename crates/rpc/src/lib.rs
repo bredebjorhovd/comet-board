@@ -117,26 +117,6 @@ pub mod methods {
     pub const LIST_FOLDERS: &str = "ListFolders";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
-    /// The repository's own recipe for a checkout, and its lifecycle (gh#422).
-    /// Device-addressed like every other checkout verb: a recipe is executed
-    /// where the working tree is, never where the button was pressed.
-    ///
-    /// `PrepareCheckout` is the verb a person presses after a preparation
-    /// failed — it re-runs the recipe against the same checkout and, if that
-    /// succeeds, releases whatever brief the failure was holding. That is the
-    /// retry that does not mint a second attempt.
-    pub const PREPARE_CHECKOUT: &str = "PrepareCheckout";
-    /// Stop an active setup command and its process group. Relay-forwardable;
-    /// cancellation must execute where the checkout lives.
-    pub const CANCEL_CHECKOUT_PREPARATION: &str = "CancelCheckoutPreparation";
-    /// Host-local trust mutation for an ordinary checkout. Approves the exact
-    /// repository + committed-tree execution digest; editing any committed
-    /// input invalidates it.
-    pub const APPROVE_CHECKOUT_PREPARATION: &str = "ApproveCheckoutPreparation";
-    /// Read-only: the last thing known about a checkout's preparation, plus the
-    /// recipe's `run` command so a viewport can offer it.
-    pub const CHECKOUT_PREP: &str = "CheckoutPrep";
-
     /// Fork a conversation from one of its messages (gh#425). Params are a
     /// [`comet_proto::ForkRequest`] → [`comet_proto::ForkResult`].
     ///
@@ -226,10 +206,6 @@ pub mod methods {
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";
-    /// Approve the exact committed-tree digest blocking a live task, then retry its
-    /// preparation in place. Host-local only: repository code must not be able
-    /// to authorize itself through the relay. Params: `{taskId}`.
-    pub const APPROVE_TASK_PREPARATION: &str = "ApproveTaskPreparation";
     /// The issue text behind one row, for the detail surface (gh#132). Params:
     /// `{taskId}` → `{id, body}`.
     ///

@@ -449,10 +449,6 @@ impl ChatDocHandle {
     ///
     /// Deduped by id like [`Self::write_user_message`], so a retried write —
     /// or a second engine holding the same doc — leaves one entry.
-    ///
-    /// gh#422's visible surface: a checkout preparing, and a checkout that
-    /// could not be prepared, are both things the chat says out loud rather
-    /// than facts you find in a log on the box.
     pub fn write_notice(
         &self,
         message_id: &str,

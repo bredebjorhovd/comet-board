@@ -241,7 +241,7 @@ impl EngineHandle {
         });
         // Only the embedded desktop carries operator authority. A localhost
         // WebSocket client can be repository code or a dispatched agent and
-        // must never approve host preparation on a person's behalf.
+        // must never act with a person's authority on their behalf.
         let client = operator_memory_client(service.clone());
 
         // Serve the same service on the IPC port so a terminal viewport can

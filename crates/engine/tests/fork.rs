@@ -345,7 +345,6 @@ fn deps<'a>(core: &'a EngineCore) -> comet_engine::ForkDeps<'a> {
         workspace: &core.workspace,
         doc_host: &core.doc_host,
         repos: &core.repos,
-        checkout_prep: &core.checkout_prep,
         handoff: core.sessions.handoff(),
         default_harness: HarnessId::Mock,
     }
@@ -1389,12 +1388,6 @@ async fn a_failed_isolated_fork_reclaims_the_worktree_it_cut() {
         1,
         "only the primary checkout is registered: {registered}"
     );
-    assert!(
-        walk(&rig._dir.path().join("data"))
-            .into_iter()
-            .all(|path| path.file_name().is_none_or(|name| name != "prep.json")),
-        "failed isolated forks forget checkout preparation state"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1429,27 +1422,6 @@ async fn an_unacknowledged_fork_is_reclaimed_when_the_engine_reseeds() {
         .unwrap();
     rig.core.doc_host.persist_chat_snapshot(chat_id).unwrap();
     rig.core.workspace.flush_checked().unwrap();
-    let prepared_path = std::path::PathBuf::from(&worktree.path);
-    let repository_id = rig
-        .core
-        .repos
-        .repository_identity(&prepared_path)
-        .await
-        .unwrap();
-    let prepared = rig
-        .core
-        .checkout_prep
-        .prepare(comet_engine::checkout_prep::PrepareRequest {
-            worktree: &prepared_path,
-            repository_id: &repository_id,
-            force: false,
-            cancel: None,
-        })
-        .await;
-    assert_eq!(
-        prepared.state,
-        comet_engine::checkout_prep::PrepState::Ready
-    );
     rig.core
         .sessions
         .handoff()
@@ -1495,10 +1467,6 @@ async fn an_unacknowledged_fork_is_reclaimed_when_the_engine_reseeds() {
     assert!(!branch_still_exists);
     assert!(!intent_dir.join("chat-crashed-fork.fork.json").exists());
     assert!(!intent_dir.join("chat-crashed-fork.md").exists());
-    assert!(
-        reseeded.checkout_prep.status(&path).is_none(),
-        "restart recovery forgets stale Ready preparation state"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1694,7 +1662,6 @@ async fn a_fork_is_not_a_review_candidate() {
             .merged_sessions_watch(rig.core.sessions.watch_sessions()),
         rig.core.sessions.journal(),
         rig.core.agent_accounts.clone(),
-        rig.core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     );
     let candidates = tokio::task::spawn_blocking(move || {

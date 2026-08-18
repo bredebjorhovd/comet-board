@@ -150,7 +150,6 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
             .merged_sessions_watch(core.sessions.watch_sessions()),
         core.sessions.journal(),
         core.agent_accounts.clone(),
-        core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     ));
     runtime.set_push_credentials(push);
@@ -446,9 +445,7 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         std::fs::create_dir_all(checkout.join(cache)).unwrap();
         std::fs::write(checkout.join(cache).join("blob"), vec![b'x'; 4096]).unwrap();
     }
-    // On `spawn_blocking` like every other trait call here (see the header):
-    // since gh#422 the sweep may run the repo's own `[archive]` step first,
-    // which blocks on the runtime handle exactly as `dispatch` does.
+    // On `spawn_blocking` like every other trait call here (see the header).
     let swept = {
         let rt = runtime.clone();
         let cwd = handle.cwd.clone();

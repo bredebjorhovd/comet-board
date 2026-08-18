@@ -22,9 +22,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use comet_board::config::Paths;
-use comet_doc::{SessionCommandPayload, SessionCommandStatus};
 use comet_engine::push_credentials::PushCredentials;
-use comet_engine::{Engine, EngineConfig, EngineCore, HarnessRegistry};
+use comet_engine::{EngineCore, HarnessRegistry};
 use comet_harness::{Harness, HarnessError, RunControls};
 use comet_proto::{
     AgentEvent, ChatConfig, DoneStatus, GitAuthor, HarnessId, Model, ReasoningLevel, RunRequest,
@@ -168,20 +167,6 @@ fn chat_config(push_repo: Option<&str>, git_author: Option<GitAuthor>) -> ChatCo
         turn_limits: Default::default(),
         mcp_servers: Vec::new(),
     }
-}
-
-fn git(repo: &std::path::Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .expect("git runs");
-    assert!(
-        output.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 /// Write the config value exactly as an older/remote CRDT client would. This
@@ -535,132 +520,6 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
             .any(|run| run.chat_id.as_deref() == Some("chat-broken-handoff")),
         "broken handoff reached the harness"
     );
-
-    // Boot recovery used to release a ready checkout before installing this
-    // resolver. A GitHub command then failed its credential preflight and was
-    // durably rejected before the engine reached the next statement. Persist
-    // that exact state, reboot through production assembly, and prove an
-    // actual recovered Run reaches the harness.
-    std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=ghp_secret\n").unwrap();
-    let recovered_repo = dir.join("recovered-repo");
-    std::fs::create_dir_all(recovered_repo.join(".comet")).unwrap();
-    git(&recovered_repo, &["init", "-b", "main"]);
-    git(
-        &recovered_repo,
-        &["config", "user.email", "recovery@test.invalid"],
-    );
-    git(&recovered_repo, &["config", "user.name", "Recovery Test"]);
-    std::fs::write(
-        recovered_repo.join(comet_engine::checkout_prep::RECIPE_PATH),
-        "version = 1\n",
-    )
-    .unwrap();
-    git(&recovered_repo, &["add", "."]);
-    git(&recovered_repo, &["commit", "-m", "recipe"]);
-
-    core.workspace
-        .create_space(
-            "space-recovered",
-            &core.device_id,
-            &recovered_repo.to_string_lossy(),
-            Some("widget".into()),
-            true,
-        )
-        .unwrap();
-    core.workspace
-        .create_chat(
-            "chat-recovered",
-            "space-recovered",
-            Some(chat_config(Some("owner/widget"), None)),
-            Some(recovered_repo.to_string_lossy().into_owned()),
-        )
-        .unwrap();
-    let repository_id = core
-        .repos
-        .repository_identity(&recovered_repo)
-        .await
-        .unwrap();
-    let digest = core
-        .checkout_prep
-        .review_digest(&recovered_repo)
-        .unwrap()
-        .unwrap();
-    core.checkout_prep
-        .approve(&recovered_repo, &repository_id, &digest)
-        .unwrap();
-    let ready = core
-        .checkout_prep
-        .prepare(comet_engine::checkout_prep::PrepareRequest {
-            worktree: &recovered_repo,
-            repository_id: &repository_id,
-            force: false,
-            cancel: None,
-        })
-        .await;
-    assert!(ready.is_ready(), "{ready:?}");
-    let command = SessionCommandPayload::Run {
-        request: run_request(&recovered_repo.to_string_lossy()),
-        message_id: "message-recovered".into(),
-    };
-    core.checkout_prep
-        .park(
-            &recovered_repo,
-            &serde_json::json!({
-                "chat_id": "chat-recovered",
-                "command_id": "command-recovered",
-                "repository_id": repository_id,
-                "command": command,
-            })
-            .to_string(),
-        )
-        .unwrap();
-    core.shutdown().await;
-    drop(core);
-
-    let config = EngineConfig {
-        data_dir: data.clone(),
-        edge_url: "off".into(),
-        edge_token: None,
-        ipc_port: 0,
-        default_harness: HarnessId::Mock,
-        org_id: None,
-        workos_client_id: None,
-        board: true,
-    };
-    let auth = Engine::build_auth(&config).await;
-    let restarted = Engine::assemble_runtime(&config, auth)
-        .await
-        .expect("production engine reassembles");
-    let restarted_core = restarted.core();
-    let handle = restarted_core
-        .doc_host
-        .open("chat-recovered")
-        .expect("recovered chat opens");
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        let commands = handle.doc().read_commands().unwrap();
-        if commands.iter().any(|entry| {
-            entry.id == "command-recovered" && entry.status == SessionCommandStatus::Applied
-        }) {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "recovered GitHub Run never reached Sessions: {commands:?}"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert!(
-        handle
-            .doc()
-            .read_entries()
-            .unwrap()
-            .iter()
-            .flat_map(|entry| &entry.parts)
-            .any(|part| matches!(part, comet_doc::MessagePart::Text { text, .. } if text == "push it")),
-        "credential preflight succeeded and the recovered prompt became a real turn"
-    );
-    restarted.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

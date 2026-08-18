@@ -348,22 +348,6 @@ final class BoardStore {
         }
     }
 
-    /// Retry a failed preparation in place. No account picker: the agent has
-    /// not started and this verb reuses the parked brief, chat and checkout.
-    func retryPreparation(taskId: String) async -> String? {
-        guard let host = hostDeviceId else { return "No board host" }
-        struct Reply: Decodable { var chatId: String? }
-        do {
-            let _: Reply = try await relay(for: host).call(
-                method: "DispatchTask",
-                params: ["taskId": taskId, "replace": true]
-            )
-            return nil
-        } catch {
-            return error.localizedDescription
-        }
-    }
-
     /// The issue text behind one row, for the detail sheet (gh#132).
     ///
     /// An issue with no description and a read that did not happen are

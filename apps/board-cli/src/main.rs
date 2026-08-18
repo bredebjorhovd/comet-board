@@ -245,11 +245,6 @@ enum Command {
         #[arg(long)]
         task: String,
     },
-    /// Explain why shell/PTY approval is refused and name the operator surface.
-    ApprovePreparation {
-        #[arg(long)]
-        task: String,
-    },
     /// Block until watched work settles. The counterpart to `dispatch`.
     Wait {
         /// Task to watch; repeat for several. Omit to watch everything in
@@ -971,9 +966,6 @@ fn main() -> Result<()> {
                 Ok(())
             })
         }
-        Command::ApprovePreparation { .. } => bail!(
-            "approve-preparation cannot grant host authority from a shell or PTY; review and approve it in the embedded Comet app on the worktree host"
-        ),
         Command::Wait {
             task,
             state,
