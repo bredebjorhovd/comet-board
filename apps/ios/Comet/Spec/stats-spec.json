@@ -306,7 +306,7 @@
         "attempts": 3,
         "boardCount": 2,
         "complete": false,
-        "completenessNote": "Partial aggregate — Offline laptop did not answer. The totals include only the boards that answered.",
+        "completenessNote": "Partial aggregate — Offline laptop did not answer this cycle. The totals include only the boards that answered.",
         "hostStatuses": [
           "answered",
           "duplicate",

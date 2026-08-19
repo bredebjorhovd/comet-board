@@ -85,12 +85,6 @@ enum Msg {
         task_id: String,
         reply: oneshot::Sender<anyhow::Result<TaskDetail>>,
     },
-    /// Throughput over a window (gh#143). On the loop's thread for the same
-    /// reason `Detail` is: that thread owns `board.db`.
-    Stats {
-        since_days: Option<i64>,
-        reply: oneshot::Sender<anyhow::Result<(BoardStats, StatsMergeBasis)>>,
-    },
     /// An agent's file-anchored claims about what its attempt did (§gh#183).
     /// A write, so it could only ever have been on this thread; it answers with
     /// the review the claims land in, remainder included.
@@ -390,17 +384,37 @@ impl BoardService {
     }
 
     /// One stats answer plus the lossless percentile/breakdown basis used by
-    /// the all-board collector. Still one board-loop read and one gather pass.
+    /// the all-board collector. Still one gather pass — but on its own read of
+    /// the store, never queued behind the loop (gh#512). The loop spends whole
+    /// seconds inside `sync_once` talking to GitHub and Linear, and a stats
+    /// probe waiting behind that cycle blows the collector's per-device budget
+    /// — which reported healthy boards, this engine's own included, as
+    /// unreachable. `board.db` is WAL and the CLI's single-board `stats`
+    /// already reads it from another process entirely; a reader here is no
+    /// different, and the loop keeps sole ownership of writes.
+    ///
+    /// Priced the way that CLI path prices (gh#182): with what `routing.toml`
+    /// says on disk. The loop rereads the same file at most one cycle later,
+    /// so a window is never priced against rates the operator has already
+    /// replaced.
     pub async fn stats_mergeable(
         &self,
         since_days: Option<i64>,
     ) -> anyhow::Result<(BoardStats, StatsMergeBasis)> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(Msg::Stats { since_days, reply })
-            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
-        rx.await
-            .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
+        let paths = self.paths.clone();
+        tokio::task::spawn_blocking(move || {
+            let db = comet_board::db::Db::open(&paths.db())?;
+            let prices = comet_board::config::RoutingConfig::load_unvalidated(&paths.routing())
+                .map(|cfg| comet_board::prices::Prices::from_config(&cfg))
+                .unwrap_or_else(|_| comet_board::prices::Prices::builtin());
+            Ok(comet_board::stats::gather_mergeable_priced(
+                &db.load_tasks()?,
+                since_days,
+                &prices,
+            ))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("board stats read was cancelled"))?
     }
 
     /// Record what an agent says its attempt did, and answer with the review
@@ -655,20 +669,6 @@ fn run_loop(
             }
             // A read, so it publishes nothing and logs nothing: opening a row
             // is not an event on the board.
-            // A read like `Detail`: publishes nothing, logs nothing. Opening
-            // the stats page is not an event on the board.
-            Ok(Msg::Stats { since_days, reply }) => {
-                // Priced with the config the loop is currently running on
-                // (gh#182), so an edited `[defaults.rates]` reaches the page on
-                // the same cycle the rest of a config change does — and a
-                // window is never priced against rates the board has stopped
-                // using.
-                let prices = comet_board::prices::Prices::from_config(&engine.cfg);
-                let result = engine.db.load_tasks().map(|tasks| {
-                    comet_board::stats::gather_mergeable_priced(&tasks, since_days, &prices)
-                });
-                let _ = reply.send(result);
-            }
             Ok(Msg::Detail { task_id, reply }) => {
                 let result = engine
                     .db
@@ -1744,6 +1744,29 @@ runtime = "mock"
         );
 
         service.shutdown();
+    }
+
+    /// gh#512: the stats read must not queue behind the loop. The loop spends
+    /// whole seconds inside `sync_once` on GitHub and Linear, and a stats
+    /// probe waiting behind that cycle blew the all-board collector's
+    /// per-device budget — reporting the very board hosting the collector as
+    /// unreachable. Pinned at the extreme: a loop that is *gone* still
+    /// answers, so a loop that is merely busy cannot starve the read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stats_answer_without_waiting_on_the_loop() {
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#512", "gh#512");
+        seed_attempt(&paths, "gh:owner/widget#512", "chat-512");
+
+        let (_, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![]);
+        service.shutdown();
+
+        let (stats, _basis) = service
+            .stats_mergeable(None)
+            .await
+            .expect("the store answers whether or not the loop is listening");
+        assert_eq!(stats.attempts, 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -1339,7 +1339,11 @@ impl AggregateBoardStats {
                         .unwrap_or("unknown")
                 ),
                 StatsHostStatus::Unreadable => format!("{} was unreadable", host.device.label),
-                _ => format!("{} did not answer", host.device.label),
+                // "this cycle", deliberately (gh#512): the host is missing
+                // from this ask, not gone from the account — the next read
+                // asks it again, and a reader must not conclude the box is
+                // down or its board deleted from one missed answer.
+                _ => format!("{} did not answer this cycle", host.device.label),
             })
             .collect();
         (!missing.is_empty()).then(|| {
@@ -3478,7 +3482,7 @@ mod tests {
         assert_eq!(
             aggregate.completeness_note().as_deref(),
             Some(
-                "Partial aggregate — Offline laptop did not answer. The totals include only the boards that answered."
+                "Partial aggregate — Offline laptop did not answer this cycle. The totals include only the boards that answered."
             )
         );
 

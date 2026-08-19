@@ -1081,6 +1081,18 @@ impl EngineRpc {
         }
     }
 
+    /// As [`Self::stats_probe_error`], for the candidate that is this engine.
+    /// The local board is read in-process — no relay is on the path — so no
+    /// failure of that read is ever `unreachable` (gh#512): an operator shown
+    /// that word debugs a network that was never asked. A local read either
+    /// honestly has no board, or failed to be read.
+    fn local_stats_probe_error(error: RpcError) -> StatsProbeResult {
+        match error {
+            RpcError::Refused(_) => StatsProbeResult::NoBoard,
+            other => StatsProbeResult::Unreadable(other.to_string()),
+        }
+    }
+
     /// Read the first frame of the N-1-compatible update stream. This is only
     /// used after an old peer explicitly rejects BoardStatsSnapshot, so a
     /// normal aggregate still performs exactly one request per candidate.
@@ -1132,7 +1144,43 @@ impl EngineRpc {
     /// Ask one candidate under the same per-device budget as the existing
     /// board census. All candidates run concurrently, so one dark laptop costs
     /// five seconds of wall time, not five seconds multiplied by the fleet.
+    ///
+    /// A probe that failed in transport gets exactly one immediate retry
+    /// (gh#512): the failed call is the moment [`Self::forward`] evicts a
+    /// half-open cached relay link, so the second ask re-dials fresh instead
+    /// of reporting a host that answered twenty seconds ago as gone. A probe
+    /// that *timed out* is not retried — that budget was already spent waiting
+    /// on a host that said nothing, and renewing it would double the cost of
+    /// every genuinely dark laptop on every stats read.
     async fn stats_probe(&self, candidate: StatsDevice, since_days: Option<i64>) -> StatsProbe {
+        let local = candidate.device_id == self.doc_host.device_id();
+        let first = match self.stats_probe_once(candidate, since_days).await {
+            Ok(probe) => probe,
+            Err(candidate) => return Self::stats_probe_timeout(candidate, local),
+        };
+        if !Self::stats_probe_should_retry(&first.result, local) {
+            return first;
+        }
+        match self.stats_probe_once(first.candidate, since_days).await {
+            Ok(probe) => probe,
+            Err(candidate) => Self::stats_probe_timeout(candidate, false),
+        }
+    }
+
+    /// Only a transport-flavored miss earns the one retry. The local read has
+    /// no link to re-dial; every other result — including a peer's own error —
+    /// is an answer, and asking again would just repeat it.
+    fn stats_probe_should_retry(result: &StatsProbeResult, local: bool) -> bool {
+        !local && matches!(result, StatsProbeResult::Unreachable(_))
+    }
+
+    /// One ask under one budget. `Err` carries the candidate whose budget
+    /// expired — the only failure [`Self::stats_probe`] must not retry.
+    async fn stats_probe_once(
+        &self,
+        candidate: StatsDevice,
+        since_days: Option<i64>,
+    ) -> Result<StatsProbe, StatsDevice> {
         let timeout_candidate = candidate.clone();
         match tokio::time::timeout(
             PEER_SWEEP_BUDGET,
@@ -1140,13 +1188,24 @@ impl EngineRpc {
         )
         .await
         {
-            Ok(probe) => probe,
-            Err(_) => StatsProbe {
-                candidate: timeout_candidate,
-                result: StatsProbeResult::Unreachable(format!(
-                    "timed out after {}s",
-                    PEER_SWEEP_BUDGET.as_secs()
-                )),
+            Ok(probe) => Ok(probe),
+            Err(_) => Err(timeout_candidate),
+        }
+    }
+
+    /// What an expired budget reads as. Local is never `unreachable`: the read
+    /// crossed no relay (gh#512), so a missed budget is a read that failed,
+    /// not a host that is gone.
+    fn stats_probe_timeout(candidate: StatsDevice, local: bool) -> StatsProbe {
+        let seconds = PEER_SWEEP_BUDGET.as_secs();
+        StatsProbe {
+            candidate,
+            result: if local {
+                StatsProbeResult::Unreadable(format!(
+                    "the local board did not answer within {seconds}s"
+                ))
+            } else {
+                StatsProbeResult::Unreachable(format!("timed out after {seconds}s"))
             },
         }
     }
@@ -1217,6 +1276,7 @@ impl EngineRpc {
                     )),
                 }
             }
+            Err(error) if candidate.device_id == local => Self::local_stats_probe_error(error),
             Err(error) => Self::stats_probe_error(error),
             Ok(RpcReply::Stream(_)) => {
                 StatsProbeResult::Unreadable("stats snapshot answered with a stream".into())
@@ -3023,6 +3083,73 @@ mod tests {
             aggregate.hosts[0].status,
             comet_proto::view::stats::StatsHostStatus::Unreadable
         );
+    }
+
+    /// gh#512: the local board is read in-process, so no local failure — not
+    /// even a missed budget — may read as `unreachable`. An operator shown
+    /// that word for the engine answering the very request starts debugging a
+    /// relay that was never on the path.
+    #[test]
+    fn the_local_board_is_never_unreachable() {
+        assert!(matches!(
+            EngineRpc::local_stats_probe_error(RpcError::Refused("board disabled".into())),
+            StatsProbeResult::NoBoard
+        ));
+        // Transport-shaped errors cannot honestly happen locally; even if one
+        // surfaces, it is a read failure, not a gone host.
+        assert!(matches!(
+            EngineRpc::local_stats_probe_error(RpcError::Transport("offline".into())),
+            StatsProbeResult::Unreadable(_)
+        ));
+        assert!(matches!(
+            EngineRpc::local_stats_probe_error(RpcError::Failed(
+                "reading board stats: database is locked".into()
+            )),
+            StatsProbeResult::Unreadable(_)
+        ));
+
+        let local = EngineRpc::stats_probe_timeout(
+            StatsDevice {
+                device_id: "here".into(),
+                label: "McComet".into(),
+            },
+            true,
+        );
+        assert!(matches!(local.result, StatsProbeResult::Unreadable(_)));
+        let remote = EngineRpc::stats_probe_timeout(
+            StatsDevice {
+                device_id: "away".into(),
+                label: "Offline laptop".into(),
+            },
+            false,
+        );
+        match remote.result {
+            StatsProbeResult::Unreachable(error) => assert!(error.contains("timed out")),
+            other => panic!("a dark peer is unreachable, got {other:?}"),
+        }
+    }
+
+    /// gh#512: a probe that failed in transport is retried exactly once — the
+    /// failure just evicted the half-open cached relay link, so the second ask
+    /// re-dials — while a timeout, a local miss, and every genuine answer are
+    /// not asked again.
+    #[test]
+    fn only_a_remote_transport_miss_earns_the_retry() {
+        let unreachable = StatsProbeResult::Unreachable("connection closed".into());
+        assert!(EngineRpc::stats_probe_should_retry(&unreachable, false));
+        assert!(!EngineRpc::stats_probe_should_retry(&unreachable, true));
+        for answered in [
+            StatsProbeResult::NoBoard,
+            StatsProbeResult::Unreadable("could not decode".into()),
+            StatsProbeResult::UpgradeRequired {
+                current_version: "0.9.0".into(),
+                required_version: "0.10.0".into(),
+                error: "unknown method".into(),
+                can_apply: false,
+            },
+        ] {
+            assert!(!EngineRpc::stats_probe_should_retry(&answered, false));
+        }
     }
 
     #[test]
