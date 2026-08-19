@@ -236,10 +236,22 @@ pub enum Edit {
     /// duplicate never starts enabled, whatever its source said: enabling is
     /// the authorization, and it is given to a rule, not inherited by its
     /// copies.
+    ///
+    /// The three keys creating asks for (gh#524) — the label, the owner, the
+    /// account — ride the same write, so a new rule lands whole in one echo
+    /// instead of four writes racing the sweep. Each is optional and lands
+    /// exactly as the keyed edit would have written it.
     AutomationAdd {
         name: String,
         #[serde(default)]
         from: Option<String>,
+        /// Comma-separated required labels, as the `labels` keyed edit takes.
+        #[serde(default)]
+        labels: Option<String>,
+        #[serde(default)]
+        owner: Option<String>,
+        #[serde(default)]
+        account: Option<String>,
     },
     /// Delete a rule's whole block (gh#490). Its history in `board.db` keeps
     /// itself until retention prunes it; work already running is untouched —
@@ -533,9 +545,52 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
         } => {
             let kind = kind_of(AUTOMATION_KEYS, key, "automation")?;
             let (at, end) = automation_block(&before, automation)?;
-            set_between(&before, at, end, key, rendered(kind, value.as_deref())?)
+            let after = set_between(&before, at, end, key, rendered(kind, value.as_deref())?);
+            // Enabling is consent to spend, and the account is who pays
+            // (gh#524): the write seam refuses the two edits that would leave
+            // a rule enabled with nobody paying — enabling an unpaid rule and
+            // unpaying an enabled one. A seam check rather than a validation
+            // rule, deliberately: a hand-written file with such a rule must
+            // still *load* (it reads `unhealthy` and refuses its candidates),
+            // or an upgrade would take the whole board's routing down with it.
+            if (key == "enabled" || key == "account")
+                && let Ok(cfg) = toml::from_str::<RoutingConfig>(&after)
+                && let Some(rule) = cfg.automations.iter().find(|a| a.name == *automation)
+                && rule.enabled
+                && rule.account.as_deref().map(str::trim).unwrap_or("").is_empty()
+            {
+                bail!(
+                    "automation `{automation}` would be enabled with no billing account; \
+                     the account is the consent every unattended dispatch spends — \
+                     set `account` first"
+                );
+            }
+            after
         }
-        Edit::AutomationAdd { name, from } => add_automation(&before, name, from.as_deref())?,
+        Edit::AutomationAdd {
+            name,
+            from,
+            labels,
+            owner,
+            account,
+        } => {
+            let mut after = add_automation(&before, name, from.as_deref())?;
+            // The creation questions land through the same keyed writer an
+            // edit would use, so what one write creates and what four would
+            // have cannot differ.
+            let seeds = [
+                ("labels", labels),
+                ("owner", owner),
+                ("account", account),
+            ];
+            for (key, value) in seeds {
+                let Some(value) = value else { continue };
+                let kind = kind_of(AUTOMATION_KEYS, key, "automation")?;
+                let (at, end) = automation_block(&after, name)?;
+                after = set_between(&after, at, end, key, rendered(kind, Some(value))?);
+            }
+            after
+        }
         Edit::AutomationRemove { name } => {
             let (at, end) = automation_block(&before, name)?;
             let lines: Vec<&str> = before.lines().collect();
@@ -1505,6 +1560,9 @@ max_duration = "banana"
             &Edit::AutomationAdd {
                 name: "approved".into(),
                 from: None,
+                labels: None,
+                owner: None,
+                account: None,
             },
         )
         .unwrap();
@@ -1519,6 +1577,9 @@ max_duration = "banana"
             &Edit::AutomationAdd {
                 name: "Approved".into(),
                 from: None,
+                labels: None,
+                owner: None,
+                account: None,
             },
         )
         .unwrap_err()
@@ -1542,6 +1603,9 @@ max_duration = "banana"
             &Edit::AutomationAdd {
                 name: "approved-docs".into(),
                 from: Some("approved".into()),
+                labels: None,
+                owner: None,
+                account: None,
             },
         )
         .unwrap();
@@ -1582,15 +1646,84 @@ max_duration = "banana"
             &Edit::AutomationAdd {
                 name: "hasty".into(),
                 from: None,
+                labels: None,
+                owner: None,
+                account: None,
             },
         )
         .unwrap();
         let before = read(&paths).unwrap().text;
         // The whole chain: `apply` wraps the validator's sentence, and the
-        // RPC layer prints the chain (`{e:#}`), so the page reads both.
+        // RPC layer prints the chain (`{e:#}`), so the page reads both. A
+        // wholly blank rule trips the account seam first (gh#524); one with
+        // an account falls through to the validator's own sentences.
+        let err = format!("{:#}", automation_edit(&paths, "hasty", "enabled", Some("true")).unwrap_err());
+        assert!(err.contains("no billing account"), "{err}");
+        assert_eq!(read(&paths).unwrap().text, before, "the file moved");
+
+        automation_edit(&paths, "hasty", "account", Some("slot-1")).unwrap();
+        let paid = read(&paths).unwrap().text;
         let err = format!("{:#}", automation_edit(&paths, "hasty", "enabled", Some("true")).unwrap_err());
         assert!(err.contains("no owner") || err.contains("no required labels"), "{err}");
-        assert_eq!(read(&paths).unwrap().text, before, "the file moved");
+        assert_eq!(read(&paths).unwrap().text, paid, "the file moved");
+    }
+
+    /// gh#524: enabling is consent to spend, and the account is who pays —
+    /// the seam refuses the two edits that would leave a rule enabled with
+    /// nobody paying, while a hand-written file in that state still loads
+    /// (and reads `unhealthy`) so an upgrade cannot take routing down.
+    #[test]
+    fn an_enabled_rule_cannot_be_left_with_nobody_paying() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        edit(
+            &paths,
+            &Edit::AutomationAdd {
+                name: "paid".into(),
+                from: None,
+                labels: Some("auto".into()),
+                owner: Some("Brede".into()),
+                account: Some("slot-1".into()),
+            },
+        )
+        .unwrap();
+        automation_edit(&paths, "paid", "enabled", Some("true")).unwrap();
+
+        // Unpaying an enabled rule is the same hole from the other side.
+        let err = automation_edit(&paths, "paid", "account", None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no billing account"), "{err}");
+
+        // Paused first, then unpaid: a draft may be half-written.
+        automation_edit(&paths, "paid", "enabled", Some("false")).unwrap();
+        let view = automation_edit(&paths, "paid", "account", None).unwrap();
+        let rule = &view.config.as_ref().unwrap().automations[0];
+        assert!(rule.account.is_none());
+    }
+
+    /// gh#524: creating asks three things, and they ride the one write — the
+    /// new rule lands whole, paused, with its label, owner and account exactly
+    /// as the keyed edits would have written them.
+    #[test]
+    fn a_seeded_add_lands_the_three_creation_answers_in_one_write() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let view = edit(
+            &paths,
+            &Edit::AutomationAdd {
+                name: "docs sweep".into(),
+                from: None,
+                labels: Some("docs, approved".into()),
+                owner: Some("Brede".into()),
+                account: Some("slot-1".into()),
+            },
+        )
+        .unwrap();
+        let rule = &view.config.as_ref().unwrap().automations[0];
+        assert_eq!(rule.name, "docs sweep");
+        assert!(!rule.enabled, "created paused — enabling is its own consent");
+        assert_eq!(rule.labels, vec!["docs", "approved"]);
+        assert_eq!(rule.owner.as_deref(), Some("Brede"));
+        assert_eq!(rule.account.as_deref(), Some("slot-1"));
     }
 
     /// The ops address rules by name, and an unknown name or key is refused
@@ -1608,6 +1741,9 @@ max_duration = "banana"
             &Edit::AutomationAdd {
                 name: "real".into(),
                 from: None,
+                labels: None,
+                owner: None,
+                account: None,
             },
         )
         .unwrap();
@@ -1626,7 +1762,7 @@ max_duration = "banana"
             "op": "automationAdd", "name": "approved", "from": "other"
         }))
         .unwrap();
-        assert!(matches!(add, Edit::AutomationAdd { ref name, ref from }
+        assert!(matches!(add, Edit::AutomationAdd { ref name, ref from, .. }
             if name == "approved" && from.as_deref() == Some("other")));
         let set: Edit = serde_json::from_value(serde_json::json!({
             "op": "automation", "automation": "approved", "key": "enabled", "value": "true"

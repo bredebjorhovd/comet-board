@@ -1984,6 +1984,23 @@ impl Db {
         Ok(())
     }
 
+    /// Dispatches per agent-account slot since `since`, busiest first — what
+    /// the automations page shows beside each account it offers (gh#524). Off
+    /// the attempts table because an attempt row is the record of a dispatch
+    /// that happened; NULL `account` rows (the box's own login) are nobody's
+    /// slot and stay out.
+    pub fn account_dispatch_totals(&self, since: &str) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT account, COUNT(*) FROM attempts
+              WHERE account IS NOT NULL AND started_at >= ?1
+              GROUP BY account ORDER BY COUNT(*) DESC, account",
+        )?;
+        let rows = stmt.query_map(params![since], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     // ---- writeback queue ------------------------------------------------
 
     /// Enqueue a writeback. Returns `false` when this exact effect is already

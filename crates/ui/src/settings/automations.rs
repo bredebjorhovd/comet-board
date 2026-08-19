@@ -1,57 +1,63 @@
-//! Settings → Automations (gh#490): the board host's auto-pick rules — what
-//! they match, what a dispatch under them runs as, whether they are enabled,
-//! paused or unhealthy, and the history of what each rule did and declined to
-//! do.
+//! Settings → Automations (gh#490, reworked gh#524): each auto-pick rule is
+//! rendered as the sentence the planner executes, and proves itself against
+//! the live board before anybody enables it.
 //!
-//! Board-hosted like Routing (gh#75), and shaped like it: the rules are
-//! `routing.toml`, so every edit here is a `WriteBoardConfig` op through the
-//! board crate's validating writer — it has to parse, it has to validate, and
-//! the previous contents land in `routing.toml.bak`. What the config cannot
-//! carry — live counts, budget meters, health, the run history — arrives by
-//! `ReadBoardAutomations` from the same host the config sweep settled on.
+//! Board-hosted like Routing (gh#75): the rules are `routing.toml`, so every
+//! edit here is a `WriteBoardConfig` op through the board crate's validating
+//! writer. What the config cannot carry — live counts, health, history, and
+//! the preview — arrives by `ReadBoardAutomations` from the host each rule
+//! lives on.
 //!
-//! ## The board is a choice, not a fate (gh#514)
+//! ## The three questions a good automations page answers in place (gh#524)
 //!
-//! The sweep settles on a default the way Routing's does, but on an account
-//! with two boards "whichever settled" is invisible until a rule lands on the
-//! board the reader is not looking at. So the sweep here keeps every host that
-//! answered, and the page carries an explicit board picker: which board these
-//! rules live on, changeable, before anything is created into it.
+//! 1. **What will this rule do?** The rule renders as one sentence with each
+//!    field sitting at the point where it acts, click-to-edit. A required
+//!    field with nothing in it is a *blank in the sentence* — "who pays?" in
+//!    the danger hue — not a quiet chip.
+//! 2. **What would it do right now?** Every rule carries a preview computed
+//!    by the loop's own planner (`autopick::plan`) against the current board,
+//!    with the rule treated as enabled — so the panel under a paused draft is
+//!    exactly what enabling would authorize, in the planner's own reason
+//!    sentences, and the preview and the loop can never disagree.
+//! 3. **Did my change take?** Every write renders saving → saved-from-host /
+//!    refused-on-this-field. "Saved" is the host's round-tripped echo (gh#522
+//!    fences replies by host), never optimism; a refusal lands on the field
+//!    that caused it, in the writer's own words.
 //!
-//! ## Reading a rule (gh#514)
+//! ## No page-level board picker (gh#524, superseding gh#514's)
 //!
-//! A rule is three different kinds of thing and the row says so: **match**
-//! (which tasks it picks), **dispatch as** (what a dispatch runs and spends),
-//! **limits** (how much of it). A required field that is missing — owner,
-//! labels, account — is painted in the warning hue and named in a strip,
-//! because "owned by nobody" is not metadata, it is the thing standing between
-//! the rule and working. Edits happen inside the rule they belong to.
+//! The list is the union of every board the host sweep finds. Which board a
+//! rule lives on is a per-rule *fact* shown on the rule, never a page mode:
+//! writes are addressed at the rule's own host, so the contradiction gh#513
+//! fixed — a view of one board with writes aimed at another — cannot be
+//! reassembled by a picker. A host is only ever *chosen* at creation, and
+//! only when it is genuinely ambiguous (more than one device hosts a board).
 //!
-//! Two ceremonies are deliberate. **Enabling** a rule opens a confirmation
-//! naming exactly what is being authorized — dispatching agents without a
-//! keypress, spending the named account — because enabling *is* the human
-//! authorization every later dispatch rides on. **Deleting** confirms too, and
-//! says what it does not do: work already running is untouched.
+//! ## Creating asks three things (gh#524)
 //!
-//! ## The rules on screen are the host's rules or say they are not (gh#513)
+//! Label, owner, account — the slots that cannot default. They ride one
+//! `automationAdd` write, so the rule lands whole in one echo, paused, with
+//! its preview already showing what it would have done. Enabling is a
+//! separate, informed consent: the ceremony names what it authorizes, and the
+//! writer refuses to enable a sentence that is missing who pays.
 //!
-//! Every write here is addressed at `page.host`, so the list must never be
-//! another host's: a reply is applied only if the page is still addressed at
-//! the host it was asked of, and anything that moves `page.host` drops the
-//! old host's view first. A read that fails does not leave the old list
-//! rendered as current — it is marked stale where it renders. And a write the
-//! host refuses because the rule is unknown re-reads instead of leaving a
-//! contradicted list under the refusal: "there is no automation named X" with
-//! X listed below it was this page addressing a different board than it showed.
+//! ## Reads stay honest (gh#513)
+//!
+//! A reply is applied to the board it was asked of; a failed re-read marks
+//! that board's rules stale where they render instead of leaving them dressed
+//! as current; a write the host refuses re-reads rather than leaving a
+//! contradicted list under the refusal.
 
 use gpui::{
-    AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
+    px,
 };
 
 use comet_board::autopick::{AutomationsView, RuleStatus};
 use comet_board::config::Automation;
 use comet_board::db::AutomationLogRow;
 use comet_board::routes::RoutingView;
+use comet_proto::AgentAccount;
 use comet_proto::view::board;
 use comet_rpc::methods;
 use serde::Deserialize;
@@ -68,23 +74,60 @@ use crate::theme::Theme;
 #[derive(Debug, Clone, Deserialize)]
 struct BoardConfig {
     routing: RoutingView,
-    /// The furniture question (gh#434), riding the config reply so the host
-    /// sweep can settle on a board somebody has actually released work from.
+    /// Whether anybody has ever released work from this board (gh#434) —
+    /// kept riding the reply so the default creation target can prefer a
+    /// board with evidence.
     #[serde(default)]
     dispatched: bool,
 }
 
-/// One board the sweep found — a picker entry. `id: None` is this device.
-#[derive(Debug, Clone)]
-struct HostOption {
-    id: Option<String>,
-    /// Whether anybody has ever released work from it (gh#434). The default
-    /// pick prefers a board with evidence; the picker shows both.
-    dispatched: bool,
+/// The accounts reply, as `accounts.rs` reads it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountsReply {
+    #[serde(default)]
+    accounts: Vec<AgentAccount>,
 }
 
-/// One rule key this page edits inline. Everything else — a rename, a rule
-/// reordering — is a `routing.toml` edit somebody does knowingly.
+/// One board host this page reads and writes — the union's unit (gh#524).
+/// `id: None` is this device. Every read and write is fenced to its entry:
+/// a reply about one board can only ever repaint that board (gh#513).
+struct HostBoard {
+    id: Option<String>,
+    config: Option<BoardConfig>,
+    automations: Option<AutomationsView>,
+    /// The agent-account slots saved on this host — what the account slot
+    /// offers when a rule picks who pays.
+    accounts: Vec<AgentAccount>,
+    /// A read for this board is in flight — "Reading…", not "missing".
+    fetching: bool,
+    /// The rules on screen are a previous successful read carried past a
+    /// failed re-read (gh#513) — rendered under a strip saying so.
+    stale: bool,
+    config_task: Option<Task<()>>,
+    fetch_task: Option<Task<()>>,
+    accounts_task: Option<Task<()>>,
+}
+
+impl HostBoard {
+    fn new(id: Option<String>) -> Self {
+        Self {
+            id,
+            config: None,
+            automations: None,
+            accounts: Vec::new(),
+            fetching: false,
+            stale: false,
+            config_task: None,
+            fetch_task: None,
+            accounts_task: None,
+        }
+    }
+}
+
+/// One rule key this page edits inline — a slot in the sentence. Everything
+/// else (a rename, a reordering) is a `routing.toml` edit somebody does
+/// knowingly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RuleField {
     Owner,
@@ -117,45 +160,58 @@ impl RuleField {
         }
     }
 
-    fn label(self) -> &'static str {
+    /// Why the field exists, phrased as consequence (gh#524) — shown where
+    /// the field is edited. The account line is the planner's own refusal
+    /// sentence turned around, so help text and behavior cannot drift.
+    fn purpose(self) -> &'static str {
         match self {
-            RuleField::Owner => "Owner",
-            RuleField::Labels => "Required labels (comma-separated)",
-            RuleField::ExcludeLabels => "Excluded labels (comma-separated)",
-            RuleField::Account => "Billing account (slot id)",
-            RuleField::Runtime => "Runtime",
-            RuleField::Model => "Model",
-            RuleField::Route => "Route",
-            RuleField::MaxPerEval => "Max dispatches per evaluation",
-            RuleField::MaxConcurrent => "Max live attempts",
-            RuleField::DailyBudget => "Daily dispatch budget",
-            RuleField::Cooldown => "Failure cooldown",
-        }
-    }
-
-    /// What an empty field means, said before somebody clears one.
-    fn empty_hint(self) -> &'static str {
-        match self {
-            RuleField::Owner => "Required to enable — the human this automation answers to.",
-            RuleField::Labels => "Required to enable — the label that means \
-                                  \"approved for autonomous execution\".",
-            RuleField::ExcludeLabels => "Empty: nothing excluded.",
-            RuleField::Account => "Required — without it every candidate is refused. \
-                                   `comet-board doctor` lists this device's slot ids.",
-            RuleField::Runtime => "Empty: the route's runtime.",
-            RuleField::Model => "Empty: the harness default.",
-            RuleField::Route => "Empty: whatever route each task resolves to.",
-            RuleField::MaxPerEval => "Empty: 1 per evaluation.",
-            RuleField::MaxConcurrent => "Empty: 1 live attempt.",
-            RuleField::DailyBudget => "Empty: no daily cap (concurrency still holds).",
-            RuleField::Cooldown => "Empty: 30m. `off` reconsiders on the next cycle.",
+            RuleField::Owner => {
+                "The human this rule's dispatches answer to — named on every \
+                 attempt it releases. Required to enable."
+            }
+            RuleField::Labels => {
+                "A task must carry all of these to be considered — the label that \
+                 means \"approved for autonomous execution\". Comma-separated. \
+                 Required to enable."
+            }
+            RuleField::ExcludeLabels => {
+                "A task carrying any of these is skipped even when the required \
+                 labels match. Empty excludes nothing."
+            }
+            RuleField::Account => {
+                "The slot this rule's dispatches bill. Without one, every \
+                 candidate is refused."
+            }
+            RuleField::Runtime => {
+                "What a dispatch runs on. Empty runs whatever runtime the task's \
+                 route names."
+            }
+            RuleField::Model => "Model override for dispatches. Empty runs the harness default.",
+            RuleField::Route => {
+                "Only dispatch tasks that resolve to this route. Empty takes \
+                 whatever route each task resolves to — the rule never invents one."
+            }
+            RuleField::MaxPerEval => {
+                "Most dispatches one evaluation may make. Evaluations run every \
+                 sync cycle, so this is a rate more than a ceiling. Empty: 1."
+            }
+            RuleField::MaxConcurrent => {
+                "Most live attempts this rule may have running at once. Empty: 1."
+            }
+            RuleField::DailyBudget => {
+                "Most dispatches per rolling 24 hours. Empty: no daily cap — the \
+                 live cap still holds."
+            }
+            RuleField::Cooldown => {
+                "How long a task waits after a failure or refusal before this rule \
+                 considers it again — what keeps a standing refusal from \
+                 hot-looping. Empty: 30m. `off` reconsiders next cycle."
+            }
         }
     }
 
     fn current(self, rule: &Automation) -> Option<String> {
-        let list = |labels: &[String]| {
-            (!labels.is_empty()).then(|| labels.join(", "))
-        };
+        let list = |labels: &[String]| (!labels.is_empty()).then(|| labels.join(", "));
         match self {
             RuleField::Owner => rule.owner.clone(),
             RuleField::Labels => list(&rule.labels),
@@ -172,24 +228,147 @@ impl RuleField {
     }
 }
 
+/// What one sentence slot says for a rule, and whether it is a **blank** — a
+/// required slot with nothing in it, rendered as the question the sentence
+/// cannot answer ("who pays?") rather than as a quiet default (gh#524).
+fn slot_text(field: RuleField, rule: &Automation) -> (String, bool) {
+    let list = |labels: &[String]| -> String {
+        labels
+            .iter()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let set = |value: &Option<String>| -> Option<String> {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    match field {
+        RuleField::Labels => {
+            let text = list(&rule.labels);
+            if text.is_empty() {
+                ("which label?".into(), true)
+            } else {
+                (text, false)
+            }
+        }
+        RuleField::ExcludeLabels => {
+            let text = list(&rule.exclude_labels);
+            if text.is_empty() {
+                ("nothing".into(), false)
+            } else {
+                (text, false)
+            }
+        }
+        RuleField::Route => (set(&rule.route).unwrap_or_else(|| "any route".into()), false),
+        RuleField::Runtime => (
+            set(&rule.runtime).unwrap_or_else(|| "the route's runtime".into()),
+            false,
+        ),
+        RuleField::Model => (
+            set(&rule.model).unwrap_or_else(|| "the default model".into()),
+            false,
+        ),
+        RuleField::Account => match set(&rule.account) {
+            Some(account) => (account, false),
+            None => ("who pays?".into(), true),
+        },
+        RuleField::Owner => match set(&rule.owner) {
+            Some(owner) => (owner, false),
+            None => ("who owns it?".into(), true),
+        },
+        RuleField::MaxPerEval => (format!("{} per check", rule.max_per_eval.max(1)), false),
+        RuleField::MaxConcurrent => (format!("{} live", rule.max_concurrent.max(1)), false),
+        RuleField::DailyBudget => (
+            rule.daily_budget
+                .map(|b| format!("{b} per day"))
+                .unwrap_or_else(|| "no daily cap".into()),
+            false,
+        ),
+        RuleField::Cooldown => {
+            let cooldown = rule.cooldown.trim();
+            if cooldown.is_empty() {
+                ("30m cooldown".into(), false)
+            } else if cooldown.eq_ignore_ascii_case("off") {
+                ("no cooldown".into(), false)
+            } else {
+                (format!("{cooldown} cooldown"), false)
+            }
+        }
+    }
+}
+
 /// What keeps a paused rule from being enabled — the writer's own refusals
-/// (`config.rs` validates owner and labels on enable), said before the click
-/// instead of after it. Empty for an enabled rule: it got past the writer.
+/// (`config.rs` validates owner and labels on enable; the write seam in
+/// `routes.rs` refuses enabling with nobody paying, gh#524), said before the
+/// click instead of after it. Empty for an enabled rule: it got past the
+/// writer.
 fn enable_blockers(rule: &Automation) -> Vec<&'static str> {
     let mut out = Vec::new();
     if rule.enabled {
         return out;
     }
     if rule.owner.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        out.push("an owner");
+        out.push("who owns it (owner)");
     }
     if rule.labels.iter().all(|l| l.trim().is_empty()) {
-        out.push("at least one required label");
+        out.push("which label it fires on (labels)");
+    }
+    if rule.account.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        out.push("who pays (account)");
     }
     out
 }
 
-struct FieldDialog {
+/// A new rule's name, from the label it fires on — creating asks three
+/// things, and a name is not one of them (gh#524). Deduped against the
+/// board's rules the way the writer would refuse.
+fn derive_rule_name(label: &str, existing: &[String]) -> String {
+    let base = {
+        let trimmed = label.trim();
+        if trimmed.is_empty() {
+            "rule".to_string()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    let mut candidate = base.clone();
+    let mut n = 2;
+    while existing.iter().any(|e| e.eq_ignore_ascii_case(&candidate)) {
+        candidate = format!("{base} {n}");
+        n += 1;
+    }
+    candidate
+}
+
+/// Where one write is in its life: sent, echoed back by the host, or refused
+/// (gh#524). "Saved" is the host's round-tripped reply and nothing earlier —
+/// the page never marks its own optimism as landed.
+#[derive(Debug, Clone, PartialEq)]
+enum WriteState {
+    Saving,
+    Saved,
+    Refused(SharedString),
+}
+
+/// The one in-flight (or just-landed) write, addressed like the write itself:
+/// which board, which rule, which slot. `seq` fences replies — a slow answer
+/// to a superseded write must not repaint the mark of a newer one.
+#[derive(Debug, Clone)]
+struct WriteMark {
+    seq: u64,
+    host: Option<String>,
+    rule: Option<String>,
+    field: Option<RuleField>,
+    state: WriteState,
+}
+
+struct FieldEditor {
+    host: Option<String>,
     rule: String,
     field: RuleField,
     input: Entity<ComposerInput>,
@@ -201,52 +380,55 @@ struct FieldDialog {
 enum Confirm {
     /// Enabling is the authorization (gh#490) — the dialog names the agents,
     /// the account and the owner it authorizes.
-    Enable { rule: String, summary: String },
-    Delete { rule: String },
+    Enable {
+        host: Option<String>,
+        rule: String,
+        summary: String,
+    },
+    Delete {
+        host: Option<String>,
+        rule: String,
+    },
 }
 
 impl Confirm {
-    fn rule(&self) -> &str {
+    fn addresses(&self, host: &Option<String>, rule: &str) -> bool {
         match self {
-            Confirm::Enable { rule, .. } | Confirm::Delete { rule } => rule,
+            Confirm::Enable {
+                host: h, rule: r, ..
+            }
+            | Confirm::Delete { host: h, rule: r } => h == host && r == rule,
         }
     }
 }
 
+/// The creation scaffold (gh#524): exactly the three slots that cannot
+/// default, plus — only when more than one device hosts a board — which board
+/// the rule is created into.
 struct NewRule {
-    name: Entity<ComposerInput>,
-    _events: Subscription,
+    host: Option<String>,
+    label: Entity<ComposerInput>,
+    owner: Entity<ComposerInput>,
+    account: Entity<ComposerInput>,
+    _events: Vec<Subscription>,
 }
 
 pub struct AutomationsPage {
     state: Entity<AppState>,
-    /// Which device's board — `None` is this one. Defaulted by the same sweep
-    /// Routing uses, and changeable by the picker (gh#514).
-    host: Option<String>,
-    /// Every device the sweep found a board on — the picker's options.
-    hosts: Vec<HostOption>,
-    config: Option<BoardConfig>,
-    automations: Option<AutomationsView>,
-    dialog: Option<FieldDialog>,
+    /// Every device that answered the config sweep with a board — the union
+    /// this page renders (gh#524). No page-level current board exists.
+    boards: Vec<HostBoard>,
+    editor: Option<FieldEditor>,
     confirm: Option<Confirm>,
     new_rule: Option<NewRule>,
+    /// The one in-flight or last-settled write.
+    mark: Option<WriteMark>,
+    write_seq: u64,
     error: Option<SharedString>,
     busy: bool,
     loaded: bool,
-    /// A read for the current host is in flight — "Reading…", not "missing".
-    fetching: bool,
-    /// The rules on screen are a previous successful read carried past a
-    /// failed re-read (gh#513) — rendered under a strip saying so, never as
-    /// the board's current state.
-    stale: bool,
-    /// The user picked a board explicitly (gh#514); the sweep must never
-    /// re-settle the page onto another one over that (gh#513).
-    picked: bool,
-    task: Option<Task<()>>,
-    fetch_task: Option<Task<()>>,
-    /// A picked host's config read runs on its own slot, so choosing a board
-    /// does not cancel the sweep still filling the picker.
-    host_task: Option<Task<()>>,
+    sweep_task: Option<Task<()>>,
+    write_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -255,31 +437,26 @@ impl AutomationsPage {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let mut page = Self {
             state,
-            host: None,
-            hosts: Vec::new(),
-            config: None,
-            automations: None,
-            dialog: None,
+            boards: Vec::new(),
+            editor: None,
             confirm: None,
             new_rule: None,
+            mark: None,
+            write_seq: 0,
             error: None,
             busy: false,
             loaded: false,
-            fetching: false,
-            stale: false,
-            picked: false,
-            task: None,
-            fetch_task: None,
-            host_task: None,
+            sweep_task: None,
+            write_task: None,
             _observe: observe,
         };
         page.reload(cx);
         page
     }
 
-    fn host_params(&self, value: serde_json::Value) -> serde_json::Value {
+    fn host_params(host: &Option<String>, value: serde_json::Value) -> serde_json::Value {
         let mut value = value;
-        if let (Some(host), Some(object)) = (self.host.as_deref(), value.as_object_mut()) {
+        if let (Some(host), Some(object)) = (host.as_deref(), value.as_object_mut()) {
             object.insert("targetDeviceId".into(), serde_json::json!(host));
         }
         value
@@ -299,14 +476,13 @@ impl AutomationsPage {
             .unwrap_or_else(|| SharedString::from(host.to_string()))
     }
 
-    fn host_label(&self, cx: &gpui::App) -> SharedString {
-        self.device_label(self.host.as_deref(), cx)
+    fn board_ix(&self, host: &Option<String>) -> Option<usize> {
+        self.boards.iter().position(|b| &b.id == host)
     }
 
-    /// Sweep every host candidate and keep every board that answers — the
-    /// picker's options — while settling the default the way Routing does
-    /// (gh#434): the first board with dispatch evidence, shown as soon as it
-    /// answers, else the first "furniture" board once everyone has been asked.
+    /// Sweep every host candidate and keep **every** board that answers —
+    /// the union this page is (gh#524). No settling, no default: a board
+    /// found is a board rendered.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
@@ -318,16 +494,11 @@ impl AutomationsPage {
         };
         let candidates = board::host_candidates(&devices, local.as_deref());
         self.error = None;
-        self.hosts.clear();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.sweep_task = Some(cx.spawn(async move |this, cx| {
             let mut last: Option<String> = None;
-            let mut furniture: Option<(Option<String>, BoardConfig)> = None;
-            let mut settled = false;
+            let mut found = false;
             for candidate in candidates {
-                let mut params = serde_json::json!({});
-                if let (Some(host), Some(object)) = (candidate.as_deref(), params.as_object_mut()) {
-                    object.insert("targetDeviceId".into(), serde_json::json!(host));
-                }
+                let params = Self::host_params(&candidate, serde_json::json!({}));
                 match engine
                     .client()
                     .call(methods::READ_BOARD_CONFIG, params)
@@ -335,23 +506,13 @@ impl AutomationsPage {
                 {
                     Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
                         Ok(config) => {
-                            // The first board with evidence is shown right
-                            // away; the sweep keeps going only to finish the
-                            // picker's list.
-                            let take = config.dispatched && !settled;
-                            settled = settled || take;
-                            let option = HostOption {
-                                id: candidate.clone(),
-                                dispatched: config.dispatched,
-                            };
-                            if !take && furniture.is_none() && !settled {
-                                furniture = Some((candidate.clone(), config.clone()));
-                            }
+                            found = true;
                             let updated = this.update(cx, |page, cx| {
-                                page.hosts.push(option);
-                                if take {
-                                    page.settle_host(candidate.clone(), config.clone(), cx);
-                                }
+                                let mut entry = HostBoard::new(candidate.clone());
+                                entry.config = Some(config);
+                                page.boards.push(entry);
+                                page.fetch_automations(candidate.clone(), cx);
+                                page.fetch_accounts(candidate.clone(), cx);
                                 cx.notify();
                             });
                             if updated.is_err() {
@@ -365,21 +526,14 @@ impl AutomationsPage {
             }
             this.update(cx, |page, cx| {
                 page.loaded = true;
-                if !settled && !page.picked && page.config.is_none() {
-                    match furniture {
-                        Some((host, config)) => {
-                            page.settle_host(host, config, cx);
+                if !found {
+                    page.error = Some(
+                        match last {
+                            Some(err) => format!("No device here hosts a board ({err})"),
+                            None => "No device here hosts a board".to_string(),
                         }
-                        None => {
-                            page.error = Some(
-                                match last {
-                                    Some(err) => format!("No device here hosts a board ({err})"),
-                                    None => "No device here hosts a board".to_string(),
-                                }
-                                .into(),
-                            );
-                        }
-                    }
+                        .into(),
+                    );
                 }
                 cx.notify();
             })
@@ -387,96 +541,51 @@ impl AutomationsPage {
         }));
     }
 
-    /// Adopt a host the sweep settled on (gh#434) — unless the user has
-    /// picked one, which the sweep never re-settles over (gh#513). A settle
-    /// that moves the page to a different board drops the old board's view
-    /// first: one host's rules must never render while every write on the
-    /// page is addressed at another.
-    fn settle_host(
-        &mut self,
-        host: Option<String>,
-        config: BoardConfig,
-        cx: &mut Context<Self>,
-    ) {
-        if self.picked {
-            return;
+    /// A read off one board failed: the error names the board, and whatever
+    /// rules of *that board* are on screen stop being presented as current
+    /// (gh#513) — they are the last successful read, and the strip above them
+    /// says so. Every other board is untouched.
+    fn read_failed(&mut self, host: &Option<String>, err: String, cx: &gpui::App) {
+        let label = self.device_label(host.as_deref(), cx);
+        if let Some(ix) = self.board_ix(host) {
+            let board = &mut self.boards[ix];
+            board.fetching = false;
+            board.stale = board.automations.is_some();
         }
-        self.loaded = true;
-        if self.host != host {
-            self.automations = None;
-            self.stale = false;
-            self.dialog = None;
-            self.confirm = None;
-        }
-        self.host = host;
-        self.config = Some(config);
-        self.fetch_automations(cx);
+        self.error = Some(format!("{label}: {err}").into());
     }
 
-    /// Point the page at another board (gh#514). Everything on screen belongs
-    /// to the old host, so it all drops; the new host's config and rules are
-    /// read fresh rather than served from whatever the sweep cached.
-    fn select_host(&mut self, target: Option<String>, cx: &mut Context<Self>) {
-        // Even a click on the current board is an explicit pick — from here
-        // the sweep fills the picker but never moves the page (gh#513).
-        self.picked = true;
-        if self.host == target && self.config.is_some() {
-            return;
-        }
-        self.host = target;
-        self.config = None;
-        self.automations = None;
-        self.stale = false;
-        self.dialog = None;
-        self.confirm = None;
-        self.new_rule = None;
-        self.error = None;
-        // An in-flight read for the old host must not repaint this one — the
-        // reply guard would drop it, and cancelling it is cheaper still.
-        self.fetch_task = None;
-        self.fetch_config(cx);
-        cx.notify();
-    }
-
-    /// A read off the current host failed: the error shows, and whatever
-    /// rules are still on screen stop being presented as current (gh#513) —
-    /// they are the last successful read, and the strip above them says so.
-    fn read_failed(&mut self, err: String) {
-        self.fetching = false;
-        self.error = Some(err.into());
-        self.stale = self.automations.is_some();
-    }
-
-    /// Read the current host's config, then its rules. The reply is applied
-    /// only if the page is still addressed at the host it was asked of — a
-    /// slow answer must not repaint a page that has moved on (gh#513).
-    fn fetch_config(&mut self, cx: &mut Context<Self>) {
+    /// Re-read one board's config (after a refused write, or from the retry
+    /// strip). The reply is applied to the board it was asked of and no other.
+    fn fetch_config(&mut self, host: Option<String>, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.fetching = false;
-            self.error = Some("Engine not connected".into());
             return;
         };
-        let params = self.host_params(serde_json::json!({}));
-        let host = self.host.clone();
-        self.fetching = true;
-        self.host_task = Some(cx.spawn(async move |this, cx| {
+        let Some(ix) = self.board_ix(&host) else {
+            return;
+        };
+        let params = Self::host_params(&host, serde_json::json!({}));
+        self.boards[ix].fetching = true;
+        let task_host = host.clone();
+        self.boards[ix].config_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::READ_BOARD_CONFIG, params)
                 .await;
             this.update(cx, |page, cx| {
-                if page.host != host {
-                    return;
-                }
                 match result {
                     Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
                         Ok(config) => {
-                            page.config = Some(config);
-                            page.fetch_automations(cx);
+                            if let Some(ix) = page.board_ix(&task_host) {
+                                page.boards[ix].config = Some(config);
+                            }
+                            page.fetch_automations(task_host.clone(), cx);
                         }
-                        Err(err) => page.read_failed(format!("Unreadable config: {err}")),
+                        Err(err) => {
+                            page.read_failed(&task_host, format!("Unreadable config: {err}"), cx)
+                        }
                     },
-                    Err(err) => page.read_failed(format!("{err}")),
+                    Err(err) => page.read_failed(&task_host, format!("{err}"), cx),
                 }
                 cx.notify();
             })
@@ -484,35 +593,34 @@ impl AutomationsPage {
         }));
     }
 
-    /// Read the rules' health and history off the current host. Success
-    /// replaces the view; failure does not leave the old list rendered as
-    /// current — it is marked stale where it renders (gh#513). A reply for a
-    /// board the page has since left is dropped.
-    fn fetch_automations(&mut self, cx: &mut Context<Self>) {
+    /// Read one board's rules, health, history and preview. Success replaces
+    /// that board's view; failure marks it stale where it renders (gh#513).
+    fn fetch_automations(&mut self, host: Option<String>, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.fetching = false;
             return;
         };
-        let params = self.host_params(serde_json::json!({}));
-        let host = self.host.clone();
-        self.fetching = true;
-        self.fetch_task = Some(cx.spawn(async move |this, cx| {
+        let Some(ix) = self.board_ix(&host) else {
+            return;
+        };
+        let params = Self::host_params(&host, serde_json::json!({}));
+        self.boards[ix].fetching = true;
+        let task_host = host.clone();
+        self.boards[ix].fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::READ_BOARD_AUTOMATIONS, params)
                 .await;
             this.update(cx, |page, cx| {
-                if page.host != host {
-                    return;
-                }
                 match result {
                     Ok(value) => match serde_json::from_value::<AutomationsView>(value) {
-                        Ok(view) => page.apply_automations(view),
-                        Err(err) => {
-                            page.read_failed(format!("Unreadable automations: {err}"))
-                        }
+                        Ok(view) => page.apply_automations(&task_host, view),
+                        Err(err) => page.read_failed(
+                            &task_host,
+                            format!("Unreadable automations: {err}"),
+                            cx,
+                        ),
                     },
-                    Err(err) => page.read_failed(format!("{err}")),
+                    Err(err) => page.read_failed(&task_host, format!("{err}"), cx),
                 }
                 cx.notify();
             })
@@ -520,17 +628,93 @@ impl AutomationsPage {
         }));
     }
 
-    /// A fresh read of the current host's rules — the one thing that makes
-    /// the list current again.
-    fn apply_automations(&mut self, view: AutomationsView) {
-        self.fetching = false;
-        self.automations = Some(view);
-        self.stale = false;
+    /// The agent-account slots one host has saved — what the account slot
+    /// offers. A failure here quietly leaves the free-text input, which still
+    /// works; the accounts are a convenience, not the write path.
+    fn fetch_accounts(&mut self, host: Option<String>, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(ix) = self.board_ix(&host) else {
+            return;
+        };
+        let params = Self::host_params(&host, serde_json::json!({ "forceUsage": false }));
+        let task_host = host.clone();
+        self.boards[ix].accounts_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_AGENT_ACCOUNTS, params)
+                .await;
+            this.update(cx, |page, cx| {
+                if let Ok(value) = result
+                    && let Ok(reply) = serde_json::from_value::<AccountsReply>(value)
+                    && let Some(ix) = page.board_ix(&task_host)
+                {
+                    page.boards[ix].accounts = reply.accounts;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
-    /// Send one write; the reply replaces the config, and the health/history
-    /// view is re-read — a write that flipped `enabled` changes both.
-    fn write(&mut self, op: serde_json::Value, cx: &mut Context<Self>) {
+    /// A fresh read of one board's rules — the one thing that makes that
+    /// board's list current again.
+    fn apply_automations(&mut self, host: &Option<String>, view: AutomationsView) {
+        if let Some(ix) = self.board_ix(host) {
+            let board = &mut self.boards[ix];
+            board.fetching = false;
+            board.automations = Some(view);
+            board.stale = false;
+        }
+    }
+
+    /// What one write's reply did to the page — split from the wire so the
+    /// transitions are testable. Applies only while `seq` is still the
+    /// current write: a slow reply to a superseded write repaints nothing.
+    /// Returns whether the config landed (the caller re-reads the rules view
+    /// on success and the config on refusal).
+    fn note_write_result(
+        &mut self,
+        seq: u64,
+        host: &Option<String>,
+        result: Result<BoardConfig, String>,
+    ) -> bool {
+        self.busy = false;
+        let current = self.mark.as_ref().is_some_and(|m| m.seq == seq);
+        match result {
+            Ok(config) => {
+                if let Some(ix) = self.board_ix(host) {
+                    self.boards[ix].config = Some(config);
+                }
+                if current && let Some(mark) = &mut self.mark {
+                    mark.state = WriteState::Saved;
+                }
+                true
+            }
+            Err(err) => {
+                if current && let Some(mark) = &mut self.mark {
+                    mark.state = WriteState::Refused(err.into());
+                } else {
+                    self.error = Some(err.into());
+                }
+                false
+            }
+        }
+    }
+
+    /// Send one write to one board. The reply replaces that board's config
+    /// and re-reads its view — a write that flipped `enabled` changes both.
+    /// A refusal re-reads the config too: a name-addressed write that misses
+    /// is the page showing a rule the host does not have (gh#513).
+    fn write(
+        &mut self,
+        host: Option<String>,
+        rule: Option<String>,
+        field: Option<RuleField>,
+        op: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
             cx.notify();
@@ -538,40 +722,33 @@ impl AutomationsPage {
         };
         self.busy = true;
         self.error = None;
-        let params = self.host_params(op);
-        let host = self.host.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.write_seq += 1;
+        let seq = self.write_seq;
+        self.mark = Some(WriteMark {
+            seq,
+            host: host.clone(),
+            rule,
+            field,
+            state: WriteState::Saving,
+        });
+        let params = Self::host_params(&host, op);
+        self.write_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::WRITE_BOARD_CONFIG, params)
                 .await;
             this.update(cx, |page, cx| {
-                page.busy = false;
-                // The write went to a board the page has since left; its
-                // reply — config or refusal — describes that board, not the
-                // one on screen (gh#513).
-                if page.host != host {
-                    cx.notify();
-                    return;
-                }
-                match result {
+                let outcome = match result {
                     Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
-                        Ok(config) => {
-                            page.config = Some(config);
-                            page.fetch_automations(cx);
-                        }
-                        Err(err) => page.error = Some(format!("Unreadable reply: {err}").into()),
+                        Ok(config) => Ok(config),
+                        Err(err) => Err(format!("Unreadable reply: {err}")),
                     },
-                    // The refusals are written to be read: "automation `x` is
-                    // enabled with no owner; …". A refusal can also mean the
-                    // view predates the board — a name-addressed write that
-                    // misses is the page showing a rule the host does not have
-                    // (gh#513) — so the host is re-read rather than the
-                    // contradicted list left rendered under the refusal.
-                    Err(err) => {
-                        page.error = Some(format!("{err}").into());
-                        page.fetch_config(cx);
-                    }
+                    Err(err) => Err(format!("{err}")),
+                };
+                if page.note_write_result(seq, &host, outcome) {
+                    page.fetch_automations(host.clone(), cx);
+                } else {
+                    page.fetch_config(host.clone(), cx);
                 }
                 cx.notify();
             })
@@ -580,50 +757,10 @@ impl AutomationsPage {
         cx.notify();
     }
 
-    fn open_dialog(&mut self, rule: String, field: RuleField, cx: &mut Context<Self>) {
-        let current = self
-            .rule_config(&rule)
-            .and_then(|r| field.current(r));
-        let input = cx.new(|cx| ComposerInput::new(field.label(), cx));
-        if let Some(current) = current {
-            input.update(cx, |input, cx| input.set_text(current, cx));
-        }
-        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.submit_dialog(cx);
-            }
-        });
-        self.dialog = Some(FieldDialog {
-            rule,
-            field,
-            input,
-            _events: events,
-        });
-        self.confirm = None;
-        cx.notify();
-    }
-
-    fn submit_dialog(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.dialog.take() else {
-            return;
-        };
-        let text = dialog.input.read(cx).text().trim().to_string();
-        // An emptied field is a removal: the key falls back to its default,
-        // which is what the dialog's hint said clearing means.
-        let value = (!text.is_empty()).then_some(text);
-        self.write(
-            serde_json::json!({
-                "op": "automation",
-                "automation": dialog.rule,
-                "key": dialog.field.key(),
-                "value": value,
-            }),
-            cx,
-        );
-    }
-
-    fn rule_config(&self, name: &str) -> Option<&Automation> {
-        self.config
+    fn rule_config(&self, host: &Option<String>, name: &str) -> Option<&Automation> {
+        let ix = self.board_ix(host)?;
+        self.boards[ix]
+            .config
             .as_ref()?
             .routing
             .config
@@ -633,42 +770,174 @@ impl AutomationsPage {
             .find(|a| a.name == name)
     }
 
+    fn rule_names(&self, host: &Option<String>) -> Vec<String> {
+        self.board_ix(host)
+            .and_then(|ix| self.boards[ix].config.as_ref())
+            .and_then(|c| c.routing.config.as_ref())
+            .map(|c| c.automations.iter().map(|a| a.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn open_editor(
+        &mut self,
+        host: Option<String>,
+        rule: String,
+        field: RuleField,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.rule_config(&host, &rule).and_then(|r| field.current(r));
+        let input = cx.new(|cx| ComposerInput::new(field.key(), cx));
+        if let Some(current) = current {
+            input.update(cx, |input, cx| input.set_text(current, cx));
+        }
+        let events = cx.subscribe(&input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_editor(cx);
+            }
+        });
+        self.editor = Some(FieldEditor {
+            host,
+            rule,
+            field,
+            input,
+            _events: events,
+        });
+        self.confirm = None;
+        cx.notify();
+    }
+
+    fn submit_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.take() else {
+            return;
+        };
+        let text = editor.input.read(cx).text().trim().to_string();
+        // An emptied field is a removal: the key falls back to its default,
+        // which is what the editor's purpose line said clearing means.
+        let value = (!text.is_empty()).then_some(text);
+        self.write(
+            editor.host.clone(),
+            Some(editor.rule.clone()),
+            Some(editor.field),
+            serde_json::json!({
+                "op": "automation",
+                "automation": editor.rule,
+                "key": editor.field.key(),
+                "value": value,
+            }),
+            cx,
+        );
+    }
+
+    /// Write one field to one value directly — the account rows' click.
+    fn write_field(
+        &mut self,
+        host: Option<String>,
+        rule: String,
+        field: RuleField,
+        value: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.editor = None;
+        self.write(
+            host,
+            Some(rule.clone()),
+            Some(field),
+            serde_json::json!({
+                "op": "automation",
+                "automation": rule,
+                "key": field.key(),
+                "value": value,
+            }),
+            cx,
+        );
+    }
+
     fn open_new_rule(&mut self, cx: &mut Context<Self>) {
         if self.new_rule.is_some() {
             return;
         }
-        let name = cx.new(|cx| ComposerInput::new("Rule name", cx));
-        let events = cx.subscribe(&name, |this: &mut Self, _, event, cx| {
+        // The default creation target: the first board somebody has released
+        // work from (gh#434), else the first board found. A choice is only
+        // ever shown when more than one device hosts a board.
+        let host = self
+            .boards
+            .iter()
+            .find(|b| b.config.as_ref().is_some_and(|c| c.dispatched))
+            .or(self.boards.first())
+            .map(|b| b.id.clone());
+        let Some(host) = host else {
+            return;
+        };
+        let label = cx.new(|cx| ComposerInput::new("label, e.g. autopick", cx));
+        let owner = cx.new(|cx| ComposerInput::new("owner, e.g. Brede", cx));
+        let account = cx.new(|cx| ComposerInput::new("account slot", cx));
+        fn submit(
+            this: &mut AutomationsPage,
+            _: Entity<ComposerInput>,
+            event: &ComposerInputEvent,
+            cx: &mut Context<AutomationsPage>,
+        ) {
             if matches!(event, ComposerInputEvent::Submitted) {
                 this.submit_new_rule(cx);
             }
-        });
+        }
+        let events = vec![
+            cx.subscribe(&label, submit),
+            cx.subscribe(&owner, submit),
+            cx.subscribe(&account, submit),
+        ];
         self.new_rule = Some(NewRule {
-            name,
+            host,
+            label,
+            owner,
+            account,
             _events: events,
         });
         cx.notify();
     }
 
     fn submit_new_rule(&mut self, cx: &mut Context<Self>) {
-        let Some(flow) = self.new_rule.take() else {
+        let Some(flow) = &self.new_rule else {
             return;
         };
-        let name = flow.name.read(cx).text().trim().to_string();
-        if name.is_empty() {
-            self.error = Some("A rule needs a name".into());
+        let label = flow.label.read(cx).text().trim().to_string();
+        let owner = flow.owner.read(cx).text().trim().to_string();
+        let account = flow.account.read(cx).text().trim().to_string();
+        let host = flow.host.clone();
+        if label.is_empty() {
+            self.error = Some(
+                "A rule needs the label that means \"approved for autonomous execution\"."
+                    .into(),
+            );
             cx.notify();
             return;
         }
-        self.write(
-            serde_json::json!({ "op": "automationAdd", "name": name }),
-            cx,
-        );
+        let name = derive_rule_name(&label, &self.rule_names(&host));
+        self.new_rule = None;
+        let mut op = serde_json::json!({
+            "op": "automationAdd",
+            "name": name,
+            "labels": label,
+        });
+        if let Some(object) = op.as_object_mut() {
+            if !owner.is_empty() {
+                object.insert("owner".into(), serde_json::json!(owner));
+            }
+            if !account.is_empty() {
+                object.insert("account".into(), serde_json::json!(account));
+            }
+        }
+        self.write(host, Some(name), None, op, cx);
     }
 
-    /// Enable ceremony: everything the click would authorize, in one sentence,
-    /// before the write that authorizes it.
-    fn open_enable_confirm(&mut self, status: &RuleStatus, cx: &mut Context<Self>) {
+    /// Enable ceremony: everything the click would authorize, in one
+    /// sentence, before the write that authorizes it.
+    fn open_enable_confirm(
+        &mut self,
+        host: Option<String>,
+        status: &RuleStatus,
+        cx: &mut Context<Self>,
+    ) {
         let rule = &status.rule;
         let mut parts: Vec<String> = Vec::new();
         parts.push(format!(
@@ -701,16 +970,26 @@ impl AutomationsPage {
             rule.owner.as_deref().unwrap_or("nobody — set an owner first"),
         );
         self.confirm = Some(Confirm::Enable {
+            host,
             rule: rule.name.clone(),
             summary,
         });
-        self.dialog = None;
+        self.editor = None;
         cx.notify();
     }
 
-    fn set_enabled(&mut self, rule: String, enabled: bool, cx: &mut Context<Self>) {
+    fn set_enabled(
+        &mut self,
+        host: Option<String>,
+        rule: String,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
         self.confirm = None;
         self.write(
+            host,
+            Some(rule.clone()),
+            None,
             serde_json::json!({
                 "op": "automation",
                 "automation": rule,
@@ -721,15 +1000,10 @@ impl AutomationsPage {
         );
     }
 
-    fn duplicate(&mut self, rule: &str, cx: &mut Context<Self>) {
+    fn duplicate(&mut self, host: Option<String>, rule: &str, cx: &mut Context<Self>) {
         // `<name> copy`, `<name> copy 2`, … — the writer refuses duplicates,
         // so probe against the config we hold.
-        let existing: Vec<String> = self
-            .config
-            .as_ref()
-            .and_then(|c| c.routing.config.as_ref())
-            .map(|c| c.automations.iter().map(|a| a.name.clone()).collect())
-            .unwrap_or_default();
+        let existing = self.rule_names(&host);
         let mut candidate = format!("{rule} copy");
         let mut n = 2;
         while existing.iter().any(|e| e.eq_ignore_ascii_case(&candidate)) {
@@ -737,62 +1011,98 @@ impl AutomationsPage {
             n += 1;
         }
         self.write(
+            host,
+            Some(candidate.clone()),
+            None,
             serde_json::json!({ "op": "automationAdd", "name": candidate, "from": rule }),
             cx,
         );
     }
 
-    fn delete(&mut self, rule: String, cx: &mut Context<Self>) {
+    fn delete(&mut self, host: Option<String>, rule: String, cx: &mut Context<Self>) {
         self.confirm = None;
         self.write(
+            host,
+            Some(rule.clone()),
+            None,
             serde_json::json!({ "op": "automationRemove", "name": rule }),
             cx,
         );
+    }
+
+    /// Recent history across every board, newest first — one list, because
+    /// the page is one list (gh#524).
+    fn merged_recent(&self) -> Vec<(Option<String>, AutomationLogRow)> {
+        let mut rows: Vec<(Option<String>, AutomationLogRow)> = Vec::new();
+        for board in &self.boards {
+            if let Some(view) = &board.automations {
+                for row in &view.recent {
+                    rows.push((board.id.clone(), row.clone()));
+                }
+            }
+        }
+        rows.sort_by(|a, b| b.1.last_at.cmp(&a.1.last_at));
+        rows.truncate(40);
+        rows
+    }
+}
+
+/// The hue a decision word wears, both in the preview ("dispatch") and the
+/// log ("dispatched"): the status ramp, because the words are statuses.
+fn decision_color(theme: &Theme, decision: &str) -> Hsla {
+    match decision {
+        "dispatch" | "dispatched" => theme.settled_text(),
+        "defer" | "deferred" => theme.warning_text(),
+        "refuse" | "refused" => theme.danger_text(),
+        _ => theme.text_subtle,
     }
 }
 
 impl Render for AutomationsPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let host = self.host_label(cx);
         let busy = self.busy;
-        let view = self.automations.clone();
+        let multi_board = self.boards.len() > 1;
+        let rule_count: usize = self
+            .boards
+            .iter()
+            .filter_map(|b| b.automations.as_ref())
+            .map(|v| v.rules.len())
+            .sum();
+        let any_view = self.boards.iter().any(|b| b.automations.is_some());
+        let fetching = self.boards.iter().any(|b| b.fetching);
+        let next_eval = self
+            .boards
+            .iter()
+            .filter_map(|b| b.automations.as_ref())
+            .filter_map(|v| v.next_eval_secs)
+            .min();
 
         let mut column = widgets::page_column()
             .child(widgets::page_header(
                 &theme,
                 "Automations",
-                view.as_ref().map(|v| v.rules.len()),
+                any_view.then_some(rule_count),
             ))
             .child(widgets::page_subtitle(
                 &theme,
-                match &view {
-                    Some(view) => {
-                        let next = view
-                            .next_eval_secs
-                            .map(|s| format!(" · next check in {}", board::format_age(s as i64)))
-                            .unwrap_or_default();
-                        format!(
-                            "Auto-pick rules on {host} — an enabled rule dispatches ready, \
-                             labeled tasks without a keypress{next}."
-                        )
-                    }
-                    None if self.fetching || !self.loaded => "Reading…".to_string(),
-                    // A board was found; its rules were not readable. The
-                    // strip below carries the retry (gh#513).
-                    None if self.config.is_some() => {
-                        format!("Auto-pick rules on {host}.")
-                    }
-                    None => "No board found".to_string(),
+                if any_view {
+                    let next = next_eval
+                        .map(|s| format!(" Next check in {}.", board::format_age(s as i64)))
+                        .unwrap_or_default();
+                    format!(
+                        "Each rule is the sentence the planner executes — click any part \
+                         of it to change it. A new rule asks three things: label, owner, \
+                         account; everything else defaults.{next}"
+                    )
+                } else if fetching || !self.loaded {
+                    "Reading…".to_string()
+                } else if self.boards.is_empty() {
+                    "No board found".to_string()
+                } else {
+                    "Each rule is the sentence the planner executes.".to_string()
                 },
             ));
-
-        // Which board these rules live on, said before the rules — and on an
-        // account with more than one, changeable (gh#514). A rule created
-        // here lands on this board and no other.
-        if self.hosts.len() > 1 {
-            column = column.child(self.render_host_picker(&theme, cx));
-        }
 
         if let Some(error) = self.error.clone() {
             column = column.child(
@@ -806,7 +1116,38 @@ impl Render for AutomationsPage {
             );
         }
 
-        if self.config.is_some() {
+        if !self.boards.is_empty() {
+            // Every write has a visible state (gh#524): the rule's own card
+            // carries the mark, and this header repeats it — so a write whose
+            // rule has no card yet (a creation saving) or no card anymore (a
+            // delete landing) still lands somewhere the eye can see.
+            let header_mark: Option<AnyElement> = self.mark.as_ref().map(|m| {
+                let (text, color) = match &m.state {
+                    WriteState::Saving => ("saving…", theme.text_subtle),
+                    WriteState::Saved => ("✓ saved", theme.settled_text()),
+                    WriteState::Refused(_) => ("refused", theme.danger_text()),
+                };
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(color)
+                    .child(SharedString::from(text))
+                    .into_any_element()
+            });
+            // A refusal about a rule with no card on screen — a refused
+            // creation, mostly — would otherwise be a word with no sentence.
+            let orphan_refusal: Option<SharedString> = self.mark.as_ref().and_then(|m| {
+                let WriteState::Refused(reason) = &m.state else {
+                    return None;
+                };
+                let rendered = self
+                    .boards
+                    .iter()
+                    .filter_map(|b| b.automations.as_ref())
+                    .flat_map(|v| v.rules.iter())
+                    .any(|r| Some(r.rule.name.as_str()) == m.rule.as_deref());
+                (!rendered).then(|| reason.clone())
+            });
             // The creation affordance is a button on the section header, not
             // a card disguised as a rule in the list it creates into (gh#514).
             column = column.child(
@@ -818,10 +1159,18 @@ impl Render for AutomationsPage {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(Theme::TEXT_BODY))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.text)
-                            .child(SharedString::from("Rules")),
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_BODY))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text)
+                                    .child(SharedString::from("Rules")),
+                            )
+                            .children(header_mark),
                     )
                     .child(
                         widgets::ghost_action(&theme)
@@ -839,53 +1188,89 @@ impl Render for AutomationsPage {
                             .child(SharedString::from("New rule")),
                     ),
             );
+            if let Some(reason) = orphan_refusal {
+                column = column.child(
+                    widgets::error_strip(&theme, reason)
+                        .id("automation-orphan-refused")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.mark = None;
+                            cx.notify();
+                        })),
+                );
+            }
             if self.new_rule.is_some() {
                 column = column.child(self.render_new_rule_editor(&theme, busy, cx));
             }
         }
 
-        // The staleness question, answered where the rules are (gh#513): a
-        // list that outlived a failed re-read is the last successful read,
-        // not the board's current state — and a board whose rules could not
-        // be read at all shows the retry instead of nothing.
-        if self.stale && view.is_some() {
-            column = column.child(
-                widgets::warning_strip(
+        // The rules, across every board found, each card saying which board
+        // it lives on when that is ambiguous. Staleness is answered where the
+        // rules render (gh#513).
+        let mut rule_ix = 0usize;
+        let mut rendered_any = false;
+        for board_ix in 0..self.boards.len() {
+            let host = self.boards[board_ix].id.clone();
+            let host_label = self.device_label(host.as_deref(), cx);
+            if self.boards[board_ix].stale && self.boards[board_ix].automations.is_some() {
+                let retry_host = host.clone();
+                column = column.child(
+                    widgets::warning_strip(
+                        &theme,
+                        format!(
+                            "{host_label} did not answer the last read — its rules below \
+                             are an earlier read and may be out of date. Click to re-read."
+                        ),
+                    )
+                    .mt(px(widgets::BLOCK_GAP))
+                    .id(("automations-stale", board_ix))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fetch_config(retry_host.clone(), cx);
+                        cx.notify();
+                    })),
+                );
+            }
+            if self.boards[board_ix].automations.is_none()
+                && self.boards[board_ix].config.is_some()
+                && !self.boards[board_ix].fetching
+            {
+                let retry_host = host.clone();
+                column = column.child(
+                    widgets::warning_strip(
+                        &theme,
+                        format!("The rules on {host_label} could not be read. Click to retry."),
+                    )
+                    .mt(px(widgets::BLOCK_GAP))
+                    .id(("automations-retry", board_ix))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fetch_config(retry_host.clone(), cx);
+                        cx.notify();
+                    })),
+                );
+            }
+            let Some(view) = self.boards[board_ix].automations.clone() else {
+                continue;
+            };
+            for status in &view.rules {
+                rendered_any = true;
+                column = column.child(self.render_rule(
                     &theme,
-                    format!(
-                        "{host} did not answer the last read — these rules are an \
-                         earlier read and may be out of date. Click to re-read."
-                    ),
-                )
-                .mt(px(widgets::BLOCK_GAP))
-                .id("automations-stale")
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.fetch_config(cx);
-                    cx.notify();
-                })),
-            );
+                    rule_ix,
+                    &host,
+                    multi_board.then(|| host_label.clone()),
+                    status,
+                    board_ix,
+                    busy,
+                    cx,
+                ));
+                rule_ix += 1;
+            }
         }
-        if view.is_none() && self.config.is_some() && !self.fetching {
+        if any_view && !rendered_any {
             column = column.child(
-                widgets::warning_strip(
-                    &theme,
-                    format!("The rules on {host} could not be read. Click to retry."),
-                )
-                .mt(px(widgets::BLOCK_GAP))
-                .id("automations-retry")
-                .cursor_pointer()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.fetch_config(cx);
-                    cx.notify();
-                })),
-            );
-        }
-
-        if let Some(view) = &view {
-            let mut card = widgets::section_card(&theme);
-            if view.rules.is_empty() {
-                card = card.child(
+                widgets::section_card(&theme).child(
                     widgets::card_row(&theme, true).child(
                         div()
                             .text_size(px(Theme::TEXT_DENSE))
@@ -894,28 +1279,36 @@ impl Render for AutomationsPage {
                                 "No rules yet — the board dispatches nothing on its own.",
                             )),
                     ),
-                );
-            }
-            for (ix, status) in view.rules.iter().enumerate() {
-                card = card.child(self.render_rule(&theme, ix, status, busy, cx));
-            }
-            column = column.child(card);
+                ),
+            );
+        }
 
+        if any_view {
             column = column
                 .child(
                     div()
                         .mt(px(28.0))
-                        .text_size(px(Theme::TEXT_BODY))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .child(SharedString::from("Recent activity")),
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child(SharedString::from("Recent activity")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_DENSE))
+                                .text_color(theme.text_subtle)
+                                .child(SharedString::from(
+                                    "why every considered task went where it went",
+                                )),
+                        ),
                 )
-                .child(widgets::page_subtitle(
-                    &theme,
-                    "Why every considered task was dispatched, skipped, deferred or refused. \
-                     Repeats collapse into one line with a count.",
-                ))
-                .child(render_history(&theme, &view.recent));
+                .child(self.render_history(&theme, multi_board, cx));
         }
 
         div()
@@ -927,140 +1320,32 @@ impl Render for AutomationsPage {
 }
 
 impl AutomationsPage {
-    /// The board picker (gh#514): every board the sweep found, the one being
-    /// edited marked, the rest one click away.
-    fn render_host_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let mut row = div()
-            .mt(px(widgets::BLOCK_GAP))
-            .flex()
-            .flex_row()
-            .flex_wrap()
-            .items_center()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(theme.text_faint)
-                    .child(SharedString::from("Board")),
-            );
-        for (ix, option) in self.hosts.iter().enumerate() {
-            // A board nobody has ever released work from is named as such —
-            // "which of these is the real one" is the question that put the
-            // picker here.
-            let label: SharedString = if option.dispatched {
-                self.device_label(option.id.as_deref(), cx)
-            } else {
-                format!(
-                    "{} · no dispatches yet",
-                    self.device_label(option.id.as_deref(), cx)
-                )
-                .into()
-            };
-            if option.id == self.host {
-                row = row.child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .h(px(widgets::ACTION_HEIGHT))
-                        .px(px(widgets::ACTION_PAD_X))
-                        .rounded(px(Theme::RADIUS_CHIP))
-                        .border_1()
-                        .border_color(theme.settled.opacity(0.35))
-                        .bg(theme.settled.opacity(0.14))
-                        .text_size(px(Theme::TEXT_DENSE))
-                        .text_color(theme.settled_text())
-                        .child(label),
-                );
-            } else {
-                let target = option.id.clone();
-                row = row.child(
-                    widgets::ghost_action(theme)
-                        .id(("automation-host", ix))
-                        .border_1()
-                        .border_color(theme.border)
-                        .hover(widgets::ghost_hover(theme))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_host(target.clone(), cx);
-                        }))
-                        .child(label),
-                );
-            }
-        }
-        row.into_any_element()
-    }
-
-    /// The open creation editor — a name and two verbs, under the header
-    /// whose button opened it.
-    fn render_new_rule_editor(
-        &self,
-        theme: &Theme,
-        busy: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(flow) = &self.new_rule else {
-            return div().into_any_element();
-        };
-        widgets::section_card(theme)
-            .child(
-                widgets::card_row(theme, true)
-                    .flex_col()
-                    .items_start()
-                    .gap(px(8.0))
-                    .child(widgets::row_title(theme, "New rule"))
-                    .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.text_subtle)
-                            .child(SharedString::from(
-                                "Created paused — fill in its match and dispatch settings, \
-                                 then enable it.",
-                            )),
-                    )
-                    .child(div().w_full().child(flow.name.clone()))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(8.0))
-                            .child(
-                                widgets::ghost_action(theme)
-                                    .id("automation-new-create")
-                                    .hover(widgets::ghost_hover(theme))
-                                    .when(busy, |el| el.opacity(0.4))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if this.busy {
-                                            return;
-                                        }
-                                        this.submit_new_rule(cx);
-                                    }))
-                                    .child(SharedString::from("Create")),
-                            )
-                            .child(
-                                widgets::ghost_action(theme)
-                                    .id("automation-new-cancel")
-                                    .hover(widgets::ghost_hover(theme))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.new_rule = None;
-                                        cx.notify();
-                                    }))
-                                    .child(SharedString::from("Cancel")),
-                            ),
-                    ),
-            )
+    /// One word of the sentence — the connective tissue between the slots.
+    fn word(theme: &Theme, text: impl Into<SharedString>) -> AnyElement {
+        div()
+            .text_color(theme.text_muted)
+            .child(text.into())
             .into_any_element()
     }
 
+    /// One rule, as the card the mock draws: header, sentence, whatever is
+    /// open inside it (editor, confirm), and the preview footer where the
+    /// rule proves itself against the live board.
+    #[allow(clippy::too_many_arguments)]
     fn render_rule(
         &self,
         theme: &Theme,
         ix: usize,
+        host: &Option<String>,
+        host_fact: Option<SharedString>,
         status: &RuleStatus,
+        board_ix: usize,
         busy: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let rule = &status.rule;
         let name = rule.name.clone();
+        let blockers = enable_blockers(rule);
 
         let state_badge = match status.state.as_str() {
             "enabled" => widgets::badge_active(theme, "enabled").into_any_element(),
@@ -1077,196 +1362,159 @@ impl AutomationsPage {
             _ => widgets::badge(theme, "paused").into_any_element(),
         };
 
-        // The quiet meta line is activity only — what the rule is set to
-        // lives in the grouped fields below, where it is editable.
-        let mut meta: Vec<AnyElement> = Vec::new();
-        meta.push(
-            div()
-                .child(SharedString::from(format!(
-                    "{} live · {} today",
-                    status.live, status.dispatched_last_day
-                )))
+        // Did my change take? The mark, rendered where the rule is (gh#524):
+        // saving is in flight, saved is the host's echo, a refusal renders as
+        // a strip below in the writer's own words.
+        let mark = self
+            .mark
+            .as_ref()
+            .filter(|m| &m.host == host && m.rule.as_deref() == Some(name.as_str()));
+        let mark_indicator: Option<AnyElement> = mark.map(|m| match &m.state {
+            WriteState::Saving => div()
+                .flex_none()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(theme.text_subtle)
+                .child(SharedString::from("saving…"))
                 .into_any_element(),
-        );
-        if let Some(event) = &status.last_event {
-            meta.push(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .child(SharedString::from(format!(
-                        "last: {} {}",
-                        event.identifier.as_deref().unwrap_or(""),
-                        event.decision
-                    )))
-                    .into_any_element(),
-            );
-        }
+            WriteState::Saved => div()
+                .flex_none()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(theme.settled_text())
+                .child(SharedString::from("✓ saved"))
+                .into_any_element(),
+            WriteState::Refused(_) => div()
+                .flex_none()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(theme.danger_text())
+                .child(SharedString::from("refused"))
+                .into_any_element(),
+        });
+        let refusal: Option<SharedString> = mark.and_then(|m| match &m.state {
+            WriteState::Refused(reason) => Some(reason.clone()),
+            _ => None,
+        });
+        let echoed_field: Option<RuleField> = mark.and_then(|m| {
+            matches!(m.state, WriteState::Saved)
+                .then_some(m.field)
+                .flatten()
+        });
 
-        // A field chip: what it is set to, one click to edit. A required
-        // field that is missing wears the warning hue — an unset required
-        // field must not read like an unset optional one (gh#514).
-        let chip = |field: RuleField, label: SharedString, missing: bool| -> AnyElement {
+        // A sentence slot: what it is set to, one click to edit. A blank —
+        // a required slot with nothing in it — wears the danger hue and a
+        // dashed border: the sentence visibly cannot finish (gh#524). The
+        // slot a save just echoed wears the settled ring.
+        let chip = |field: RuleField| -> AnyElement {
+            let (label, missing) = slot_text(field, rule);
             let name = name.clone();
-            let base = widgets::ghost_action(theme)
-                .id(("automation-field", ix * 16 + field as usize))
+            let host = host.clone();
+            let base = div()
+                .id(("automation-slot", ix * 16 + field as usize))
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(22.0))
+                .px(px(8.0))
+                .rounded(px(Theme::RADIUS_CHIP))
+                .text_size(px(Theme::TEXT_DENSE))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .cursor_pointer()
                 .when(busy, |el| el.opacity(0.4))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.busy {
                         return;
                     }
-                    this.open_dialog(name.clone(), field, cx);
+                    this.open_editor(host.clone(), name.clone(), field, cx);
                 }));
             if missing {
-                let warning = theme.warning;
+                let danger = theme.danger;
                 base.border_1()
-                    .border_color(warning.opacity(0.35))
-                    .text_color(theme.warning_text())
-                    .hover(move |s| s.bg(warning.opacity(0.09)))
-                    .child(label)
+                    .border_dashed()
+                    .border_color(danger.opacity(0.55))
+                    .text_color(theme.danger_text())
+                    .hover(move |s| s.bg(danger.opacity(0.09)))
+                    .child(SharedString::from(label))
                     .into_any_element()
             } else {
-                base.hover(widgets::ghost_hover(theme))
-                    .child(label)
+                let hover_bg = theme.white_alpha(0.10);
+                base.bg(theme.white_alpha(0.06))
+                    .text_color(theme.text)
+                    .when(echoed_field == Some(field), |el| {
+                        el.border_1().border_color(theme.settled.opacity(0.55))
+                    })
+                    .hover(move |s| s.bg(hover_bg))
+                    .child(SharedString::from(label))
                     .into_any_element()
             }
         };
-        let short = |value: &Option<String>, fallback: &str| -> String {
-            value.clone().unwrap_or_else(|| fallback.to_string())
-        };
-
-        // One group per kind of thing: match, dispatch as, limits (gh#514).
-        let group = |label: &'static str, chips: Vec<AnyElement>| {
+        // A slot with its trailing punctuation glued on, so a wrap cannot
+        // strand a comma at the start of a line.
+        let glued = |chip: AnyElement, suffix: &'static str| -> AnyElement {
             div()
                 .flex()
                 .flex_row()
-                .items_start()
-                .gap(px(8.0))
+                .items_center()
+                .child(chip)
                 .child(
                     div()
-                        .flex_none()
-                        .w(px(72.0))
-                        .h(px(widgets::ACTION_HEIGHT))
-                        .flex()
-                        .items_center()
-                        .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(label)),
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(suffix)),
                 )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .gap(px(4.0))
-                        .children(chips),
-                )
+                .into_any_element()
         };
 
-        let owner_missing = rule.owner.as_deref().map(str::trim).unwrap_or("").is_empty();
-        let account_missing = rule.account.as_deref().map(str::trim).unwrap_or("").is_empty();
-        let labels_missing = rule.labels.iter().all(|l| l.trim().is_empty());
+        // The sentence (gh#524): each field at the point where it acts.
+        let mut sentence = div()
+            .px(px(widgets::ROW_PAD_X))
+            .pb(px(widgets::ROW_PAD_Y))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_x(px(5.0))
+            .gap_y(px(8.0))
+            .text_size(px(Theme::TEXT_BODY))
+            .child(Self::word(theme, "When a"))
+            .child(
+                div()
+                    .text_color(theme.text)
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(SharedString::from("ready")),
+            )
+            .child(Self::word(theme, "task"));
+        if let Some(source) = rule.source.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            sentence = sentence
+                .child(Self::word(theme, "from"))
+                .child(Self::word(theme, source.to_string()));
+        }
+        sentence = sentence
+            .child(Self::word(theme, "in"))
+            .child(chip(RuleField::Route))
+            .child(Self::word(theme, "carries label"))
+            .child(chip(RuleField::Labels))
+            .child(Self::word(theme, "and not"))
+            .child(glued(chip(RuleField::ExcludeLabels), ","))
+            .child(Self::word(theme, "dispatch it on"))
+            .child(chip(RuleField::Runtime))
+            .child(Self::word(theme, "running"))
+            .child(chip(RuleField::Model))
+            .child(Self::word(theme, "as"))
+            .child(glued(chip(RuleField::Account), ","))
+            .child(Self::word(theme, "owned by"))
+            .child(glued(chip(RuleField::Owner), ","))
+            .child(Self::word(theme, "holding to at most"))
+            .child(chip(RuleField::MaxConcurrent))
+            .child(Self::word(theme, "·"))
+            .child(chip(RuleField::DailyBudget))
+            .child(Self::word(theme, "·"))
+            .child(chip(RuleField::MaxPerEval))
+            .child(Self::word(theme, "·"))
+            .child(chip(RuleField::Cooldown))
+            .child(Self::word(theme, "after failure."));
 
-        let match_group = group(
-            "match",
-            vec![
-                chip(
-                    RuleField::Labels,
-                    if labels_missing {
-                        "labels: required".into()
-                    } else {
-                        format!("labels: {}", rule.labels.join(", ")).into()
-                    },
-                    labels_missing,
-                ),
-                chip(
-                    RuleField::ExcludeLabels,
-                    format!(
-                        "exclude: {}",
-                        if rule.exclude_labels.is_empty() {
-                            "none".to_string()
-                        } else {
-                            rule.exclude_labels.join(", ")
-                        }
-                    )
-                    .into(),
-                    false,
-                ),
-                chip(
-                    RuleField::Route,
-                    format!("route: {}", short(&rule.route, "any")).into(),
-                    false,
-                ),
-            ],
-        );
-        let dispatch_group = group(
-            "dispatch as",
-            vec![
-                chip(
-                    RuleField::Owner,
-                    if owner_missing {
-                        "owner: required".into()
-                    } else {
-                        format!("owner: {}", short(&rule.owner, "—")).into()
-                    },
-                    owner_missing,
-                ),
-                chip(
-                    RuleField::Account,
-                    if account_missing {
-                        "account: required".into()
-                    } else {
-                        format!("account: {}", short(&rule.account, "—")).into()
-                    },
-                    account_missing,
-                ),
-                chip(
-                    RuleField::Runtime,
-                    format!("runtime: {}", short(&rule.runtime, "route's")).into(),
-                    false,
-                ),
-                chip(
-                    RuleField::Model,
-                    format!("model: {}", short(&rule.model, "default")).into(),
-                    false,
-                ),
-            ],
-        );
-        let limits_group = group(
-            "limits",
-            vec![
-                chip(
-                    RuleField::MaxPerEval,
-                    format!("per eval: {}", rule.max_per_eval.max(1)).into(),
-                    false,
-                ),
-                chip(
-                    RuleField::MaxConcurrent,
-                    format!("concurrent: {}", rule.max_concurrent.max(1)).into(),
-                    false,
-                ),
-                chip(
-                    RuleField::DailyBudget,
-                    format!(
-                        "budget: {}",
-                        rule.daily_budget
-                            .map(|b| format!("{b}/day"))
-                            .unwrap_or_else(|| "none".into())
-                    )
-                    .into(),
-                    false,
-                ),
-                chip(
-                    RuleField::Cooldown,
-                    format!("cooldown: {}", rule.cooldown).into(),
-                    false,
-                ),
-            ],
-        );
-
+        // Header: the rule's name, its state, its activity — and the verbs.
         let toggle: AnyElement = if rule.enabled {
             let name = name.clone();
+            let host = host.clone();
             widgets::ghost_action(theme)
                 .id(("automation-pause", ix))
                 .hover(widgets::ghost_hover(theme))
@@ -1277,136 +1525,463 @@ impl AutomationsPage {
                     }
                     // Pausing needs no ceremony: it only stops future
                     // dispatches, and stopping is never the risky direction.
-                    this.set_enabled(name.clone(), false, cx);
+                    this.set_enabled(host.clone(), name.clone(), false, cx);
                 }))
                 .child(SharedString::from("Pause"))
                 .into_any_element()
-        } else {
+        } else if blockers.is_empty() {
             let status = status.clone();
+            let host = host.clone();
             widgets::ghost_action(theme)
                 .id(("automation-enable", ix))
+                .border_1()
+                .border_color(theme.border)
                 .hover(widgets::ghost_hover(theme))
                 .when(busy, |el| el.opacity(0.4))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.busy {
                         return;
                     }
-                    this.open_enable_confirm(&status, cx);
+                    this.open_enable_confirm(host.clone(), &status, cx);
                 }))
                 .child(SharedString::from("Enable…"))
                 .into_any_element()
+        } else {
+            // Not clickable: the sentence is missing answers, and the strip
+            // in the preview footer says which. A dead verb that says why is
+            // better than a live one that refuses after the click.
+            widgets::ghost_action(theme)
+                .id(("automation-enable-blocked", ix))
+                .border_1()
+                .border_color(theme.border)
+                .opacity(0.4)
+                .child(SharedString::from("Enable"))
+                .into_any_element()
         };
 
-        // What stands between the rule and working, said as a notice rather
-        // than left to read like metadata (gh#514): the writer's own enable
-        // blockers for a paused rule, and the live problems for an enabled one.
-        let mut problems = div().flex().flex_col().gap(px(4.0)).w_full();
-        let blockers = enable_blockers(rule);
-        if !blockers.is_empty() {
-            problems = problems.child(
-                widgets::warning_strip(
-                    theme,
-                    format!("Not ready to enable — needs {}.", blockers.join(" and ")),
-                )
-                .mt(px(6.0))
-                .id(("automation-blocked", ix)),
+        let mut header = div()
+            .px(px(widgets::ROW_PAD_X))
+            .pt(px(12.0))
+            .pb(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(widgets::row_title(theme, rule.name.clone()))
+            .child(state_badge)
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(format!(
+                        "{} live · {} today",
+                        status.live, status.dispatched_last_day
+                    ))),
+            );
+        if let Some(fact) = host_fact {
+            // Which board this rule lives on — a fact on the rule, never a
+            // page mode (gh#524). Writes on this card go there and nowhere.
+            header = header.child(
+                div()
+                    .flex_none()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format!("on {fact}"))),
             );
         }
-        for (pix, problem) in status.problems.iter().enumerate() {
-            problems = problems.child(
-                widgets::warning_strip(theme, problem.clone())
-                    .mt(px(6.0))
-                    .id(("automation-problem", ix * 8 + pix)),
+        header = header.child(div().flex_1());
+        if let Some(indicator) = mark_indicator {
+            header = header.child(indicator);
+        }
+        let dup_name = name.clone();
+        let dup_host = host.clone();
+        let del_name = name.clone();
+        let del_host = host.clone();
+        header = header
+            .child(toggle)
+            .child(
+                widgets::ghost_action(theme)
+                    .id(("automation-duplicate", ix))
+                    .hover(widgets::ghost_hover(theme))
+                    .when(busy, |el| el.opacity(0.4))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.busy {
+                            return;
+                        }
+                        this.duplicate(dup_host.clone(), &dup_name, cx);
+                    }))
+                    .child(SharedString::from("Duplicate")),
+            )
+            .child(
+                widgets::ghost_action(theme)
+                    .id(("automation-delete", ix))
+                    .hover(widgets::ghost_hover(theme))
+                    .when(busy, |el| el.opacity(0.4))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.busy {
+                            return;
+                        }
+                        this.confirm = Some(Confirm::Delete {
+                            host: del_host.clone(),
+                            rule: del_name.clone(),
+                        });
+                        this.editor = None;
+                        cx.notify();
+                    }))
+                    .child(SharedString::from("Delete…")),
+            );
+
+        let mut card = widgets::section_card(theme).child(header);
+
+        // A refused write lands on the rule it addressed, in the writer's own
+        // words — nothing on this page fails silently (gh#524).
+        if let Some(reason) = refusal {
+            card = card.child(
+                div()
+                    .px(px(widgets::ROW_PAD_X))
+                    .pb(px(8.0))
+                    .child(widgets::error_strip(theme, reason).mt(px(0.0)).id((
+                        "automation-refused",
+                        ix,
+                    ))),
             );
         }
 
-        let mut body = div()
-            .flex_1()
-            .min_w_0()
+        card = card.child(sentence);
+
+        if let Some(editor) = &self.editor
+            && &editor.host == host
+            && editor.rule == rule.name
+        {
+            card = card.child(self.render_field_editor(theme, editor, board_ix, ix, cx));
+        }
+        if let Some(confirm) = &self.confirm
+            && confirm.addresses(host, &rule.name)
+        {
+            card = card.child(self.render_confirm(theme, confirm, busy, cx));
+        }
+
+        card = card.child(self.render_preview(theme, ix, status, &blockers));
+
+        card.into_any_element()
+    }
+
+    /// The preview footer (gh#524): the rule proving itself against the live
+    /// board, in the planner's own words — the same `autopick::plan` the loop
+    /// runs, addressed at this rule. An enabled rule reads as "next evaluation
+    /// would"; a paused one as what enabling would authorize.
+    fn render_preview(
+        &self,
+        theme: &Theme,
+        ix: usize,
+        status: &RuleStatus,
+        blockers: &[&'static str],
+    ) -> AnyElement {
+        let enabled = status.rule.enabled;
+        let dot = if !blockers.is_empty() || status.preview.iter().any(|r| r.decision == "refuse")
+        {
+            theme.danger
+        } else if enabled {
+            theme.warning
+        } else {
+            theme.text_faint
+        };
+        let title = if enabled {
+            "Next evaluation would"
+        } else {
+            "If enabled, right now this would"
+        };
+        let counts = if status.considered == 0 {
+            " · no task on the board carries this rule's labels".to_string()
+        } else {
+            format!(
+                " · same planner the loop runs · considers {} task{}",
+                status.considered,
+                if status.considered == 1 { "" } else { "s" }
+            )
+        };
+
+        let mut footer = div()
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.white_alpha(0.015))
+            .px(px(widgets::ROW_PAD_X))
+            .py(px(12.0))
             .flex()
             .flex_col()
+            .gap(px(8.0))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .items_center()
                     .gap(px(8.0))
-                    .child(widgets::row_title(theme, rule.name.clone()))
-                    .child(state_badge),
-            )
-            .child(widgets::meta_line(theme, meta))
-            .child(problems)
-            .child(
-                div()
-                    .mt(px(8.0))
-                    .flex()
-                    .flex_col()
-                    .gap(px(4.0))
-                    .child(match_group)
-                    .child(dispatch_group)
-                    .child(limits_group),
+                    // round-ok: the preview's status dot.
+                    .child(div().flex_none().size(px(6.0)).rounded_full().bg(dot))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(title)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(counts)),
+                    ),
             );
 
-        // Edits and confirmations happen inside the rule they belong to, not
-        // in a detached card below the list (gh#514).
-        if let Some(dialog) = &self.dialog
-            && dialog.rule == rule.name
-        {
-            body = body.child(self.render_field_editor(theme, dialog, cx));
+        for (pix, row) in status.preview.iter().enumerate() {
+            footer = footer.child(
+                div()
+                    .id(("automation-preview", ix * 32 + pix))
+                    .flex()
+                    .flex_row()
+                    .items_start()
+                    .gap(px(10.0))
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(72.0))
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text)
+                            .child(SharedString::from(row.identifier.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(64.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(decision_color(theme, &row.decision))
+                            .child(SharedString::from(row.decision.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(row.reason.clone())),
+                    ),
+            );
         }
-        if let Some(confirm) = &self.confirm
-            && confirm.rule() == rule.name
-        {
-            body = body.child(self.render_confirm(theme, confirm, busy, cx));
+        if status.considered > status.preview.len() {
+            footer = footer.child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format!(
+                        "+{} more considered",
+                        status.considered - status.preview.len()
+                    ))),
+            );
         }
 
-        let dup_name = name.clone();
-        let del_name = name.clone();
-        widgets::card_row(theme, ix == 0)
-            .id(("automation", ix))
-            .items_start()
-            .child(widgets::row_tile(theme, crate::icons::MAGIC_STICK))
-            .child(body)
+        if !blockers.is_empty() {
+            footer = footer.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(7.0))
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.danger_text())
+                    .child(SharedString::from(format!(
+                        "Can't enable — the sentence is missing {}.",
+                        blockers.join(" and ")
+                    ))),
+            );
+        }
+        for (pix, problem) in status.problems.iter().enumerate() {
+            footer = footer.child(
+                widgets::warning_strip(theme, problem.clone())
+                    .id(("automation-problem", ix * 8 + pix)),
+            );
+        }
+
+        footer.into_any_element()
+    }
+
+    /// One agent-account row: who it is, what plan, and what it has already
+    /// dispatched this month — the board's own totals, never an external
+    /// usage meter (gh#524).
+    fn render_account_row(
+        &self,
+        theme: &Theme,
+        id: (&'static str, usize),
+        account: &AgentAccount,
+        dispatched: Option<usize>,
+        on_pick: impl Fn(&mut Self, String, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let title = account
+            .email
+            .clone()
+            .or_else(|| account.display_name.clone())
+            .unwrap_or_else(|| account.id.clone());
+        let initial = title
+            .chars()
+            .find(|c| c.is_alphanumeric())
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".into());
+        let plan = crate::settings::accounts::plan_slot(account);
+        let slot = account.id.clone();
+        div()
+            .id(id)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(9.0))
+            .px(px(9.0))
+            .py(px(7.0))
+            .rounded(px(Theme::RADIUS_CHIP))
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.white_alpha(0.04)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.busy {
+                    return;
+                }
+                on_pick(this, slot.clone(), cx);
+            }))
             .child(
                 div()
                     .flex_none()
+                    .size(px(22.0))
+                    // round-ok: an avatar.
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.border)
                     .flex()
-                    .flex_col()
-                    .items_end()
-                    .gap(px(4.0))
-                    .child(toggle)
-                    .child(
-                        widgets::ghost_action(theme)
-                            .id(("automation-duplicate", ix))
-                            .hover(widgets::ghost_hover(theme))
-                            .when(busy, |el| el.opacity(0.4))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.busy {
-                                    return;
-                                }
-                                this.duplicate(&dup_name.clone(), cx);
-                            }))
-                            .child(SharedString::from("Duplicate")),
-                    )
-                    .child(
-                        widgets::ghost_action(theme)
-                            .id(("automation-delete", ix))
-                            .hover(widgets::ghost_hover(theme))
-                            .when(busy, |el| el.opacity(0.4))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if this.busy {
-                                    return;
-                                }
-                                this.confirm = Some(Confirm::Delete {
-                                    rule: del_name.clone(),
-                                });
-                                this.dialog = None;
-                                cx.notify();
-                            }))
-                            .child(SharedString::from("Delete…")),
-                    ),
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(initial)),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from(title)),
+            )
+            .child(widgets::badge(theme, plan))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(match dispatched {
+                        Some(n) => format!("{n} dispatches · this month"),
+                        None => "no dispatches yet".to_string(),
+                    })),
             )
             .into_any_element()
+    }
+
+    /// The one-slot editor, rendered inside the rule whose sentence it edits:
+    /// the field's purpose as consequence, the input, and — for the account
+    /// slot — the host's saved accounts with their totals, one click each.
+    fn render_field_editor(
+        &self,
+        theme: &Theme,
+        editor: &FieldEditor,
+        board_ix: usize,
+        ix: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut panel = div()
+            .mx(px(widgets::ROW_PAD_X))
+            .mb(px(12.0))
+            .w_auto()
+            .p(px(12.0))
+            .rounded(px(Theme::RADIUS_ROW))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.white_alpha(0.02))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from(editor.field.key())),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .line_height(px(16.0))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(editor.field.purpose())),
+            );
+
+        if editor.field == RuleField::Account {
+            let board = &self.boards[board_ix];
+            let usage: Vec<(String, usize)> = board
+                .automations
+                .as_ref()
+                .map(|v| {
+                    v.accounts
+                        .iter()
+                        .map(|a| (a.slot.clone(), a.dispatches_this_month))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let host = editor.host.clone();
+            let rule = editor.rule.clone();
+            let accounts = board.accounts.clone();
+            for (aix, account) in accounts.iter().enumerate() {
+                let dispatched = usage
+                    .iter()
+                    .find(|(slot, _)| slot == &account.id)
+                    .map(|(_, n)| *n);
+                let host = host.clone();
+                let rule = rule.clone();
+                panel = panel.child(self.render_account_row(
+                    theme,
+                    ("automation-account", ix * 16 + aix),
+                    account,
+                    dispatched,
+                    move |this, slot, cx| {
+                        this.write_field(host.clone(), rule.clone(), RuleField::Account, slot, cx);
+                    },
+                    cx,
+                ));
+            }
+        }
+
+        panel = panel.child(div().w_full().child(editor.input.clone())).child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(6.0))
+                .child(
+                    widgets::ghost_action(theme)
+                        .id("automation-editor-save")
+                        .hover(widgets::ghost_hover(theme))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.submit_editor(cx);
+                        }))
+                        .child(SharedString::from("Save")),
+                )
+                .child(
+                    widgets::ghost_action(theme)
+                        .id("automation-editor-cancel")
+                        .hover(widgets::ghost_hover(theme))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.editor = None;
+                            cx.notify();
+                        }))
+                        .child(SharedString::from("Cancel")),
+                ),
+        );
+        panel.into_any_element()
     }
 
     /// A confirmation rendered inside the rule it is about, in the hue of
@@ -1424,17 +1999,25 @@ impl AutomationsPage {
             gpui::Hsla,
             Box<dyn Fn(&mut Self, &mut Context<Self>)>,
         ) = match confirm {
-            Confirm::Enable { rule, summary } => {
+            Confirm::Enable {
+                host,
+                rule,
+                summary,
+            } => {
                 let rule = rule.clone();
+                let host = host.clone();
                 (
                     summary.clone(),
                     "Enable",
                     theme.warning,
-                    Box::new(move |this, cx| this.set_enabled(rule.clone(), true, cx)),
+                    Box::new(move |this, cx| {
+                        this.set_enabled(host.clone(), rule.clone(), true, cx)
+                    }),
                 )
             }
-            Confirm::Delete { rule } => {
+            Confirm::Delete { host, rule } => {
                 let name = rule.clone();
+                let host = host.clone();
                 (
                     format!(
                         "Delete “{name}”? Future dispatches stop; work already running \
@@ -1443,13 +2026,13 @@ impl AutomationsPage {
                     ),
                     "Delete",
                     theme.danger,
-                    Box::new(move |this, cx| this.delete(name.clone(), cx)),
+                    Box::new(move |this, cx| this.delete(host.clone(), name.clone(), cx)),
                 )
             }
         };
         div()
-            .mt(px(8.0))
-            .w_full()
+            .mx(px(widgets::ROW_PAD_X))
+            .mb(px(12.0))
             .p(px(12.0))
             .rounded(px(Theme::RADIUS_ROW))
             .border_1()
@@ -1497,121 +2080,303 @@ impl AutomationsPage {
             .into_any_element()
     }
 
-    /// The one-field editor, rendered inside the rule whose field it edits.
-    fn render_field_editor(
+    /// The creation scaffold (gh#524): three questions — label, owner,
+    /// account — everything else defaults and is edited later by clicking the
+    /// sentence. The rule arrives paused, preview already answering.
+    fn render_new_rule_editor(
         &self,
         theme: &Theme,
-        dialog: &FieldDialog,
+        busy: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        div()
-            .mt(px(8.0))
-            .w_full()
-            .p(px(12.0))
-            .rounded(px(Theme::RADIUS_ROW))
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.white_alpha(0.02))
-            .flex()
-            .flex_col()
-            .gap(px(6.0))
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_DENSE))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text)
-                    .child(SharedString::from(dialog.field.label())),
-            )
-            .child(
-                div()
-                    .text_size(px(Theme::TEXT_CAPTION))
-                    .text_color(theme.text_subtle)
-                    .child(SharedString::from(dialog.field.empty_hint())),
-            )
-            .child(div().w_full().child(dialog.input.clone()))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap(px(6.0))
-                    .child(
-                        widgets::ghost_action(theme)
-                            .id("automation-dialog-save")
-                            .hover(widgets::ghost_hover(theme))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.submit_dialog(cx);
-                            }))
-                            .child(SharedString::from("Save")),
-                    )
-                    .child(
-                        widgets::ghost_action(theme)
-                            .id("automation-dialog-cancel")
-                            .hover(widgets::ghost_hover(theme))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.dialog = None;
-                                cx.notify();
-                            }))
-                            .child(SharedString::from("Cancel")),
-                    ),
-            )
-            .into_any_element()
-    }
-}
-
-/// The history card: one line per streak, newest first.
-fn render_history(theme: &Theme, rows: &[AutomationLogRow]) -> AnyElement {
-    let mut card = widgets::section_card(theme);
-    if rows.is_empty() {
-        card = card.child(
-            widgets::card_row(theme, true).child(
-                div()
-                    .text_size(px(Theme::TEXT_DENSE))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from("Nothing yet.")),
-            ),
-        );
-    }
-    for (ix, row) in rows.iter().enumerate() {
-        let age = chrono::DateTime::parse_from_rfc3339(&row.last_at)
-            .map(|at| {
-                let secs = (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds();
-                format!("{} ago", board::format_age(secs))
-            })
-            .unwrap_or_else(|_| row.last_at.clone());
-        let subject = row.identifier.clone().or(row.task_id.clone());
-        let count = (row.count > 1)
-            .then(|| format!(" ×{}", row.count))
-            .unwrap_or_default();
-        let line = format!(
-            "{}{} — {}{}: {}",
-            row.rule,
-            subject.map(|s| format!(" · {s}")).unwrap_or_default(),
-            row.decision,
-            count,
-            row.reason
-        );
-        card = card.child(
-            widgets::card_row(theme, ix == 0)
-                .items_start()
+        let Some(flow) = &self.new_rule else {
+            return div().into_any_element();
+        };
+        let field = |title: &'static str, hint: &'static str, input: Entity<ComposerInput>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
                 .child(
                     div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_size(px(Theme::TEXT_DENSE))
-                        .line_height(px(18.0))
-                        .text_color(theme.text_subtle)
-                        .child(SharedString::from(line)),
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(theme.text)
+                        .child(SharedString::from(title)),
                 )
                 .child(
                     div()
-                        .flex_none()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(hint)),
+                )
+                .child(div().w_full().child(input))
+        };
+
+        let mut card = widgets::section_card(theme).child(
+            widgets::card_row(theme, true)
+                .flex_col()
+                .items_start()
+                .gap(px(10.0))
+                .child(widgets::row_title(theme, "New rule"))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(
+                            "Three answers; everything else defaults (any route, 1 live, \
+                             30m cooldown) and is edited later by clicking the sentence. \
+                             The rule arrives paused, with its preview already showing \
+                             what it would have done.",
+                        )),
+                )
+                .child(field(
+                    "label",
+                    "The label that means \"approved for autonomous execution\" — \
+                     a task must carry it to be considered.",
+                    flow.label.clone(),
+                ))
+                .child(field(
+                    "owner",
+                    "The human this rule's dispatches answer to.",
+                    flow.owner.clone(),
+                ))
+                .child(field(
+                    "account",
+                    "The slot dispatches bill — without one every candidate is refused. \
+                     Pick one below or type a slot id.",
+                    flow.account.clone(),
+                )),
+        );
+
+        // The host's saved accounts, with the board's own totals — click one
+        // to answer "who pays" (gh#524, operator decision 2).
+        if let Some(board_ix) = self.board_ix(&flow.host) {
+            let board = &self.boards[board_ix];
+            let usage: Vec<(String, usize)> = board
+                .automations
+                .as_ref()
+                .map(|v| {
+                    v.accounts
+                        .iter()
+                        .map(|a| (a.slot.clone(), a.dispatches_this_month))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let accounts = board.accounts.clone();
+            if !accounts.is_empty() {
+                let mut rows = div()
+                    .px(px(widgets::ROW_PAD_X - 9.0))
+                    .pb(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0));
+                for (aix, account) in accounts.iter().enumerate() {
+                    let dispatched = usage
+                        .iter()
+                        .find(|(slot, _)| slot == &account.id)
+                        .map(|(_, n)| *n);
+                    rows = rows.child(self.render_account_row(
+                        theme,
+                        ("automation-new-account", aix),
+                        account,
+                        dispatched,
+                        move |this, slot, cx| {
+                            if let Some(flow) = &this.new_rule {
+                                flow.account
+                                    .update(cx, |input, cx| input.set_text(slot, cx));
+                            }
+                        },
+                        cx,
+                    ));
+                }
+                card = card.child(rows);
+            }
+        }
+
+        // Which board the rule is created into — asked only when it is
+        // genuinely ambiguous: more than one device hosts a board (gh#524).
+        if self.boards.len() > 1 {
+            let mut row = div()
+                .px(px(widgets::ROW_PAD_X))
+                .pb(px(10.0))
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .items_center()
+                .gap(px(6.0))
+                .child(
+                    div()
                         .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.text_faint)
-                        .child(SharedString::from(age)),
+                        .child(SharedString::from("on board")),
+                );
+            for (bix, board) in self.boards.iter().enumerate() {
+                let label = self.device_label(board.id.as_deref(), cx);
+                if board.id == flow.host {
+                    row = row.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .h(px(widgets::ACTION_HEIGHT))
+                            .px(px(widgets::ACTION_PAD_X))
+                            .rounded(px(Theme::RADIUS_CHIP))
+                            .border_1()
+                            .border_color(theme.settled.opacity(0.35))
+                            .bg(theme.settled.opacity(0.14))
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .text_color(theme.settled_text())
+                            .child(label),
+                    );
+                } else {
+                    let target = board.id.clone();
+                    row = row.child(
+                        widgets::ghost_action(theme)
+                            .id(("automation-new-host", bix))
+                            .border_1()
+                            .border_color(theme.border)
+                            .hover(widgets::ghost_hover(theme))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(flow) = &mut this.new_rule {
+                                    flow.host = target.clone();
+                                }
+                                cx.notify();
+                            }))
+                            .child(label),
+                    );
+                }
+            }
+            card = card.child(row);
+        }
+
+        card = card.child(
+            div()
+                .px(px(widgets::ROW_PAD_X))
+                .pb(px(widgets::ROW_PAD_Y))
+                .flex()
+                .flex_row()
+                .gap(px(8.0))
+                .child(
+                    widgets::ghost_action(theme)
+                        .id("automation-new-create")
+                        .border_1()
+                        .border_color(theme.border)
+                        .hover(widgets::ghost_hover(theme))
+                        .when(busy, |el| el.opacity(0.4))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.busy {
+                                return;
+                            }
+                            this.submit_new_rule(cx);
+                        }))
+                        .child(SharedString::from("Create paused")),
+                )
+                .child(
+                    widgets::ghost_action(theme)
+                        .id("automation-new-cancel")
+                        .hover(widgets::ghost_hover(theme))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.new_rule = None;
+                            cx.notify();
+                        }))
+                        .child(SharedString::from("Cancel")),
                 ),
         );
+        card.into_any_element()
     }
-    card.into_any_element()
+
+    /// The history card: one line per streak, newest first, across every
+    /// board — time, task, decision, reason, and the streak count.
+    fn render_history(
+        &self,
+        theme: &Theme,
+        multi_board: bool,
+        cx: &gpui::App,
+    ) -> AnyElement {
+        let rows = self.merged_recent();
+        let mut card = widgets::section_card(theme);
+        if rows.is_empty() {
+            card = card.child(
+                widgets::card_row(theme, true).child(
+                    div()
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Nothing yet.")),
+                ),
+            );
+        }
+        for (ix, (host, row)) in rows.iter().enumerate() {
+            let age = chrono::DateTime::parse_from_rfc3339(&row.last_at)
+                .map(|at| {
+                    let secs =
+                        (chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_seconds();
+                    format!("{} ago", board::format_age(secs))
+                })
+                .unwrap_or_else(|_| row.last_at.clone());
+            let subject = row
+                .identifier
+                .clone()
+                .or(row.task_id.clone())
+                .unwrap_or_default();
+            let mut detail = format!("{} · {}", row.reason, row.rule);
+            if multi_board {
+                detail.push_str(&format!(" on {}", self.device_label(host.as_deref(), cx)));
+            }
+            card = card.child(
+                widgets::card_row(theme, ix == 0)
+                    .items_start()
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(64.0))
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(age)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(72.0))
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text)
+                            .child(SharedString::from(subject)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(80.0))
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(decision_color(theme, &row.decision))
+                            .child(SharedString::from(row.decision.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .line_height(px(18.0))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(detail)),
+                    )
+                    .when(row.count > 1, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .px(px(7.0))
+                                .rounded(px(Theme::RADIUS_CHIP))
+                                .bg(theme.white_alpha(0.06))
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_subtle)
+                                .child(SharedString::from(format!("×{}", row.count))),
+                        )
+                    }),
+            );
+        }
+        card.into_any_element()
+    }
 }
 
 #[cfg(test)]
@@ -1623,31 +2388,39 @@ mod tests {
     }
 
     /// The blockers this page names before the enable click are exactly the
-    /// writer's own refusals (`config.rs` validates owner and labels on
-    /// enable) — a strip that promised more or less than the writer enforces
+    /// writer's refusals — `config.rs` validates owner and labels on enable,
+    /// and the `routes.rs` write seam refuses enabling with nobody paying
+    /// (gh#524). A strip that promised more or less than the writer enforces
     /// would be wrong in one direction or the other.
     #[test]
     fn the_enable_blockers_are_the_writers_refusals() {
         let drafted = rule(serde_json::json!({ "name": "a" }));
         assert_eq!(
             enable_blockers(&drafted),
-            vec!["an owner", "at least one required label"]
+            vec![
+                "who owns it (owner)",
+                "which label it fires on (labels)",
+                "who pays (account)"
+            ]
         );
 
         let ready = rule(serde_json::json!({
             "name": "a",
             "owner": "brede",
-            "labels": ["mylder"],
+            "labels": ["autopick"],
+            "account": "slot-1",
         }));
         assert!(enable_blockers(&ready).is_empty());
 
-        // Whitespace is not an owner and not a label — the writer trims too.
+        // Whitespace is not an owner, not a label and not an account — the
+        // writer trims too.
         let hollow = rule(serde_json::json!({
             "name": "a",
             "owner": "  ",
             "labels": ["  "],
+            "account": " ",
         }));
-        assert_eq!(enable_blockers(&hollow).len(), 2);
+        assert_eq!(enable_blockers(&hollow).len(), 3);
     }
 
     /// An enabled rule reports no blockers: it got past the writer, and its
@@ -1658,7 +2431,88 @@ mod tests {
         assert!(enable_blockers(&enabled).is_empty());
     }
 
-    fn board_config() -> BoardConfig {
+    /// gh#524: a required slot with nothing in it reads as the question the
+    /// sentence cannot answer, and an optional one reads as its default —
+    /// what an unfilled field *means*, said where it acts.
+    #[test]
+    fn empty_slots_read_as_blanks_or_defaults() {
+        let drafted = rule(serde_json::json!({ "name": "a" }));
+        assert_eq!(
+            slot_text(RuleField::Labels, &drafted),
+            ("which label?".to_string(), true)
+        );
+        assert_eq!(
+            slot_text(RuleField::Account, &drafted),
+            ("who pays?".to_string(), true)
+        );
+        assert_eq!(
+            slot_text(RuleField::Owner, &drafted),
+            ("who owns it?".to_string(), true)
+        );
+        assert_eq!(
+            slot_text(RuleField::Route, &drafted),
+            ("any route".to_string(), false)
+        );
+        assert_eq!(
+            slot_text(RuleField::Runtime, &drafted),
+            ("the route's runtime".to_string(), false)
+        );
+        assert_eq!(
+            slot_text(RuleField::ExcludeLabels, &drafted),
+            ("nothing".to_string(), false)
+        );
+        assert_eq!(
+            slot_text(RuleField::DailyBudget, &drafted),
+            ("no daily cap".to_string(), false)
+        );
+
+        let filled = rule(serde_json::json!({
+            "name": "a",
+            "labels": ["autopick", "bug"],
+            "account": "slot-1",
+            "owner": "Brede",
+            "cooldown": "45m",
+            "max_concurrent": 2,
+            "daily_budget": 4,
+        }));
+        assert_eq!(
+            slot_text(RuleField::Labels, &filled),
+            ("autopick, bug".to_string(), false)
+        );
+        assert_eq!(
+            slot_text(RuleField::MaxConcurrent, &filled),
+            ("2 live".to_string(), false)
+        );
+        assert_eq!(
+            slot_text(RuleField::DailyBudget, &filled),
+            ("4 per day".to_string(), false)
+        );
+        assert_eq!(
+            slot_text(RuleField::Cooldown, &filled),
+            ("45m cooldown".to_string(), false)
+        );
+
+        let uncooled = rule(serde_json::json!({ "name": "a", "cooldown": "off" }));
+        assert_eq!(
+            slot_text(RuleField::Cooldown, &uncooled),
+            ("no cooldown".to_string(), false)
+        );
+    }
+
+    /// gh#524: a new rule is named by the label it fires on — creating asks
+    /// three things and a name is not one of them — deduped the way the
+    /// writer would refuse.
+    #[test]
+    fn a_new_rules_name_derives_from_its_label() {
+        assert_eq!(derive_rule_name("docs", &[]), "docs");
+        assert_eq!(
+            derive_rule_name("docs", &["docs".into(), "Docs 2".into()]),
+            "docs 3"
+        );
+        assert_eq!(derive_rule_name("  ", &[]), "rule");
+    }
+
+    fn board_config(dispatched: bool) -> BoardConfig {
         serde_json::from_value(serde_json::json!({
             "routing": {
                 "path": "/tmp/routing.toml",
@@ -1667,7 +2521,7 @@ mod tests {
                 "problems": [],
                 "backup": false,
             },
-            "dispatched": true,
+            "dispatched": dispatched,
         }))
         .unwrap()
     }
@@ -1692,106 +2546,185 @@ mod tests {
             let observe = cx.observe(&state, |_, _, cx| cx.notify());
             AutomationsPage {
                 state,
-                host: None,
-                hosts: Vec::new(),
-                config: None,
-                automations: None,
-                dialog: None,
+                boards: Vec::new(),
+                editor: None,
                 confirm: None,
                 new_rule: None,
+                mark: None,
+                write_seq: 0,
                 error: None,
                 busy: false,
                 loaded: false,
-                fetching: false,
-                stale: false,
-                picked: false,
-                task: None,
-                fetch_task: None,
-                host_task: None,
+                sweep_task: None,
+                write_task: None,
                 _observe: observe,
             }
         })
     }
 
-    /// gh#513: a sweep that settles the page onto a different board must drop
-    /// the previous board's rules and anything aimed at them — a delete
-    /// confirmation rendered over host A's rules and addressed at host B is
-    /// exactly the contradiction this page shipped.
+    fn board(id: &str, rule_name: Option<&str>) -> HostBoard {
+        let mut b = HostBoard::new(Some(id.into()));
+        b.config = Some(board_config(true));
+        b.automations = rule_name.map(view_of);
+        b
+    }
+
+    /// gh#524/gh#513: the page is a union, and every reply lands on the board
+    /// it was asked of — a write's echo repaints that board's config and that
+    /// board's mark, and no other board notices.
     #[gpui::test]
-    async fn settling_on_another_board_drops_the_old_boards_view(
-        cx: &mut gpui::TestAppContext,
-    ) {
+    async fn a_writes_echo_lands_on_the_board_it_addressed(cx: &mut gpui::TestAppContext) {
         let page = page(cx);
-        page.update(cx, |page, cx| {
-            page.host = Some("box".into());
-            page.automations = Some(view_of("check bugs"));
-            page.confirm = Some(Confirm::Delete {
-                rule: "check bugs".into(),
+        page.update(cx, |page, _| {
+            page.boards.push(board("box", Some("check bugs")));
+            page.boards.push(board("mac", Some("docs sweep")));
+            page.boards[0].config = None;
+            page.write_seq = 1;
+            page.mark = Some(WriteMark {
+                seq: 1,
+                host: Some("box".into()),
+                rule: Some("check bugs".into()),
+                field: Some(RuleField::Account),
+                state: WriteState::Saving,
             });
-            page.stale = true;
-            page.settle_host(Some("mac".into()), board_config(), cx);
-            assert_eq!(page.host.as_deref(), Some("mac"));
-            assert!(page.automations.is_none(), "old host's rules must drop");
-            assert!(page.confirm.is_none(), "a confirm aimed at them too");
-            assert!(!page.stale);
-            assert!(page.config.is_some());
+
+            let landed =
+                page.note_write_result(1, &Some("box".into()), Ok(board_config(true)));
+            assert!(landed);
+            assert!(page.boards[0].config.is_some(), "the echo landed there");
+            assert!(
+                matches!(page.mark.as_ref().unwrap().state, WriteState::Saved),
+                "saved is the host's echo"
+            );
+            assert!(
+                page.boards[1].automations.is_some(),
+                "the other board never moved"
+            );
         });
     }
 
-    /// gh#513: once the user has picked a board, the still-running sweep
-    /// fills the picker but never moves the page.
+    /// gh#524: a refusal lands on the field that caused it, in the writer's
+    /// own words — and a slow reply to a superseded write repaints nothing.
     #[gpui::test]
-    async fn a_settle_never_overrides_an_explicit_pick(cx: &mut gpui::TestAppContext) {
-        let page = page(cx);
-        page.update(cx, |page, cx| {
-            page.host = Some("mac".into());
-            page.picked = true;
-            page.settle_host(Some("box".into()), board_config(), cx);
-            assert_eq!(page.host.as_deref(), Some("mac"));
-            assert!(page.config.is_none());
-        });
-    }
-
-    /// gh#514/gh#513: picking a board drops everything rendered for the old
-    /// one before anything of the new one is read.
-    #[gpui::test]
-    async fn picking_a_board_invalidates_the_old_view(cx: &mut gpui::TestAppContext) {
-        let page = page(cx);
-        page.update(cx, |page, cx| {
-            page.host = Some("box".into());
-            page.config = Some(board_config());
-            page.automations = Some(view_of("check bugs"));
-            page.stale = true;
-            page.select_host(Some("mac".into()), cx);
-            assert!(page.picked);
-            assert_eq!(page.host.as_deref(), Some("mac"));
-            assert!(page.automations.is_none());
-            assert!(page.config.is_none());
-            assert!(!page.stale);
-        });
-    }
-
-    /// gh#513: a failed read does not leave the old list rendered as current
-    /// — it stays as the last successful read, marked stale, and only a
-    /// fresh read makes it current again.
-    #[gpui::test]
-    async fn a_failed_read_marks_the_view_stale_until_a_fresh_one(
+    async fn a_refusal_marks_the_field_and_a_stale_reply_marks_nothing(
         cx: &mut gpui::TestAppContext,
     ) {
         let page = page(cx);
         page.update(cx, |page, _| {
-            // With nothing on screen there is nothing to mark.
-            page.read_failed("host did not answer".into());
-            assert!(!page.stale);
+            page.boards.push(board("box", Some("check bugs")));
+            page.write_seq = 2;
+            page.mark = Some(WriteMark {
+                seq: 2,
+                host: Some("box".into()),
+                rule: Some("check bugs".into()),
+                field: Some(RuleField::Account),
+                state: WriteState::Saving,
+            });
 
-            page.automations = Some(view_of("check bugs"));
-            page.read_failed("host did not answer".into());
-            assert!(page.stale, "the list on screen is no longer current");
-            assert!(page.error.is_some());
-            assert!(page.automations.is_some(), "the last read stays, labeled");
+            // A reply for write 1 arrives after write 2 started: dropped.
+            let landed = page.note_write_result(
+                1,
+                &Some("box".into()),
+                Err("no automation named `old`".into()),
+            );
+            assert!(!landed);
+            assert!(
+                matches!(page.mark.as_ref().unwrap().state, WriteState::Saving),
+                "a superseded reply must not repaint the current mark"
+            );
 
-            page.apply_automations(view_of("check bugs"));
-            assert!(!page.stale);
+            let landed = page.note_write_result(
+                2,
+                &Some("box".into()),
+                Err("`x` is not a whole number".into()),
+            );
+            assert!(!landed);
+            match &page.mark.as_ref().unwrap().state {
+                WriteState::Refused(reason) => {
+                    assert!(reason.contains("whole number"), "{reason}")
+                }
+                other => panic!("expected refusal, got {other:?}"),
+            }
+        });
+    }
+
+    /// gh#513: a failed read marks the board it was about stale — the last
+    /// successful read stays, labeled — and only that board; a fresh read
+    /// makes it current again.
+    #[gpui::test]
+    async fn a_failed_read_marks_only_its_board_stale(cx: &mut gpui::TestAppContext) {
+        let page = page(cx);
+        cx.update(|cx| {
+            page.update(cx, |page, cx| {
+                page.boards.push(board("box", Some("check bugs")));
+                page.boards.push(board("mac", Some("docs sweep")));
+                page.read_failed(&Some("box".into()), "host did not answer".into(), cx);
+                assert!(page.boards[0].stale, "the list on screen is not current");
+                assert!(!page.boards[1].stale, "the other board answered nothing");
+                assert!(page.error.is_some());
+                assert!(
+                    page.boards[0].automations.is_some(),
+                    "the last read stays, labeled"
+                );
+
+                page.apply_automations(&Some("box".into()), view_of("check bugs"));
+                assert!(!page.boards[0].stale);
+            });
+        });
+    }
+
+    /// gh#513: a read that fails before anything rendered has nothing to
+    /// mark — no stale strip over an empty list.
+    #[gpui::test]
+    async fn a_failed_read_with_nothing_on_screen_marks_nothing(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let page = page(cx);
+        cx.update(|cx| {
+            page.update(cx, |page, cx| {
+                page.boards.push(board("box", None));
+                page.read_failed(&Some("box".into()), "host did not answer".into(), cx);
+                assert!(!page.boards[0].stale);
+                assert!(page.error.is_some());
+            });
+        });
+    }
+
+    /// gh#524: history is one list across every board, newest first — the
+    /// page is a union, so its memory is too.
+    #[gpui::test]
+    async fn recent_activity_merges_across_boards_newest_first(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let page = page(cx);
+        page.update(cx, |page, _| {
+            let mut a = board("box", Some("check bugs"));
+            a.automations.as_mut().unwrap().recent = vec![serde_json::from_value(
+                serde_json::json!({
+                    "id": 1, "rule": "check bugs", "decision": "dispatched",
+                    "reason": "dispatched to chat c1",
+                    "firstAt": "2026-08-19T10:00:00Z", "lastAt": "2026-08-19T10:00:00Z",
+                    "count": 1,
+                }),
+            )
+            .unwrap()];
+            let mut b = board("mac", Some("docs sweep"));
+            b.automations.as_mut().unwrap().recent = vec![serde_json::from_value(
+                serde_json::json!({
+                    "id": 2, "rule": "docs sweep", "decision": "deferred",
+                    "reason": "rule is at 1 of 1 live",
+                    "firstAt": "2026-08-19T11:00:00Z", "lastAt": "2026-08-19T11:00:00Z",
+                    "count": 3,
+                }),
+            )
+            .unwrap()];
+            page.boards.push(a);
+            page.boards.push(b);
+
+            let merged = page.merged_recent();
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].1.rule, "docs sweep", "newest first");
+            assert_eq!(merged[0].0.as_deref(), Some("mac"));
         });
     }
 }
