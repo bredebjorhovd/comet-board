@@ -10,6 +10,23 @@
 //! carry — live counts, budget meters, health, the run history — arrives by
 //! `ReadBoardAutomations` from the same host the config sweep settled on.
 //!
+//! ## The board is a choice, not a fate (gh#514)
+//!
+//! The sweep settles on a default the way Routing's does, but on an account
+//! with two boards "whichever settled" is invisible until a rule lands on the
+//! board the reader is not looking at. So the sweep here keeps every host that
+//! answered, and the page carries an explicit board picker: which board these
+//! rules live on, changeable, before anything is created into it.
+//!
+//! ## Reading a rule (gh#514)
+//!
+//! A rule is three different kinds of thing and the row says so: **match**
+//! (which tasks it picks), **dispatch as** (what a dispatch runs and spends),
+//! **limits** (how much of it). A required field that is missing — owner,
+//! labels, account — is painted in the warning hue and named in a strip,
+//! because "owned by nobody" is not metadata, it is the thing standing between
+//! the rule and working. Edits happen inside the rule they belong to.
+//!
 //! Two ceremonies are deliberate. **Enabling** a rule opens a confirmation
 //! naming exactly what is being authorized — dispatching agents without a
 //! keypress, spending the named account — because enabling *is* the human
@@ -43,6 +60,15 @@ struct BoardConfig {
     /// The furniture question (gh#434), riding the config reply so the host
     /// sweep can settle on a board somebody has actually released work from.
     #[serde(default)]
+    dispatched: bool,
+}
+
+/// One board the sweep found — a picker entry. `id: None` is this device.
+#[derive(Debug, Clone)]
+struct HostOption {
+    id: Option<String>,
+    /// Whether anybody has ever released work from it (gh#434). The default
+    /// pick prefers a board with evidence; the picker shows both.
     dispatched: bool,
 }
 
@@ -135,6 +161,23 @@ impl RuleField {
     }
 }
 
+/// What keeps a paused rule from being enabled — the writer's own refusals
+/// (`config.rs` validates owner and labels on enable), said before the click
+/// instead of after it. Empty for an enabled rule: it got past the writer.
+fn enable_blockers(rule: &Automation) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if rule.enabled {
+        return out;
+    }
+    if rule.owner.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        out.push("an owner");
+    }
+    if rule.labels.iter().all(|l| l.trim().is_empty()) {
+        out.push("at least one required label");
+    }
+    out
+}
+
 struct FieldDialog {
     rule: String,
     field: RuleField,
@@ -143,12 +186,20 @@ struct FieldDialog {
 }
 
 /// The two confirmations, one shape: what is about to happen, said in full,
-/// with the one verb that does it.
+/// with the one verb that does it. Each renders inside the rule it is about.
 enum Confirm {
     /// Enabling is the authorization (gh#490) — the dialog names the agents,
     /// the account and the owner it authorizes.
     Enable { rule: String, summary: String },
     Delete { rule: String },
+}
+
+impl Confirm {
+    fn rule(&self) -> &str {
+        match self {
+            Confirm::Enable { rule, .. } | Confirm::Delete { rule } => rule,
+        }
+    }
 }
 
 struct NewRule {
@@ -158,8 +209,11 @@ struct NewRule {
 
 pub struct AutomationsPage {
     state: Entity<AppState>,
-    /// Which device's board — `None` is this one. The same sweep Routing uses.
+    /// Which device's board — `None` is this one. Defaulted by the same sweep
+    /// Routing uses, and changeable by the picker (gh#514).
     host: Option<String>,
+    /// Every device the sweep found a board on — the picker's options.
+    hosts: Vec<HostOption>,
     config: Option<BoardConfig>,
     automations: Option<AutomationsView>,
     dialog: Option<FieldDialog>,
@@ -170,6 +224,9 @@ pub struct AutomationsPage {
     loaded: bool,
     task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
+    /// A picked host's config read runs on its own slot, so choosing a board
+    /// does not cancel the sweep still filling the picker.
+    host_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -179,6 +236,7 @@ impl AutomationsPage {
         let mut page = Self {
             state,
             host: None,
+            hosts: Vec::new(),
             config: None,
             automations: None,
             dialog: None,
@@ -189,6 +247,7 @@ impl AutomationsPage {
             loaded: false,
             task: None,
             fetch_task: None,
+            host_task: None,
             _observe: observe,
         };
         page.reload(cx);
@@ -203,8 +262,9 @@ impl AutomationsPage {
         value
     }
 
-    fn host_label(&self, cx: &gpui::App) -> SharedString {
-        let Some(host) = self.host.as_deref() else {
+    /// A device's display name — `None` is this one.
+    fn device_label(&self, host: Option<&str>, cx: &gpui::App) -> SharedString {
+        let Some(host) = host else {
             return "this device".into();
         };
         self.state
@@ -216,9 +276,14 @@ impl AutomationsPage {
             .unwrap_or_else(|| SharedString::from(host.to_string()))
     }
 
-    /// Find the board host and read its config — the same sweep and the same
-    /// furniture rule as the Routing page (gh#434) — then fetch the rules'
-    /// health and history from whichever host settled.
+    fn host_label(&self, cx: &gpui::App) -> SharedString {
+        self.device_label(self.host.as_deref(), cx)
+    }
+
+    /// Sweep every host candidate and keep every board that answers — the
+    /// picker's options — while settling the default the way Routing does
+    /// (gh#434): the first board with dispatch evidence, shown as soon as it
+    /// answers, else the first "furniture" board once everyone has been asked.
     fn reload(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.error = Some("Engine not connected".into());
@@ -230,10 +295,11 @@ impl AutomationsPage {
         };
         let candidates = board::host_candidates(&devices, local.as_deref());
         self.error = None;
+        self.hosts.clear();
         self.task = Some(cx.spawn(async move |this, cx| {
             let mut last: Option<String> = None;
             let mut furniture: Option<(Option<String>, BoardConfig)> = None;
-            let mut settled: Option<(Option<String>, BoardConfig)> = None;
+            let mut settled = false;
             for candidate in candidates {
                 let mut params = serde_json::json!({});
                 if let (Some(host), Some(object)) = (candidate.as_deref(), params.as_object_mut()) {
@@ -245,13 +311,31 @@ impl AutomationsPage {
                     .await
                 {
                     Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
-                        Ok(config) if config.dispatched => {
-                            settled = Some((candidate, config));
-                            break;
-                        }
                         Ok(config) => {
-                            if furniture.is_none() {
-                                furniture = Some((candidate, config));
+                            // The first board with evidence is shown right
+                            // away; the sweep keeps going only to finish the
+                            // picker's list.
+                            let take = config.dispatched && !settled;
+                            settled = settled || take;
+                            let option = HostOption {
+                                id: candidate.clone(),
+                                dispatched: config.dispatched,
+                            };
+                            if !take && furniture.is_none() && !settled {
+                                furniture = Some((candidate.clone(), config.clone()));
+                            }
+                            let updated = this.update(cx, |page, cx| {
+                                page.hosts.push(option);
+                                if take {
+                                    page.loaded = true;
+                                    page.host = candidate.clone();
+                                    page.config = Some(config.clone());
+                                    page.fetch_automations(cx);
+                                }
+                                cx.notify();
+                            });
+                            if updated.is_err() {
+                                return;
                             }
                         }
                         Err(err) => last = Some(format!("Unreadable config: {err}")),
@@ -261,20 +345,22 @@ impl AutomationsPage {
             }
             this.update(cx, |page, cx| {
                 page.loaded = true;
-                match settled.or(furniture) {
-                    Some((host, config)) => {
-                        page.host = host;
-                        page.config = Some(config);
-                        page.fetch_automations(cx);
-                    }
-                    None => {
-                        page.error = Some(
-                            match last {
-                                Some(err) => format!("No device here hosts a board ({err})"),
-                                None => "No device here hosts a board".to_string(),
-                            }
-                            .into(),
-                        );
+                if !settled && page.config.is_none() {
+                    match furniture {
+                        Some((host, config)) => {
+                            page.host = host;
+                            page.config = Some(config);
+                            page.fetch_automations(cx);
+                        }
+                        None => {
+                            page.error = Some(
+                                match last {
+                                    Some(err) => format!("No device here hosts a board ({err})"),
+                                    None => "No device here hosts a board".to_string(),
+                                }
+                                .into(),
+                            );
+                        }
                     }
                 }
                 cx.notify();
@@ -283,7 +369,56 @@ impl AutomationsPage {
         }));
     }
 
-    /// Read the rules' health and history off the settled host.
+    /// Point the page at another board (gh#514). Everything on screen belongs
+    /// to the old host, so it all drops; the new host's config and rules are
+    /// read fresh rather than served from whatever the sweep cached.
+    fn select_host(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+        if self.host == target && self.config.is_some() {
+            return;
+        }
+        self.host = target;
+        self.config = None;
+        self.automations = None;
+        self.dialog = None;
+        self.confirm = None;
+        self.new_rule = None;
+        self.error = None;
+        self.fetch_config(cx);
+        cx.notify();
+    }
+
+    /// Read the current host's config, then its rules.
+    fn fetch_config(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some("Engine not connected".into());
+            return;
+        };
+        let params = self.host_params(serde_json::json!({}));
+        self.host_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::READ_BOARD_CONFIG, params)
+                .await;
+            this.update(cx, |page, cx| {
+                match result {
+                    Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
+                        Ok(config) => {
+                            page.config = Some(config);
+                            page.fetch_automations(cx);
+                        }
+                        Err(err) => {
+                            page.error = Some(format!("Unreadable config: {err}").into())
+                        }
+                    },
+                    Err(err) => page.error = Some(format!("{err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Read the rules' health and history off the current host.
     fn fetch_automations(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -401,6 +536,9 @@ impl AutomationsPage {
     }
 
     fn open_new_rule(&mut self, cx: &mut Context<Self>) {
+        if self.new_rule.is_some() {
+            return;
+        }
         let name = cx.new(|cx| ComposerInput::new("Rule name", cx));
         let events = cx.subscribe(&name, |this: &mut Self, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -546,6 +684,13 @@ impl Render for AutomationsPage {
                 },
             ));
 
+        // Which board these rules live on, said before the rules — and on an
+        // account with more than one, changeable (gh#514). A rule created
+        // here lands on this board and no other.
+        if self.hosts.len() > 1 {
+            column = column.child(self.render_host_picker(&theme, cx));
+        }
+
         if let Some(error) = self.error.clone() {
             column = column.child(
                 widgets::error_strip(&theme, error)
@@ -558,7 +703,43 @@ impl Render for AutomationsPage {
             );
         }
 
-        column = column.child(self.render_new_rule(&theme, busy, cx));
+        if self.config.is_some() {
+            // The creation affordance is a button on the section header, not
+            // a card disguised as a rule in the list it creates into (gh#514).
+            column = column.child(
+                div()
+                    .mt(px(28.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_BODY))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(SharedString::from("Rules")),
+                    )
+                    .child(
+                        widgets::ghost_action(&theme)
+                            .id("automation-new-open")
+                            .border_1()
+                            .border_color(theme.border)
+                            .hover(widgets::ghost_hover(&theme))
+                            .when(busy, |el| el.opacity(0.4))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.busy {
+                                    return;
+                                }
+                                this.open_new_rule(cx);
+                            }))
+                            .child(SharedString::from("New rule")),
+                    ),
+            );
+            if self.new_rule.is_some() {
+                column = column.child(self.render_new_rule_editor(&theme, busy, cx));
+            }
+        }
 
         if let Some(view) = &view {
             let mut card = widgets::section_card(&theme);
@@ -578,13 +759,6 @@ impl Render for AutomationsPage {
                 card = card.child(self.render_rule(&theme, ix, status, busy, cx));
             }
             column = column.child(card);
-
-            if let Some(confirm) = &self.confirm {
-                column = column.child(self.render_confirm(&theme, confirm, busy, cx));
-            }
-            if let Some(dialog) = &self.dialog {
-                column = column.child(self.render_dialog(&theme, dialog));
-            }
 
             column = column
                 .child(
@@ -612,49 +786,80 @@ impl Render for AutomationsPage {
 }
 
 impl AutomationsPage {
-    fn render_new_rule(&self, theme: &Theme, busy: bool, cx: &mut Context<Self>) -> AnyElement {
-        let Some(flow) = &self.new_rule else {
-            return widgets::section_card(theme)
-                .child(
-                    widgets::card_row(theme, true)
-                        .child(widgets::row_tile(theme, crate::icons::MAGIC_STICK))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .child(widgets::row_title(theme, "New rule…"))
-                                .child(widgets::meta_line(
-                                    theme,
-                                    vec![
-                                        div()
-                                            .min_w_0()
-                                            .child(SharedString::from(
-                                                "Created paused — fill in its match and \
-                                                 dispatch settings, then enable it",
-                                            ))
-                                            .into_any_element(),
-                                    ],
-                                )),
-                        )
-                        .child(
-                            widgets::ghost_action(theme)
-                                .id("automation-new-open")
-                                .hover(widgets::ghost_hover(theme))
-                                .when(busy, |el| el.opacity(0.4))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.busy {
-                                        return;
-                                    }
-                                    this.open_new_rule(cx);
-                                }))
-                                .child(SharedString::from("New rule")),
-                        ),
+    /// The board picker (gh#514): every board the sweep found, the one being
+    /// edited marked, the rest one click away.
+    fn render_host_picker(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = div()
+            .mt(px(widgets::BLOCK_GAP))
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap(px(6.0))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("Board")),
+            );
+        for (ix, option) in self.hosts.iter().enumerate() {
+            // A board nobody has ever released work from is named as such —
+            // "which of these is the real one" is the question that put the
+            // picker here.
+            let label: SharedString = if option.dispatched {
+                self.device_label(option.id.as_deref(), cx)
+            } else {
+                format!(
+                    "{} · no dispatches yet",
+                    self.device_label(option.id.as_deref(), cx)
                 )
-                .into_any_element();
-        };
+                .into()
+            };
+            if option.id == self.host {
+                row = row.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .h(px(widgets::ACTION_HEIGHT))
+                        .px(px(widgets::ACTION_PAD_X))
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .border_1()
+                        .border_color(theme.settled.opacity(0.35))
+                        .bg(theme.settled.opacity(0.14))
+                        .text_size(px(Theme::TEXT_DENSE))
+                        .text_color(theme.settled_text())
+                        .child(label),
+                );
+            } else {
+                let target = option.id.clone();
+                row = row.child(
+                    widgets::ghost_action(theme)
+                        .id(("automation-host", ix))
+                        .border_1()
+                        .border_color(theme.border)
+                        .hover(widgets::ghost_hover(theme))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.select_host(target.clone(), cx);
+                        }))
+                        .child(label),
+                );
+            }
+        }
+        row.into_any_element()
+    }
 
+    /// The open creation editor — a name and two verbs, under the header
+    /// whose button opened it.
+    fn render_new_rule_editor(
+        &self,
+        theme: &Theme,
+        busy: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(flow) = &self.new_rule else {
+            return div().into_any_element();
+        };
         widgets::section_card(theme)
             .child(
                 widgets::card_row(theme, true)
@@ -662,6 +867,15 @@ impl AutomationsPage {
                     .items_start()
                     .gap(px(8.0))
                     .child(widgets::row_title(theme, "New rule"))
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(
+                                "Created paused — fill in its match and dispatch settings, \
+                                 then enable it.",
+                            )),
+                    )
                     .child(div().w_full().child(flow.name.clone()))
                     .child(
                         div()
@@ -722,26 +936,9 @@ impl AutomationsPage {
             _ => widgets::badge(theme, "paused").into_any_element(),
         };
 
+        // The quiet meta line is activity only — what the rule is set to
+        // lives in the grouped fields below, where it is editable.
         let mut meta: Vec<AnyElement> = Vec::new();
-        meta.push(
-            div()
-                .child(SharedString::from(format!(
-                    "owned by {}",
-                    rule.owner.as_deref().unwrap_or("nobody")
-                )))
-                .into_any_element(),
-        );
-        meta.push(
-            div()
-                .min_w_0()
-                .truncate()
-                .child(SharedString::from(if rule.labels.is_empty() {
-                    "no labels".to_string()
-                } else {
-                    format!("labels: {}", rule.labels.join(", "))
-                }))
-                .into_any_element(),
-        );
         meta.push(
             div()
                 .child(SharedString::from(format!(
@@ -764,23 +961,168 @@ impl AutomationsPage {
             );
         }
 
-        let field_chip = |field: RuleField, label: SharedString| {
+        // A field chip: what it is set to, one click to edit. A required
+        // field that is missing wears the warning hue — an unset required
+        // field must not read like an unset optional one (gh#514).
+        let chip = |field: RuleField, label: SharedString, missing: bool| -> AnyElement {
             let name = name.clone();
-            widgets::ghost_action(theme)
-                .id(("automation-field", ix * 16 + field.key().len()))
-                .hover(widgets::ghost_hover(theme))
+            let base = widgets::ghost_action(theme)
+                .id(("automation-field", ix * 16 + field as usize))
                 .when(busy, |el| el.opacity(0.4))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     if this.busy {
                         return;
                     }
                     this.open_dialog(name.clone(), field, cx);
-                }))
-                .child(label)
+                }));
+            if missing {
+                let warning = theme.warning;
+                base.border_1()
+                    .border_color(warning.opacity(0.35))
+                    .text_color(theme.warning_text())
+                    .hover(move |s| s.bg(warning.opacity(0.09)))
+                    .child(label)
+                    .into_any_element()
+            } else {
+                base.hover(widgets::ghost_hover(theme))
+                    .child(label)
+                    .into_any_element()
+            }
         };
         let short = |value: &Option<String>, fallback: &str| -> String {
             value.clone().unwrap_or_else(|| fallback.to_string())
         };
+
+        // One group per kind of thing: match, dispatch as, limits (gh#514).
+        let group = |label: &'static str, chips: Vec<AnyElement>| {
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(72.0))
+                        .h(px(widgets::ACTION_HEIGHT))
+                        .flex()
+                        .items_center()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(label)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(4.0))
+                        .children(chips),
+                )
+        };
+
+        let owner_missing = rule.owner.as_deref().map(str::trim).unwrap_or("").is_empty();
+        let account_missing = rule.account.as_deref().map(str::trim).unwrap_or("").is_empty();
+        let labels_missing = rule.labels.iter().all(|l| l.trim().is_empty());
+
+        let match_group = group(
+            "match",
+            vec![
+                chip(
+                    RuleField::Labels,
+                    if labels_missing {
+                        "labels: required".into()
+                    } else {
+                        format!("labels: {}", rule.labels.join(", ")).into()
+                    },
+                    labels_missing,
+                ),
+                chip(
+                    RuleField::ExcludeLabels,
+                    format!(
+                        "exclude: {}",
+                        if rule.exclude_labels.is_empty() {
+                            "none".to_string()
+                        } else {
+                            rule.exclude_labels.join(", ")
+                        }
+                    )
+                    .into(),
+                    false,
+                ),
+                chip(
+                    RuleField::Route,
+                    format!("route: {}", short(&rule.route, "any")).into(),
+                    false,
+                ),
+            ],
+        );
+        let dispatch_group = group(
+            "dispatch as",
+            vec![
+                chip(
+                    RuleField::Owner,
+                    if owner_missing {
+                        "owner: required".into()
+                    } else {
+                        format!("owner: {}", short(&rule.owner, "—")).into()
+                    },
+                    owner_missing,
+                ),
+                chip(
+                    RuleField::Account,
+                    if account_missing {
+                        "account: required".into()
+                    } else {
+                        format!("account: {}", short(&rule.account, "—")).into()
+                    },
+                    account_missing,
+                ),
+                chip(
+                    RuleField::Runtime,
+                    format!("runtime: {}", short(&rule.runtime, "route's")).into(),
+                    false,
+                ),
+                chip(
+                    RuleField::Model,
+                    format!("model: {}", short(&rule.model, "default")).into(),
+                    false,
+                ),
+            ],
+        );
+        let limits_group = group(
+            "limits",
+            vec![
+                chip(
+                    RuleField::MaxPerEval,
+                    format!("per eval: {}", rule.max_per_eval.max(1)).into(),
+                    false,
+                ),
+                chip(
+                    RuleField::MaxConcurrent,
+                    format!("concurrent: {}", rule.max_concurrent.max(1)).into(),
+                    false,
+                ),
+                chip(
+                    RuleField::DailyBudget,
+                    format!(
+                        "budget: {}",
+                        rule.daily_budget
+                            .map(|b| format!("{b}/day"))
+                            .unwrap_or_else(|| "none".into())
+                    )
+                    .into(),
+                    false,
+                ),
+                chip(
+                    RuleField::Cooldown,
+                    format!("cooldown: {}", rule.cooldown).into(),
+                    false,
+                ),
+            ],
+        );
 
         let toggle: AnyElement = if rule.enabled {
             let name = name.clone();
@@ -814,7 +1156,21 @@ impl AutomationsPage {
                 .into_any_element()
         };
 
+        // What stands between the rule and working, said as a notice rather
+        // than left to read like metadata (gh#514): the writer's own enable
+        // blockers for a paused rule, and the live problems for an enabled one.
         let mut problems = div().flex().flex_col().gap(px(4.0)).w_full();
+        let blockers = enable_blockers(rule);
+        if !blockers.is_empty() {
+            problems = problems.child(
+                widgets::warning_strip(
+                    theme,
+                    format!("Not ready to enable — needs {}.", blockers.join(" and ")),
+                )
+                .mt(px(6.0))
+                .id(("automation-blocked", ix)),
+            );
+        }
         for (pix, problem) in status.problems.iter().enumerate() {
             problems = problems.child(
                 widgets::warning_strip(theme, problem.clone())
@@ -823,104 +1179,53 @@ impl AutomationsPage {
             );
         }
 
+        let mut body = div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(widgets::row_title(theme, rule.name.clone()))
+                    .child(state_badge),
+            )
+            .child(widgets::meta_line(theme, meta))
+            .child(problems)
+            .child(
+                div()
+                    .mt(px(8.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(match_group)
+                    .child(dispatch_group)
+                    .child(limits_group),
+            );
+
+        // Edits and confirmations happen inside the rule they belong to, not
+        // in a detached card below the list (gh#514).
+        if let Some(dialog) = &self.dialog
+            && dialog.rule == rule.name
+        {
+            body = body.child(self.render_field_editor(theme, dialog, cx));
+        }
+        if let Some(confirm) = &self.confirm
+            && confirm.rule() == rule.name
+        {
+            body = body.child(self.render_confirm(theme, confirm, busy, cx));
+        }
+
         let dup_name = name.clone();
         let del_name = name.clone();
         widgets::card_row(theme, ix == 0)
             .id(("automation", ix))
             .items_start()
             .child(widgets::row_tile(theme, crate::icons::MAGIC_STICK))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(widgets::row_title(theme, rule.name.clone()))
-                            .child(state_badge),
-                    )
-                    .child(widgets::meta_line(theme, meta))
-                    .child(problems)
-                    .child(
-                        div()
-                            .mt(px(6.0))
-                            .flex()
-                            .flex_row()
-                            .flex_wrap()
-                            .gap(px(4.0))
-                            .child(field_chip(
-                                RuleField::Labels,
-                                format!(
-                                    "labels: {}",
-                                    if rule.labels.is_empty() {
-                                        "—".to_string()
-                                    } else {
-                                        rule.labels.join(", ")
-                                    }
-                                )
-                                .into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::ExcludeLabels,
-                                format!(
-                                    "exclude: {}",
-                                    if rule.exclude_labels.is_empty() {
-                                        "—".to_string()
-                                    } else {
-                                        rule.exclude_labels.join(", ")
-                                    }
-                                )
-                                .into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::Owner,
-                                format!("owner: {}", short(&rule.owner, "—")).into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::Account,
-                                format!("account: {}", short(&rule.account, "—")).into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::Runtime,
-                                format!("runtime: {}", short(&rule.runtime, "route's")).into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::Model,
-                                format!("model: {}", short(&rule.model, "default")).into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::Route,
-                                format!("route: {}", short(&rule.route, "any")).into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::MaxPerEval,
-                                format!("per eval: {}", rule.max_per_eval.max(1)).into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::MaxConcurrent,
-                                format!("concurrent: {}", rule.max_concurrent.max(1)).into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::DailyBudget,
-                                format!(
-                                    "budget: {}",
-                                    rule.daily_budget
-                                        .map(|b| format!("{b}/day"))
-                                        .unwrap_or_else(|| "—".into())
-                                )
-                                .into(),
-                            ))
-                            .child(field_chip(
-                                RuleField::Cooldown,
-                                format!("cooldown: {}", rule.cooldown).into(),
-                            )),
-                    ),
-            )
+            .child(body)
             .child(
                 div()
                     .flex_none()
@@ -963,6 +1268,8 @@ impl AutomationsPage {
             .into_any_element()
     }
 
+    /// A confirmation rendered inside the rule it is about, in the hue of
+    /// what it does: enabling in the working hue, deleting in the blocked one.
     fn render_confirm(
         &self,
         theme: &Theme,
@@ -970,93 +1277,141 @@ impl AutomationsPage {
         busy: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let (copy, verb, action): (String, &str, Box<dyn Fn(&mut Self, &mut Context<Self>)>) =
-            match confirm {
-                Confirm::Enable { rule, summary } => {
-                    let rule = rule.clone();
-                    (
-                        summary.clone(),
-                        "Enable",
-                        Box::new(move |this, cx| this.set_enabled(rule.clone(), true, cx)),
-                    )
-                }
-                Confirm::Delete { rule } => {
-                    let name = rule.clone();
-                    (
-                        format!(
-                            "Delete “{name}”? Future dispatches stop; work already running \
-                             is not cancelled, and its history stays on this page until it \
-                             ages out."
-                        ),
-                        "Delete",
-                        Box::new(move |this, cx| this.delete(name.clone(), cx)),
-                    )
-                }
-            };
-        widgets::section_card(theme)
+        let (copy, verb, hue, action): (
+            String,
+            &str,
+            gpui::Hsla,
+            Box<dyn Fn(&mut Self, &mut Context<Self>)>,
+        ) = match confirm {
+            Confirm::Enable { rule, summary } => {
+                let rule = rule.clone();
+                (
+                    summary.clone(),
+                    "Enable",
+                    theme.warning,
+                    Box::new(move |this, cx| this.set_enabled(rule.clone(), true, cx)),
+                )
+            }
+            Confirm::Delete { rule } => {
+                let name = rule.clone();
+                (
+                    format!(
+                        "Delete “{name}”? Future dispatches stop; work already running \
+                         is not cancelled, and its history stays on this page until it \
+                         ages out."
+                    ),
+                    "Delete",
+                    theme.danger,
+                    Box::new(move |this, cx| this.delete(name.clone(), cx)),
+                )
+            }
+        };
+        div()
+            .mt(px(8.0))
+            .w_full()
+            .p(px(12.0))
+            .rounded(px(Theme::RADIUS_ROW))
+            .border_1()
+            .border_color(hue.opacity(0.30))
+            .bg(hue.opacity(0.06))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
             .child(
-                widgets::card_row(theme, true)
-                    .flex_col()
-                    .items_start()
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .line_height(px(18.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(copy)),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
                     .gap(px(8.0))
                     .child(
-                        div()
-                            .text_size(px(Theme::TEXT_DENSE))
-                            .line_height(px(18.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(copy)),
+                        widgets::ghost_action(theme)
+                            .id("automation-confirm")
+                            .hover(widgets::ghost_hover(theme))
+                            .when(busy, |el| el.opacity(0.4))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this.busy {
+                                    return;
+                                }
+                                action(this, cx);
+                            }))
+                            .child(SharedString::from(verb.to_string())),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .gap(px(8.0))
-                            .child(
-                                widgets::ghost_action(theme)
-                                    .id("automation-confirm")
-                                    .hover(widgets::ghost_hover(theme))
-                                    .when(busy, |el| el.opacity(0.4))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if this.busy {
-                                            return;
-                                        }
-                                        action(this, cx);
-                                    }))
-                                    .child(SharedString::from(verb.to_string())),
-                            )
-                            .child(
-                                widgets::ghost_action(theme)
-                                    .id("automation-confirm-cancel")
-                                    .hover(widgets::ghost_hover(theme))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.confirm = None;
-                                        cx.notify();
-                                    }))
-                                    .child(SharedString::from("Cancel")),
-                            ),
+                        widgets::ghost_action(theme)
+                            .id("automation-confirm-cancel")
+                            .hover(widgets::ghost_hover(theme))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm = None;
+                                cx.notify();
+                            }))
+                            .child(SharedString::from("Cancel")),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_dialog(&self, theme: &Theme, dialog: &FieldDialog) -> AnyElement {
-        widgets::section_card(theme)
+    /// The one-field editor, rendered inside the rule whose field it edits.
+    fn render_field_editor(
+        &self,
+        theme: &Theme,
+        dialog: &FieldDialog,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .mt(px(8.0))
+            .w_full()
+            .p(px(12.0))
+            .rounded(px(Theme::RADIUS_ROW))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.white_alpha(0.02))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
             .child(
-                widgets::card_row(theme, true)
-                    .flex_col()
-                    .items_start()
-                    .gap(px(8.0))
-                    .child(widgets::row_title(
-                        theme,
-                        format!("{} — {}", dialog.rule, dialog.field.label()),
-                    ))
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from(dialog.field.label())),
+            )
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from(dialog.field.empty_hint())),
+            )
+            .child(div().w_full().child(dialog.input.clone()))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap(px(6.0))
                     .child(
-                        div()
-                            .text_size(px(Theme::TEXT_CAPTION))
-                            .text_color(theme.text_subtle)
-                            .child(SharedString::from(dialog.field.empty_hint())),
+                        widgets::ghost_action(theme)
+                            .id("automation-dialog-save")
+                            .hover(widgets::ghost_hover(theme))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.submit_dialog(cx);
+                            }))
+                            .child(SharedString::from("Save")),
                     )
-                    .child(div().w_full().child(dialog.input.clone())),
+                    .child(
+                        widgets::ghost_action(theme)
+                            .id("automation-dialog-cancel")
+                            .hover(widgets::ghost_hover(theme))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.dialog = None;
+                                cx.notify();
+                            }))
+                            .child(SharedString::from("Cancel")),
+                    ),
             )
             .into_any_element()
     }
@@ -1116,4 +1471,49 @@ fn render_history(theme: &Theme, rows: &[AutomationLogRow]) -> AnyElement {
         );
     }
     card.into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(value: serde_json::Value) -> Automation {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// The blockers this page names before the enable click are exactly the
+    /// writer's own refusals (`config.rs` validates owner and labels on
+    /// enable) — a strip that promised more or less than the writer enforces
+    /// would be wrong in one direction or the other.
+    #[test]
+    fn the_enable_blockers_are_the_writers_refusals() {
+        let drafted = rule(serde_json::json!({ "name": "a" }));
+        assert_eq!(
+            enable_blockers(&drafted),
+            vec!["an owner", "at least one required label"]
+        );
+
+        let ready = rule(serde_json::json!({
+            "name": "a",
+            "owner": "brede",
+            "labels": ["mylder"],
+        }));
+        assert!(enable_blockers(&ready).is_empty());
+
+        // Whitespace is not an owner and not a label — the writer trims too.
+        let hollow = rule(serde_json::json!({
+            "name": "a",
+            "owner": "  ",
+            "labels": ["  "],
+        }));
+        assert_eq!(enable_blockers(&hollow).len(), 2);
+    }
+
+    /// An enabled rule reports no blockers: it got past the writer, and its
+    /// live problems arrive from `RuleStatus::problems` instead.
+    #[test]
+    fn an_enabled_rule_is_past_blocking() {
+        let enabled = rule(serde_json::json!({ "name": "a", "enabled": true }));
+        assert!(enable_blockers(&enabled).is_empty());
+    }
 }
