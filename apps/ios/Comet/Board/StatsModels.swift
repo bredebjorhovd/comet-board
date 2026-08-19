@@ -607,9 +607,11 @@ struct AggregateBoardStats: Decodable, Hashable {
                 return "\(host.device.label) is on v\(host.upgrade?.currentVersion ?? "unknown"); "
                     + "v\(host.upgrade?.requiredVersion ?? "unknown") is required for all-board stats"
             }
+            // "this cycle", deliberately (gh#512): missing from this ask, not
+            // gone from the account — the next read asks it again.
             return host.status == .unreadable
                 ? "\(host.device.label) was unreadable"
-                : "\(host.device.label) did not answer"
+                : "\(host.device.label) did not answer this cycle"
         }
         guard !missing.isEmpty else { return nil }
         return "Partial aggregate — \(missing.joined(separator: "; ")). "
