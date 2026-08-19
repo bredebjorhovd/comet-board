@@ -32,6 +32,17 @@
 //! keypress, spending the named account — because enabling *is* the human
 //! authorization every later dispatch rides on. **Deleting** confirms too, and
 //! says what it does not do: work already running is untouched.
+//!
+//! ## The rules on screen are the host's rules or say they are not (gh#513)
+//!
+//! Every write here is addressed at `page.host`, so the list must never be
+//! another host's: a reply is applied only if the page is still addressed at
+//! the host it was asked of, and anything that moves `page.host` drops the
+//! old host's view first. A read that fails does not leave the old list
+//! rendered as current — it is marked stale where it renders. And a write the
+//! host refuses because the rule is unknown re-reads instead of leaving a
+//! contradicted list under the refusal: "there is no automation named X" with
+//! X listed below it was this page addressing a different board than it showed.
 
 use gpui::{
     AnyElement, Context, Entity, SharedString, Subscription, Task, Window, div, prelude::*, px,
@@ -222,6 +233,15 @@ pub struct AutomationsPage {
     error: Option<SharedString>,
     busy: bool,
     loaded: bool,
+    /// A read for the current host is in flight — "Reading…", not "missing".
+    fetching: bool,
+    /// The rules on screen are a previous successful read carried past a
+    /// failed re-read (gh#513) — rendered under a strip saying so, never as
+    /// the board's current state.
+    stale: bool,
+    /// The user picked a board explicitly (gh#514); the sweep must never
+    /// re-settle the page onto another one over that (gh#513).
+    picked: bool,
     task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
     /// A picked host's config read runs on its own slot, so choosing a board
@@ -245,6 +265,9 @@ impl AutomationsPage {
             error: None,
             busy: false,
             loaded: false,
+            fetching: false,
+            stale: false,
+            picked: false,
             task: None,
             fetch_task: None,
             host_task: None,
@@ -327,10 +350,7 @@ impl AutomationsPage {
                             let updated = this.update(cx, |page, cx| {
                                 page.hosts.push(option);
                                 if take {
-                                    page.loaded = true;
-                                    page.host = candidate.clone();
-                                    page.config = Some(config.clone());
-                                    page.fetch_automations(cx);
+                                    page.settle_host(candidate.clone(), config.clone(), cx);
                                 }
                                 cx.notify();
                             });
@@ -345,12 +365,10 @@ impl AutomationsPage {
             }
             this.update(cx, |page, cx| {
                 page.loaded = true;
-                if !settled && page.config.is_none() {
+                if !settled && !page.picked && page.config.is_none() {
                     match furniture {
                         Some((host, config)) => {
-                            page.host = host;
-                            page.config = Some(config);
-                            page.fetch_automations(cx);
+                            page.settle_host(host, config, cx);
                         }
                         None => {
                             page.error = Some(
@@ -369,48 +387,96 @@ impl AutomationsPage {
         }));
     }
 
+    /// Adopt a host the sweep settled on (gh#434) — unless the user has
+    /// picked one, which the sweep never re-settles over (gh#513). A settle
+    /// that moves the page to a different board drops the old board's view
+    /// first: one host's rules must never render while every write on the
+    /// page is addressed at another.
+    fn settle_host(
+        &mut self,
+        host: Option<String>,
+        config: BoardConfig,
+        cx: &mut Context<Self>,
+    ) {
+        if self.picked {
+            return;
+        }
+        self.loaded = true;
+        if self.host != host {
+            self.automations = None;
+            self.stale = false;
+            self.dialog = None;
+            self.confirm = None;
+        }
+        self.host = host;
+        self.config = Some(config);
+        self.fetch_automations(cx);
+    }
+
     /// Point the page at another board (gh#514). Everything on screen belongs
     /// to the old host, so it all drops; the new host's config and rules are
     /// read fresh rather than served from whatever the sweep cached.
     fn select_host(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+        // Even a click on the current board is an explicit pick — from here
+        // the sweep fills the picker but never moves the page (gh#513).
+        self.picked = true;
         if self.host == target && self.config.is_some() {
             return;
         }
         self.host = target;
         self.config = None;
         self.automations = None;
+        self.stale = false;
         self.dialog = None;
         self.confirm = None;
         self.new_rule = None;
         self.error = None;
+        // An in-flight read for the old host must not repaint this one — the
+        // reply guard would drop it, and cancelling it is cheaper still.
+        self.fetch_task = None;
         self.fetch_config(cx);
         cx.notify();
     }
 
-    /// Read the current host's config, then its rules.
+    /// A read off the current host failed: the error shows, and whatever
+    /// rules are still on screen stop being presented as current (gh#513) —
+    /// they are the last successful read, and the strip above them says so.
+    fn read_failed(&mut self, err: String) {
+        self.fetching = false;
+        self.error = Some(err.into());
+        self.stale = self.automations.is_some();
+    }
+
+    /// Read the current host's config, then its rules. The reply is applied
+    /// only if the page is still addressed at the host it was asked of — a
+    /// slow answer must not repaint a page that has moved on (gh#513).
     fn fetch_config(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.fetching = false;
             self.error = Some("Engine not connected".into());
             return;
         };
         let params = self.host_params(serde_json::json!({}));
+        let host = self.host.clone();
+        self.fetching = true;
         self.host_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::READ_BOARD_CONFIG, params)
                 .await;
             this.update(cx, |page, cx| {
+                if page.host != host {
+                    return;
+                }
                 match result {
                     Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
                         Ok(config) => {
                             page.config = Some(config);
                             page.fetch_automations(cx);
                         }
-                        Err(err) => {
-                            page.error = Some(format!("Unreadable config: {err}").into())
-                        }
+                        Err(err) => page.read_failed(format!("Unreadable config: {err}")),
                     },
-                    Err(err) => page.error = Some(format!("{err}").into()),
+                    Err(err) => page.read_failed(format!("{err}")),
                 }
                 cx.notify();
             })
@@ -418,31 +484,48 @@ impl AutomationsPage {
         }));
     }
 
-    /// Read the rules' health and history off the current host.
+    /// Read the rules' health and history off the current host. Success
+    /// replaces the view; failure does not leave the old list rendered as
+    /// current — it is marked stale where it renders (gh#513). A reply for a
+    /// board the page has since left is dropped.
     fn fetch_automations(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.fetching = false;
             return;
         };
         let params = self.host_params(serde_json::json!({}));
+        let host = self.host.clone();
+        self.fetching = true;
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::READ_BOARD_AUTOMATIONS, params)
                 .await;
             this.update(cx, |page, cx| {
+                if page.host != host {
+                    return;
+                }
                 match result {
                     Ok(value) => match serde_json::from_value::<AutomationsView>(value) {
-                        Ok(view) => page.automations = Some(view),
+                        Ok(view) => page.apply_automations(view),
                         Err(err) => {
-                            page.error = Some(format!("Unreadable automations: {err}").into())
+                            page.read_failed(format!("Unreadable automations: {err}"))
                         }
                     },
-                    Err(err) => page.error = Some(format!("{err}").into()),
+                    Err(err) => page.read_failed(format!("{err}")),
                 }
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// A fresh read of the current host's rules — the one thing that makes
+    /// the list current again.
+    fn apply_automations(&mut self, view: AutomationsView) {
+        self.fetching = false;
+        self.automations = Some(view);
+        self.stale = false;
     }
 
     /// Send one write; the reply replaces the config, and the health/history
@@ -456,6 +539,7 @@ impl AutomationsPage {
         self.busy = true;
         self.error = None;
         let params = self.host_params(op);
+        let host = self.host.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -463,6 +547,13 @@ impl AutomationsPage {
                 .await;
             this.update(cx, |page, cx| {
                 page.busy = false;
+                // The write went to a board the page has since left; its
+                // reply — config or refusal — describes that board, not the
+                // one on screen (gh#513).
+                if page.host != host {
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(value) => match serde_json::from_value::<BoardConfig>(value) {
                         Ok(config) => {
@@ -472,8 +563,15 @@ impl AutomationsPage {
                         Err(err) => page.error = Some(format!("Unreadable reply: {err}").into()),
                     },
                     // The refusals are written to be read: "automation `x` is
-                    // enabled with no owner; …".
-                    Err(err) => page.error = Some(format!("{err}").into()),
+                    // enabled with no owner; …". A refusal can also mean the
+                    // view predates the board — a name-addressed write that
+                    // misses is the page showing a rule the host does not have
+                    // (gh#513) — so the host is re-read rather than the
+                    // contradicted list left rendered under the refusal.
+                    Err(err) => {
+                        page.error = Some(format!("{err}").into());
+                        page.fetch_config(cx);
+                    }
                 }
                 cx.notify();
             })
@@ -679,8 +777,13 @@ impl Render for AutomationsPage {
                              labeled tasks without a keypress{next}."
                         )
                     }
-                    None if self.loaded => "No board found".to_string(),
-                    None => "Reading…".to_string(),
+                    None if self.fetching || !self.loaded => "Reading…".to_string(),
+                    // A board was found; its rules were not readable. The
+                    // strip below carries the retry (gh#513).
+                    None if self.config.is_some() => {
+                        format!("Auto-pick rules on {host}.")
+                    }
+                    None => "No board found".to_string(),
                 },
             ));
 
@@ -739,6 +842,44 @@ impl Render for AutomationsPage {
             if self.new_rule.is_some() {
                 column = column.child(self.render_new_rule_editor(&theme, busy, cx));
             }
+        }
+
+        // The staleness question, answered where the rules are (gh#513): a
+        // list that outlived a failed re-read is the last successful read,
+        // not the board's current state — and a board whose rules could not
+        // be read at all shows the retry instead of nothing.
+        if self.stale && view.is_some() {
+            column = column.child(
+                widgets::warning_strip(
+                    &theme,
+                    format!(
+                        "{host} did not answer the last read — these rules are an \
+                         earlier read and may be out of date. Click to re-read."
+                    ),
+                )
+                .mt(px(widgets::BLOCK_GAP))
+                .id("automations-stale")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.fetch_config(cx);
+                    cx.notify();
+                })),
+            );
+        }
+        if view.is_none() && self.config.is_some() && !self.fetching {
+            column = column.child(
+                widgets::warning_strip(
+                    &theme,
+                    format!("The rules on {host} could not be read. Click to retry."),
+                )
+                .mt(px(widgets::BLOCK_GAP))
+                .id("automations-retry")
+                .cursor_pointer()
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.fetch_config(cx);
+                    cx.notify();
+                })),
+            );
         }
 
         if let Some(view) = &view {
@@ -1515,5 +1656,142 @@ mod tests {
     fn an_enabled_rule_is_past_blocking() {
         let enabled = rule(serde_json::json!({ "name": "a", "enabled": true }));
         assert!(enable_blockers(&enabled).is_empty());
+    }
+
+    fn board_config() -> BoardConfig {
+        serde_json::from_value(serde_json::json!({
+            "routing": {
+                "path": "/tmp/routing.toml",
+                "exists": false,
+                "text": "",
+                "problems": [],
+                "backup": false,
+            },
+            "dispatched": true,
+        }))
+        .unwrap()
+    }
+
+    fn view_of(rule_name: &str) -> AutomationsView {
+        serde_json::from_value(serde_json::json!({
+            "rules": [{
+                "rule": { "name": rule_name },
+                "state": "paused",
+                "live": 0,
+                "dispatchedLastDay": 0,
+            }],
+        }))
+        .unwrap()
+    }
+
+    /// A page as constructed, minus the constructor's sweep — these tests
+    /// exercise the state transitions, not the wire.
+    fn page(cx: &mut gpui::TestAppContext) -> gpui::Entity<AutomationsPage> {
+        let state = cx.new(|_| AppState::new());
+        cx.new(|cx| {
+            let observe = cx.observe(&state, |_, _, cx| cx.notify());
+            AutomationsPage {
+                state,
+                host: None,
+                hosts: Vec::new(),
+                config: None,
+                automations: None,
+                dialog: None,
+                confirm: None,
+                new_rule: None,
+                error: None,
+                busy: false,
+                loaded: false,
+                fetching: false,
+                stale: false,
+                picked: false,
+                task: None,
+                fetch_task: None,
+                host_task: None,
+                _observe: observe,
+            }
+        })
+    }
+
+    /// gh#513: a sweep that settles the page onto a different board must drop
+    /// the previous board's rules and anything aimed at them — a delete
+    /// confirmation rendered over host A's rules and addressed at host B is
+    /// exactly the contradiction this page shipped.
+    #[gpui::test]
+    async fn settling_on_another_board_drops_the_old_boards_view(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let page = page(cx);
+        page.update(cx, |page, cx| {
+            page.host = Some("box".into());
+            page.automations = Some(view_of("check bugs"));
+            page.confirm = Some(Confirm::Delete {
+                rule: "check bugs".into(),
+            });
+            page.stale = true;
+            page.settle_host(Some("mac".into()), board_config(), cx);
+            assert_eq!(page.host.as_deref(), Some("mac"));
+            assert!(page.automations.is_none(), "old host's rules must drop");
+            assert!(page.confirm.is_none(), "a confirm aimed at them too");
+            assert!(!page.stale);
+            assert!(page.config.is_some());
+        });
+    }
+
+    /// gh#513: once the user has picked a board, the still-running sweep
+    /// fills the picker but never moves the page.
+    #[gpui::test]
+    async fn a_settle_never_overrides_an_explicit_pick(cx: &mut gpui::TestAppContext) {
+        let page = page(cx);
+        page.update(cx, |page, cx| {
+            page.host = Some("mac".into());
+            page.picked = true;
+            page.settle_host(Some("box".into()), board_config(), cx);
+            assert_eq!(page.host.as_deref(), Some("mac"));
+            assert!(page.config.is_none());
+        });
+    }
+
+    /// gh#514/gh#513: picking a board drops everything rendered for the old
+    /// one before anything of the new one is read.
+    #[gpui::test]
+    async fn picking_a_board_invalidates_the_old_view(cx: &mut gpui::TestAppContext) {
+        let page = page(cx);
+        page.update(cx, |page, cx| {
+            page.host = Some("box".into());
+            page.config = Some(board_config());
+            page.automations = Some(view_of("check bugs"));
+            page.stale = true;
+            page.select_host(Some("mac".into()), cx);
+            assert!(page.picked);
+            assert_eq!(page.host.as_deref(), Some("mac"));
+            assert!(page.automations.is_none());
+            assert!(page.config.is_none());
+            assert!(!page.stale);
+        });
+    }
+
+    /// gh#513: a failed read does not leave the old list rendered as current
+    /// — it stays as the last successful read, marked stale, and only a
+    /// fresh read makes it current again.
+    #[gpui::test]
+    async fn a_failed_read_marks_the_view_stale_until_a_fresh_one(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let page = page(cx);
+        page.update(cx, |page, _| {
+            // With nothing on screen there is nothing to mark.
+            page.read_failed("host did not answer".into());
+            assert!(!page.stale);
+
+            page.automations = Some(view_of("check bugs"));
+            page.read_failed("host did not answer".into());
+            assert!(page.stale, "the list on screen is no longer current");
+            assert!(page.error.is_some());
+            assert!(page.automations.is_some(), "the last read stays, labeled");
+
+            page.apply_automations(view_of("check bugs"));
+            assert!(!page.stale);
+        });
     }
 }
