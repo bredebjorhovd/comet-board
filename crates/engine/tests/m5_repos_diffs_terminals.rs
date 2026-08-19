@@ -208,6 +208,76 @@ async fn repos_round_trip_add_branches_worktrees() {
     );
 }
 
+/// The space's own checkout vouches for its chats' cwds — the registry never
+/// learns adopted or picker-opened spaces, and used to refuse every chat in
+/// one (gh#504). A stale registry entry, which once aborted the whole scan
+/// and refused every checkout on the host, refuses nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_space_checkout_validates_without_a_registry_entry() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(tmp.path()).expect("canonical tempdir");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).expect("data dir");
+    let repos = test_repos(&data);
+
+    let adopted = root.join("adopted");
+    init_repo(&adopted).await;
+    // Never registered; the one entry the registry holds is stale.
+    std::fs::write(data.join("repos.json"), "[\"/no/such/stale-repo\"]").expect("registry");
+
+    let space = adopted.to_string_lossy();
+    // The space's own folder, and a linked worktree of its repo, both validate.
+    assert_eq!(
+        repos.validated_checkout_root(&space, &space).await,
+        Some(adopted.clone())
+    );
+    let worktree = repos
+        .create_worktree(&adopted, "main")
+        .await
+        .expect("worktree");
+    assert!(
+        repos
+            .validated_checkout_root(&space, &worktree.path)
+            .await
+            .is_some(),
+        "a dispatched chat stands in a linked worktree"
+    );
+    // From a space inside the worktree, the primary root still validates.
+    assert_eq!(
+        repos.validated_checkout_root(&worktree.path, &space).await,
+        Some(adopted.clone())
+    );
+
+    // Any other host folder is still refused: another checkout, and a plain
+    // directory — a synced cwd is a claim, not authority.
+    let other = root.join("other");
+    init_repo(&other).await;
+    let plain = root.join("plain");
+    std::fs::create_dir_all(&plain).expect("plain dir");
+    for candidate in [&other, &plain] {
+        assert_eq!(
+            repos
+                .validated_checkout_root(&space, &candidate.to_string_lossy())
+                .await,
+            None,
+            "{} must not validate against the adopted space",
+            candidate.display()
+        );
+    }
+    // A space that is not a checkout at all vouches for its own folder only.
+    let plain_space = plain.to_string_lossy();
+    assert_eq!(
+        repos
+            .validated_checkout_root(&plain_space, &plain_space)
+            .await,
+        Some(plain.clone())
+    );
+    assert_eq!(
+        repos.validated_checkout_root(&plain_space, &space).await,
+        None
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Folder lister
 // ---------------------------------------------------------------------------

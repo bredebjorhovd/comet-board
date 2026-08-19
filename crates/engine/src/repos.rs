@@ -117,8 +117,22 @@ pub struct Repos {
 }
 
 impl Repos {
-    /// Resolve mutable workspace rows only when both the owning space and the
-    /// requested checkout are roots registered on this host.
+    /// Resolve mutable workspace rows only when the requested checkout is one
+    /// the owning space vouches for on this host: the space's own folder, its
+    /// repository's primary root, or one of that repository's linked worktrees.
+    ///
+    /// The space — not `repos.json` — is the authority (gh#504). The registry
+    /// only ever learns paths through `AddRepo`/`CloneRepo`/`CreateRepo`, and
+    /// most spaces pass through none of them: a checkout the board adopted, or
+    /// a folder the picker opened, has a space row and no registry entry, so a
+    /// registry-only check refused every chat standing in it. Nothing is lost
+    /// by asking the space instead — the old check accepted only when the space
+    /// and the candidate sat in one registered repo's root-plus-worktrees set,
+    /// and that same set is computed here from the space's side, by git. A
+    /// synced cwd naming any other host folder is refused exactly as before.
+    ///
+    /// (This also retires the scan a single stale registry entry could abort,
+    /// which refused every checkout on the host over one deleted repo dir.)
     pub async fn validated_checkout_root(
         &self,
         space_path: &str,
@@ -126,21 +140,25 @@ impl Repos {
     ) -> Option<PathBuf> {
         let space_root = std::fs::canonicalize(space_path).ok()?;
         let candidate_root = std::fs::canonicalize(candidate).ok()?;
-        for repo in self.list().await {
-            let repo_root = std::fs::canonicalize(&repo.path).ok()?;
-            let mut registered = vec![repo_root];
-            if let Ok(refs) = self.refs(Path::new(&repo.path)).await {
-                registered.extend(
-                    refs.into_iter()
-                        .filter_map(|reference| reference.worktree_path)
-                        .filter_map(|path| std::fs::canonicalize(path).ok()),
-                );
-            }
-            if registered.contains(&space_root) && registered.contains(&candidate_root) {
-                return Some(candidate_root);
-            }
+        // The space's own folder is where its chats already run — including a
+        // space that is not a checkout at all.
+        if candidate_root == space_root {
+            return Some(candidate_root);
         }
-        None
+        // Anywhere else must be the same repository, asked of git: the primary
+        // root (the space may sit in a subfolder or a linked worktree), or a
+        // linked worktree of it (where the board's dispatched chats stand).
+        let repo_root = self.repo_root(&space_root).await.ok()?;
+        let repo_root = std::fs::canonicalize(&repo_root).ok()?;
+        if candidate_root == repo_root {
+            return Some(candidate_root);
+        }
+        let refs = self.refs(&repo_root).await.ok()?;
+        refs.into_iter()
+            .filter_map(|reference| reference.worktree_path)
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .any(|worktree| worktree == candidate_root)
+            .then_some(candidate_root)
     }
 
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root

@@ -824,7 +824,7 @@ async fn rename_archive_branch_and_runtime_caches_do_not_replace_fork_policy() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn direct_steer_revalidates_the_registered_checkout() {
+async fn direct_steer_revalidates_the_checkout_on_every_turn() {
     let (env_guard, dir) = test_env().await;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let rig = rig_with_harness(
@@ -868,26 +868,83 @@ async fn direct_steer_revalidates_the_registered_checkout() {
     )
     .await;
 
-    std::fs::write(rig._dir.path().join("data/repos.json"), "[]").unwrap();
+    // The checkout vanishing from disk is what revokes it — the registry no
+    // longer gates a space's own checkout (gh#504).
+    std::fs::remove_dir_all(&rig.repo).unwrap();
     let error = rig
         .core
         .sessions
         .steer(&result.chat_id, "direct steer", None)
         .await
-        .expect_err("direct steer revalidates the registered checkout too");
+        .expect_err("direct steer revalidates the checkout too");
     assert!(
         error.to_string().contains("no longer registered"),
         "{error}"
     );
 }
 
+/// An adopted space — a checkout the board detected and routed, or a folder
+/// the picker opened — has a space row and no `repos.json` entry, and its
+/// forks must land anyway (gh#504). The one entry the registry does hold is
+/// stale, which used to abort validation for every checkout on the host.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_deregistered_stored_checkout_path_is_refused() {
+async fn a_fork_in_an_adopted_unregistered_space_lands() {
+    let rig = rig().await;
+    std::fs::write(
+        rig._dir.path().join("data/repos.json"),
+        "[\"/no/such/stale-repo\"]",
+    )
+    .unwrap();
+    let result = comet_engine::fork_chat(deps(&rig.core), &request(ForkCheckout::Shared))
+        .await
+        .expect("the space's own checkout vouches without a registry entry");
+    rig.core
+        .sessions
+        .dispatch(
+            &result.chat_id,
+            HarnessId::Mock,
+            RunRequest {
+                prompt: "run in the adopted checkout".into(),
+                model: None,
+                reasoning: None,
+                model_options: Default::default(),
+                cwd: result.cwd.clone(),
+                sandbox: SandboxLevel::ReadOnly,
+                auto_approve: false,
+                resume: None,
+                attachments: Vec::new(),
+            },
+            None,
+        )
+        .await
+        .expect("the turn revalidates against the space, not the registry");
+    wait_for(
+        || {
+            !rig.seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        },
+        "adopted-space run",
+    )
+    .await;
+    let seen = rig
+        .seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        std::fs::canonicalize(&seen[0].cwd).unwrap(),
+        std::fs::canonicalize(&result.cwd).unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vanished_stored_checkout_path_is_refused() {
     let rig = rig().await;
     let result = comet_engine::fork_chat(deps(&rig.core), &request(ForkCheckout::Shared))
         .await
         .unwrap();
-    std::fs::write(rig._dir.path().join("data/repos.json"), "[]").unwrap();
+    std::fs::remove_dir_all(&rig.repo).unwrap();
     let error = rig
         .core
         .sessions
@@ -895,7 +952,7 @@ async fn a_deregistered_stored_checkout_path_is_refused() {
             &result.chat_id,
             HarnessId::Mock,
             RunRequest {
-                prompt: "do not trust the surviving path".into(),
+                prompt: "do not trust the stored path".into(),
                 model: None,
                 reasoning: None,
                 model_options: Default::default(),
@@ -908,7 +965,7 @@ async fn a_deregistered_stored_checkout_path_is_refused() {
             None,
         )
         .await
-        .expect_err("registry proof is required on every turn");
+        .expect_err("host proof is required on every turn");
     assert!(
         error.to_string().contains("no longer registered"),
         "{error}"
