@@ -188,9 +188,11 @@ async fn entry_task(
 }
 
 /// Probe git presence + the checked-out branch and stamp the row — write only
-/// on change.
+/// on change. A folder that is gone from disk is stamped non-git from a stat
+/// alone: spawning git with a deleted cwd fails the spawn itself, and paying
+/// three of those per repair tick per swept space is the gh#526 shape.
 async fn check_space(inner: &Arc<SpacesSyncInner>, space_id: &str, path: &Path) {
-    let detected = inner.repos.is_repo(path).await;
+    let detected = Repos::path_exists(path).await && inner.repos.is_repo(path).await;
     let (checkout_id, branch) = if detected {
         let checkout_id = match inner.repos.checkout_identity(path).await {
             Ok(identity) => Some(identity.id),
