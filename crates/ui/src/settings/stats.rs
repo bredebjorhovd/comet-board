@@ -46,6 +46,16 @@
 //! a fraction of itself. The four status hues appear once, in the outcomes bar,
 //! where they name states (gh#173).
 //!
+//! **Every mark answers when asked (gh#469).** A bar's length is a comparison,
+//! not a reading, so every drawn mark — a day column, a heat cell, a split or
+//! landing band, a breakdown track — is inspectable: hover holds a detail card
+//! open over the full mark's hit area (a quiet day's 2px rule answers over its
+//! whole column), each chart is one tab stop whose marks the arrow keys walk
+//! to the same card, and every mark carries the same sentence as an
+//! accessibility label. The wording is
+//! [`comet_proto::view::stats::MarkDetail`], shared with the phone, so a
+//! tooltip and a VoiceOver label cannot disagree about a number.
+//!
 //! **The four rates are priced apart and then read together (gh#225).** A
 //! cache read is a tenth of fresh input and output is five times it, so the
 //! window's price is nothing like its token counts — and the block that used
@@ -120,15 +130,18 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Entity, FocusHandle, KeyDownEvent, SharedString, Task, Window, div,
+    prelude::*, px,
+};
 use serde::{Deserialize, Serialize};
 
 use comet_proto::view::rates::human_usd;
 use comet_proto::view::stats::{
     AgentSpend, AggregateBoardStats, BREAKDOWN_ROWS, BoardSpend, BoardStats, Breakdown,
-    BreakdownRow, CostSplit, Dimension, HostBoard, LandingKind, WINDOWS, bar_fraction,
-    day_captions_fit, day_columns, elsewhere_note, hour_grid, human_minutes, human_multiple,
-    human_tokens, other_boards_note, peak_tokens, percent,
+    BreakdownRow, CostSplit, Dimension, HostBoard, LandingKind, MarkDetail, WINDOWS, bar_fraction,
+    day_captions_fit, day_columns, elsewhere_note, hour_cell_detail, hour_grid, human_minutes,
+    human_multiple, human_tokens, other_boards_note, peak_tokens, percent,
 };
 use comet_rpc::methods;
 
@@ -267,6 +280,104 @@ impl TrackSize {
         }
     }
 }
+
+// ---- inspecting a mark (gh#469) --------------------------------------------
+
+/// The inspectable charts, in page order — and the ⇥ order, since each chart
+/// is one tab stop whose marks the arrow keys then walk. One stop per chart
+/// rather than one per mark, because a heat grid is 120 marks and a keyboard
+/// that has to tab through all of them to leave the card is a keyboard trap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chart {
+    Days,
+    Grid,
+    Split,
+    Landing,
+    Breakdown,
+}
+
+impl Chart {
+    const ALL: [Chart; 5] = [
+        Chart::Days,
+        Chart::Grid,
+        Chart::Split,
+        Chart::Landing,
+        Chart::Breakdown,
+    ];
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|c| *c == self).unwrap_or(0)
+    }
+}
+
+/// One mark on one chart — the page's cursor into its own drawings. `row` and
+/// `col` are positions in what was *drawn* this frame (a landing band index
+/// counts only the non-empty bands), so a stale cursor after a reload simply
+/// matches nothing rather than pointing at the wrong bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarkRef {
+    chart: Chart,
+    row: usize,
+    col: usize,
+}
+
+impl MarkRef {
+    fn at(chart: Chart, row: usize, col: usize) -> Self {
+        Self { chart, row, col }
+    }
+
+    /// A stable per-frame element id for this mark and its floating card.
+    fn key(self) -> usize {
+        // Decimal fields, wide enough for an all-time window's day count —
+        // bit-packing at 8 bits collided the moment a board was a year old.
+        self.chart.index() * 100_000_000 + self.row * 10_000 + self.col
+    }
+}
+
+/// How many rows and columns of marks a chart drew this frame — what the
+/// arrows have to stay inside.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChartDims {
+    rows: usize,
+    cols: usize,
+}
+
+/// The keyboard cursor rule (gh#469): the first arrow lands on the first
+/// mark, later ones move one mark and clamp at the edges rather than wrap —
+/// a cursor that teleports from the last day to the first reads as a bug —
+/// and Escape puts the cursor down. Any other key leaves it alone.
+fn step_mark(
+    current: Option<MarkRef>,
+    chart: Chart,
+    dims: ChartDims,
+    key: &str,
+) -> Option<MarkRef> {
+    if dims.rows == 0 || dims.cols == 0 {
+        return None;
+    }
+    if key == "escape" {
+        return None;
+    }
+    if !matches!(key, "left" | "right" | "up" | "down") {
+        return current;
+    }
+    let Some(mark) = current.filter(|m| m.chart == chart && m.row < dims.rows && m.col < dims.cols)
+    else {
+        return Some(MarkRef::at(chart, 0, 0));
+    };
+    let (row, col) = match key {
+        "left" => (mark.row, mark.col.saturating_sub(1)),
+        "right" => (mark.row, (mark.col + 1).min(dims.cols - 1)),
+        "up" => (mark.row.saturating_sub(1), mark.col),
+        "down" => ((mark.row + 1).min(dims.rows - 1), mark.col),
+        _ => (mark.row, mark.col),
+    };
+    Some(MarkRef::at(chart, row, col))
+}
+
+/// How much a mark's ink steps up while it is the one being inspected — a
+/// change of tone, never of layout (gh#132's rule for hover).
+const INSPECT_LIFT: f32 = 0.18;
 
 // ---- which board (gh#254) --------------------------------------------------
 
@@ -431,6 +542,24 @@ pub struct StatsPage {
     reload_generation: u64,
     updating: Option<String>,
     update_task: Option<Task<()>>,
+    /// Which chart mark the pointer is holding open (gh#469). Cleared only by
+    /// the mark that owns it, so two adjacent bars swapping in one frame never
+    /// blink the detail.
+    hovered: Option<MarkRef>,
+    /// The pointer is over the detail card itself — kept apart from
+    /// [`hovered`](Self::hovered) so leaving a bar *for its card* keeps the
+    /// card open whichever of the two events lands first.
+    detail_hovered: Option<MarkRef>,
+    /// The keyboard cursor (gh#469): the mark the arrows are on. Shown only
+    /// while its chart holds focus, so a cursor parked last week does not
+    /// paint a tooltip under an unrelated mouse.
+    keyed: Option<MarkRef>,
+    /// One focus handle per inspectable chart, indexed by [`Chart::index`] —
+    /// each chart is one tab stop, and the arrows walk its marks.
+    charts_focus: Vec<FocusHandle>,
+    /// The page's own focus, on the scroll container: the landing spot a
+    /// click gives the keyboard, from which ⇥ enters the first chart.
+    page_focus: FocusHandle,
 }
 
 impl StatsPage {
@@ -457,6 +586,11 @@ impl StatsPage {
             reload_generation: 0,
             updating: None,
             update_task: None,
+            hovered: None,
+            detail_hovered: None,
+            keyed: None,
+            charts_focus: Chart::ALL.iter().map(|_| cx.focus_handle()).collect(),
+            page_focus: cx.focus_handle(),
         };
         page.reload(cx);
         page
@@ -693,6 +827,200 @@ impl StatsPage {
         }
         self.dimension = dimension;
         cx.notify();
+    }
+
+    // -- inspecting a mark (gh#469) ------------------------------------------
+
+    fn chart_focus(&self, chart: Chart) -> &FocusHandle {
+        &self.charts_focus[chart.index()]
+    }
+
+    /// The mark the pointer is holding open: the bar under it, or the card it
+    /// walked onto. Their union, so the two hover events swapping order in one
+    /// frame cannot blink the card.
+    fn pointer_mark(&self) -> Option<MarkRef> {
+        self.hovered.or(self.detail_hovered)
+    }
+
+    /// Which mark shows its detail this frame. The pointer wins while it is on
+    /// anything; the keyboard cursor shows only while its chart holds focus.
+    fn inspected(&self, window: &Window) -> Option<MarkRef> {
+        self.pointer_mark().or_else(|| {
+            self.keyed
+                .filter(|mark| self.chart_focus(mark.chart).is_focused(window))
+        })
+    }
+
+    /// A mark's hover changed. **Only the owner clears** (the rule
+    /// `transcript.rs` taught the rail): when the pointer moves straight from
+    /// one bar to its neighbour, the new bar's enter and the old bar's leave
+    /// land in the same frame in either order, and an unconditional clear
+    /// would blink the detail between them.
+    fn set_mark_hover(&mut self, mark: MarkRef, entered: bool, cx: &mut Context<Self>) {
+        if entered {
+            if self.hovered != Some(mark) {
+                self.hovered = Some(mark);
+                cx.notify();
+            }
+        } else if self.hovered == Some(mark) {
+            self.hovered = None;
+            cx.notify();
+        }
+    }
+
+    /// The pointer entered or left the floating detail card itself. Same
+    /// owner rule; the card's hit area starts flush with the mark's edge (the
+    /// visual gap is padding *inside* it), so the crossing has no dead zone
+    /// to flicker in.
+    fn set_detail_hover(&mut self, mark: MarkRef, entered: bool, cx: &mut Context<Self>) {
+        if entered {
+            if self.detail_hovered != Some(mark) {
+                self.detail_hovered = Some(mark);
+                cx.notify();
+            }
+        } else if self.detail_hovered == Some(mark) {
+            self.detail_hovered = None;
+            cx.notify();
+        }
+    }
+
+    /// A key landed while one of the charts held focus. Returns whether it
+    /// was ours, so the caller can stop it travelling on to the page.
+    fn on_chart_key(
+        &mut self,
+        chart: Chart,
+        dims: ChartDims,
+        key: &str,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !matches!(key, "left" | "right" | "up" | "down" | "escape") {
+            return false;
+        }
+        let next = step_mark(self.keyed, chart, dims, key);
+        if next != self.keyed {
+            self.keyed = next;
+            cx.notify();
+        }
+        true
+    }
+
+    /// The focusable frame around one chart's marks: a tab stop, the arrow
+    /// keys, a group label saying how to read it, and — while it holds focus —
+    /// the chip wash, a change of tone rather than of layout.
+    fn chart_frame(
+        &self,
+        chart: Chart,
+        dims: ChartDims,
+        label: String,
+        body: gpui::Div,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let handle = self.chart_focus(chart);
+        let focused = handle.is_focused(window);
+        div()
+            .id(("stats-chart", chart.index()))
+            .track_focus(handle)
+            .tab_index(0)
+            .role(gpui::Role::Group)
+            .aria_label(SharedString::from(label))
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if this.on_chart_key(chart, dims, event.keystroke.key.as_str(), cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .rounded(px(Theme::RADIUS_CHIP))
+            .when(focused, |el| el.bg(theme.chip))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// One inspectable mark: the a11y node (`GraphicsSymbol`, labelled with
+    /// the whole sentence), the hover listener, and — while this is the mark
+    /// being inspected — its floating detail card. `body` is the drawn mark;
+    /// the wrapper is the hit area, which may be taller than the ink (a 2px
+    /// quiet-day rule answers to its whole column).
+    fn inspectable(
+        &self,
+        mark: MarkRef,
+        detail: &MarkDetail,
+        active_cursor: bool,
+        body: gpui::Div,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let inspected = self.inspected(window) == Some(mark);
+        body.id(("stats-mark", mark.key()))
+            .role(gpui::Role::GraphicsSymbol)
+            .aria_label(SharedString::from(detail.sentence()))
+            .when(active_cursor, |el| el.aria_active_descendant())
+            .relative()
+            .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                this.set_mark_hover(mark, *entered, cx);
+            }))
+            .when(inspected, |el| {
+                el.child(self.mark_overlay(mark, detail, theme, cx))
+            })
+    }
+
+    /// The floating detail card over an inspected mark: the shared popover
+    /// glass, anchored to the mark's top-left, opening upward and snapping
+    /// inside the window. Its hit area reaches down to the mark's edge (the
+    /// 6px of visual air is padding inside it) and it keeps its own mark alive
+    /// while hovered, so pointer travel from a bar into its card never blinks.
+    fn mark_overlay(
+        &self,
+        mark: MarkRef,
+        detail: &MarkDetail,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let card = crate::popover::popover_card(theme)
+            .p(px(10.0))
+            .max_w(px(280.0))
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .child(
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text)
+                    .child(SharedString::from(detail.title.clone())),
+            )
+            .children(detail.lines.iter().map(|line| {
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(line.clone()))
+                    .into_any_element()
+            }));
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_0()
+            .child(
+                gpui::deferred(
+                    gpui::anchored()
+                        .anchor(gpui::Anchor::BottomLeft)
+                        .snap_to_window_with_margin(px(8.0))
+                        .child(
+                            div()
+                                .id(("stats-mark-card", mark.key()))
+                                .occlude()
+                                .pb(px(6.0))
+                                .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                                    this.set_detail_hover(mark, *entered, cx);
+                                }))
+                                .child(crate::frost::frosted(12.0, 16.0, card)),
+                        ),
+                )
+                .priority(1),
+            )
+            .into_any_element()
     }
 
     /// What to call a candidate: the device's own name.
@@ -1020,7 +1348,14 @@ impl StatsPage {
     /// (gh#178), possibly several people's on a box carrying several slots. The
     /// only honest thing to do with the pair is divide it, which is the
     /// multiple the second cell shows.
-    fn render_spend(stats: &BoardStats, wrong_board: Option<String>, theme: &Theme) -> AnyElement {
+    fn render_spend(
+        &self,
+        stats: &BoardStats,
+        wrong_board: Option<String>,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(spend) = stats.spend.as_ref().filter(|s| s.has_price()) else {
             // The two ways there is no number, said apart — `spend_label` owns
             // which one this is, and neither of them is $0.00. No band and no
@@ -1057,14 +1392,14 @@ impl StatsPage {
         };
 
         let split = spend.cost_split();
-        let window = stats.window_label();
+        let window_label = stats.window_label();
 
         let price = Self::spend_cell(
             theme,
             human_usd(spend.list_price),
             "list-price API estimate for this work",
             Some(format!(
-                "{} tokens over {window}",
+                "{} tokens over {window_label}",
                 human_tokens(split.tokens)
             )),
         );
@@ -1124,7 +1459,7 @@ impl StatsPage {
                 .child(Self::rule(theme))
                 .child(plans)
                 .child(Self::rule(theme))
-                .child(Self::render_cost_split(&split, theme)),
+                .child(self.render_cost_split(&split, theme, window, cx)),
         );
         if let Some(agent_usage) = Self::render_agent_usage(stats, theme) {
             card = card.child(agent_usage);
@@ -1195,7 +1530,13 @@ impl StatsPage {
     ///
     /// Both figures per class, always. Dollars alone hide that the cheap class
     /// is the enormous one; tokens alone hide that the small one is the bill.
-    fn render_cost_split(split: &CostSplit, theme: &Theme) -> AnyElement {
+    fn render_cost_split(
+        &self,
+        split: &CostSplit,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let cell = div()
             .flex_grow(1.0)
             .flex_basis(px(0.0))
@@ -1219,7 +1560,14 @@ impl StatsPage {
                 .into_any_element();
         }
 
-        let tone = |index: usize| Self::mark(theme, Self::CLASS_TONES[index.min(3)]);
+        let inspected = self.inspected(window);
+        let keyed = self.keyed;
+        let tone = |index: usize, lifted: bool| {
+            Self::mark(
+                theme,
+                Self::CLASS_TONES[index.min(3)] + if lifted { INSPECT_LIFT } else { 0.0 },
+            )
+        };
         let bar = div()
             .flex()
             .flex_row()
@@ -1227,16 +1575,26 @@ impl StatsPage {
             .w_full()
             .h(px(BAR_HEIGHT))
             .children(split.slices.iter().enumerate().map(|(index, slice)| {
-                div()
-                    // Proportional, and never invisible: a class that cost a
-                    // fraction of a percent is still a class that was spent in.
-                    .flex_grow(slice.share as f32)
-                    .flex_basis(px(0.0))
-                    .min_w(px(3.0))
-                    .h_full()
-                    .rounded(px(MARK_RADIUS))
-                    .bg(tone(index))
-                    .into_any_element()
+                let mark = MarkRef::at(Chart::Split, 0, index);
+                self.inspectable(
+                    mark,
+                    &slice.detail(),
+                    keyed == Some(mark),
+                    div()
+                        // Proportional, and never invisible: a class that cost
+                        // a fraction of a percent is still a class that was
+                        // spent in.
+                        .flex_grow(slice.share as f32)
+                        .flex_basis(px(0.0))
+                        .min_w(px(3.0))
+                        .h_full()
+                        .rounded(px(MARK_RADIUS))
+                        .bg(tone(index, inspected == Some(mark))),
+                    theme,
+                    window,
+                    cx,
+                )
+                .into_any_element()
             }));
 
         let legend = div()
@@ -1257,7 +1615,7 @@ impl StatsPage {
                             .flex_none()
                             .size(px(SWATCH))
                             .rounded(px(MARK_RADIUS))
-                            .bg(tone(index)),
+                            .bg(tone(index, false)),
                     )
                     .child(
                         div()
@@ -1275,7 +1633,23 @@ impl StatsPage {
                     .into_any_element()
             }));
 
-        cell.child(bar).child(legend).into_any_element()
+        cell.child(
+            self.chart_frame(
+                Chart::Split,
+                ChartDims {
+                    rows: 1,
+                    cols: split.slices.len(),
+                },
+                "Where the list-price API estimate goes. Left and right read each token class."
+                    .to_string(),
+                div().child(bar),
+                theme,
+                window,
+                cx,
+            ),
+        )
+        .child(legend)
+        .into_any_element()
     }
 
     /// The four tones of the cost bar, biggest class first.
@@ -1502,7 +1876,13 @@ impl StatsPage {
     /// a day that spent nothing is a 2px rule on the baseline, never a gap. A
     /// seven-day window on a board that worked one day is a shape; one lonely
     /// bar reads as six days the board failed to record.
-    fn render_chart(stats: &BoardStats, theme: &Theme) -> AnyElement {
+    fn render_chart(
+        &self,
+        stats: &BoardStats,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let columns = day_columns(&stats.daily, &stats.daily_tokens);
         if columns.is_empty() {
             return Self::padded_card(theme)
@@ -1527,41 +1907,76 @@ impl StatsPage {
             ));
 
         if peak > 0 {
-            card = card.child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_end()
-                    .gap(px(COLUMN_GAP))
-                    .h(px(CHART_HEIGHT))
-                    .children(columns.iter().map(|column| {
-                        let quiet = column.is_quiet();
+            let keyed = self.keyed;
+            let inspected = self.inspected(window);
+            let band = div()
+                .flex()
+                .flex_row()
+                .items_end()
+                .gap(px(COLUMN_GAP))
+                .h(px(CHART_HEIGHT))
+                .children(columns.iter().enumerate().map(|(index, column)| {
+                    let quiet = column.is_quiet();
+                    let mark = MarkRef::at(Chart::Days, 0, index);
+                    let base = if quiet {
+                        0.12
+                    } else if column.tokens == peak {
+                        0.55
+                    } else {
+                        0.40
+                    };
+                    let lifted = inspected == Some(mark);
+                    self.inspectable(
+                        mark,
+                        &column.detail(),
+                        keyed == Some(mark),
+                        // The hit area is the whole column, not the ink: a
+                        // quiet day's 2px rule answers hover over the full
+                        // band height, which is what "no pixel hunting" means
+                        // for the shortest mark on the page (gh#469).
                         div()
                             .flex_1()
                             .min_w(px(3.0))
-                            .h(px(if quiet {
-                                QUIET_RULE
-                            } else {
-                                (CHART_HEIGHT * column.fraction).max(QUIET_RULE + 1.0)
-                            }))
-                            .rounded(px(MARK_RADIUS))
-                            // A rule in the border's own weight where the bar
-                            // would be: the day is present and it spent
-                            // nothing, which is a different statement from a
-                            // short bar somebody has to squint at.
-                            .bg(Self::mark(
-                                theme,
-                                if quiet {
-                                    0.12
-                                } else if column.tokens == peak {
-                                    0.55
-                                } else {
-                                    0.40
-                                },
-                            ))
-                            .into_any_element()
-                    })),
-            );
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .h(px(if quiet {
+                                        QUIET_RULE
+                                    } else {
+                                        (CHART_HEIGHT * column.fraction).max(QUIET_RULE + 1.0)
+                                    }))
+                                    .rounded(px(MARK_RADIUS))
+                                    // A rule in the border's own weight where
+                                    // the bar would be: the day is present and
+                                    // it spent nothing, which is a different
+                                    // statement from a short bar somebody has
+                                    // to squint at.
+                                    .bg(Self::mark(
+                                        theme,
+                                        base + if lifted { INSPECT_LIFT } else { 0.0 },
+                                    )),
+                            ),
+                        theme,
+                        window,
+                        cx,
+                    )
+                    .into_any_element()
+                }));
+            card = card.child(self.chart_frame(
+                Chart::Days,
+                ChartDims {
+                    rows: 1,
+                    cols: columns.len(),
+                },
+                format!("{}. Left and right read each day.", Self::CHART_TITLE),
+                div().child(band),
+                theme,
+                window,
+                cx,
+            ));
         }
 
         if captioned {
@@ -1642,7 +2057,13 @@ impl StatsPage {
     /// can tell that the board runs late and that one repo takes most of the
     /// work, and cannot tell whether those are the same fact — which is the
     /// only thing either card was ever going to be used for.
-    fn render_when_and_where(stats: &BoardStats, theme: &Theme) -> AnyElement {
+    fn render_when_and_where(
+        &self,
+        stats: &BoardStats,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let grid = hour_grid(&stats.hours_by_workspace, GRID_ROWS);
         let head = Self::card_head(
             theme,
@@ -1665,7 +2086,7 @@ impl StatsPage {
             }
             return Self::padded_card(theme)
                 .child(head)
-                .child(Self::hour_margin(theme, &stats.hour_of_day))
+                .child(self.hour_margin(theme, &stats.hour_of_day, window, cx))
                 .child(Self::hour_labels(theme))
                 .child(Self::note(
                     theme,
@@ -1676,10 +2097,13 @@ impl StatsPage {
         }
 
         let peak = grid.peak;
+        let keyed = self.keyed;
+        let inspected = self.inspected(window);
         let rows: Vec<AnyElement> = grid
             .rows
             .iter()
-            .map(|row| {
+            .enumerate()
+            .map(|(row_index, row)| {
                 div()
                     .flex()
                     .flex_row()
@@ -1701,22 +2125,33 @@ impl StatsPage {
                             .flex()
                             .flex_row()
                             .gap(px(2.0))
-                            .children(row.hours.iter().map(|count| {
+                            .children(row.hours.iter().enumerate().map(|(hour, count)| {
                                 let heat = bar_fraction(*count, peak);
-                                div()
-                                    .flex_1()
-                                    .min_w(px(4.0))
-                                    .h(px(HEAT_CELL))
-                                    .rounded(px(MARK_RADIUS))
-                                    .bg(Self::mark(
-                                        theme,
-                                        if *count == 0 {
-                                            0.04
-                                        } else {
-                                            0.12 + 0.56 * heat
-                                        },
-                                    ))
-                                    .into_any_element()
+                                let mark = MarkRef::at(Chart::Grid, row_index, hour);
+                                let base = if *count == 0 {
+                                    0.04
+                                } else {
+                                    0.12 + 0.56 * heat
+                                };
+                                let lifted = inspected == Some(mark);
+                                self.inspectable(
+                                    mark,
+                                    &hour_cell_detail(&row.label, hour, *count),
+                                    keyed == Some(mark),
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(4.0))
+                                        .h(px(HEAT_CELL))
+                                        .rounded(px(MARK_RADIUS))
+                                        .bg(Self::mark(
+                                            theme,
+                                            base + if lifted { INSPECT_LIFT } else { 0.0 },
+                                        )),
+                                    theme,
+                                    window,
+                                    cx,
+                                )
+                                .into_any_element()
                             })),
                     )
                     .child(Self::cell(theme, format!("{}", row.total), TOTAL_COL, true))
@@ -1724,17 +2159,41 @@ impl StatsPage {
             })
             .collect();
 
+        let dims = ChartDims {
+            rows: grid.rows.len(),
+            cols: comet_proto::view::stats::HOURS,
+        };
         Self::padded_card(theme)
             .child(head)
-            .child(div().flex().flex_col().gap(px(3.0)).children(rows))
+            .child(self.chart_frame(
+                Chart::Grid,
+                dims,
+                "When you release work, and where. The arrow keys move across hours and spaces."
+                    .to_string(),
+                div().flex().flex_col().gap(px(3.0)).children(rows),
+                theme,
+                window,
+                cx,
+            ))
             .child(Self::hour_labels(theme))
             .into_any_element()
     }
 
     /// The hour histogram, for the one board that cannot send the crossing.
-    fn hour_margin(theme: &Theme, hours: &[usize]) -> AnyElement {
+    /// Its bars answer as `every space` — which is what they are, and the
+    /// wording keeps the degraded card inspectable on the same terms as the
+    /// crossing it stands in for (gh#469).
+    fn hour_margin(
+        &self,
+        theme: &Theme,
+        hours: &[usize],
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let peak = hours.iter().copied().max().unwrap_or(0);
-        div()
+        let keyed = self.keyed;
+        let inspected = self.inspected(window);
+        let band = div()
             .flex()
             .flex_row()
             .items_end()
@@ -1756,19 +2215,52 @@ impl StatsPage {
                     .flex_row()
                     .items_end()
                     .gap(px(2.0))
-                    .children(hours.iter().map(|count| {
+                    .children(hours.iter().enumerate().map(|(hour, count)| {
                         let fraction = bar_fraction(*count, peak);
-                        div()
-                            .flex_1()
-                            .min_w(px(4.0))
-                            .h(px((HEAT_CELL * fraction).max(QUIET_RULE)))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(Self::mark(theme, if *count == 0 { 0.04 } else { 0.45 }))
-                            .into_any_element()
+                        let mark = MarkRef::at(Chart::Grid, 0, hour);
+                        let base = if *count == 0 { 0.04 } else { 0.45 };
+                        let lifted = inspected == Some(mark);
+                        self.inspectable(
+                            mark,
+                            &hour_cell_detail("every space", hour, *count),
+                            keyed == Some(mark),
+                            div()
+                                .flex_1()
+                                .min_w(px(4.0))
+                                .h(px(HEAT_CELL))
+                                .flex()
+                                .flex_col()
+                                .justify_end()
+                                .child(
+                                    div()
+                                        .h(px((HEAT_CELL * fraction).max(QUIET_RULE)))
+                                        .rounded(px(MARK_RADIUS))
+                                        .bg(Self::mark(
+                                            theme,
+                                            base + if lifted { INSPECT_LIFT } else { 0.0 },
+                                        )),
+                                ),
+                            theme,
+                            window,
+                            cx,
+                        )
+                        .into_any_element()
                     })),
             )
-            .child(div().w(px(TOTAL_COL)).flex_none())
-            .into_any_element()
+            .child(div().w(px(TOTAL_COL)).flex_none());
+        self.chart_frame(
+            Chart::Grid,
+            ChartDims {
+                rows: 1,
+                cols: comet_proto::view::stats::HOURS,
+            },
+            "Dispatches by local hour, every space together. Left and right read each hour."
+                .to_string(),
+            div().child(band),
+            theme,
+            window,
+            cx,
+        )
     }
 
     /// The hour axis: four marks over 24 columns. Every third hour is a smear
@@ -1814,10 +2306,11 @@ impl StatsPage {
         &self,
         stats: &BoardStats,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let breakdown = self.render_breakdown(stats, theme, cx);
-        let landing = Self::render_landing(stats, theme);
+        let breakdown = self.render_breakdown(stats, theme, window, cx);
+        let landing = self.render_landing(stats, theme, window, cx);
         if breakdown.is_none() && landing.is_none() {
             return None;
         }
@@ -1850,7 +2343,13 @@ impl StatsPage {
     /// The bar is over tasks that landed. Work still running is a caption under
     /// it and never a band, because a proportion of unfinished work is a
     /// proportion that moves while nothing lands.
-    fn render_landing(stats: &BoardStats, theme: &Theme) -> Option<AnyElement> {
+    fn render_landing(
+        &self,
+        stats: &BoardStats,
+        theme: &Theme,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let landing = stats.landing;
         if landing.touched() == 0 {
             return None;
@@ -1875,29 +2374,63 @@ impl StatsPage {
             ));
 
         if landed {
+            let keyed = self.keyed;
+            let inspected = self.inspected(window);
+            let drawn: Vec<_> = segments.iter().filter(|s| s.count > 0).collect();
+            let bands = drawn.len();
+            let bar = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .w_full()
+                .h(px(BAR_HEIGHT))
+                .children(drawn.into_iter().enumerate().map(|(index, s)| {
+                    let mark = MarkRef::at(Chart::Landing, 0, index);
+                    self.inspectable(
+                        mark,
+                        &s.detail(),
+                        keyed == Some(mark),
+                        div()
+                            // Grow from a floor rather than sizing to the
+                            // share, so a single-task band stays visible
+                            // and four bands still fit the track exactly.
+                            .flex_grow(s.fraction as f32)
+                            .flex_basis(px(0.0))
+                            .min_w(px(LANDING_BAND_MIN))
+                            .h_full()
+                            .rounded(px(MARK_RADIUS))
+                            .bg(Self::landing_tone(theme, s.kind))
+                            // The hues already paint at full strength, so the
+                            // inspected band lifts with a wash over the ink
+                            // rather than a fifth tone of it.
+                            .when(inspected == Some(mark), |el| {
+                                el.child(
+                                    div()
+                                        .size_full()
+                                        .rounded(px(MARK_RADIUS))
+                                        .bg(theme.white_alpha(0.22)),
+                                )
+                            }),
+                        theme,
+                        window,
+                        cx,
+                    )
+                    .into_any_element()
+                }));
             card = card
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(2.0))
-                        .w_full()
-                        .h(px(BAR_HEIGHT))
-                        .children(segments.iter().filter(|s| s.count > 0).map(|s| {
-                            div()
-                                // Grow from a floor rather than sizing to the
-                                // share, so a single-task band stays visible
-                                // and four bands still fit the track exactly.
-                                .flex_grow(s.fraction as f32)
-                                .flex_basis(px(0.0))
-                                .min_w(px(LANDING_BAND_MIN))
-                                .h_full()
-                                .rounded(px(MARK_RADIUS))
-                                .bg(Self::landing_tone(theme, s.kind))
-                                .into_any_element()
-                        })),
-                )
+                .child(self.chart_frame(
+                    Chart::Landing,
+                    ChartDims {
+                        rows: 1,
+                        cols: bands,
+                    },
+                    "Where the work landed. Left and right read each outcome.".to_string(),
+                    div().child(bar),
+                    theme,
+                    window,
+                    cx,
+                ))
                 .child(
                     div()
                         .flex()
@@ -2090,6 +2623,7 @@ impl StatsPage {
         &self,
         stats: &BoardStats,
         theme: &Theme,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         // A window that dropped the chosen axis falls back to the first one it
@@ -2128,17 +2662,30 @@ impl StatsPage {
             .min_w_0()
             .child(head)
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    // Tighter than a card's own gap: these are rows of one
-                    // table, not stacked facts.
-                    .gap(px(9.0))
-                    .children(
-                        cut.rows
-                            .iter()
-                            .map(|row| Self::breakdown_row(theme, cut, row, priced)),
+                self.chart_frame(
+                    Chart::Breakdown,
+                    ChartDims {
+                        rows: cut.rows.len(),
+                        cols: 1,
+                    },
+                    format!(
+                        "Breakdown by {}, {}. Up and down read each row.",
+                        cut.dimension.label(),
+                        cut.ranking.caption()
                     ),
+                    div()
+                        .flex()
+                        .flex_col()
+                        // Tighter than a card's own gap: these are rows of one
+                        // table, not stacked facts.
+                        .gap(px(9.0))
+                        .children(cut.rows.iter().enumerate().map(|(index, row)| {
+                            self.breakdown_row(index, theme, cut, row, priced, window, cx)
+                        })),
+                    theme,
+                    window,
+                    cx,
+                ),
             );
         if priced && unpriced > 0 {
             card = card.child(Self::caption(
@@ -2186,64 +2733,85 @@ impl StatsPage {
 
     /// One row: what it is, how big a share of the window it is, what it spent,
     /// and what that cost.
+    ///
+    /// The whole row is the hit area (gh#469): its track is six pixels tall,
+    /// and asking a pointer to stand on a hairline is the pixel-hunting this
+    /// ticket is about. What the detail adds over the printed columns is the
+    /// dispatch count and the reason behind an `unpriced` or an em dash.
     fn breakdown_row(
+        &self,
+        index: usize,
         theme: &Theme,
         cut: &Breakdown,
         row: &BreakdownRow,
         priced: bool,
+        window: &Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let fraction = cut.share(row);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(12.0))
-            .child(
-                div()
-                    .w(px(BREAKDOWN_LABEL))
-                    .flex_none()
-                    .truncate()
-                    .text_size(px(Theme::TEXT_DENSE))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(row.label.clone())),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(40.0))
-                    .h(px(TRACK_HEIGHT))
-                    .rounded(px(MARK_RADIUS))
-                    .bg(Self::mark(theme, 0.07))
-                    .child(
-                        div()
-                            .h_full()
-                            .w(gpui::relative(fraction))
-                            .rounded(px(MARK_RADIUS))
-                            .bg(Self::mark(theme, 0.45)),
-                    ),
-            )
-            .child(Self::cell(theme, Self::row_tokens(row), TOKENS_COL, false))
-            .when(priced, |el| {
-                el.child(
+        let mark = MarkRef::at(Chart::Breakdown, index, 0);
+        let inspected = self.inspected(window) == Some(mark);
+        self.inspectable(
+            mark,
+            &row.detail(cut.dimension),
+            self.keyed == Some(mark),
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .rounded(px(Theme::RADIUS_CHIP))
+                .when(inspected, |el| el.bg(theme.element_hover))
+                .child(
                     div()
-                        .w(px(PRICE_COL))
+                        .w(px(BREAKDOWN_LABEL))
                         .flex_none()
-                        .text_right()
                         .truncate()
                         .text_size(px(Theme::TEXT_DENSE))
-                        // The loudest thing on the row, because it is the one
-                        // the card is opened for — except where the answer is
-                        // a word about the absence of money (gh#359), which is
-                        // said a tone back so a column of figures still reads
-                        // as a column of figures.
-                        .text_color(match row.is_unpriced() {
-                            true => theme.text_subtle,
-                            false => theme.text,
-                        })
-                        .child(SharedString::from(row.price_label())),
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(row.label.clone())),
                 )
-            })
-            .into_any_element()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(40.0))
+                        .h(px(TRACK_HEIGHT))
+                        .rounded(px(MARK_RADIUS))
+                        .bg(Self::mark(theme, 0.07))
+                        .child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(fraction))
+                                .rounded(px(MARK_RADIUS))
+                                .bg(Self::mark(theme, 0.45)),
+                        ),
+                )
+                .child(Self::cell(theme, Self::row_tokens(row), TOKENS_COL, false))
+                .when(priced, |el| {
+                    el.child(
+                        div()
+                            .w(px(PRICE_COL))
+                            .flex_none()
+                            .text_right()
+                            .truncate()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            // The loudest thing on the row, because it is the one
+                            // the card is opened for — except where the answer is
+                            // a word about the absence of money (gh#359), which is
+                            // said a tone back so a column of figures still reads
+                            // as a column of figures.
+                            .text_color(match row.is_unpriced() {
+                                true => theme.text_subtle,
+                                false => theme.text,
+                            })
+                            .child(SharedString::from(row.price_label())),
+                    )
+                }),
+            theme,
+            window,
+            cx,
+        )
+        .into_any_element()
     }
 
     /// A row's tokens — a dash where it reported none, never a zero that would
@@ -2338,21 +2906,38 @@ fn apply_failure_may_be_restart(error: &comet_rpc::RpcError) -> bool {
     }
 }
 
-/// The scroll container every settings page wraps its column in — and the one
-/// this page shipped without, which on the longest page in the app meant
-/// everything below the fold was simply unreachable (operator, 2026-08-08).
-/// It has to wrap EVERY return path, including the two empty states, or the
-/// bug comes back the first time somebody adds a third.
-fn scroll_page(column: gpui::Div) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id("stats-page")
-        .size_full()
-        .overflow_y_scroll()
-        .child(column)
+impl StatsPage {
+    /// The scroll container every settings page wraps its column in — and the
+    /// one this page shipped without, which on the longest page in the app
+    /// meant everything below the fold was simply unreachable (operator,
+    /// 2026-08-08). It has to wrap EVERY return path, including the two empty
+    /// states, or the bug comes back the first time somebody adds a third.
+    ///
+    /// It is also the keyboard's ground (gh#469): focusable, so a click lands
+    /// the keyboard on the page, and ⇥/⇧⇥ move it through the charts — gpui
+    /// binds no Tab of its own, so the page does.
+    fn scroll_page(&self, column: gpui::Div, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("stats-page")
+            .track_focus(&self.page_focus)
+            .on_key_down(cx.listener(|_, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key.as_str() == "tab" {
+                    if event.keystroke.modifiers.shift {
+                        window.focus_prev(cx);
+                    } else {
+                        window.focus_next(cx);
+                    }
+                    cx.stop_propagation();
+                }
+            }))
+            .size_full()
+            .overflow_y_scroll()
+            .child(column)
+    }
 }
 
 impl Render for StatsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         // Which board, and which others there were (gh#254). Resolved once per
         // frame: the header, both empty states and the spend card are all
@@ -2487,13 +3072,14 @@ impl Render for StatsPage {
             } else {
                 "Reading the board…"
             };
-            return scroll_page(
+            return self.scroll_page(
                 column.child(
                     div()
                         .text_size(px(Theme::TEXT_BODY))
                         .text_color(theme.text_subtle)
                         .child(SharedString::from(note)),
                 ),
+                cx,
             );
         };
 
@@ -2526,7 +3112,7 @@ impl Render for StatsPage {
                         .flatten(),
                     |el, note| el.child(SharedString::from(note)),
                 );
-            return scroll_page(column.child(empty));
+            return self.scroll_page(column.child(empty), cx);
         }
 
         // The board that has attempts and no tokens on it — the state this
@@ -2545,14 +3131,14 @@ impl Render for StatsPage {
         // the window cut whichever way the reader wants it, beside where the
         // work actually landed.
         column = column
-            .child(Self::render_spend(&stats, wrong_board, &theme))
-            .child(Self::render_chart(&stats, &theme))
-            .child(Self::render_when_and_where(&stats, &theme));
-        if let Some(row) = self.render_bottom_row(&stats, &theme, cx) {
+            .child(self.render_spend(&stats, wrong_board, &theme, window, cx))
+            .child(self.render_chart(&stats, &theme, window, cx))
+            .child(self.render_when_and_where(&stats, &theme, window, cx));
+        if let Some(row) = self.render_bottom_row(&stats, &theme, window, cx) {
             column = column.child(row);
         }
 
-        scroll_page(column)
+        self.scroll_page(column, cx)
     }
 }
 
@@ -2560,6 +3146,145 @@ impl Render for StatsPage {
 mod tests {
     use super::*;
     use comet_proto::view::stats::StatsHostStatus;
+
+    /// A page with nothing loaded and no reload in flight — the ground the
+    /// interaction tests stand on.
+    fn blank_page(cx: &mut gpui::TestAppContext) -> gpui::Entity<StatsPage> {
+        let state = cx.new(|_| AppState::new());
+        cx.new(|cx| StatsPage {
+            state,
+            since_days: Some(7),
+            dimension: Dimension::Model,
+            answers: Vec::new(),
+            aggregate: None,
+            pinned: None,
+            swept: false,
+            error: None,
+            task: None,
+            reload_generation: 0,
+            updating: None,
+            update_task: None,
+            hovered: None,
+            detail_hovered: None,
+            keyed: None,
+            charts_focus: Chart::ALL.iter().map(|_| cx.focus_handle()).collect(),
+            page_focus: cx.focus_handle(),
+        })
+    }
+
+    fn mark(chart: Chart, row: usize, col: usize) -> MarkRef {
+        MarkRef::at(chart, row, col)
+    }
+
+    // -- inspecting a mark (gh#469) -------------------------------------------
+
+    #[test]
+    fn the_first_arrow_lands_on_the_first_mark_and_the_edges_clamp() {
+        let dims = ChartDims { rows: 1, cols: 7 };
+        let first = step_mark(None, Chart::Days, dims, "right");
+        assert_eq!(first, Some(mark(Chart::Days, 0, 0)));
+        let second = step_mark(first, Chart::Days, dims, "right");
+        assert_eq!(second, Some(mark(Chart::Days, 0, 1)));
+        assert_eq!(
+            step_mark(first, Chart::Days, dims, "left"),
+            first,
+            "the cursor clamps at the edge rather than wrapping"
+        );
+        let last = Some(mark(Chart::Days, 0, 6));
+        assert_eq!(step_mark(last, Chart::Days, dims, "right"), last);
+        assert_eq!(step_mark(second, Chart::Days, dims, "escape"), None);
+        assert_eq!(
+            step_mark(second, Chart::Days, dims, "a"),
+            second,
+            "keys the chart does not claim leave the cursor alone"
+        );
+        assert_eq!(
+            step_mark(None, Chart::Days, ChartDims { rows: 1, cols: 0 }, "right"),
+            None,
+            "an empty chart has nowhere to land"
+        );
+    }
+
+    #[test]
+    fn the_grid_cursor_moves_in_two_dimensions_and_a_stale_cursor_restarts() {
+        let dims = ChartDims { rows: 3, cols: 24 };
+        let cell = Some(mark(Chart::Grid, 1, 5));
+        assert_eq!(
+            step_mark(cell, Chart::Grid, dims, "down"),
+            Some(mark(Chart::Grid, 2, 5))
+        );
+        assert_eq!(
+            step_mark(cell, Chart::Grid, dims, "up"),
+            Some(mark(Chart::Grid, 0, 5))
+        );
+        // A cursor left on another chart — or beyond a window that shrank
+        // under it — restarts at the first mark instead of teleporting.
+        assert_eq!(
+            step_mark(Some(mark(Chart::Days, 0, 3)), Chart::Grid, dims, "right"),
+            Some(mark(Chart::Grid, 0, 0))
+        );
+        assert_eq!(
+            step_mark(
+                Some(mark(Chart::Grid, 9, 9)),
+                Chart::Grid,
+                ChartDims { rows: 2, cols: 4 },
+                "down"
+            ),
+            Some(mark(Chart::Grid, 0, 0))
+        );
+    }
+
+    #[gpui::test]
+    async fn a_detail_follows_the_pointer_and_only_its_owner_puts_it_down(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let page = blank_page(cx);
+        let (a, b) = (mark(Chart::Days, 0, 0), mark(Chart::Days, 0, 1));
+        page.update(cx, |page, cx| {
+            page.set_mark_hover(a, true, cx);
+            assert_eq!(page.pointer_mark(), Some(a));
+            // Straight onto a neighbour: the new bar's enter and the old
+            // bar's leave land in the same frame in either order, and neither
+            // order may blink the detail.
+            page.set_mark_hover(b, true, cx);
+            page.set_mark_hover(a, false, cx);
+            assert_eq!(page.pointer_mark(), Some(b), "only the owner clears");
+            // Onto the floating card itself: the card keeps its mark alive
+            // while the pointer crosses off the bar (gh#469's no-flicker rule).
+            page.set_detail_hover(b, true, cx);
+            page.set_mark_hover(b, false, cx);
+            assert_eq!(page.pointer_mark(), Some(b));
+            page.set_detail_hover(b, false, cx);
+            assert_eq!(page.pointer_mark(), None);
+        });
+    }
+
+    #[gpui::test]
+    async fn arrow_keys_walk_a_time_series_and_a_breakdown_and_escape_clears(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let page = blank_page(cx);
+        page.update(cx, |page, cx| {
+            // The time-series chart, walked left to right.
+            let days = ChartDims { rows: 1, cols: 7 };
+            assert!(page.on_chart_key(Chart::Days, days, "right", cx));
+            assert!(page.on_chart_key(Chart::Days, days, "right", cx));
+            assert_eq!(page.keyed, Some(mark(Chart::Days, 0, 1)));
+            // The categorical chart: the same cursor, walked by rows — and
+            // arriving from another chart restarts at its first mark.
+            let cut = ChartDims { rows: 4, cols: 1 };
+            assert!(page.on_chart_key(Chart::Breakdown, cut, "down", cx));
+            assert_eq!(page.keyed, Some(mark(Chart::Breakdown, 0, 0)));
+            assert!(page.on_chart_key(Chart::Breakdown, cut, "down", cx));
+            assert_eq!(page.keyed, Some(mark(Chart::Breakdown, 1, 0)));
+            assert!(page.on_chart_key(Chart::Breakdown, cut, "escape", cx));
+            assert_eq!(page.keyed, None, "Escape puts the cursor down");
+            assert!(
+                !page.on_chart_key(Chart::Breakdown, cut, "enter", cx),
+                "unclaimed keys travel on to the page"
+            );
+        });
+    }
 
     fn recovery(status: comet_proto::view::stats::StatsHostStatus) -> AggregateBoardStats {
         AggregateBoardStats {
@@ -2621,7 +3346,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         let state = cx.new(|_| AppState::new());
-        let page = cx.new(|_| StatsPage {
+        let page = cx.new(|cx| StatsPage {
             state,
             since_days: Some(7),
             dimension: Dimension::Model,
@@ -2634,6 +3359,11 @@ mod tests {
             reload_generation: 3,
             updating: Some("peer".into()),
             update_task: None,
+            hovered: None,
+            detail_hovered: None,
+            keyed: None,
+            charts_focus: Chart::ALL.iter().map(|_| cx.focus_handle()).collect(),
+            page_focus: cx.focus_handle(),
         });
         let old_generation = 3;
         let (partial_tx, partial_rx) = tokio::sync::oneshot::channel();

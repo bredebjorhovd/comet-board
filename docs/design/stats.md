@@ -149,10 +149,23 @@ have, and they are claims about *this* page rather than transcriptions.
 - **I4 Empty card.** A card whose own question has no answer keeps its head and
   says so in one 12px `--subtle` sentence — never a row of em dashes over a
   chart of zeroes. The day band **collapses** rather than reserving 96px.
-- **I5 Hover.** A segment in either track takes the hover wash; nothing else on
-  the page is interactive, and nothing else takes one. Sampled in light: the
-  track reads `(242,242,242)`, a hovered segment `(236,236,236)`, the chosen one
-  `(255,255,255)` — three states, three tones, no overlap.
+- **I5 Hover.** A segment in either track takes the hover wash. Sampled in
+  light: the track reads `(242,242,242)`, a hovered segment `(236,236,236)`,
+  the chosen one `(255,255,255)` — three states, three tones, no overlap.
+  Since gh#469 the drawn marks are interactive too, but on their own terms
+  (I8), never with the segment wash: a control takes a wash, a mark lifts its
+  own ink.
+- **I8 Inspecting a mark (gh#469).** Every drawn mark — a day column, a heat
+  cell, a cost or landing band, a breakdown track — answers when asked: hover
+  over the mark's full hit area (a quiet day's 2px rule answers over its whole
+  96px column) holds open a floating detail card naming the bucket and every
+  figure in it, in the page's own formats with the exact count beside the
+  rounded one. Each chart is one tab stop; the arrow keys walk its marks to
+  the same card, Escape puts the cursor down, and every mark carries the same
+  sentence as its accessibility label. The card never moves the layout: the
+  inspected mark lifts its ink one step (`INSPECT_LIFT`), and the card floats
+  on the popover glass, snapped inside the window. The wording is
+  `comet_proto::view::stats::MarkDetail`, shared with the phone.
 - **I6 Selected.** Selection on this page is only ever a segment, and it is
   B7/F4's surface change — never a hue.
 - **I7 Host picker (gh#254).** When the sweep finds more than one board, a

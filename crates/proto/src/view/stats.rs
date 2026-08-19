@@ -2336,6 +2336,208 @@ pub fn day_columns(daily: &[DayBucket], daily_tokens: &[TokenDay]) -> Vec<DayCol
         .collect()
 }
 
+// ---------------------------------------------------------------------------
+// What a mark says when asked (gh#469)
+// ---------------------------------------------------------------------------
+
+/// What one chart mark says when asked (gh#469): the bucket or category the
+/// mark stands for, and one line per figure it carries, each with its unit and
+/// series name.
+///
+/// One derivation for every surface that reads a mark — the desktop tooltip,
+/// its keyboard detail, and both platforms' accessibility labels — because a
+/// hover that says `1.31M` beside a screen reader that says something else is
+/// two answers to one question. Figures keep the page's own formats
+/// ([`human_tokens`], [`human_usd`]) with the exact count beside the rounded
+/// one, so a reader stops estimating from geometry without the detail
+/// inventing a fourth number format.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MarkDetail {
+    /// The bucket or category: `Tue 5 Aug 2026`, `comet-native · 21:00–22:00`,
+    /// `output`.
+    pub title: String,
+    /// The figures, one per series the mark carries: `540 tokens`,
+    /// `8 dispatches`, `$0.40 at list price`.
+    pub lines: Vec<String>,
+}
+
+impl MarkDetail {
+    /// The whole detail as one sentence — what assistive technology announces
+    /// for the mark.
+    pub fn sentence(&self) -> String {
+        format!("{}: {}", self.title, self.lines.join(", "))
+    }
+}
+
+/// An exact count a detail can quote: `1,310,442`. The page's figures stay
+/// [`human_tokens`] — this appears beside them, never instead of them.
+pub fn group_digits(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A mark's token figure: the page's own rounding with the exact count beside
+/// it once they differ — `1.31M tokens (1,310,442)`, `812 tokens`.
+pub fn tokens_line(tokens: u64) -> String {
+    let human = human_tokens(tokens);
+    let exact = group_digits(tokens);
+    if human == exact {
+        format!("{human} tokens")
+    } else {
+        format!("{human} tokens ({exact})")
+    }
+}
+
+/// A mark's dispatch figure: `no dispatches`, `1 dispatch`, `7 dispatches` — a
+/// zero says the bucket is empty rather than printing a figure nobody needs.
+pub fn dispatches_line(count: usize) -> String {
+    match count {
+        0 => "no dispatches".to_string(),
+        1 => "1 dispatch".to_string(),
+        n => format!("{n} dispatches"),
+    }
+}
+
+/// A mark's day as its detail says it: `Tue 5 Aug 2026`. Longer than the
+/// caption's `Tue 5`, because a detail is read alone, without the chart's
+/// window under it. A date that will not parse is returned as it came.
+pub fn mark_day(date: &str) -> String {
+    match chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d") {
+        Ok(day) => day.format("%a %-d %b %Y").to_string(),
+        Err(_) => date.to_string(),
+    }
+}
+
+/// The hour bucket `14` as a detail says it: `14:00–15:00`, wrapping at the
+/// end of the day so 23 reads `23:00–00:00`.
+pub fn hour_span(hour: usize) -> String {
+    let hour = hour % HOURS;
+    format!("{:02}:00–{:02}:00", hour, (hour + 1) % HOURS)
+}
+
+impl DayColumn {
+    /// What this column says when asked (gh#469): the day, what it spent, and
+    /// what ran — both series, because both are in the mark.
+    pub fn detail(&self) -> MarkDetail {
+        MarkDetail {
+            title: mark_day(&self.date),
+            lines: vec![
+                if self.tokens == 0 {
+                    "no tokens reported".to_string()
+                } else {
+                    tokens_line(self.tokens)
+                },
+                dispatches_line(self.dispatches),
+            ],
+        }
+    }
+}
+
+/// The dispatch chart's mark (the phone still plots dispatches): the day, what
+/// ran, and how much of it has since ended `done` — the stacked series named
+/// apart, so a reader can tell the solid band from the whole bar.
+pub fn day_bucket_detail(day: &DayBucket) -> MarkDetail {
+    let lines = if day.dispatches == 0 {
+        vec!["no dispatches".to_string()]
+    } else {
+        vec![
+            dispatches_line(day.dispatches),
+            format!("{} ended done", day.done),
+        ]
+    };
+    MarkDetail {
+        title: mark_day(&day.date),
+        lines,
+    }
+}
+
+/// One cell of the crossing — or one bar of the degraded hour histogram, whose
+/// space is `every space`: which space, which hour, and what was released then.
+pub fn hour_cell_detail(space: &str, hour: usize, count: usize) -> MarkDetail {
+    MarkDetail {
+        title: format!("{space} · {}", hour_span(hour)),
+        lines: vec![dispatches_line(count)],
+    }
+}
+
+impl CostSlice {
+    /// gh#469: the token class, what it cost, what that bought, and its share
+    /// of the priced total.
+    pub fn detail(&self) -> MarkDetail {
+        let mut lines = vec![
+            format!("{} at list price", human_usd(self.cost)),
+            tokens_line(self.tokens),
+        ];
+        if let Some(share) = percent(Some(self.share)) {
+            lines.push(format!("{share} of the priced total"));
+        }
+        MarkDetail {
+            title: self.label().to_string(),
+            lines,
+        }
+    }
+}
+
+impl LandingSegment {
+    /// gh#469: the outcome, the count, and its share of what landed. An empty
+    /// category says `no tasks` and claims no share — a percentage of nothing
+    /// landed is not a figure.
+    pub fn detail(&self) -> MarkDetail {
+        let mut lines = vec![match self.count {
+            0 => "no tasks".to_string(),
+            1 => "1 task".to_string(),
+            n => format!("{n} tasks"),
+        }];
+        if self.count > 0 {
+            if let Some(share) = percent(Some(self.fraction)) {
+                lines.push(format!("{share} of what landed"));
+            }
+        }
+        MarkDetail {
+            title: self.label.clone(),
+            lines,
+        }
+    }
+}
+
+impl BreakdownRow {
+    /// gh#469: what the row's track says when asked — the row's own three
+    /// facts plus the dispatch count the columns have no room for, and the
+    /// same three money states as [`BreakdownRow::price_label`], worded so a
+    /// missing figure is a reason rather than a blank.
+    pub fn detail(&self, dimension: Dimension) -> MarkDetail {
+        let mut lines = vec![dispatches_line(self.dispatches)];
+        if self.usage.is_zero() {
+            lines.push("no token usage reported".to_string());
+        } else {
+            lines.push(tokens_line(self.usage.total()));
+        }
+        if self.is_unpriced() {
+            lines.push("unpriced — no rate for this model".to_string());
+        } else if let Some(cost) = self.cost.filter(|_| !self.usage.is_zero()) {
+            lines.push(format!("{} at list price", human_usd(cost)));
+            if self.unpriced_tokens > 0 {
+                lines.push(format!(
+                    "{} of that unpriced",
+                    human_tokens(self.unpriced_tokens)
+                ));
+            }
+        }
+        MarkDetail {
+            title: format!("{} · {}", self.label, dimension.label()),
+            lines,
+        }
+    }
+}
+
 /// A duration in minutes, said the way a person would: `48m`, `3h 20m`, `2d 4h`.
 ///
 /// Not `human_window`'s job (that phrases retention windows, and rounds to one
@@ -3729,6 +3931,182 @@ mod tests {
         assert!(!day_captions_fit(30), "a month reads as a shape");
     }
 
+    // -- what a mark says when asked (gh#469) ---------------------------------
+
+    #[test]
+    fn a_mark_detail_is_the_page_format_with_the_exact_count_beside_it() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(812), "812");
+        assert_eq!(group_digits(1_310_442), "1,310,442");
+        assert_eq!(tokens_line(812), "812 tokens", "no parenthesis when equal");
+        assert_eq!(tokens_line(1_310_442), "1.31M tokens (1,310,442)");
+        assert_eq!(mark_day("2026-08-05"), "Wed 5 Aug 2026");
+        assert_eq!(
+            mark_day("whenever"),
+            "whenever",
+            "unparseable stays as it came"
+        );
+        assert_eq!(hour_span(14), "14:00–15:00");
+        assert_eq!(hour_span(23), "23:00–00:00", "the last hour wraps");
+    }
+
+    #[test]
+    fn a_day_column_answers_with_both_of_its_series() {
+        let daily = vec![bucket("2026-08-03", 4, 2), bucket("2026-08-04", 0, 0)];
+        let columns = day_columns(&daily, &[spent_on("2026-08-03", 1_310_442)]);
+        let busy = columns[0].detail();
+        assert_eq!(busy.title, "Mon 3 Aug 2026");
+        assert_eq!(
+            busy.lines,
+            vec!["1.31M tokens (1,310,442)", "4 dispatches"],
+            "tokens and dispatches are both in the mark, so both are in the answer"
+        );
+        assert_eq!(
+            busy.sentence(),
+            "Mon 3 Aug 2026: 1.31M tokens (1,310,442), 4 dispatches"
+        );
+        // A quiet day is inspectable too, and says what its absence means
+        // rather than printing a zero that would read as work that was free.
+        let quiet = columns[1].detail();
+        assert_eq!(quiet.lines, vec!["no tokens reported", "no dispatches"]);
+    }
+
+    #[test]
+    fn a_dispatch_bar_names_its_stacked_series_apart() {
+        let busy = day_bucket_detail(&bucket("2026-08-05", 8, 5));
+        assert_eq!(busy.title, "Wed 5 Aug 2026");
+        assert_eq!(busy.lines, vec!["8 dispatches", "5 ended done"]);
+        let quiet = day_bucket_detail(&bucket("2026-08-04", 0, 0));
+        assert_eq!(
+            quiet.lines,
+            vec!["no dispatches"],
+            "an empty day does not claim a done share of nothing"
+        );
+    }
+
+    #[test]
+    fn a_heat_cell_answers_with_its_crossing_and_a_zero_is_still_an_answer() {
+        let cell = hour_cell_detail("comet-native", 21, 3);
+        assert_eq!(cell.title, "comet-native · 21:00–22:00");
+        assert_eq!(cell.lines, vec!["3 dispatches"]);
+        assert_eq!(
+            hour_cell_detail("edge", 9, 0).lines,
+            vec!["no dispatches"],
+            "a cold cell is inspectable, not mute"
+        );
+    }
+
+    #[test]
+    fn a_cost_slice_answers_with_money_tokens_and_share() {
+        let slice = CostSlice {
+            class: CostClass::Output,
+            cost: Usd::from_dollars(0.15),
+            tokens: 6_100,
+            share: 0.374,
+        };
+        let detail = slice.detail();
+        assert_eq!(detail.title, "output");
+        assert_eq!(
+            detail.lines,
+            vec![
+                "$0.15 at list price",
+                "6.1k tokens (6,100)",
+                "37% of the priced total"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_landing_band_answers_with_its_share_and_an_empty_one_claims_none() {
+        let landing = Landing {
+            merged: 5,
+            open: 2,
+            closed_unmerged: 1,
+            no_pr: 0,
+            in_flight: 2,
+        };
+        let segments = landing.segments();
+        let merged = segments[0].detail();
+        assert_eq!(merged.title, "Merged");
+        assert_eq!(merged.lines, vec!["5 tasks", "62% of what landed"]);
+        let empty = segments[3].detail();
+        assert_eq!(
+            empty.lines,
+            vec!["no tasks"],
+            "a category with nothing in it says so and takes no share"
+        );
+    }
+
+    #[test]
+    fn a_breakdown_track_answers_in_the_money_columns_three_states() {
+        let priced = BreakdownRow {
+            label: "claude-opus-5".into(),
+            dispatches: 8,
+            usage: usage(9_000, 6_000, 148_000, 21_000),
+            cost: Some(Usd::from_dollars(0.40)),
+            unpriced_tokens: 0,
+        };
+        let detail = priced.detail(Dimension::Model);
+        assert_eq!(detail.title, "claude-opus-5 · Model");
+        assert_eq!(
+            detail.lines,
+            vec![
+                "8 dispatches",
+                "184k tokens (184,000)",
+                "$0.40 at list price"
+            ]
+        );
+        let unpriced = BreakdownRow {
+            label: "gpt-5.6-luna".into(),
+            dispatches: 4,
+            usage: usage(400, 100, 0, 500),
+            cost: Some(Usd::ZERO),
+            unpriced_tokens: 1_000,
+        };
+        assert_eq!(
+            unpriced.detail(Dimension::Model).lines,
+            vec![
+                "4 dispatches",
+                "1.0k tokens (1,000)",
+                "unpriced — no rate for this model"
+            ],
+            "no rate is a reason, never a blank or a $0.00"
+        );
+        let unmetered = BreakdownRow {
+            label: "cursor".into(),
+            dispatches: 2,
+            usage: TokenUsage::default(),
+            cost: None,
+            unpriced_tokens: 0,
+        };
+        assert_eq!(
+            unmetered.detail(Dimension::Runtime).lines,
+            vec!["2 dispatches", "no token usage reported"]
+        );
+    }
+
+    #[test]
+    fn a_folded_breakdown_row_is_as_inspectable_as_the_rows_it_stands_for() {
+        // The `n others` bucket a truncated cut ends in is a real bucket
+        // (gh#469): the reader who hovers it gets its real totals, not a shrug.
+        let rows: Vec<BreakdownRow> = ["a", "b", "c", "d"]
+            .iter()
+            .enumerate()
+            .map(|(index, label)| BreakdownRow {
+                label: (*label).to_string(),
+                dispatches: 4 - index,
+                usage: usage(100 * (4 - index as u64), 0, 0, 0),
+                cost: None,
+                unpriced_tokens: 0,
+            })
+            .collect();
+        let cut = rank_breakdown(Dimension::Space, rows, 2);
+        let folded = cut.rows.last().expect("the folded tail");
+        let detail = folded.detail(Dimension::Space);
+        assert_eq!(detail.title, "2 others · Space");
+        assert_eq!(detail.lines, vec!["3 dispatches", "300 tokens"]);
+    }
+
     // -- the spend headline (gh#182 rendered by gh#179) -----------------------
 
     fn account(
@@ -4123,6 +4501,17 @@ mod spec {
                 "landingHeadline": stats.landing.headline(),
                 "landingSegments": stats.landing.segments(),
                 "landingInFlightNote": stats.landing.in_flight_note(),
+                // gh#469. What a tapped or hovered mark says: the phone's day
+                // bars and landing bands read these, and the desktop derives
+                // its own marks from the same module, so a bar can never say
+                // one number on the Mac and another in a VoiceOver label.
+                "dayBucketDetails": stats.daily.iter().map(day_bucket_detail).collect::<Vec<_>>(),
+                "landingSegmentDetails": stats
+                    .landing
+                    .segments()
+                    .iter()
+                    .map(LandingSegment::detail)
+                    .collect::<Vec<_>>(),
                 // gh#271. The other meter: a window that reported nothing has
                 // no share to show, and `0 of 0` would read as a board with no
                 // context pressure rather than one with no measurements.

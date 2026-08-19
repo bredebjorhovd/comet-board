@@ -665,11 +665,38 @@
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": null,
+        "dayBucketDetails": [],
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
         "landingHeadline": "0 tasks",
         "landingInFlightNote": null,
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 0,
@@ -793,11 +820,38 @@
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": null,
+        "dayBucketDetails": [],
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
         "landingHeadline": "0 tasks",
         "landingInFlightNote": null,
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 0,
@@ -921,11 +975,38 @@
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": null,
+        "dayBucketDetails": [],
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": true,
         "landingHeadline": "0 tasks",
         "landingInFlightNote": null,
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 0,
@@ -1049,11 +1130,38 @@
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": "0%",
+        "dayBucketDetails": [],
         "hasSpend": false,
         "hasTokens": false,
         "isEmpty": false,
         "landingHeadline": "0 tasks",
         "landingInFlightNote": null,
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 0,
@@ -1177,11 +1285,70 @@
         "completionPercent": "82%",
         "contextReported": true,
         "coveragePercent": "62%",
+        "dayBucketDetails": [
+          {
+            "lines": [
+              "2 dispatches",
+              "2 ended done"
+            ],
+            "title": "Mon 3 Aug 2026"
+          },
+          {
+            "lines": [
+              "no dispatches"
+            ],
+            "title": "Tue 4 Aug 2026"
+          },
+          {
+            "lines": [
+              "8 dispatches",
+              "5 ended done"
+            ],
+            "title": "Wed 5 Aug 2026"
+          },
+          {
+            "lines": [
+              "3 dispatches",
+              "3 ended done"
+            ],
+            "title": "Thu 6 Aug 2026"
+          }
+        ],
         "hasSpend": false,
         "hasTokens": true,
         "isEmpty": false,
         "landingHeadline": "9 tasks",
         "landingInFlightNote": "2 still running — not landed anywhere yet",
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "5 tasks",
+              "56% of what landed"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "2 tasks",
+              "22% of what landed"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "1 task",
+              "11% of what landed"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "1 task",
+              "11% of what landed"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 5,
@@ -1441,11 +1608,70 @@
         "completionPercent": "82%",
         "contextReported": true,
         "coveragePercent": "62%",
+        "dayBucketDetails": [
+          {
+            "lines": [
+              "2 dispatches",
+              "2 ended done"
+            ],
+            "title": "Mon 3 Aug 2026"
+          },
+          {
+            "lines": [
+              "no dispatches"
+            ],
+            "title": "Tue 4 Aug 2026"
+          },
+          {
+            "lines": [
+              "8 dispatches",
+              "5 ended done"
+            ],
+            "title": "Wed 5 Aug 2026"
+          },
+          {
+            "lines": [
+              "3 dispatches",
+              "3 ended done"
+            ],
+            "title": "Thu 6 Aug 2026"
+          }
+        ],
         "hasSpend": true,
         "hasTokens": true,
         "isEmpty": false,
         "landingHeadline": "9 tasks",
         "landingInFlightNote": "2 still running — not landed anywhere yet",
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "5 tasks",
+              "56% of what landed"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "2 tasks",
+              "22% of what landed"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "1 task",
+              "11% of what landed"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "1 task",
+              "11% of what landed"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 5,
@@ -1979,11 +2205,38 @@
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": "100%",
+        "dayBucketDetails": [],
         "hasSpend": false,
         "hasTokens": true,
         "isEmpty": false,
         "landingHeadline": "0 tasks",
         "landingInFlightNote": null,
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 0,
@@ -2238,11 +2491,38 @@
         "completionPercent": null,
         "contextReported": false,
         "coveragePercent": "100%",
+        "dayBucketDetails": [],
         "hasSpend": true,
         "hasTokens": true,
         "isEmpty": false,
         "landingHeadline": "0 tasks",
         "landingInFlightNote": null,
+        "landingSegmentDetails": [
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Merged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "PR open"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "Closed unmerged"
+          },
+          {
+            "lines": [
+              "no tasks"
+            ],
+            "title": "No PR raised"
+          }
+        ],
         "landingSegments": [
           {
             "count": 0,
