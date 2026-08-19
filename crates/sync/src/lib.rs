@@ -11,9 +11,13 @@
 //!   boundary for their side effect; see `comet-engine`'s recoverable `Run` transition.
 
 pub mod jitter;
+mod recovery;
 mod room;
 mod store;
 pub mod wake;
 
+pub use recovery::{
+    SessionRecovery, SessionRecoveryError, SessionRecoveryManifest, build_session_recovery,
+};
 pub use room::{DocRecovery, RoomClient, RoomEvent, StaticUrl, SyncError, UrlProvider};
 pub use store::{DocsStore, StoreError};
