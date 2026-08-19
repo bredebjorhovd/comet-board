@@ -751,6 +751,79 @@ let statsWindows: [(days: Int64?, label: String)] = [
     (1, "24h"), (7, "7d"), (30, "30d"), (nil, "All"),
 ]
 
+// MARK: - What a mark says when asked (gh#469)
+
+/// What one chart mark says when asked — mirrors `stats::MarkDetail`. One
+/// derivation for the tap detail and the accessibility label, pinned by the
+/// fixture, so a bar cannot say one number on the Mac and another in a
+/// VoiceOver label here.
+struct MarkDetail: Decodable, Hashable {
+    var title: String
+    var lines: [String]
+
+    /// `MarkDetail::sentence` — what VoiceOver announces for the mark.
+    var sentence: String { "\(title): \(lines.joined(separator: ", "))" }
+}
+
+/// Mirrors `stats::dispatches_line` — a zero says the bucket is empty rather
+/// than printing a figure nobody needs.
+func dispatchesLine(_ count: Int) -> String {
+    switch count {
+    case 0: "no dispatches"
+    case 1: "1 dispatch"
+    default: "\(count) dispatches"
+    }
+}
+
+/// A mark's day as its detail says it: `Tue 5 Aug 2026` — longer than the
+/// axis's `Aug 3`, because a detail is read alone. The weekday comes from
+/// Sakamoto's method rather than a `DateFormatter`, for the same reason
+/// `shortDay` splits the string by hand: the date is the box's own day, and a
+/// phone in another timezone must not rename the box's Tuesday.
+/// Mirrors `stats::mark_day`; a date that will not parse is returned as it
+/// came.
+func markDay(_ date: String) -> String {
+    let parts = date.split(separator: "-")
+    guard parts.count == 3, let year = Int(parts[0]), let month = Int(parts[1]),
+          let day = Int(parts[2]), (1...12).contains(month), (1...31).contains(day)
+    else { return date }
+    // Sakamoto's method, 0 = Sunday — pure arithmetic, no calendar object.
+    let t = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4]
+    let y = month < 3 ? year - 1 : year
+    let weekday = (y + y / 4 - y / 100 + y / 400 + t[month - 1] + day) % 7
+    let days = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+    let months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                  "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    return "\(days[weekday]) \(day) \(months[month - 1]) \(year)"
+}
+
+/// Mirrors `stats::day_bucket_detail`: the day, what ran, and how much of it
+/// has since ended done — the stacked series named apart, so a reader can tell
+/// the solid band from the whole bar. An empty day does not claim a done
+/// share of nothing.
+func dayBucketDetail(_ day: DayBucket) -> MarkDetail {
+    MarkDetail(
+        title: markDay(day.date),
+        lines: day.dispatches == 0
+            ? ["no dispatches"]
+            : [dispatchesLine(day.dispatches), "\(day.done) ended done"])
+}
+
+/// Mirrors `stats::LandingSegment::detail`: the outcome, the count, and its
+/// share of what landed — no share for an empty category, because a
+/// percentage of nothing landed is not a figure.
+func landingSegmentDetail(_ segment: LandingSegment) -> MarkDetail {
+    var lines: [String] = switch segment.count {
+    case 0: ["no tasks"]
+    case 1: ["1 task"]
+    default: ["\(segment.count) tasks"]
+    }
+    if segment.count > 0, let share = percentLabel(segment.fraction) {
+        lines.append("\(share) of what landed")
+    }
+    return MarkDetail(title: segment.label, lines: lines)
+}
+
 // MARK: - The renderer's own
 //
 // Everything below this line has no counterpart in `comet_proto` and so is not
@@ -835,6 +908,14 @@ func statsTokenLines(_ usage: TokenUsage) -> [(label: String, value: String)] {
         ("Cache writes", humanTokens(usage.cacheCreationTokens)),
         ("Output", humanTokens(usage.outputTokens)),
     ]
+}
+
+/// The tap rule the charts share (gh#469): tapping a mark selects it, tapping
+/// the same mark again puts the selection down, and tapping another moves it.
+/// One function rather than three inline ternaries, so the day chart and the
+/// landing bar cannot drift apart on what a second tap means.
+func toggledMark<T: Equatable>(_ current: T?, _ tapped: T) -> T? {
+    current == tapped ? nil : tapped
 }
 
 /// `Aug 3` — a day bucket's date said short, for the ends of the chart's axis.

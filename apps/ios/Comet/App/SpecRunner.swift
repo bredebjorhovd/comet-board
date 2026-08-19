@@ -147,6 +147,11 @@ enum SpecRunner {
             var landingHeadline: String
             var landingSegments: [LandingSegment]
             var landingInFlightNote: String?
+            /// gh#469. What a tapped mark says — the day bars' and landing
+            /// bands' details, and through them the VoiceOver labels, pinned
+            /// against the Rust wording.
+            var dayBucketDetails: [MarkDetail]
+            var landingSegmentDetails: [MarkDetail]
             /// gh#271. The other meter's gate: a window nothing reported has
             /// no share to draw, and `0 of 0` would read as no pressure
             /// rather than as no measurements.
@@ -243,12 +248,27 @@ enum SpecRunner {
             expect(s.landing.segments, c.expect.landingSegments, "\(what): landing segments")
             expect(s.landing.inFlightNote, c.expect.landingInFlightNote,
                    "\(what): in-flight note")
+            // gh#469: what a tapped mark says, and so what VoiceOver reads.
+            expect(s.daily.map(dayBucketDetail), c.expect.dayBucketDetails,
+                   "\(what): day bucket details")
+            expect(s.landing.segments.map(landingSegmentDetail),
+                   c.expect.landingSegmentDetails,
+                   "\(what): landing segment details")
             // gh#271: the context half is gated on having been measured.
             expect(s.contextReported, c.expect.contextReported,
                    "\(what): context reported")
             // 24 slots exist even before anything has run in them.
             expect(s.hourOfDay.count, 24, "\(what): hour slots")
         }
+        // gh#469: the tap rule the charts share, checked here rather than in
+        // the fixture because it has no Rust counterpart — a tap selects, the
+        // same tap again dismisses, a different tap moves the selection.
+        expect(toggledMark(nil, "2026-08-03"), "2026-08-03", "a tap selects a mark")
+        expect(toggledMark("2026-08-03", "2026-08-04"), "2026-08-04",
+               "a tap on another mark moves the selection")
+        expect(toggledMark("2026-08-04", "2026-08-04"), nil,
+               "a second tap on the same mark dismisses it")
+
         for c in spec.aggregateStats {
             let a = c.aggregate
             let what = "aggregateStats — \(c.name)"

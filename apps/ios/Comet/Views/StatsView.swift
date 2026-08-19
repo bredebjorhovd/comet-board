@@ -37,6 +37,13 @@ struct StatsView: View {
     @State private var scopeWasPicked = false
     @State private var error: String?
     @State private var loaded = false
+    /// The day bar a tap is holding open (gh#469), keyed by the box's own
+    /// date. It stays until tapped away, dismissed, or another bar takes it —
+    /// and a date that leaves the window simply stops matching, so a stale
+    /// selection shows nothing rather than the wrong day.
+    @State private var selectedDay: String?
+    /// The landing band a tap is holding open, by outcome.
+    @State private var selectedLanding: LandingKind?
 
     /// How many rows a tally shows before folding the rest into `n others`.
     private static let tallyRows = 5
@@ -299,10 +306,34 @@ struct StatsView: View {
                                         .frame(width: bandWidth(band.fraction,
                                                                 across: geo.size.width,
                                                                 bands: bands.count))
+                                        .overlay {
+                                            if selectedLanding == band.kind {
+                                                // scale-ok: the band's own
+                                                // cap, ringed while selected
+                                                RoundedRectangle(cornerRadius: 3)
+                                                    .strokeBorder(Theme.borderStrong,
+                                                                  lineWidth: 1)
+                                            }
+                                        }
+                                        .contentShape(Rectangle())
+                                        .onTapGesture {
+                                            selectedLanding =
+                                                toggledMark(selectedLanding, band.kind)
+                                        }
+                                        .accessibilityElement()
+                                        .accessibilityLabel(landingSegmentDetail(band).sentence)
+                                        .accessibilityAddTraits(
+                                            selectedLanding == band.kind
+                                                ? [.isButton, .isSelected] : .isButton)
                                 }
                             }
                         }
                         .frame(height: Self.landingBar)
+                    }
+                    // The tapped band's answer (gh#469), between the bar and
+                    // its legend — persistent, dismissible, movable.
+                    if let selected = landing.segments.first(where: { $0.kind == selectedLanding }) {
+                        markDetailRow(landingSegmentDetail(selected)) { selectedLanding = nil }
                     }
                     ForEach(landing.segments) { segment in
                         legendRow(segment)
@@ -375,6 +406,45 @@ struct StatsView: View {
                 .font(Theme.sans(Theme.textDense, weight: .medium))
                 .foregroundStyle(empty ? Theme.textSubtle : Theme.text)
         }
+        // The legend row is the band's full-width tap target (gh#469): a
+        // one-merge band is six points wide, and this is the same selection
+        // with room for a finger — including the empty categories, which have
+        // no band at all to tap.
+        .contentShape(Rectangle())
+        .onTapGesture { selectedLanding = toggledMark(selectedLanding, segment.kind) }
+        .accessibilityElement()
+        .accessibilityLabel(landingSegmentDetail(segment).sentence)
+        .accessibilityAddTraits(
+            selectedLanding == segment.kind ? [.isButton, .isSelected] : .isButton)
+    }
+
+    /// The tapped mark's answer (gh#469): the bucket, its figures in the
+    /// screen's own formats, and a dismiss. It stays until tapped away, so the
+    /// number can be read at leisure rather than during a gesture.
+    private func markDetailRow(_ detail: MarkDetail, dismiss: @escaping () -> Void) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text(detail.title)
+                .font(Theme.sans(Theme.textDense, weight: .medium))
+                .foregroundStyle(Theme.text)
+            Text(detail.lines.joined(separator: " · "))
+                .font(Theme.sans(Theme.textDense))
+                .foregroundStyle(Theme.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 8)
+            Image(systemName: "xmark")
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(Theme.textSubtle)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Theme.surfaceRaised.opacity(0.6),
+                    in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: dismiss)
+        .accessibilityElement()
+        .accessibilityLabel(detail.sentence)
+        .accessibilityHint("Dismisses the detail")
+        .accessibilityAddTraits(.isButton)
     }
 
     // MARK: Per day
@@ -396,6 +466,12 @@ struct StatsView: View {
                         }
                     }
                     .frame(height: 72)
+                    // The tapped bar's answer (gh#469), between the chart and
+                    // its axis: it stays put until tapped away or another bar
+                    // takes it, so the number can actually be read.
+                    if let selected = stats.daily.first(where: { $0.date == selectedDay }) {
+                        markDetailRow(dayBucketDetail(selected)) { selectedDay = nil }
+                    }
                     HStack {
                         Text(shortDay(stats.daily.first?.date ?? ""))
                         Spacer(minLength: 4)
@@ -423,21 +499,38 @@ struct StatsView: View {
         // quiet day rather than a busy one somebody scaled away.
         let total = max(72 * barFraction(day.dispatches, peak), day.dispatches > 0 ? 2 : 0)
         let done = 72 * min(barFraction(day.done, peak), barFraction(day.dispatches, peak))
+        let selected = selectedDay == day.date
+        let detail = dayBucketDetail(day)
         return VStack(spacing: 0) {
             Spacer(minLength: 0)
             ZStack(alignment: .bottom) {
                 // scale-ok: a drawn column's own cap — a few points wide, and
                 // its corner relates to that width, not to a box it sits in
                 RoundedRectangle(cornerRadius: 3)
-                    .fill(Theme.accent.opacity(0.22))
+                    .fill(Theme.accent.opacity(selected ? 0.34 : 0.22))
                     .frame(height: total)
                 // scale-ok: the same column, filled to its done share
                 RoundedRectangle(cornerRadius: 3)
                     .fill(Theme.accent.opacity(0.85))
                     .frame(height: done)
             }
+            .overlay {
+                if selected {
+                    // scale-ok: the ring is the column's own cap, selected
+                    RoundedRectangle(cornerRadius: 3)
+                        .strokeBorder(Theme.borderStrong, lineWidth: 1)
+                }
+            }
         }
         .frame(maxWidth: .infinity)
+        // The whole 72pt column answers the tap (gh#469), not just the drawn
+        // bar — a two-point hairline is not a tap target, and an empty day
+        // still answers with "no dispatches".
+        .contentShape(Rectangle())
+        .onTapGesture { selectedDay = toggledMark(selectedDay, day.date) }
+        .accessibilityElement()
+        .accessibilityLabel(detail.sentence)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : .isButton)
     }
 
     // MARK: Tokens (gh#151)
@@ -618,6 +711,10 @@ struct StatsView: View {
                 .foregroundStyle(Theme.textMuted)
                 .frame(width: 46, alignment: .trailing)
         }
+        // One announcement per row (gh#469): the bar is decoration over the
+        // label and value either side of it, and reading them apart makes a
+        // tally three stops long.
+        .accessibilityElement(children: .combine)
     }
 
     /// `label — value`, the line a fact reads as.
