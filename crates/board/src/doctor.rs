@@ -3325,6 +3325,7 @@ mod tests {
             update_available: latest.is_some_and(|l| comet_update::version_newer(l, here)),
             checked_at: Some(0),
             error: None,
+            can_apply: None,
         }
     }
 
