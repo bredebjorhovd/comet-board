@@ -23,6 +23,12 @@ use crate::EngineError;
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
 /// dead network mounts where a bare `stat` hangs for minutes.
 const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Floor between `git spawn failed` WARNs. A spawn failure is an environment
+/// fault (no git binary, fd exhaustion) that repeats identically for every
+/// caller — gh#526 was 100k copies of one line in 40 minutes, which buries the
+/// journal the line was meant to inform. One warn per interval carries the
+/// same news; the rest drop to debug and are counted onto the next warn.
+const SPAWN_WARN_INTERVAL: Duration = Duration::from_secs(30);
 /// Hard wall-clock ceiling for a folder listing (the walk runs in a disposable
 /// blocking task; on expiry the caller unblocks and the task is abandoned).
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
@@ -104,11 +110,43 @@ fn redacted_command(args: &[&str]) -> String {
 /// `scheme://user:secret@host/…` → `scheme://user:***@host/…`. Anything that is
 /// not a URL with a password comes back untouched.
 
+/// Warn-rate gate for spawn failures (see [`SPAWN_WARN_INTERVAL`]). Process-wide:
+/// the storm this exists for hits every `Repos` handle with the same fault.
+struct SpawnWarnGate {
+    last: Option<std::time::Instant>,
+    suppressed: u64,
+}
+
+impl SpawnWarnGate {
+    /// `Some(suppressed_since_last_warn)` when this failure may warn now;
+    /// `None` when it must drop to debug.
+    fn permit(&mut self, now: std::time::Instant) -> Option<u64> {
+        match self.last {
+            Some(last) if now.duration_since(last) < SPAWN_WARN_INTERVAL => {
+                self.suppressed += 1;
+                None
+            }
+            _ => {
+                self.last = Some(now);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+}
+
+static SPAWN_WARN_GATE: std::sync::Mutex<SpawnWarnGate> = std::sync::Mutex::new(SpawnWarnGate {
+    last: None,
+    suppressed: 0,
+});
+
 struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
     planned_worktrees: std::sync::Mutex<HashSet<PathBuf>>,
+    /// Every `git` child spawn attempted through this handle — the gh#526
+    /// regression test's probe counter.
+    spawn_attempts: std::sync::atomic::AtomicU64,
 }
 
 #[derive(Clone)]
@@ -175,8 +213,19 @@ impl Repos {
                 device_id: device_id.to_string(),
                 worktrees_root,
                 planned_worktrees: std::sync::Mutex::new(HashSet::new()),
+                spawn_attempts: std::sync::atomic::AtomicU64::new(0),
             }),
         }
+    }
+
+    /// Total `git` child spawns attempted through this handle. A test probe:
+    /// the gh#526 regression asserts a recorded-but-deleted checkout stops
+    /// costing spawns, by watching this stay flat across ticks.
+    #[doc(hidden)]
+    pub fn git_spawn_attempts(&self) -> u64 {
+        self.inner
+            .spawn_attempts
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // ── registry (repos.json) ───────────────────────────────────────────────
@@ -262,11 +311,13 @@ impl Repos {
             cmd.env(k, v);
         }
         cmd.stdin(std::process::Stdio::null());
-        let output = cmd.output().await.map_err(|e| {
-            let command = redacted_command(args);
-            tracing::warn!(command, error = %e, "git spawn failed");
-            EngineError::Other(format!("git spawn failed: {e}"))
-        })?;
+        self.inner
+            .spawn_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let output = match cmd.output().await {
+            Ok(output) => output,
+            Err(e) => return Err(Self::spawn_failed(args, cwd, e).await),
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
@@ -303,9 +354,50 @@ impl Repos {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// What a failed SPAWN puts in the log — the child never ran, so there is
+    /// no stderr to keep, and the errno is ambiguous: `posix_spawn` returns the
+    /// same `No such file or directory` for "no git binary" and "no such cwd"
+    /// (gh#526 burned five days on that ambiguity, 100k warns naming the
+    /// command but never the directory). A missing cwd is an ANSWER, not a
+    /// fault — checkouts are swept out from under recorded paths as a matter
+    /// of course — so it goes to debug, named. Everything else is a real
+    /// environment fault and warns, rate-limited (see [`SPAWN_WARN_INTERVAL`]).
+    async fn spawn_failed(args: &[&str], cwd: Option<&Path>, error: std::io::Error) -> EngineError {
+        let command = redacted_command(args);
+        let cwd_display = cwd.map(|p| p.display().to_string());
+        if let Some(cwd) = cwd
+            && !Self::path_exists(cwd).await
+        {
+            tracing::debug!(command, cwd = cwd_display, error = %error,
+                "git spawn failed: cwd is gone");
+            return EngineError::Other(format!(
+                "git spawn failed: cwd {} is gone ({error})",
+                cwd.display()
+            ));
+        }
+        let permit = SPAWN_WARN_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .permit(std::time::Instant::now());
+        match permit {
+            Some(suppressed) => {
+                tracing::warn!(command, cwd = cwd_display, suppressed, error = %error,
+                    "git spawn failed")
+            }
+            None => {
+                tracing::debug!(command, cwd = cwd_display, error = %error,
+                    "git spawn failed (warn rate-limited)")
+            }
+        }
+        EngineError::Other(match cwd {
+            Some(cwd) => format!("git spawn failed in {}: {error}", cwd.display()),
+            None => format!("git spawn failed: {error}"),
+        })
+    }
+
     /// Async existence probe with a timeout: a wedged network mount just reads
     /// as "gone" instead of hanging every caller.
-    async fn path_exists(path: &Path) -> bool {
+    pub(crate) async fn path_exists(path: &Path) -> bool {
         let path = path.to_path_buf();
         matches!(
             tokio::time::timeout(PATH_EXISTS_TIMEOUT, tokio::fs::metadata(path)).await,
@@ -1392,6 +1484,27 @@ mod tests {
             loggable_url("git@github.com:o/r.git"),
             "git@github.com:o/r.git"
         );
+    }
+
+    /// gh#526: 100k identical spawn-failure warns in 40 minutes made the
+    /// journal unusable. The gate lets one through per interval and folds the
+    /// rest into the next warn's `suppressed` count.
+    #[test]
+    fn spawn_warns_are_rate_limited_and_the_suppressed_are_counted() {
+        let mut gate = SpawnWarnGate {
+            last: None,
+            suppressed: 0,
+        };
+        let t0 = std::time::Instant::now();
+        assert_eq!(gate.permit(t0), Some(0), "first failure warns");
+        assert_eq!(gate.permit(t0 + Duration::from_secs(1)), None);
+        assert_eq!(gate.permit(t0 + Duration::from_secs(2)), None);
+        assert_eq!(
+            gate.permit(t0 + SPAWN_WARN_INTERVAL),
+            Some(2),
+            "next interval warns and reports what it swallowed"
+        );
+        assert_eq!(gate.permit(t0 + SPAWN_WARN_INTERVAL), None);
     }
 
     #[test]

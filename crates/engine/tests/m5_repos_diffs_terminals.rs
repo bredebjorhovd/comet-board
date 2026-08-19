@@ -618,6 +618,69 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     core.shutdown().await;
 }
 
+/// gh#526: a box whose retention had swept 42 of 73 recorded checkouts spent
+/// 30% of a core spawning `git rev-parse` against the missing directories —
+/// ~46 ENOENT spawns a second, for days — because every reconcile re-probed
+/// every chat cwd with git. A recorded-but-deleted checkout must cost zero git
+/// spawns per tick: the stat gate parks it, and only a directory that comes
+/// BACK is asked about again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deleted_checkout_is_never_probed_with_git_again() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("swept-repo");
+    init_repo(&repo_dir).await;
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-swept",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    core.workspace
+        .create_chat("chat-swept", "space-swept", None, None)
+        .expect("chat row");
+    core.diff_sync.reconcile_now().await;
+    core.spaces_sync.reconcile_now().await;
+
+    // Retention sweeps the checkout out from under the recorded cwd.
+    std::fs::remove_dir_all(&repo_dir).expect("sweep checkout");
+
+    // Let the deletion-triggered watcher kicks (500ms debounce) drain, then
+    // one reconcile to observe the gone directory and park it.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    core.diff_sync.reconcile_now().await;
+    core.spaces_sync.reconcile_now().await;
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let before = core.repos.git_spawn_attempts();
+    for _ in 0..5 {
+        core.diff_sync.reconcile_now().await;
+        core.spaces_sync.reconcile_now().await;
+    }
+    // Space rechecks are debounced — wait them out so a regression's spawns
+    // actually land before the counter is read.
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    let after = core.repos.git_spawn_attempts();
+    assert_eq!(
+        after, before,
+        "a recorded-but-deleted checkout must not be probed with git on every tick"
+    );
+
+    // The park is not a tombstone: the directory coming back is re-probed and
+    // the chat regroups under its checkout.
+    init_repo(&repo_dir).await;
+    core.diff_sync.reconcile_now().await;
+    assert!(
+        core.repos.git_spawn_attempts() > after,
+        "a checkout that reappears must be asked about again"
+    );
+    core.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Terminals
 // ---------------------------------------------------------------------------

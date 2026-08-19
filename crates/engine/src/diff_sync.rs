@@ -18,6 +18,10 @@
 //! Fast recursive `notify` watchers (debounced [`WATCH_DEBOUNCE`]) are backed by a
 //! slow 2-minute repair tick because native watchers may coalesce or drop events.
 //! Snapshots carry a sha256 checksum; an unchanged checksum publishes nothing.
+//!
+//! Cwd → identity resolution is cached ([`CachedCwd`]): reconcile runs on every
+//! chat change, and asking git afresh each time meant a spawn per chat per
+//! change — against directories retention had already swept, forever (gh#526).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -96,6 +100,22 @@ struct CheckoutEntry {
     _watchers: Vec<notify::RecommendedWatcher>,
 }
 
+/// What reconcile remembers about a chat's cwd, so a reconcile — which runs on
+/// EVERY workspace chat change — costs one `stat` per chat, not git spawns
+/// (gh#526: a box with dozens of swept checkouts spent 30% of a core spawning
+/// `git rev-parse` against directories that no longer exist, ~46 times a
+/// second, for days).
+enum CachedCwd {
+    Checkout(CheckoutIdentity),
+    /// The directory was missing at last look. Never probed with git while it
+    /// stays missing; cleared the moment a stat says it is back.
+    Gone,
+    /// The directory exists but git does not call it a work tree. Re-asked
+    /// only on refresh passes (the repair tick) — `git init` in a chat folder
+    /// is noticed within [`REPAIR_INTERVAL`], not paid for on every change.
+    NotACheckout,
+}
+
 struct DiffSyncInner {
     repos: Repos,
     workspace: WorkspaceHost,
@@ -103,6 +123,9 @@ struct DiffSyncInner {
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
+    /// chat cwd → its last resolution (see [`CachedCwd`]). Pruned each
+    /// reconcile to the cwds chats still name.
+    identities: Mutex<HashMap<String, CachedCwd>>,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
 }
 
@@ -133,6 +156,7 @@ impl CheckoutDiffSync {
                 edge,
                 http: reqwest::Client::new(),
                 entries: Mutex::new(HashMap::new()),
+                identities: Mutex::new(HashMap::new()),
                 diffs_tx,
             }),
         };
@@ -152,7 +176,7 @@ impl CheckoutDiffSync {
     /// Public for tests (the background task calls it on every chat change).
     pub async fn reconcile_now(&self) {
         let chats = self.inner.workspace.watch_chats().borrow().clone();
-        reconcile(&self.inner, chats).await;
+        reconcile(&self.inner, chats, true).await;
     }
 
     /// Kick an immediate sync of every tracked checkout (repair-tick path).
@@ -167,9 +191,50 @@ impl CheckoutDiffSync {
 // Reconcile: chats ⇄ checkout entries
 // ---------------------------------------------------------------------------
 
-async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
+/// Resolve a chat cwd to its checkout identity through the [`CachedCwd`] map.
+///
+/// A stat gates everything: a missing directory is parked as [`CachedCwd::Gone`]
+/// and never costs a git spawn again until it reappears (gh#526). A cached
+/// answer for an existing directory is served as-is unless `refresh` — the
+/// identity is path-stable, so only the repair tick re-asks git.
+async fn resolve_identity(
+    inner: &Arc<DiffSyncInner>,
+    cwd: &str,
+    refresh: bool,
+) -> Option<CheckoutIdentity> {
+    if !Repos::path_exists(Path::new(cwd)).await {
+        let mut cache = lock(&inner.identities);
+        if !matches!(cache.get(cwd), Some(CachedCwd::Gone)) {
+            tracing::debug!(cwd = %cwd, "diff-sync: checkout directory is gone; parked");
+            cache.insert(cwd.to_string(), CachedCwd::Gone);
+        }
+        return None;
+    }
+    match lock(&inner.identities).get(cwd) {
+        Some(CachedCwd::Checkout(identity)) if !refresh => return Some(identity.clone()),
+        Some(CachedCwd::NotACheckout) if !refresh => return None,
+        _ => {} // uncached, back-from-gone, or a refresh pass — ask git
+    }
+    match inner.repos.checkout_identity(Path::new(cwd)).await {
+        Ok(identity) => {
+            lock(&inner.identities).insert(cwd.to_string(), CachedCwd::Checkout(identity.clone()));
+            Some(identity)
+        }
+        Err(err) => {
+            tracing::debug!(cwd = %cwd, error = %err, "diff-sync: not a checkout");
+            lock(&inner.identities).insert(cwd.to_string(), CachedCwd::NotACheckout);
+            None
+        }
+    }
+}
+
+/// `refresh` re-asks git for answers the cache already holds — true on the
+/// repair tick (and `reconcile_now`), false on the per-chat-change reconciles
+/// the cache exists to keep cheap.
+async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, refresh: bool) {
     // Group this device's cwd-bearing chats by canonical checkout identity.
     let mut groups: HashMap<String, (CheckoutIdentity, Vec<Chat>)> = HashMap::new();
+    let mut named_cwds: HashSet<String> = HashSet::new();
     for chat in chats {
         if chat.device_id != inner.device_id {
             continue;
@@ -177,12 +242,9 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
         let Some(cwd) = chat.cwd.clone() else {
             continue;
         };
-        let identity = match inner.repos.checkout_identity(Path::new(&cwd)).await {
-            Ok(identity) => identity,
-            Err(err) => {
-                tracing::debug!(cwd = %cwd, error = %err, "diff-sync: not a checkout");
-                continue;
-            }
+        named_cwds.insert(cwd.clone());
+        let Some(identity) = resolve_identity(inner, &cwd, refresh).await else {
+            continue;
         };
         // Stamp the row's checkoutId so every device groups this chat correctly.
         if chat.checkout_id.as_deref() != Some(identity.id.as_str())
@@ -196,6 +258,8 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
             .1
             .push(chat);
     }
+    // Cwds no chat names anymore have nothing left to cache for.
+    lock(&inner.identities).retain(|cwd, _| named_cwds.contains(cwd));
 
     // Close entries whose checkout no longer has chats; drop their published diff.
     let removed: Vec<String> = {
@@ -481,12 +545,12 @@ async fn diff_sync_task(inner: Weak<DiffSyncInner>, mut chats_rx: watch::Receive
                 }
                 let Some(inner) = inner.upgrade() else { break };
                 let chats = chats_rx.borrow_and_update().clone();
-                reconcile(&inner, chats).await;
+                reconcile(&inner, chats, false).await;
             }
             _ = repair.tick() => {
                 let Some(inner) = inner.upgrade() else { break };
                 let chats = chats_rx.borrow().clone();
-                reconcile(&inner, chats).await;
+                reconcile(&inner, chats, true).await;
                 for entry in lock(&inner.entries).values() {
                     let _ = entry.kick_tx.send(());
                 }
