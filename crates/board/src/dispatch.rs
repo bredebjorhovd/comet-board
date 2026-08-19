@@ -1128,8 +1128,6 @@ mod tests {
             labels: vec![],
             state: crate::model::BoardState::Ready,
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             local_done: false,
             pr_url: None,
@@ -2056,8 +2054,6 @@ mod tests {
             url: "u".into(),
             labels: vec![],
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Started,
             updated_at: crate::db::now(),
         })
@@ -2315,8 +2311,6 @@ mod tests {
             url: "u".into(),
             labels: vec![],
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Started,
             updated_at: crate::db::now(),
         })

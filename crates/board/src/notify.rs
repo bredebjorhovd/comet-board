@@ -807,8 +807,6 @@ mod tests {
             url: "https://linear.app/x/LIN-142".into(),
             labels: vec![],
             source_state: None,
-            linear_team: Some("LIN".into()),
-            linear_project: None,
             upstream: UpstreamState::Started,
             state: crate::model::BoardState::Working,
             local_done: false,

@@ -1664,10 +1664,6 @@ pub fn print_onboarded(done: &Onboarded, host: Option<&str>, json: bool) -> Resu
                 });
             }
             println!("  routing  wrote    {}", wrote.join(" + "));
-            println!(
-                "           a commented `label = \"{}\"` route was left for Linear issues",
-                a.suggested_label
-            );
         }
     }
     if let Some(p) = &done.preview {
@@ -1821,22 +1817,17 @@ pub fn print_roster(roster: &Roster, host: Option<&str>, json: bool) -> Result<(
 
 // ---- new ----------------------------------------------------------------
 
-/// Where a new ticket should be written.
+/// A new ticket, always written to GitHub (gh#471).
 ///
-/// There is no inferring this. A label maps to a *route* — which repo the work
-/// happens in — and says nothing about which tracker the project's tickets live
-/// in. This board's own backlog is in Linear while its code is on GitHub, and a
-/// repo whose issues you already keep on GitHub is the reverse, so the same
-/// label would justify either answer. `[defaults] new_source` sets the habit;
-/// `--source` overrides it.
+/// `source` survives as a field so a config or script that still says
+/// `--source github` keeps working; anything else is refused with the reason.
 #[derive(Debug, Default)]
 pub struct NewTask<'a> {
     pub title: &'a str,
     pub body: Option<&'a str>,
-    /// Linear team key. Only needed with more than one team.
-    pub team: Option<&'a str>,
     pub labels: &'a [String],
-    /// `linear` or `github`; falls back to `[defaults] new_source`.
+    /// `github` is the only supported value; falls back to
+    /// `[defaults] new_source`.
     pub source: Option<&'a str>,
     /// `owner/repo`, for GitHub with several repos configured.
     pub repo: Option<&'a str>,
@@ -1857,81 +1848,26 @@ pub fn new_task(
         .source
         .map(str::to_string)
         .unwrap_or_else(|| cfg.defaults.new_source.clone());
-
-    if source == "github" {
-        let here = git_remote(".").as_deref().and_then(github_slug);
-        let repo = github_repo(&cfg.github.repos, spec.repo, here)?;
-        if matches!(config::github_auth(paths), config::GithubAuth::None) {
-            bail!(
-                "no GitHub credential — set GITHUB_TOKEN, or GITHUB_APP_ID and \
-                 GITHUB_APP_PRIVATE_KEY_PATH; see `comet-board doctor`"
-            );
-        }
-        let gh = comet_board::sources::github::Github::new(
-            comet_board::sources::github::HttpRest::from_paths(paths)?,
+    if source != "github" {
+        bail!(
+            "unknown source `{source}`; `github` is the only tracker \
+             `comet-board new` writes to (Linear was removed in gh#471)"
         );
-        let (number, url) = gh.create_issue(&repo, spec.title, spec.body, spec.labels)?;
-        return Ok((format!("{repo}#{number}"), url));
-    }
-    if source != "linear" {
-        bail!("unknown source `{source}`; expected linear or github");
     }
 
-    let key = config::linear_api_key(paths)
-        .ok_or_else(|| anyhow!("no LINEAR_API_KEY; see `comet-board doctor`"))?;
-    let linear = comet_board::sources::linear::Linear::new(
-        comet_board::sources::linear::HttpTransport::new(key)?,
+    let here = git_remote(".").as_deref().and_then(github_slug);
+    let repo = github_repo(&cfg.github.repos, spec.repo, here)?;
+    if matches!(config::github_auth(paths), config::GithubAuth::None) {
+        bail!(
+            "no GitHub credential — set GITHUB_TOKEN, or GITHUB_APP_ID and \
+             GITHUB_APP_PRIVATE_KEY_PATH; see `comet-board doctor`"
+        );
+    }
+    let gh = comet_board::sources::github::Github::new(
+        comet_board::sources::github::HttpRest::from_paths(paths)?,
     );
-
-    let teams = linear.team_ids()?;
-    let team_id = match spec.team {
-        Some(k) => teams
-            .iter()
-            .find(|(key, _)| key.eq_ignore_ascii_case(k))
-            .map(|(_, id)| id.clone())
-            .ok_or_else(|| {
-                anyhow!(
-                    "no Linear team `{k}`; known: {}",
-                    teams
-                        .iter()
-                        .map(|(key, _)| key.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?,
-        // With one team there is nothing to choose; with several, say so rather
-        // than filing into whichever came back first.
-        None if teams.len() == 1 => teams[0].1.clone(),
-        None => bail!(
-            "several Linear teams exist; name one with --team: {}",
-            teams
-                .iter()
-                .map(|(key, _)| key.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    };
-
-    let known = linear.label_ids().unwrap_or_default();
-    let mut ids = Vec::new();
-    for want in spec.labels {
-        match known
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(want))
-        {
-            Some((_, id)) => ids.push(id.clone()),
-            None => bail!(
-                "no Linear label `{want}`; known: {}",
-                known
-                    .iter()
-                    .map(|(n, _)| n.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        }
-    }
-
-    linear.create_issue(&team_id, spec.title, spec.body, &ids)
+    let (number, url) = gh.create_issue(&repo, spec.title, spec.body, spec.labels)?;
+    Ok((format!("{repo}#{number}"), url))
 }
 
 /// Which repo a GitHub ticket goes to, in order of explicitness: `--repo`, the

@@ -109,8 +109,6 @@ fn main() -> Result<()> {
             url: format!("https://example.invalid/{index}"),
             labels: vec![],
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Started,
             updated_at: comet_board::db::now(),
         })?;

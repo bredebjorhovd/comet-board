@@ -49,7 +49,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 #[command(
     name = "comet-board",
     version,
-    about = "Task board over comet — Linear/GitHub issues in, coding-agent chats out"
+    about = "Task board over comet — GitHub issues in, coding-agent chats out"
 )]
 // `version` exists for everything *outside* this binary (gh#156). `doctor` has
 // never needed it — a process knows its own `CARGO_PKG_VERSION` — but nothing
@@ -100,7 +100,7 @@ enum Command {
         /// Only this state: blocked, working, ready, review, failed, done.
         #[arg(long)]
         state: Option<String>,
-        /// Only this source: linear or github.
+        /// Only this source: github, or linear for legacy rows.
         #[arg(long)]
         source: Option<String>,
         #[arg(long)]
@@ -371,14 +371,11 @@ enum Command {
         /// Description. `-` reads it from stdin.
         #[arg(long)]
         body: Option<String>,
-        /// Linear team key. Only needed when you have more than one.
-        #[arg(long)]
-        team: Option<String>,
         /// Labels to apply — this is what routes it.
         #[arg(long)]
         label: Vec<String>,
-        /// Which tracker to write to: linear or github. Defaults to
-        /// `[defaults] new_source`.
+        /// Which tracker to write to. `github` is the only supported value;
+        /// defaults to `[defaults] new_source`.
         #[arg(long)]
         source: Option<String>,
         /// `owner/repo` when writing to GitHub and more than one is configured.
@@ -1057,7 +1054,6 @@ fn main() -> Result<()> {
         Command::New {
             title,
             body,
-            team,
             label,
             source,
             repo,
@@ -1086,7 +1082,6 @@ fn main() -> Result<()> {
                 &ops::NewTask {
                     title: &title,
                     body: body.as_deref(),
-                    team: team.as_deref(),
                     labels: &label,
                     source: source.as_deref(),
                     repo: repo.as_deref(),
@@ -1098,12 +1093,7 @@ fn main() -> Result<()> {
                 // It has to be on the board before it can be dispatched, and
                 // the engine's sync loop is what puts it there — wait for its
                 // next poll rather than failing on the race.
-                // `AGE-14` is Linear; `owner/repo#87` is GitHub.
-                let id = if identifier.contains('/') {
-                    format!("gh:{identifier}")
-                } else {
-                    format!("linear:{identifier}")
-                };
+                let id = format!("gh:{identifier}");
                 let pickup = Duration::from_secs(cfg.sync.interval_secs() * 2 + 30);
                 let via = ops::provenance(None);
                 let d = runtime.block_on(async {
@@ -1384,11 +1374,6 @@ fn main() -> Result<()> {
                     p.count_phrase()
                 );
             }
-            println!(
-                "a commented `label = \"{}\"` route was left for Linear issues — edit it if \
-                 that guess is wrong",
-                done.suggested_label
-            );
             Ok(())
         }
     }

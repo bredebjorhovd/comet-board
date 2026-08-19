@@ -1,8 +1,8 @@
 //! comet-board — an autonomous-agent task board, ported from herdr-board.
 //!
-//! Linear issues (read-write) and GitHub issues/PRs (read-only by default) come
-//! in; a dispatch releases a task into a comet chat with a coding agent; session
-//! state reconciles back to the board and to the trackers.
+//! GitHub issues/PRs (read-only by default) come in; a dispatch releases a
+//! task into a comet chat with a coding agent; session state reconciles back
+//! to the board and to the tracker.
 //!
 //! ## Provenance
 //!

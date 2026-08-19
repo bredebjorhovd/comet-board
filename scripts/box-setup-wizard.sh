@@ -180,7 +180,7 @@ finish() {
 }
 
 
-TOTAL_STAGES=10
+TOTAL_STAGES=9
 
 ENV_FILE="$HOME/.box-setup.env"
 BOARD_DIR="$HOME/.comet-native/board"
@@ -260,7 +260,7 @@ else
 fi
 note "This is the box's own identity, and the committer on everything it runs."
 note "A teammate dispatching this board authors as themselves instead — map"
-note "their sign-in email in routing.toml's [users] (stage 10, §gh#101)."
+note "their sign-in email in routing.toml's [users] (stage 9, §gh#101)."
 
 # ── 4 ──────────────────────────────────────────────────────────────────
 stage "Install comet + comet-board"
@@ -309,14 +309,6 @@ comet daemon install && comet daemon status || warn "daemon install/status faile
 say "${GREEN}✓${RESET} the engine survives reboots (linger is on)"
 
 # ── 8 ──────────────────────────────────────────────────────────────────
-stage "Linear key"
-say "The board polls Linear with one API key (Linear → Settings → Security &"
-say "access → Personal API keys — or a workspace key)."
-open_url "https://linear.app/settings/account/security"
-ask_secret LINEAR_KEY "Paste the Linear API key (lin_api_…):"
-board_env LINEAR_API_KEY "$LINEAR_KEY"
-
-# ── 9 ──────────────────────────────────────────────────────────────────
 stage "GitHub App — the board's own credential"
 say "One App, installed on each account whose repos the board works"
 say "(bredebjorhovd + Florin-AS). Personal-owned works if set to 'Any account'."
@@ -334,7 +326,7 @@ pause "PEM copied to ~/.comet-native/board/github-app.pem?"
 chmod 600 "$BOARD_DIR/github-app.pem" 2>/dev/null || warn "pem not found at $BOARD_DIR/github-app.pem yet"
 board_env GITHUB_APP_PRIVATE_KEY_PATH "$BOARD_DIR/github-app.pem"
 
-# ── 10 ─────────────────────────────────────────────────────────────────
+# ── 9 ─────────────────────────────────────────────────────────────────
 stage "Routes, agent skill + doctor"
 say "Seeding routing.toml from this device's spaces, then the truth test:"
 comet-board init 2>/dev/null || note "init needs the daemon up and spaces created — fine to re-run later"

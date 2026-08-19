@@ -1,7 +1,7 @@
 ## You may be running under the comet board
 
-This machine runs comet-board: one queue across every space, GitHub and Linear
-issues in, coding agents in comet chats out. If your first message named a task
+This machine runs comet-board: one queue across every space, GitHub issues in,
+coding agents in comet chats out. If your first message named a task
 and a branch, the board dispatched you and everything below is about you. If it
 did not, this is a fact about the machine you are on and nothing more.
 

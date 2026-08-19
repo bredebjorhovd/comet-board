@@ -1418,8 +1418,6 @@ mod tests {
             url: "https://github.com/o/r/pull/14".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: crate::model::UpstreamState::Started,
             updated_at: crate::db::now(),
         })

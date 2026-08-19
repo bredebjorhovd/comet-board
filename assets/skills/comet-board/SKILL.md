@@ -1,9 +1,9 @@
 ---
 name: comet-board
-description: Read and drive the comet board — the task board fed by GitHub/Linear that dispatches coding agents into comet chats on the box. Use when asked what work is queued/ready/blocked, to pick up or release a task, to check on a running agent, or when an issue should become an agent. Dispatching starts real agents that commit and open PRs.
+description: Read and drive the comet board — the task board fed by GitHub that dispatches coding agents into comet chats on the box. Use when asked what work is queued/ready/blocked, to pick up or release a task, to check on a running agent, or when an issue should become an agent. Dispatching starts real agents that commit and open PRs.
 ---
 
-The board is one global queue: GitHub (and optionally Linear) issues in, comet
+The board is one global queue: GitHub issues in, comet
 chats running coding agents out. The board lives on ONE host device (the box);
 `comet-board` speaks to it over the local IPC, or from any other machine with
 `--device <box-name>`.
@@ -200,7 +200,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `review` | `--task`, `--attempt`, `--json` | What an attempt was asked to do, what it says it did, and what it did not account for |
 | `verdict` | `--task`, `--attempt`, `--comment`, `--approve`, `--request-changes`, `--json` | Give the verdict: record it, hand it to the agent still standing in the checkout, and post it on the pull request |
 | `merge` | `--task`, `--yes`, `--json` | Merge a task's pull request. Asks first, on the row's own words: merging a layer of a stack merges every open layer beneath it as one group, and the confirmation names them |
-| `new <title>` | `--body`, `--team`, `--label`, `--source`, `--repo`, `--dispatch` | Write a ticket. Cheaper than not writing one |
+| `new <title>` | `--body`, `--label`, `--source`, `--repo`, `--dispatch` | Write a ticket. Cheaper than not writing one |
 | `stats` | `--since-days`, `--all-boards`, `--json` | What the board knows about its own throughput |
 | `doctor` | — | Check the environment: keys, engine, routes, repos. Exits non-zero on any failing check |
 | `init` | `--force` | Generate a starter routing.toml from the spaces on this device |

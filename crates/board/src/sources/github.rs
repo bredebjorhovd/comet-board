@@ -650,8 +650,6 @@ impl GithubIssue {
             url: self.url.clone(),
             labels: self.labels.clone(),
             source_state: Some(if self.closed { "closed" } else { "open" }.into()),
-            linear_team: None,
-            linear_project: None,
             upstream: if self.closed {
                 UpstreamState::Terminal
             } else {
@@ -724,8 +722,6 @@ impl PullRequest {
                 }
                 .into(),
             ),
-            linear_team: None,
-            linear_project: None,
             upstream: if self.open {
                 UpstreamState::Unstarted
             } else {

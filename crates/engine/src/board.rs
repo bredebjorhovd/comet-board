@@ -5,7 +5,7 @@
 //! Three inputs drive the board:
 //!
 //! - **The sync interval** (`[sync] interval` in `routing.toml`, default 30s):
-//!   poll Linear/GitHub, reconcile session state, derive states, drain the
+//!   poll GitHub, reconcile session state, derive states, drain the
 //!   writeback queue, deliver review comments (§review-delivery) against the
 //!   pulls the cycle just polled. This is the loop with lifecycle authority —
 //!   orphaning rides its steady clock, so a burst of events cannot age an
@@ -1607,8 +1607,6 @@ mod tests {
             url: "u".into(),
             labels: vec![],
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: comet_board::db::now(),
         })

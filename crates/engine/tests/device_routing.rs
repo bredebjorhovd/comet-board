@@ -1034,8 +1034,6 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
             url: "https://github.com/o/r/issues/55".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: "2026-08-04T09:00:00Z".into(),
         })
@@ -1559,8 +1557,6 @@ async fn require_own_refuses_the_teammate_the_relay_names_not_the_user_they_clai
             url: "https://github.com/o/r/issues/161".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: "2026-08-09T09:00:00Z".into(),
         })

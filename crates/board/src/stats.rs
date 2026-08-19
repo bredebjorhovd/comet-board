@@ -834,8 +834,6 @@ mod tests {
             labels: vec![],
             state: BoardState::Ready,
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             local_done: false,
             pr_url: None,

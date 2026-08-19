@@ -162,10 +162,10 @@ impl Db {
               labels       TEXT NOT NULL DEFAULT '[]',
               state        TEXT NOT NULL,
               source_state TEXT,
-              -- Linear team key and project name, so routes can match on
-              -- `linear_project` (the identifier prefix only gives us the team).
-              linear_team    TEXT,
-              linear_project TEXT,
+              -- Databases created before gh#471 also carry `linear_team` and
+              -- `linear_project` columns here. They are dead weight now — both
+              -- nullable, so nothing reads or writes them — and dropping them
+              -- would rebuild the table for nothing.
               upstream     TEXT NOT NULL DEFAULT 'unstarted',
               local_done   INTEGER NOT NULL DEFAULT 0,
               pr_url       TEXT,
@@ -458,8 +458,6 @@ impl Db {
         self.add_missing_columns(
             "tasks",
             &[
-                ("linear_team", "TEXT"),
-                ("linear_project", "TEXT"),
                 ("local_done", "INTEGER NOT NULL DEFAULT 0"),
                 ("pr_url", "TEXT"),
                 ("pr_number", "INTEGER"),
@@ -657,6 +655,14 @@ impl Db {
                 ("last_error", "TEXT"),
             ],
         )?;
+        // gh#471: Linear is no longer a connected source. Clear the poll
+        // bookkeeping an older board left behind, so no reader mistakes a
+        // stale watermark or health row for a source that is still polled.
+        // Task rows keep their `source = 'linear'` history untouched.
+        self.conn.execute_batch(
+            "DELETE FROM meta WHERE key IN
+               ('linear_watermark','linear_status','linear_last_ok','linear_failures');",
+        )?;
         Ok(())
     }
 
@@ -729,17 +735,14 @@ impl Db {
         self.conn.execute(
             "INSERT INTO tasks
                (id, source, source_id, identifier, title, body, url, labels,
-                state, source_state, linear_team, linear_project, upstream,
-                updated_at, synced_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                state, source_state, upstream, updated_at, synced_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(id) DO UPDATE SET
                title        = excluded.title,
                body         = excluded.body,
                url          = excluded.url,
                labels       = excluded.labels,
                source_state = excluded.source_state,
-               linear_team    = excluded.linear_team,
-               linear_project = excluded.linear_project,
                upstream     = excluded.upstream,
                updated_at   = excluded.updated_at,
                synced_at    = excluded.synced_at",
@@ -755,8 +758,6 @@ impl Db {
                 // Seed value only; every read re-derives.
                 BoardState::Ready.as_str(),
                 t.source_state,
-                t.linear_team,
-                t.linear_project,
                 t.upstream.as_str(),
                 t.updated_at,
                 now(),
@@ -954,7 +955,7 @@ impl Db {
     pub fn load_tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, source, source_id, identifier, title, body, url, labels,
-                    state, source_state, linear_team, linear_project, upstream,
+                    state, source_state, upstream,
                     local_done, pr_url, pr_number, pr_open, pr_merged,
                     pr_mergeable, updated_at, synced_at,
                     pr_base_ref, pr_stack_number, pr_stack_size,
@@ -966,7 +967,7 @@ impl Db {
             let labels: String = r.get(7)?;
             Ok(Task {
                 id: r.get(0)?,
-                source: Source::parse(&r.get::<_, String>(1)?).unwrap_or(Source::Linear),
+                source: Source::parse(&r.get::<_, String>(1)?).unwrap_or(Source::Github),
                 source_id: r.get(2)?,
                 identifier: r.get(3)?,
                 title: r.get(4)?,
@@ -975,32 +976,30 @@ impl Db {
                 labels: serde_json::from_str(&labels).unwrap_or_default(),
                 state: BoardState::parse(&r.get::<_, String>(8)?).unwrap_or(BoardState::Ready),
                 source_state: r.get(9)?,
-                linear_team: r.get(10)?,
-                linear_project: r.get(11)?,
-                upstream: UpstreamState::parse(&r.get::<_, String>(12)?)
+                upstream: UpstreamState::parse(&r.get::<_, String>(10)?)
                     .unwrap_or(UpstreamState::Unstarted),
-                local_done: r.get::<_, i64>(13)? != 0,
-                pr_url: r.get(14)?,
-                pr_number: r.get(15)?,
-                pr_open: r.get::<_, i64>(16)? != 0,
-                pr_merged: r.get::<_, i64>(17)? != 0,
-                pr_mergeable: r.get(18)?,
-                updated_at: r.get(19)?,
-                synced_at: r.get(20)?,
-                pr_base_ref: r.get(21)?,
+                local_done: r.get::<_, i64>(11)? != 0,
+                pr_url: r.get(12)?,
+                pr_number: r.get(13)?,
+                pr_open: r.get::<_, i64>(14)? != 0,
+                pr_merged: r.get::<_, i64>(15)? != 0,
+                pr_mergeable: r.get(16)?,
+                updated_at: r.get(17)?,
+                synced_at: r.get(18)?,
+                pr_base_ref: r.get(19)?,
                 // The stack number is the witness: without an identity there is
                 // no stack to speak of, whatever the other three columns hold.
-                pr_stack: match r.get::<_, Option<i64>>(22)? {
+                pr_stack: match r.get::<_, Option<i64>>(20)? {
                     None => None,
                     Some(number) => Some(PrStack {
                         number,
-                        size: r.get(23)?,
-                        position: r.get(24)?,
-                        base_ref: r.get(25)?,
+                        size: r.get(21)?,
+                        position: r.get(22)?,
+                        base_ref: r.get(23)?,
                     }),
                 },
-                pr_changes_requested: r.get(26)?,
-                pr_head_ref: r.get(27)?,
+                pr_changes_requested: r.get(24)?,
+                pr_head_ref: r.get(25)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -2085,8 +2084,6 @@ pub struct UpsertTask {
     pub url: String,
     pub labels: Vec<String>,
     pub source_state: Option<String>,
-    pub linear_team: Option<String>,
-    pub linear_project: Option<String>,
     pub upstream: UpstreamState,
     pub updated_at: String,
 }
@@ -2209,6 +2206,9 @@ mod tests {
         Db::open_in_memory().unwrap()
     }
 
+    /// Deliberately a *legacy* linear-sourced row (gh#471): the store must keep
+    /// loading and mutating rows written while Linear was a connected source,
+    /// and every generic test below doubles as that coverage.
     fn seed(db: &Db, id: &str) {
         db.upsert_task(&UpsertTask {
             id: id.into(),
@@ -2220,8 +2220,6 @@ mod tests {
             url: "https://linear.app/x/issue/LIN-142".into(),
             labels: vec!["herd".into()],
             source_state: Some("Todo".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: now(),
         })
@@ -2315,8 +2313,8 @@ mod tests {
         let path = dir.join("old.db");
         let _ = std::fs::remove_file(&path);
 
-        // A first-release schema: no dispatched_by, no agent_status, no
-        // linear_team/linear_project.
+        // A first-release schema: no dispatched_by, no agent_status, none of
+        // the columns added since.
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(

@@ -2,9 +2,9 @@
 
 A fork of [zeronsh/comet](https://github.com/zeronsh/comet) adding an
 autonomous-agent task board, ported from
-[herdr-board](https://github.com/bredebjorhovd/herdr-board): Linear and GitHub
-issues come in, a dispatch releases a task into a comet chat with a coding
-agent, and session state reconciles back to the board and the trackers.
+[herdr-board](https://github.com/bredebjorhovd/herdr-board): GitHub issues
+come in, a dispatch releases a task into a comet chat with a coding agent,
+and session state reconciles back to the board and the tracker.
 Agents read the board and dispatch from it themselves.
 
 A settle or a block goes to the chat that released the work. Pin one chat as

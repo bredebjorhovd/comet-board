@@ -1799,8 +1799,6 @@ mod tests {
             labels: vec![],
             state: BoardState::Review,
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Started,
             local_done: false,
             pr_url: Some("https://github.com/o/r/pull/200".into()),
