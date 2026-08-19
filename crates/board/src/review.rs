@@ -1347,8 +1347,6 @@ pub(crate) mod tests {
             labels: vec![],
             state: BoardState::Review,
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             local_done: false,
             pr_url: Some("https://github.com/o/r/pull/14".into()),
@@ -1586,7 +1584,6 @@ pub(crate) mod tests {
                 state_dir: dir,
             },
             log: std::sync::Arc::new(crate::log::Logger::new("", false)),
-            linear: None,
             github: Some(Github::new(Box::new(Shared(rest)) as Box<dyn Rest>)),
             push_capabilities: None,
             // Nothing to hand out until a test says a member holds a token
@@ -1610,8 +1607,6 @@ pub(crate) mod tests {
             url: "https://github.com/o/r/issues/13".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: crate::db::now(),
         })
@@ -2032,8 +2027,6 @@ pub(crate) mod tests {
             url: "https://github.com/o/r/issues/20".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: crate::db::now(),
         })
@@ -2088,8 +2081,6 @@ pub(crate) mod tests {
             url: "https://github.com/o/r/issues/21".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: crate::db::now(),
         })

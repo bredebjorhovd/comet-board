@@ -1,7 +1,7 @@
 //! Task/attempt types and the state-derivation matrix.
 //!
 //! Board state is **derived**, never trusted from one side alone: upstream state
-//! (Linear/GitHub) plus the live attempt (a herdr pane) produce the board state.
+//! (GitHub) plus the live attempt (a herdr pane) produce the board state.
 //! `derive_state` is the single place that decision is made; it is pure so the
 //! matrix can be tested exhaustively.
 
@@ -12,16 +12,17 @@ use serde::{Deserialize, Serialize};
 /// (and the derivation matrix below) are the board's.
 pub use comet_proto::view::board::BoardState;
 
-/// Upstream state, normalized across sources. Linear workflow states are mapped
-/// by **type**, not name; GitHub has only open/closed.
+/// Upstream state, normalized. GitHub has only open/closed; `Started` survives
+/// on rows written before the board stopped syncing sources that carried a
+/// started-type workflow state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamState {
-    /// Linear triage/backlog/unstarted, GitHub open with no started marker.
+    /// GitHub open with no started marker.
     Unstarted,
-    /// Linear `started`-type state.
+    /// A started-type workflow state, on legacy rows only.
     Started,
-    /// Linear completed/canceled, GitHub closed.
+    /// GitHub closed.
     Terminal,
     /// The issue itself is no longer there: a full sweep of the source stopped
     /// returning it. Never set by a poll — only by reaping, and only on a task
@@ -53,16 +54,6 @@ impl UpstreamState {
     /// is not there at all. Both end the task; neither can be written back to.
     pub fn is_final(self) -> bool {
         matches!(self, UpstreamState::Terminal | UpstreamState::Gone)
-    }
-
-    /// Map a Linear workflow state *type* onto our normalized upstream state.
-    pub fn from_linear_type(t: &str) -> UpstreamState {
-        match t {
-            "completed" | "canceled" | "cancelled" => UpstreamState::Terminal,
-            "started" => UpstreamState::Started,
-            // triage, backlog, unstarted, and anything unrecognized
-            _ => UpstreamState::Unstarted,
-        }
     }
 }
 
@@ -143,6 +134,11 @@ impl Outcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
+    /// Legacy only (gh#471). Linear is no longer a connected source: nothing
+    /// polls it, writes back to it, or creates issues on it. The variant stays
+    /// so rows written while it was connected still load and render as
+    /// history; no poll refreshes them, so they only leave the board by being
+    /// marked done or reaped.
     Linear,
     Github,
 }
@@ -333,8 +329,6 @@ pub struct Task {
     pub labels: Vec<String>,
     pub state: BoardState,
     pub source_state: Option<String>,
-    pub linear_team: Option<String>,
-    pub linear_project: Option<String>,
     pub upstream: UpstreamState,
     pub local_done: bool,
     pub pr_url: Option<String>,
@@ -411,8 +405,9 @@ pub use comet_proto::view::board::{gh_repo, gh_repo_name};
 /// The `owner/repo` a pull request URL names —
 /// `https://github.com/Florin-AS/tally/pull/507` → `Florin-AS/tally`.
 ///
-/// The answer for a row whose *id* names no repository: a Linear issue with a
-/// linked pull request. Everything that scopes work to a repository — merging
+/// The answer for a row whose *id* names no repository — a legacy row from a
+/// source that numbered issues per team rather than per repo, with a linked
+/// pull request. Everything that scopes work to a repository — merging
 /// it, grouping its stack (gh#283) — needs one, and the pull request's own URL
 /// is the only place such a row carries it.
 pub fn pr_repo(url: &str) -> Option<String> {
@@ -837,8 +832,8 @@ pub(crate) mod tests {
             Some("bredebjorhovd/OIOS")
         );
         assert_eq!(gh_repo_name("gh:bredebjorhovd/OIOS!10"), Some("OIOS"));
-        // A Linear id names no repo, and its identifier needs none: `LIN-142`
-        // is unique across every project the board watches.
+        // A legacy Linear id (gh#471) names no repo, and its identifier needs
+        // none: `LIN-142` was unique across every project the board watched.
         assert_eq!(gh_repo("linear:LIN-142"), None);
         assert_eq!(gh_repo_name("linear:LIN-142"), None);
     }
@@ -1146,22 +1141,4 @@ pub(crate) mod tests {
         assert_eq!(seen.len(), g.len(), "two states share a glyph: {g:?}");
     }
 
-    #[test]
-    fn linear_state_types_map_by_type_not_name() {
-        assert_eq!(
-            UpstreamState::from_linear_type("started"),
-            UpstreamState::Started
-        );
-        assert_eq!(
-            UpstreamState::from_linear_type("completed"),
-            UpstreamState::Terminal
-        );
-        assert_eq!(
-            UpstreamState::from_linear_type("canceled"),
-            UpstreamState::Terminal
-        );
-        for t in ["triage", "backlog", "unstarted"] {
-            assert_eq!(UpstreamState::from_linear_type(t), UpstreamState::Unstarted);
-        }
-    }
 }

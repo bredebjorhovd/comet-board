@@ -42,19 +42,12 @@ use crate::sources::github::{
     AsUser, Github, HttpAsUser, HttpRest, MergeStatus, PullRequest, PushCapabilities, Rest,
     pr_matches_branch,
 };
-use crate::sources::linear::{GraphQl, HttpTransport, Linear};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
-
-impl GraphQl for Box<dyn GraphQl> {
-    fn query(&self, body: &Value) -> Result<Value> {
-        (**self).query(body)
-    }
-}
 
 /// A borrowed client is a client (gh#369). `doctor` holds one [`HttpRest`] and
 /// hands it to several checks, one of which wants to ask a question through
@@ -172,7 +165,6 @@ pub struct SyncEngine {
     pub credentials: Credentials,
     pub paths: Paths,
     pub log: Arc<Logger>,
-    pub linear: Option<Linear<Box<dyn GraphQl>>>,
     pub github: Option<Github<Box<dyn Rest>>>,
     /// A pre-resolved push capability supplied by an embedding that already
     /// established the credential out of band. `None` is the production path:
@@ -199,10 +191,6 @@ pub struct SyncEngine {
 /// Meta keys. Kept together so readers and the engine's loop cannot drift.
 pub mod meta {
     pub const LAST_SYNC: &str = "last_sync";
-    pub const LINEAR_WATERMARK: &str = "linear_watermark";
-    pub const LINEAR_STATUS: &str = "linear_status";
-    pub const LINEAR_LAST_OK: &str = "linear_last_ok";
-    pub const LINEAR_FAILURES: &str = "linear_failures";
     pub const GITHUB_STATUS: &str = "github_status";
     pub const GITHUB_LAST_OK: &str = "github_last_ok";
     pub const GITHUB_FAILURES: &str = "github_failures";
@@ -290,9 +278,6 @@ fn changed_sections(before: &RoutingConfig, after: &RoutingConfig) -> String {
     if before.github != after.github {
         out.push("github");
     }
-    if before.linear != after.linear {
-        out.push("linear");
-    }
     if before.adopt != after.adopt {
         out.push("adopt");
     }
@@ -329,11 +314,6 @@ impl SyncEngine {
         log: Arc<Logger>,
         credentials: Credentials,
     ) -> Result<SyncEngine> {
-        let linear = credentials
-            .linear_api_key
-            .clone()
-            .and_then(|k| HttpTransport::new(k).ok())
-            .map(|t| Linear::new(Box::new(t) as Box<dyn GraphQl>));
         // GitHub is optional entirely; without repos configured it is never
         // polled.
         let github = if cfg.github.repos.is_empty() {
@@ -349,7 +329,6 @@ impl SyncEngine {
             credentials,
             paths,
             log,
-            linear,
             github,
             push_capabilities: None,
             as_user: Rc::new(HttpAsUser),
@@ -383,19 +362,17 @@ impl SyncEngine {
         let credentials = Credentials::load(&self.paths);
         let cfg = RoutingConfig::load_or_default(&self.paths.routing());
 
-        let linear_changed = credentials.linear_api_key != self.credentials.linear_api_key;
         // The whole GitHub credential, not just the token: registering an App
         // over a running board is exactly the change this exists to notice, and
         // comparing only `github_token` would leave it polling as the old
         // identity until somebody restarted the engine (gh#58).
         let github_changed = credentials.github_auth() != self.credentials.github_auth();
         let config_changed = cfg != self.cfg;
-        if !(linear_changed || github_changed || config_changed) {
+        if !(github_changed || config_changed) {
             return None;
         }
         self.log.info(format!(
-            "configuration changed (linear credential:{linear_changed} \
-             github credential:{github_changed} \
+            "configuration changed (github credential:{github_changed} \
              routing.toml:{}) — rebuilding",
             changed_sections(&self.cfg, &cfg)
         ));
@@ -436,7 +413,6 @@ impl SyncEngine {
         statuses: Option<&SessionStatuses>,
         runtime: Option<&dyn Runtime>,
     ) -> Result<Vec<PullRequest>> {
-        self.poll_linear();
         let pulls = self.poll_github();
         // Straight after the poll that linked them: a chain `--onto` cut
         // becomes a stack GitHub will take at the moment its last pull request
@@ -540,106 +516,6 @@ impl SyncEngine {
         }
     }
 
-    fn poll_linear(&self) {
-        let Some(linear) = &self.linear else {
-            return;
-        };
-        let full_sweep = self.due_for_full_sweep();
-        let watermark = if full_sweep {
-            None
-        } else {
-            self.db.meta_get(meta::LINEAR_WATERMARK).ok().flatten()
-        };
-
-        // Issues we hold live attempts against are fetched regardless of the
-        // board filter, so writeback targets stay fresh after they leave the
-        // queue.
-        let live_ids: Vec<String> = self
-            .db
-            .live_attempts()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|a| self.db.get_task(&a.task_id).ok().flatten())
-            .filter(|t| t.source == Source::Linear)
-            .map(|t| t.source_id)
-            .collect();
-
-        // Local midnight, so today's finished work stays on the board and
-        // yesterday's falls off by itself.
-        let today = chrono::Local::now()
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .map(|d| {
-                d.and_local_timezone(chrono::Local)
-                    .earliest()
-                    .map(|t| crate::db::rfc3339(t.with_timezone(&chrono::Utc)))
-            })
-            .unwrap_or_default();
-
-        let result = linear
-            .fetch_board_issues(
-                &self.cfg.sync.labels,
-                watermark.as_deref(),
-                today.as_deref(),
-            )
-            .and_then(|mut issues| {
-                let extra = linear.fetch_issues_by_id(&live_ids)?;
-                let known: std::collections::HashSet<_> =
-                    issues.iter().map(|i| i.id.clone()).collect();
-                issues.extend(extra.into_iter().filter(|i| !known.contains(&i.id)));
-                Ok(issues)
-            });
-
-        match result {
-            Ok(issues) => {
-                let mut high = watermark.clone().unwrap_or_default();
-                for i in &issues {
-                    if self.is_own_echo(&i.task_id(), &i.updated_at) {
-                        self.log.info(format!(
-                            "loop guard: ignoring our own update on {}",
-                            i.identifier
-                        ));
-                    }
-                    if let Err(e) = self.db.upsert_task(&i.to_upsert()) {
-                        self.log.error(format!("upsert {}: {e}", i.identifier));
-                        continue;
-                    }
-                    // A PR attached to the Linear issue is one of the two ways a
-                    // task reaches `review`.
-                    if let Some(pr) = i.pr_url() {
-                        let number = pr.rsplit('/').next().and_then(|n| n.parse::<i64>().ok());
-                        let _ = self.db.set_pr(&i.task_id(), Some(pr), number, true);
-                    }
-                    if i.updated_at > high {
-                        high.clone_from(&i.updated_at);
-                    }
-                }
-                if !high.is_empty() {
-                    let _ = self.db.meta_set(meta::LINEAR_WATERMARK, &high);
-                }
-                if full_sweep {
-                    // This response is the complete set, so anything of ours
-                    // that is missing from it is genuinely gone.
-                    let seen: std::collections::HashSet<String> =
-                        issues.iter().map(|i| i.task_id()).collect();
-                    self.reap_missing(Source::Linear, &seen);
-                    let _ = self.db.meta_set(meta::LAST_FULL_SWEEP, &crate::db::now());
-                }
-                let _ = self.db.meta_set(meta::LINEAR_STATUS, "ok");
-                let _ = self.db.meta_set(meta::LINEAR_LAST_OK, &crate::db::now());
-                let _ = self.db.meta_set(meta::LINEAR_FAILURES, "0");
-                self.log.info(format!("linear: {} issues", issues.len()));
-            }
-            Err(e) => {
-                // Serve stale data and mark the header. Never blank the list.
-                let failures = self.bump_failures(meta::LINEAR_FAILURES);
-                let _ = self.db.meta_set(meta::LINEAR_STATUS, &format!("error:{e}"));
-                self.log
-                    .warn(format!("linear poll failed (attempt {failures}): {e}"));
-            }
-        }
-    }
-
     /// Returns every pull request seen this cycle, so the caller does not have
     /// to ask GitHub for them a second time.
     fn poll_github(&self) -> Vec<PullRequest> {
@@ -692,8 +568,8 @@ impl SyncEngine {
         // coincidence (herdr-board AGE-20). New branches are repo-qualified,
         // but attempts recorded before that still hold the ambiguous name, so
         // the check carries the scope rather than trusting the string. A
-        // Linear task names no repo, so its branch is honoured in whichever
-        // repo the PR turns up in.
+        // legacy Linear task names no repo, so its branch is honoured in
+        // whichever repo the PR turns up in.
         let attempt_branches = self.attempt_branches();
 
         if let Err(e) = self.link_pull_requests(&all_pulls) {
@@ -740,6 +616,12 @@ impl SyncEngine {
         // like every issue in that repo had been deleted.
         if failed.is_none() {
             self.reap_missing(Source::Github, &seen);
+            if check_mergeable {
+                // The stamp that spaces the expensive per-PR calls out. It
+                // lived on the Linear poll until gh#471; the clock is this
+                // poll's now.
+                let _ = self.db.meta_set(meta::LAST_FULL_SWEEP, &crate::db::now());
+            }
         }
 
         match failed {
@@ -4534,22 +4416,6 @@ impl SyncEngine {
                 self.log
                     .info(format!("{}: {} → {}", task.identifier, task.state, state));
             }
-            // A Linear row that has reached `review` is work that is finished and
-            // waiting on a human — and Linear was never told. Dispatch moves the
-            // issue to a started-type state and nothing moves it again until a
-            // merge, so anyone reading Linear rather than the board sees
-            // In Progress for the whole review window.
-            //
-            // Only when `[linear] review_state` names the state to move to:
-            // Linear has no review *type* to resolve, so with nothing configured
-            // there is no correct target and the ticket stays where it is.
-            if state == BoardState::Review
-                && task.source == Source::Linear
-                && !task.upstream.is_final()
-                && self.cfg.linear.review_state.is_some()
-            {
-                self.enqueue_review(&task)?;
-            }
             // A GitHub row that has reached `done` while its issue is still open
             // upstream needs closing, or the next poll undoes it. `is_final`
             // rather than `!= Terminal`: an issue that is *gone* cannot be
@@ -4595,8 +4461,8 @@ impl SyncEngine {
         via: Option<&str>,
         billed_to: Option<&str>,
     ) -> Result<()> {
-        // Name the parent upstream too: reading the Linear issue should tell you
-        // an agent released this, not a person.
+        // Name the parent upstream too: reading the issue should tell you an
+        // agent released this, not a person.
         self.db.enqueue_writeback(&NewWriteback {
             task_id: task.id.clone(),
             kind: "dispatch".into(),
@@ -4618,34 +4484,6 @@ impl SyncEngine {
             })
             .to_string(),
             idem_key: format!("{}:dispatch:{}", task.id, attempt_no),
-        })?;
-        Ok(())
-    }
-
-    /// Tell Linear the work is finished and waiting on a human.
-    ///
-    /// Keyed by attempt so a retry can move the ticket back out of review and in
-    /// again: dispatch sends it to In Progress, and the attempt that follows has
-    /// its own review transition to make.
-    fn enqueue_review(&self, task: &Task) -> Result<()> {
-        let Some(want) = self.cfg.linear.review_state.as_deref() else {
-            return Ok(());
-        };
-        // Already there — nothing to say. Usually because we moved it on an
-        // earlier tick, sometimes because the operator did it by hand; either
-        // way a mutation that changes nothing is not worth sending.
-        if task
-            .source_state
-            .as_deref()
-            .is_some_and(|s| s.eq_ignore_ascii_case(want))
-        {
-            return Ok(());
-        }
-        self.db.enqueue_writeback(&NewWriteback {
-            task_id: task.id.clone(),
-            kind: "review".into(),
-            payload: json!({ "state": want }).to_string(),
-            idem_key: format!("{}:review:{}", task.id, task.attempt_count()),
         })?;
         Ok(())
     }
@@ -4755,111 +4593,16 @@ impl SyncEngine {
         let payload: Value = serde_json::from_str(&w.payload).unwrap_or(Value::Null);
 
         match task.source {
+            // Legacy rows (gh#471). The connector is gone, so there is nothing
+            // to deliver to — and an existing database may still hold effects
+            // queued before the removal. They leave the queue as dropped, not
+            // as failed: a retry would back off forever against a source the
+            // board can no longer reach.
             Source::Linear => {
-                let Some(linear) = &self.linear else {
-                    anyhow::bail!("no Linear credentials; writeback stays queued");
-                };
-                match w.kind.as_str() {
-                    "dispatch" => {
-                        // Move the issue into the team's started-type state.
-                        let team = task.identifier.split('-').next().unwrap_or_default();
-                        if let Ok(Some(state_id)) = linear.started_state_id(team) {
-                            linear.set_state(&task.source_id, &state_id)?;
-                        } else {
-                            self.log.warn(format!(
-                                "no started-type state for team {team}; commenting only"
-                            ));
-                        }
-                        linear.comment(&task.source_id, &dispatch_comment(&payload))?;
-                    }
-                    "outcome" => {
-                        let outcome = payload["outcome"].as_str().unwrap_or("done");
-                        let pr = payload["pr_url"].as_str();
-                        match (outcome, pr) {
-                            ("done", Some(url)) => {
-                                linear.attach_link(&task.source_id, url, "Pull request")?;
-                                linear.comment(
-                                    &task.source_id,
-                                    &format!("comet-board: attempt finished · {url}"),
-                                )?;
-                            }
-                            ("done", None) => {
-                                linear.comment(
-                                    &task.source_id,
-                                    "comet-board: attempt finished with no pull request",
-                                )?;
-                            }
-                            (other, _) => {
-                                linear.comment(
-                                    &task.source_id,
-                                    &format!(
-                                        "comet-board: attempt {} · {}{} · log: {}",
-                                        payload["attempt"].as_u64().unwrap_or(1),
-                                        other,
-                                        outcome_note(&payload),
-                                        payload["log"].as_str().unwrap_or("(none)"),
-                                    ),
-                                )?;
-                            }
-                        }
-                    }
-                    // The agent stopped and cannot go on by itself (gh#71).
-                    // Not a state transition: the issue is still In Progress
-                    // and that is true — it is in progress and stuck, which is
-                    // a thing to say rather than a state to move to.
-                    "blocked" => {
-                        linear.comment(&task.source_id, &blocked_comment(&payload))?;
-                    }
-                    // The board could not account for the credential that
-                    // pushed this attempt's work (gh#233).
-                    "credential" => {
-                        linear.comment(&task.source_id, &credential_comment(&payload))?;
-                    }
-                    // The attempt settled with work waiting on a human. Dispatch
-                    // moved this issue to In Progress and, without this, nothing
-                    // moved it again until a merge — so Linear read In Progress
-                    // for the whole review window.
-                    "review" => {
-                        // Config decides, at delivery: turning the setting off
-                        // must stop a transition still sitting in the queue.
-                        let Some(want) = self.cfg.linear.review_state.as_deref() else {
-                            return Ok(Sent::Dropped(format!(
-                                "no [linear] review_state configured ({})",
-                                task.identifier
-                            )));
-                        };
-                        let team = task.identifier.split('-').next().unwrap_or_default();
-                        match linear.state_id_named(team, want)? {
-                            Ok(state_id) => linear.set_state(&task.source_id, &state_id)?,
-                            // A named state that does not exist is a config
-                            // mistake, not an outage: retrying it against Linear
-                            // forever would only bury the reason. `doctor`
-                            // checks this name for exactly this reason.
-                            Err(have) => {
-                                return Ok(Sent::Dropped(format!(
-                                    "team {team} has no state named `{want}` (has: {})",
-                                    have.join(", ")
-                                )));
-                            }
-                        }
-                    }
-                    // Merging its pull request finished the work; the ticket is
-                    // what is left.
-                    "close" => {
-                        let team = task.identifier.split('-').next().unwrap_or_default();
-                        match linear.completed_state_id(team) {
-                            Ok(Some(state_id)) => {
-                                linear.set_state(&task.source_id, &state_id)?;
-                                linear
-                                    .comment(&task.source_id, "comet-board: pull request merged")?;
-                            }
-                            _ => self.log.warn(format!(
-                                "no completed-type state for team {team}; leaving it open"
-                            )),
-                        }
-                    }
-                    other => self.log.warn(format!("unknown writeback kind {other}")),
-                }
+                return Ok(Sent::Dropped(format!(
+                    "Linear is no longer a connected source ({})",
+                    task.identifier
+                )));
             }
             Source::Github => {
                 let Some(gh) = &self.github else {
@@ -4906,8 +4649,7 @@ impl SyncEngine {
                     "credential" => {
                         gh.comment(&repo, number, &credential_comment(&payload))?;
                     }
-                    // Close on done. This is what makes "mark done" mean the
-                    // same thing on a GitHub row as on a Linear one.
+                    // Close on done, so "mark done" reaches the issue too.
                     "close" => gh.close_issue(&repo, number)?,
                     other => self.log.warn(format!("unknown writeback kind {other}")),
                 }
@@ -5001,11 +4743,9 @@ impl SyncEngine {
 
     pub fn health(&self, source: Source) -> SourceHealth {
         let (configured, status_key, fail_key) = match source {
-            Source::Linear => (
-                self.linear.is_some(),
-                meta::LINEAR_STATUS,
-                meta::LINEAR_FAILURES,
-            ),
+            // Legacy (gh#471): nothing polls Linear, so it has no health to
+            // report — absent, on every board, whatever an old database says.
+            Source::Linear => return SourceHealth::Absent,
             Source::Github => (
                 self.github.is_some(),
                 meta::GITHUB_STATUS,
@@ -5015,8 +4755,8 @@ impl SyncEngine {
         // A recorded status means *something* polled this source, even if this
         // process built no client for it — a reader's own credentials say
         // nothing about whether the engine's loop has any. Gating on
-        // `configured` alone made the board omit `linear ✓` while the loop
-        // was happily polling Linear.
+        // `configured` alone made the board omit the source's ✓ while the
+        // loop was happily polling it.
         match self.db.meta_get(status_key).ok().flatten() {
             None if !configured => SourceHealth::Absent,
             Some(s) if s == "ok" => SourceHealth::Ok,
@@ -5102,9 +4842,9 @@ fn credential_comment(payload: &Value) -> String {
 /// The line a dispatch leaves on the issue, rendered from the queued payload
 /// (gh#232).
 ///
-/// One function for both sources because there is one sentence: Linear and
-/// GitHub had the same `format!` twice, and a fix to either was a fix to one
-/// half of the board's readers.
+/// One function because there is one sentence: when the board wrote to two
+/// sources it had the same `format!` twice, and a fix to either was a fix to
+/// one half of the board's readers.
 ///
 /// The model rides beside the runtime when the dispatch named one. For a board
 /// spreading work across harnesses that is the half worth having — `codex` says
@@ -5285,27 +5025,12 @@ pub fn split_gh_task_id(id: &str) -> Option<(String, i64)> {
     Some((repo.to_string(), number.parse().ok()?))
 }
 
-/// The route context for a task, from its stored fields.
+/// The route context for a task, from its stored fields. A legacy Linear row
+/// names no repo, so only its labels can match a route.
 pub fn route_context(task: &Task) -> RouteContext {
-    match task.source {
-        Source::Linear => RouteContext {
-            // Prefer what Linear told us; fall back to the identifier prefix
-            // (`LIN-142` → team key `LIN`) for rows stored before the team was
-            // recorded.
-            linear_team: task
-                .linear_team
-                .clone()
-                .or_else(|| task.identifier.split('-').next().map(str::to_string)),
-            linear_project: task.linear_project.clone(),
-            gh_repo: None,
-            labels: task.labels.clone(),
-        },
-        Source::Github => RouteContext {
-            linear_team: None,
-            linear_project: None,
-            gh_repo: crate::model::gh_repo(&task.id).map(str::to_string),
-            labels: task.labels.clone(),
-        },
+    RouteContext {
+        gh_repo: crate::model::gh_repo(&task.id).map(str::to_string),
+        labels: task.labels.clone(),
     }
 }
 
@@ -5450,24 +5175,20 @@ mod tests {
     use crate::config::Defaults;
     use crate::db::UpsertTask;
     use crate::sources::github::FixtureRest;
-    use crate::sources::linear::FixtureTransport;
 
     use crate::review::tests::TestEngine;
 
-    fn engine(linear: Option<Linear<Box<dyn GraphQl>>>) -> TestEngine {
-        engine_with(linear, None)
+    fn engine() -> TestEngine {
+        engine_with(None)
     }
 
-    fn engine_with(
-        linear: Option<Linear<Box<dyn GraphQl>>>,
-        github: Option<Github<Box<dyn Rest>>>,
-    ) -> TestEngine {
-        let mut e = engine_inner(linear);
+    fn engine_with(github: Option<Github<Box<dyn Rest>>>) -> TestEngine {
+        let mut e = engine_inner();
         e.github = github;
         e
     }
 
-    fn engine_inner(linear: Option<Linear<Box<dyn GraphQl>>>) -> TestEngine {
+    fn engine_inner() -> TestEngine {
         let tmp = tempfile::Builder::new()
             .prefix("comet-board-test-")
             .tempdir()
@@ -5485,7 +5206,6 @@ mod tests {
                 state_dir: dir,
             },
             log: Arc::new(Logger::new("", false)),
-            linear,
             github: None,
             push_capabilities: None,
             as_user: Rc::new(crate::sources::github::FixtureAsUser::default()),
@@ -5499,7 +5219,7 @@ mod tests {
     /// dropping the fixture is what removes it.
     #[test]
     fn a_dropped_fixture_removes_its_scratch_directory() {
-        let e = engine(None);
+        let e = engine();
         let dir = e.paths.state_dir.clone();
         assert!(dir.exists());
         drop(e);
@@ -5535,7 +5255,7 @@ mod tests {
             fail,
             ..Default::default()
         });
-        let mut e = engine_inner(None);
+        let mut e = engine_inner();
         e.cfg.defaults.notify_webhook = Some(url.to_string());
         e.webhook = hook.clone();
         (e, hook)
@@ -5552,8 +5272,6 @@ mod tests {
             url: "https://linear.app/x".into(),
             labels: vec!["herd".into()],
             source_state: None,
-            linear_team: identifier.split('-').next().map(str::to_string),
-            linear_project: None,
             upstream,
             updated_at: crate::db::now(),
         })
@@ -5584,7 +5302,7 @@ mod tests {
     /// every surface that writes these keys reported the file as the truth.
     #[test]
     fn reload_notices_a_defaults_only_change() {
-        let e = engine(None);
+        let e = engine();
         std::fs::write(
             e.paths.routing(),
             "[defaults]\nnotify_dispatcher = false\nmax_concurrent_per_workspace = 7\n",
@@ -5603,7 +5321,7 @@ mod tests {
     /// that delivers to it, not just the file.
     #[test]
     fn reload_notices_a_freshly_pinned_orchestrator() {
-        let e = engine(None);
+        let e = engine();
         assert_eq!(e.cfg.defaults.orchestrator(), None);
         std::fs::write(
             e.paths.routing(),
@@ -5620,7 +5338,7 @@ mod tests {
     /// Editing a route rather than adding one: same count, different route.
     #[test]
     fn reload_notices_a_route_edited_in_place() {
-        let mut e = engine(None);
+        let mut e = engine();
         write_and_adopt(&mut e, &one_route("claude-code", "origin/HEAD"));
         std::fs::write(e.paths.routing(), one_route("codex", "origin/main")).unwrap();
 
@@ -5636,7 +5354,7 @@ mod tests {
     /// every cycle. Asked twice, because the loop asks every 30 seconds.
     #[test]
     fn reload_is_none_while_the_file_is_untouched() {
-        let mut e = engine(None);
+        let mut e = engine();
         // No file at all is the empty board, and it is not a change either.
         assert!(e.reload_if_configuration_changed().is_none());
 
@@ -5656,7 +5374,7 @@ mod tests {
     /// leaves the engine alone.
     #[test]
     fn reload_is_none_for_a_comment_only_edit() {
-        let mut e = engine(None);
+        let mut e = engine();
         write_and_adopt(&mut e, "[defaults]\nnotify_dispatcher = false\n");
         std::fs::write(
             e.paths.routing(),
@@ -5749,7 +5467,7 @@ mod tests {
     /// harnesses is what makes the next comparison possible (gh#232).
     #[test]
     fn a_dispatch_comment_names_the_runtime_and_the_model_that_ran() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-232", "LIN-232", UpstreamState::Started);
         let task = e.db.get_task("linear:LIN-232").unwrap().unwrap();
         e.enqueue_dispatch(
@@ -5800,7 +5518,7 @@ mod tests {
     fn a_missing_chat_needs_two_ticks_before_it_orphans() {
         // Avoid flapping on a transient snapshot: one absent tick proves
         // nothing, exactly as one missing pane proved nothing in herdr-board.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         // The chat itself is gone, which since §gh#390 is what orphans — an
@@ -5824,7 +5542,7 @@ mod tests {
 
     #[test]
     fn a_chat_that_comes_back_resets_the_missing_counter() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
@@ -5846,7 +5564,7 @@ mod tests {
         // yet — indistinguishable, from here, from a chat that is gone. The
         // verdict needs `Runtime::chat_alive` (§runtime-impl); until then
         // absence of evidence must not end an attempt that may not have begun.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -5864,7 +5582,7 @@ mod tests {
 
     #[test]
     fn orphaning_queues_exactly_one_writeback_even_across_ticks() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending_without(None, &["chat-9"]);
@@ -5883,7 +5601,7 @@ mod tests {
         // ended, and the checkout was checked (§settle-logic) — but this
         // attempt has no worktree, no commits and no PR, and between turns is
         // not finished.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Idle)]))
@@ -5895,7 +5613,7 @@ mod tests {
 
     #[test]
     fn reconcile_latches_saw_working_and_persists_statuses() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -6014,7 +5732,7 @@ mod tests {
 
     #[test]
     fn reconcile_copies_the_running_total_onto_the_attempt() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = Meter::saying(tokens(100, 10), Some("claude-opus-5"));
@@ -6052,7 +5770,7 @@ mod tests {
     /// that worked for an hour for free.
     #[test]
     fn a_chat_that_reports_nothing_leaves_the_row_blank_not_zero() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.reconcile_sessions_with(
@@ -6072,7 +5790,7 @@ mod tests {
     /// longest-running attempts are exactly the ones that never report.
     #[test]
     fn an_orphaned_attempt_keeps_what_it_had_spent() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = Meter::saying(tokens(500, 50), Some("claude-opus-5"));
@@ -6107,7 +5825,7 @@ mod tests {
     /// window it never filled once.
     #[test]
     fn reconcile_replaces_the_context_level_instead_of_accumulating_it() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = Meter::saying(tokens(100, 10), Some("claude-opus-5"));
@@ -6137,7 +5855,7 @@ mod tests {
     /// would read as an agent running on an empty context.
     #[test]
     fn a_harness_that_meters_no_window_leaves_the_context_blank() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = Meter::saying(tokens(100, 10), Some("gpt-5.6-terra"));
@@ -6154,7 +5872,7 @@ mod tests {
     /// answer than none — it is also the one that says *why* it stalled.
     #[test]
     fn an_orphaned_attempt_keeps_the_last_level_it_was_seen_at() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = Meter::saying(tokens(500, 50), Some("claude-opus-5"));
@@ -6177,7 +5895,7 @@ mod tests {
 
     #[test]
     fn a_watch_event_picks_up_a_status_change_without_touching_lifecycle() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -6210,7 +5928,7 @@ mod tests {
         // Orphaning is the interval reconcile's call; watch events can arrive
         // in bursts, and counting ticks in event time would orphan a chat
         // mid-sync-hiccup.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
@@ -6228,7 +5946,7 @@ mod tests {
         // A working phase shorter than the sync interval must still latch, or
         // the interval reconcile later reads "never started" off an attempt
         // that ran and finished between two of its ticks.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.refresh_statuses(&statuses(&[("chat-9", AgentStatus::Working)]))
@@ -6238,7 +5956,7 @@ mod tests {
 
     #[test]
     fn rederive_persists_the_matrix_result() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let mut status = HashMap::new();
@@ -6434,7 +6152,7 @@ mod tests {
     fn a_pull_request_settles_the_attempt_the_moment_the_run_ends() {
         // The whole §settle-logic headline: no clock, no second sample. The
         // run ended, a PR is open — the agent said it is finished, so it is.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr(
@@ -6465,7 +6183,7 @@ mod tests {
 
     #[test]
     fn pushed_commits_settle_a_run_that_ended_cleanly() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = agent_worked_in(&e, a, Work::Pushed);
@@ -6486,7 +6204,7 @@ mod tests {
     /// row to `review` while the work sat in a worktree nobody else can reach.
     #[test]
     fn a_run_that_ends_with_unpushed_commits_does_not_read_as_review() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let (_repo, work) = agent_worked_in(&e, a, Work::Committed);
@@ -6526,7 +6244,7 @@ mod tests {
     /// made along the way.
     #[test]
     fn a_recovery_aborted_run_with_unpushed_commits_stays_live() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = agent_worked_in(&e, a, Work::Committed);
@@ -6572,7 +6290,7 @@ mod tests {
             "/repos/o/r/branches/board/lin-142".to_string(),
             json!({ "commit": { "sha": head } }),
         )])) as Box<dyn Rest>);
-        let e = engine_with(None, Some(gh));
+        let e = engine_with(Some(gh));
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_attempt_worktree(a, &wt).unwrap();
@@ -6626,7 +6344,7 @@ mod tests {
             "/repos/o/r/branches/board/lin-142".to_string(),
             json!({ "commit": { "sha": pushed } }),
         )])) as Box<dyn Rest>);
-        let e = engine_with(None, Some(gh));
+        let e = engine_with(Some(gh));
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_attempt_worktree(a, &wt).unwrap();
@@ -6649,7 +6367,7 @@ mod tests {
         // The checkout exists and holds the operator's own unpushed commit —
         // the AGE-19 trap. Measured from the attempt's base there is nothing,
         // and nothing is what must be found.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = agent_worked_in(&e, a, Work::None);
@@ -6668,7 +6386,7 @@ mod tests {
         // errored end never closes the row — even over commits — so the retry
         // lands on it, and the clean end that follows settles it with nothing
         // reopened and nothing double-counted.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = agent_worked_in(&e, a, Work::Pushed);
@@ -6705,7 +6423,7 @@ mod tests {
         // A harness that crashes moments after `gh pr create` still finished
         // the work: the PR is the agent's own statement, whatever the exit
         // said.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -6724,7 +6442,7 @@ mod tests {
         // asked something, the run is alive, the journal's last word is not a
         // `Done`. Even an open PR must not settle it — the question may be
         // about that very PR.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -6739,7 +6457,7 @@ mod tests {
     fn without_a_journal_a_blocked_status_decides_nothing() {
         // A caller with no runtime cannot tell an errored end from a pending
         // question, so it must act on neither.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -6753,7 +6471,7 @@ mod tests {
     fn a_crashed_engine_reading_unknown_is_not_completion() {
         // Staleness is absence of evidence. Settling on it would close
         // attempts every time an engine wedges with commits on the branch.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = agent_worked_in(&e, a, Work::Pushed);
@@ -6807,7 +6525,7 @@ mod tests {
     /// and the row colour was the entire signal.
     #[test]
     fn a_blocked_agent_comments_upstream_exactly_once() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(None);
@@ -6831,7 +6549,7 @@ mod tests {
     /// to hear about.
     #[test]
     fn blocking_again_after_being_answered_is_a_second_comment() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(None);
@@ -6855,7 +6573,7 @@ mod tests {
     /// the other needs a retry-or-cancel. Only the run journal splits them.
     #[test]
     fn an_errored_run_says_so_in_its_blocked_comment() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(Some(RunEnd::Errored));
@@ -6876,7 +6594,7 @@ mod tests {
     /// reviewable — so it gets the outcome comment and no blocked comment.
     #[test]
     fn a_block_that_settles_in_the_same_pass_comments_only_once() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -6898,7 +6616,7 @@ mod tests {
     /// the whole point.
     #[test]
     fn the_event_path_notices_a_block_immediately() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(None);
@@ -6919,7 +6637,7 @@ mod tests {
     /// hear.
     #[test]
     fn a_settle_wakes_the_chat_that_released_the_work() {
-        let e = engine(None);
+        let e = engine();
         assert!(e.cfg.defaults.notify_dispatcher, "on by default (gh#165)");
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
@@ -6947,7 +6665,7 @@ mod tests {
     /// Before gh#165 the dispatcher wake fired on settles only.
     #[test]
     fn a_block_wakes_the_chat_that_released_the_work_too() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
         let rt = JournalFact::ending(None);
@@ -6968,7 +6686,7 @@ mod tests {
     /// nowhere — which the log has to say (gh#165).
     #[test]
     fn the_dispatcher_wake_can_still_be_turned_off() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.notify_dispatcher = false;
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
@@ -6996,7 +6714,7 @@ mod tests {
     /// is its job.
     #[test]
     fn the_orchestrator_hears_about_work_nobody_else_released() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -7029,7 +6747,7 @@ mod tests {
     /// actually go and answer the question.
     #[test]
     fn a_block_reaches_the_orchestrator_too() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -7051,7 +6769,7 @@ mod tests {
     /// in the dispatcher's words, which are the more specific truth.
     #[test]
     fn the_orchestrator_is_not_told_twice_about_its_own_dispatch() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-boss");
@@ -7074,7 +6792,7 @@ mod tests {
     /// own — and filled with work nobody needed it for.
     #[test]
     fn a_settle_a_live_dispatcher_handled_does_not_reach_the_orchestrator() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-sibling");
@@ -7097,7 +6815,7 @@ mod tests {
     /// addressee.
     #[test]
     fn a_settle_whose_dispatcher_is_gone_hops_to_the_orchestrator() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
@@ -7127,7 +6845,7 @@ mod tests {
     /// not be told" are different things to go and fix.
     #[test]
     fn an_event_that_reaches_nobody_says_so_in_the_log() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
@@ -7150,7 +6868,7 @@ mod tests {
     /// read as one in the log rather than as nothing having happened.
     #[test]
     fn a_panel_dispatch_on_an_unpinned_board_says_so_too() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -7172,7 +6890,7 @@ mod tests {
     /// worked — which is what "no notice line of any kind" was the absence of.
     #[test]
     fn a_settle_with_a_dispatcher_recorded_reaches_it_and_says_so() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         assert!(e.cfg.defaults.notify_dispatcher, "as the box had it");
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -7198,7 +6916,7 @@ mod tests {
     /// the line names it.
     #[test]
     fn a_dispatcher_the_switch_silenced_is_named_in_the_log() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         e.cfg.defaults.notify_dispatcher = false;
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
@@ -7228,7 +6946,7 @@ mod tests {
     /// notice was dropped, so it says which.
     #[test]
     fn an_attempt_nobody_released_says_that_much() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -7251,7 +6969,7 @@ mod tests {
     /// `--via` was wrong is this line.
     #[test]
     fn a_via_that_names_the_attempts_own_chat_is_not_a_silent_drop() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-9");
@@ -7277,7 +6995,7 @@ mod tests {
     /// and no way to tell them apart.
     #[test]
     fn a_gone_chat_is_logged_against_the_channel_that_wanted_it() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -7305,7 +7023,7 @@ mod tests {
     /// it, which is what makes unpinning safe to reach for.
     #[test]
     fn unpinned_is_silent() {
-        let e = engine(None);
+        let e = engine();
         assert!(e.cfg.defaults.orchestrator().is_none(), "unset by default");
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
@@ -7324,7 +7042,7 @@ mod tests {
     /// Read as a chat id it would fail delivery on every event forever.
     #[test]
     fn a_cleared_pin_reads_as_no_pin() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("   ".into());
         assert!(e.cfg.defaults.orchestrator().is_none());
     }
@@ -7335,7 +7053,7 @@ mod tests {
     /// about the dispatches a solo operator makes most of.
     #[test]
     fn operator_released_work_has_nobody_to_wake() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -7618,7 +7336,7 @@ mod tests {
     /// origin is new", the old footing, rather than as a spent alibi.
     #[test]
     fn the_dispatch_stamp_records_origin_and_only_origin() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let task = e.db.get_task("linear:LIN-142").unwrap().unwrap();
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -7704,7 +7422,7 @@ mod tests {
     /// whole context.
     #[test]
     fn a_chat_that_outlived_its_run_is_restarted_not_orphaned() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(None);
@@ -7733,7 +7451,7 @@ mod tests {
     /// first one's context away, which is what the orphan sweep forced.
     #[test]
     fn a_restarted_run_keeps_its_attempt_its_chat_and_its_branch() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let id = dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(None);
@@ -7797,7 +7515,7 @@ mod tests {
     /// nothing vanished, and a red row is what makes somebody look at the box.
     #[test]
     fn a_run_that_keeps_dying_closes_the_attempt_failed() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(None);
@@ -7829,7 +7547,7 @@ mod tests {
     /// the note said three.
     #[test]
     fn the_engines_own_revivals_are_spent_from_the_same_budget() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::revived(None, runs::MAX_RESUMES);
@@ -7856,7 +7574,7 @@ mod tests {
     /// including the three nothing on the board recorded.
     #[test]
     fn the_note_counts_the_restarts_the_board_never_made() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::revived(None, 2);
@@ -7884,7 +7602,7 @@ mod tests {
     /// "3 times" would not be.
     #[test]
     fn an_unreadable_ledger_changes_nothing_and_claims_nothing() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::uncounted(None);
@@ -7910,7 +7628,7 @@ mod tests {
     /// either side of the fence.
     #[test]
     fn an_engine_restart_with_budget_left_costs_the_board_nothing() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::revived(None, 1);
@@ -7931,7 +7649,7 @@ mod tests {
     /// its last restart, and the sentence has to say so.
     #[test]
     fn the_restarted_agent_is_told_the_joined_position() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::revived(None, 2);
@@ -7957,7 +7675,7 @@ mod tests {
     /// the retry path it was said to be.
     #[test]
     fn an_errored_block_is_not_swept_away_behind_the_operators_back() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::ending(Some(RunEnd::Errored));
@@ -7981,7 +7699,7 @@ mod tests {
     /// never worked already lived by, now applied to one that had.
     #[test]
     fn a_chat_nobody_can_ask_about_is_left_alone() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         let rt = JournalFact::blind(None);
@@ -8004,7 +7722,7 @@ mod tests {
     /// would spend a turn undoing the work — so the settle check runs first.
     #[test]
     fn a_run_that_died_after_finishing_settles_instead_of_restarting() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr("linear:LIN-142", Some("https://x/pull/1"), Some(1), true)
@@ -8040,7 +7758,7 @@ mod tests {
         // them can be wrong. The chat working again is the proof — and it is
         // counted on this attempt as `reopened`, because nobody dispatched
         // anything.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = settled_on_commits(&e, a);
@@ -8058,7 +7776,7 @@ mod tests {
     #[test]
     fn a_finished_chat_sitting_idle_leaves_the_settle_standing() {
         // Every finished chat reads Idle forever; only Working reopens.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = settled_on_commits(&e, a);
@@ -8075,7 +7793,7 @@ mod tests {
     fn reopening_is_refused_once_somebody_redispatched() {
         // The re-dispatch names a decision-maker, and that attempt is the
         // current one — the old chat still typing does not overrule it.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = settled_on_commits(&e, a);
@@ -8096,7 +7814,7 @@ mod tests {
     fn a_task_marked_done_is_not_reopened() {
         // `mark done` is the operator deciding the task is over; an agent
         // still typing does not overrule them.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = settled_on_commits(&e, a);
@@ -8140,7 +7858,7 @@ mod tests {
     /// once, because that is how many things happened.
     #[test]
     fn a_settle_the_dispatcher_already_heard_is_not_sent_twice() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let rt = JournalFact::ending(None);
@@ -8168,7 +7886,7 @@ mod tests {
     /// this would be worse than the bug it closes.
     #[test]
     fn a_reopened_attempt_that_pushes_a_fix_is_announced_again() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let rt = JournalFact::ending(None);
         let repo = settled_for_its_dispatcher(&e, &rt);
@@ -8214,7 +7932,7 @@ mod tests {
     /// whoever was waiting on that step (gh#194).
     #[test]
     fn a_different_outcome_on_the_same_attempt_is_still_news() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let rt = JournalFact::ending(None);
         let _work = settled_for_its_dispatcher(&e, &rt);
@@ -8238,7 +7956,7 @@ mod tests {
     fn the_event_path_settles_on_the_transition() {
         // The moment the run ends — not the next interval tick. The 60-second
         // clock this replaces is the whole of §settle-logic.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr(
@@ -8266,7 +7984,7 @@ mod tests {
     fn the_event_path_reopens_the_moment_a_settled_chat_works() {
         // herdr ran its rewatch on the interval because a screen-sampled
         // `working` could lie. comet's cannot, so the event path acts on it.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let _work = settled_on_commits(&e, a);
@@ -8302,7 +8020,7 @@ mod tests {
                 "head": { "ref": "board/lin-142" },
             }]),
         )]);
-        let mut e = engine_with(None, Some(Github::new(Box::new(fixture) as Box<dyn Rest>)));
+        let mut e = engine_with(Some(Github::new(Box::new(fixture) as Box<dyn Rest>)));
         // A Linear task names no repo, so the lookup walks the configured ones.
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -8341,7 +8059,7 @@ mod tests {
                 "head": { "ref": "board/lin-142" },
             }]),
         )]);
-        let mut e = engine_with(None, Some(Github::new(Box::new(fixture) as Box<dyn Rest>)));
+        let mut e = engine_with(Some(Github::new(Box::new(fixture) as Box<dyn Rest>)));
         e.cfg.github.repos = vec!["o/r".into()];
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -8412,7 +8130,7 @@ mod tests {
         e.cfg = toml::from_str(&format!(
             r#"
 [[route]]
-match = {{ linear_team = "LIN" }}
+match = {{ label = "herd" }}
 workspace = "offhand"
 repo = "/tmp"
 runtime = "claude-code"
@@ -8427,7 +8145,7 @@ max_duration = "{max_duration}"
     /// So the orchestrator gets it alongside the agent being warned.
     #[test]
     fn the_cap_warning_reaches_the_orchestrator_before_the_kill() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-boss".into());
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -8457,7 +8175,7 @@ max_duration = "{max_duration}"
     /// than every cycle for the rest of the box's uptime.
     #[test]
     fn the_pinned_chat_is_exempt_from_the_duration_cap() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-9".into());
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -8488,7 +8206,7 @@ max_duration = "{max_duration}"
     /// hours is the default cap and this one is one hour in.
     #[test]
     fn a_run_inside_its_cap_is_left_alone() {
-        let e = engine(None);
+        let e = engine();
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -8506,7 +8224,7 @@ max_duration = "{max_duration}"
     /// however many cycles pass while the agent wraps up.
     #[test]
     fn the_cap_warns_the_chat_once_before_it_closes_anything() {
-        let e = engine(None);
+        let e = engine();
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -8550,7 +8268,7 @@ max_duration = "{max_duration}"
     /// `failed` on its own reads as a dispatch that never produced an agent.
     #[test]
     fn the_grace_running_out_closes_the_attempt_failed_with_a_writeback() {
-        let e = engine(None);
+        let e = engine();
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -8582,7 +8300,7 @@ max_duration = "{max_duration}"
     /// of the whole event was a colour on a board nothing was watching.
     #[test]
     fn an_attempt_killed_at_the_cap_tells_the_agent_that_released_it() {
-        let e = engine(None);
+        let e = engine();
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch_via(&e, "linear:LIN-142", "chat-9", "chat-parent");
@@ -8614,7 +8332,7 @@ max_duration = "{max_duration}"
     /// unwitnessed one is the worst kind to leave untraced.
     #[test]
     fn a_cap_kill_nobody_can_be_told_about_says_so() {
-        let mut e = engine(None);
+        let mut e = engine();
         let log = logging(&mut e);
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -8636,7 +8354,7 @@ max_duration = "{max_duration}"
     /// forever.
     #[test]
     fn a_stranded_idle_row_with_no_artifacts_is_closed_by_the_clock() {
-        let e = engine(None);
+        let e = engine();
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -8661,7 +8379,7 @@ max_duration = "{max_duration}"
     /// on the same tick would throw away the work it just did.
     #[test]
     fn work_finished_inside_the_grace_settles_done_not_failed() {
-        let e = engine(None);
+        let e = engine();
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
@@ -8681,7 +8399,7 @@ max_duration = "{max_duration}"
     /// route gets six hours without loosening the one that fixes typos.
     #[test]
     fn a_route_can_raise_the_cap_over_the_default() {
-        let mut e = engine(None);
+        let mut e = engine();
         routed(&mut e, "6h");
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -8697,7 +8415,7 @@ max_duration = "{max_duration}"
     /// `off` is what every board did before this existed, said out loud.
     #[test]
     fn a_route_can_turn_the_cap_off_entirely() {
-        let mut e = engine(None);
+        let mut e = engine();
         routed(&mut e, "off");
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
@@ -8716,7 +8434,7 @@ max_duration = "{max_duration}"
     /// interrupt, and the reason still written back.
     #[test]
     fn a_dispatch_that_never_got_a_chat_is_closed_by_the_clock_too() {
-        let e = engine(None);
+        let e = engine();
         let rt = CapWatcher::default();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch_on(&e, "linear:LIN-142", "board/lin-142");
@@ -8739,7 +8457,7 @@ max_duration = "{max_duration}"
     /// talk itself past its own cap.
     #[test]
     fn a_watch_event_never_enforces_the_cap() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         // Nine hours over a two-hour cap: the interval reconcile would warn on
@@ -8760,7 +8478,7 @@ max_duration = "{max_duration}"
     /// attempt is exempt.
     #[test]
     fn the_cap_still_decides_without_a_runtime_to_talk_through() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         age_attempt(&e, a, 3 * 3600, None);
@@ -8781,7 +8499,7 @@ max_duration = "{max_duration}"
     /// board's own mistake.
     #[test]
     fn reopening_gives_the_attempt_a_fresh_warning() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         age_attempt(&e, a, 3 * 3600, Some(60));
@@ -8795,7 +8513,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn pull_requests_link_to_tasks_by_attempt_branch() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         seed(&e, "linear:LIN-999", "LIN-999", UpstreamState::Started);
@@ -8830,7 +8548,7 @@ max_duration = "{max_duration}"
         // gh#282. The linked PR is the only place a Linear row learns where its
         // branch lands, and a stack a PR has left must not linger on the row —
         // sibling grouping would keep merging it into a stack it is out of.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -8914,7 +8632,7 @@ max_duration = "{max_duration}"
     /// nobody.
     #[test]
     fn the_upper_layers_of_a_stack_are_the_attempts_work_and_not_rows_of_their_own() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -8939,7 +8657,7 @@ max_duration = "{max_duration}"
     /// a row of its own rather than being swallowed by an attempt.
     #[test]
     fn a_branch_that_only_looks_like_a_layer_is_still_a_row_of_its_own() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -8957,7 +8675,7 @@ max_duration = "{max_duration}"
     /// the layers above are still being written in.
     #[test]
     fn a_bottom_layer_that_merges_first_does_not_finish_the_task() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -8975,7 +8693,7 @@ max_duration = "{max_duration}"
     /// exactly as a single pull request's does.
     #[test]
     fn the_task_finishes_when_the_whole_stack_has_merged() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -9037,7 +8755,6 @@ max_duration = "{max_duration}"
             .collect();
         routes.push((format!("/repos/{repo}/pulls?"), fixture[snapshot].clone()));
         let e = engine_with(
-            None,
             Some(Github::new(
                 Box::new(FixtureRest::new(routes)) as Box<dyn Rest>
             )),
@@ -9307,7 +9024,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_pr_from_an_ordinary_comet_chat_gets_an_attempt_backed_review() {
-        let e = engine(None);
+        let e = engine();
         let (_repo, work) = repo_ahead_of_its_remote();
         git_in(
             &work,
@@ -9445,7 +9162,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_remote_comet_chat_can_make_its_unique_pr_reviewable() {
-        let e = engine(None);
+        let e = engine();
         let pr = PullRequest {
             repo: "o/r".into(),
             number: 266,
@@ -9516,7 +9233,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn ambiguous_comet_authorship_keeps_review_and_guesses_no_chat() {
-        let e = engine(None);
+        let e = engine();
         let pr = PullRequest {
             repo: "upstream/r".into(),
             number: 267,
@@ -9575,7 +9292,6 @@ max_duration = "{max_duration}"
     #[test]
     fn a_pull_request_nobody_dispatched_is_reviewed_from_the_pull_request() {
         let mut e = engine_with(
-            None,
             Some(Github::new(Box::new(FixtureRest::new(vec![(
                 "/repos/b/itsm-agent/pulls/191/files".into(),
                 json!([
@@ -9641,7 +9357,6 @@ max_duration = "{max_duration}"
     #[test]
     fn a_diff_github_will_not_answer_for_leaves_the_review_standing() {
         let e = engine_with(
-            None,
             Some(Github::new(
                 Box::new(FixtureRest::new(vec![])) as Box<dyn Rest>
             )),
@@ -9679,7 +9394,7 @@ max_duration = "{max_duration}"
     /// and answering with an empty screen would be inventing one.
     #[test]
     fn a_row_that_never_ran_and_never_pushed_has_no_review() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "gh:o/r#4", "gh#4", UpstreamState::Unstarted);
         let err = e.review("gh:o/r#4", None).unwrap_err().to_string();
         assert!(err.contains("nothing to review"), "{err}");
@@ -9690,7 +9405,7 @@ max_duration = "{max_duration}"
         // herdr-board AGE-20, seen live: gh#2 exists in two repos, both branch
         // to `board/gh-2`, and one repo's *merged* PR attached itself to the
         // other's task — deriving it to review with no work done.
-        let e = engine(None);
+        let e = engine();
         seed(
             &e,
             "gh:Florin-AS/tripletex-mcp#2",
@@ -9733,7 +9448,6 @@ max_duration = "{max_duration}"
         // strings match, and treating it as one drops a real pull request off
         // the board with no trace.
         let mut e = engine_with(
-            None,
             Some(Github::new(Box::new(FixtureRest::new(vec![
                 (
                     "/repos/Florin-AS/tripletex-mcp/issues".into(),
@@ -9803,7 +9517,7 @@ max_duration = "{max_duration}"
         // `gh pr merge` and the web UI go nowhere near the board, so nothing
         // told the tracker and tickets sat at In Review until someone closed
         // them by hand (herdr-board AGE-22).
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -9834,8 +9548,7 @@ max_duration = "{max_duration}"
         // settled, so derivation reaches `review` off its outcome and keeps
         // reaching it — the ticket is held in the wrong state rather than
         // merely not advanced. Only something that finishes the task ends that.
-        let mut e = engine(None);
-        e.cfg.linear.review_state = Some("In Review".into());
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.close_attempt(a, Outcome::Done).unwrap();
@@ -9858,7 +9571,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_merge_observed_on_every_poll_only_closes_the_ticket_once() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         for _ in 0..5 {
@@ -9879,7 +9592,7 @@ max_duration = "{max_duration}"
     fn a_task_already_finished_upstream_is_not_reopened_by_a_merge() {
         // The issue was closed upstream; a merged PR turning up afterwards has
         // nothing left to say, and closing an already-closed ticket is noise.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.rederive_all().unwrap();
@@ -9898,24 +9611,36 @@ max_duration = "{max_duration}"
 
     // ---- source health ---------------------------------------------------
 
-    #[test]
-    fn a_linear_outage_serves_stale_data_and_marks_the_header() {
-        struct Down;
-        impl GraphQl for Down {
-            fn query(&self, _: &Value) -> Result<Value> {
-                anyhow::bail!("connection refused")
-            }
-        }
-        let e = engine(Some(Linear::new(Box::new(Down) as Box<dyn GraphQl>)));
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+    /// An engine polling one GitHub repo through a fixture.
+    fn gh_poll_engine(routes: Vec<(String, Value)>) -> TestEngine {
+        let mut e = engine_with(Some(Github::new(
+            Box::new(FixtureRest::new(routes)) as Box<dyn Rest>,
+        )));
+        e.cfg.github.repos = vec!["o/r".into()];
+        e
+    }
 
-        e.poll_linear();
+    /// Routes answering an empty repo: no issues, no pull requests.
+    fn empty_repo_routes() -> Vec<(String, Value)> {
+        vec![
+            ("/repos/o/r/issues".into(), json!([])),
+            ("/repos/o/r/pulls".into(), json!([])),
+        ]
+    }
+
+    #[test]
+    fn an_outage_serves_stale_data_and_marks_the_header() {
+        // No fixture routes at all: every call fails.
+        let e = gh_poll_engine(vec![]);
+        seed_gh(&e);
+
+        e.poll_github();
 
         // The row is still there — never blank the list because a poll failed.
         assert_eq!(e.db.load_tasks().unwrap().len(), 1);
-        match e.health(Source::Linear) {
+        match e.health(Source::Github) {
             SourceHealth::Down { error, retry_in } => {
-                assert!(error.contains("connection refused"));
+                assert!(error.contains("no fixture"));
                 assert!(retry_in > 0 && retry_in <= 300);
             }
             other => panic!("expected Down, got {other:?}"),
@@ -9924,22 +9649,16 @@ max_duration = "{max_duration}"
 
     #[test]
     fn backoff_grows_across_consecutive_failures_and_caps() {
-        struct Down;
-        impl GraphQl for Down {
-            fn query(&self, _: &Value) -> Result<Value> {
-                anyhow::bail!("nope")
-            }
-        }
-        let e = engine(Some(Linear::new(Box::new(Down) as Box<dyn GraphQl>)));
-        e.poll_linear();
-        let first = match e.health(Source::Linear) {
+        let e = gh_poll_engine(vec![]);
+        e.poll_github();
+        let first = match e.health(Source::Github) {
             SourceHealth::Down { retry_in, .. } => retry_in,
             _ => unreachable!(),
         };
         for _ in 0..10 {
-            e.poll_linear();
+            e.poll_github();
         }
-        let later = match e.health(Source::Linear) {
+        let later = match e.health(Source::Github) {
             SourceHealth::Down { retry_in, .. } => retry_in,
             _ => unreachable!(),
         };
@@ -9949,47 +9668,51 @@ max_duration = "{max_duration}"
 
     #[test]
     fn recovery_clears_the_header_and_the_failure_count() {
-        let page = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(
-            Box::new(FixtureTransport::new(vec![page.clone(), page])) as Box<dyn GraphQl>,
-        )));
-        e.db.meta_set(meta::LINEAR_STATUS, "error:earlier").unwrap();
-        e.db.meta_set(meta::LINEAR_FAILURES, "4").unwrap();
-        e.poll_linear();
-        assert_eq!(e.health(Source::Linear), SourceHealth::Ok);
+        let e = gh_poll_engine(empty_repo_routes());
+        e.db.meta_set(meta::GITHUB_STATUS, "error:earlier").unwrap();
+        e.db.meta_set(meta::GITHUB_FAILURES, "4").unwrap();
+        e.poll_github();
+        assert_eq!(e.health(Source::Github), SourceHealth::Ok);
     }
 
     #[test]
     fn an_unconfigured_source_is_absent_not_down() {
         // The header must not render `gh ✗` for a source nobody configured.
-        let e = engine(None);
+        let e = engine();
         assert_eq!(e.health(Source::Github), SourceHealth::Absent);
     }
 
     #[test]
     fn a_reader_reports_health_the_loop_recorded() {
-        // A reader builds no Linear client of its own when it starts before the
-        // key exists, but it must still show `linear ✓` once the engine's loop
-        // is polling successfully.
-        let e = engine(None);
+        // A reader builds no GitHub client of its own when it starts before
+        // the token exists, but it must still show `gh ✓` once the engine's
+        // loop is polling successfully.
+        let e = engine();
+        assert_eq!(e.health(Source::Github), SourceHealth::Absent);
+        e.db.meta_set(meta::GITHUB_STATUS, "ok").unwrap();
+        assert_eq!(e.health(Source::Github), SourceHealth::Ok);
+    }
+
+    /// gh#471: Linear is no longer polled, so it has no health on any board —
+    /// and a stale status row a pre-removal engine recorded must not
+    /// resurrect a `linear ✓` in the header.
+    #[test]
+    fn linear_is_always_absent_from_the_header() {
+        let e = engine();
         assert_eq!(e.health(Source::Linear), SourceHealth::Absent);
-        e.db.meta_set(meta::LINEAR_STATUS, "ok").unwrap();
-        assert_eq!(e.health(Source::Linear), SourceHealth::Ok);
+        e.db.meta_set("linear_status", "ok").unwrap();
+        assert_eq!(e.health(Source::Linear), SourceHealth::Absent);
     }
 
     // ---- reaping ---------------------------------------------------------
 
     #[test]
-    fn a_full_sweep_removes_a_task_deleted_upstream() {
-        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(
-            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
-        )));
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+    fn a_poll_removes_a_task_deleted_upstream() {
+        let e = gh_poll_engine(empty_repo_routes());
+        seed_gh(&e);
         assert_eq!(e.db.load_tasks().unwrap().len(), 1);
 
-        // No watermark recorded, so this poll is a full sweep.
-        e.poll_linear();
+        e.poll_github();
         assert!(
             e.db.load_tasks().unwrap().is_empty(),
             "a task the source no longer returns must not linger forever"
@@ -9997,15 +9720,12 @@ max_duration = "{max_duration}"
     }
 
     #[test]
-    fn a_sweep_never_removes_a_task_with_a_running_agent() {
-        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(
-            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
-        )));
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
-        dispatch(&e, "linear:LIN-142", "chat-9");
+    fn a_poll_never_removes_a_task_with_a_running_agent() {
+        let e = gh_poll_engine(empty_repo_routes());
+        seed_gh(&e);
+        dispatch(&e, "gh:o/r#87", "chat-9");
 
-        e.poll_linear();
+        e.poll_github();
         assert_eq!(
             e.db.load_tasks().unwrap().len(),
             1,
@@ -10017,16 +9737,13 @@ max_duration = "{max_duration}"
     /// attempt's checkout is, and `gc` then refuses to collect a directory it
     /// cannot attribute. The row stays.
     #[test]
-    fn a_sweep_keeps_the_attempts_of_a_task_that_was_worked_on() {
-        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(
-            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
-        )));
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
-        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+    fn a_poll_keeps_the_attempts_of_a_task_that_was_worked_on() {
+        let e = gh_poll_engine(empty_repo_routes());
+        seed_gh(&e);
+        let a = dispatch(&e, "gh:o/r#87", "chat-9");
         e.db.conn
             .execute(
-                "UPDATE attempts SET worktree = '/wt/lin-142-1' WHERE id = ?1",
+                "UPDATE attempts SET worktree = '/wt/gh-87-1' WHERE id = ?1",
                 rusqlite::params![a],
             )
             .unwrap();
@@ -10034,101 +9751,57 @@ max_duration = "{max_duration}"
         // by a rule of its own.
         e.db.close_attempt(a, Outcome::Done).unwrap();
 
-        e.poll_linear();
+        e.poll_github();
 
-        let t = e.db.get_task("linear:LIN-142").unwrap().expect("row kept");
+        let t = e.db.get_task("gh:o/r#87").unwrap().expect("row kept");
         assert_eq!(t.upstream, UpstreamState::Gone);
         assert_eq!(t.attempts.len(), 1, "the history is the point");
-        assert_eq!(t.attempts[0].worktree.as_deref(), Some("/wt/lin-142-1"));
+        assert_eq!(t.attempts[0].worktree.as_deref(), Some("/wt/gh-87-1"));
         // And it derives out of the queue, into `done`.
         e.rederive_all().unwrap();
         assert_eq!(
-            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
+            e.db.get_task("gh:o/r#87").unwrap().unwrap().state,
             BoardState::Done
         );
     }
 
     #[test]
-    fn a_sweep_still_forgets_a_task_nobody_ever_dispatched() {
+    fn a_poll_still_forgets_a_task_nobody_ever_dispatched() {
         // The noise case: created, mislabelled or deleted again, never worked
         // on. Nothing to keep.
-        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(
-            Box::new(FixtureTransport::new(vec![empty.clone(), empty])) as Box<dyn GraphQl>,
-        )));
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        let e = gh_poll_engine(empty_repo_routes());
+        seed_gh(&e);
 
-        e.poll_linear();
+        e.poll_github();
         assert!(e.db.load_tasks().unwrap().is_empty());
     }
 
     #[test]
-    fn a_reaped_row_is_not_reported_again_on_the_next_sweep() {
-        let empty = json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } });
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            empty.clone(),
-            empty.clone(),
-            empty.clone(),
-            empty,
-        ])) as Box<dyn GraphQl>)));
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
-        let a = dispatch(&e, "linear:LIN-142", "chat-9");
+    fn a_reaped_row_is_not_reported_again_on_the_next_poll() {
+        let e = gh_poll_engine(empty_repo_routes());
+        seed_gh(&e);
+        let a = dispatch(&e, "gh:o/r#87", "chat-9");
         e.db.close_attempt(a, Outcome::Done).unwrap();
 
-        e.poll_linear();
-        e.db.meta_set(meta::LAST_FULL_SWEEP, "2026-01-01T00:00:00Z")
-            .unwrap();
-        e.poll_linear();
+        e.poll_github();
+        e.poll_github();
         assert!(
-            e.db.reapable_task_ids(Source::Linear).unwrap().is_empty(),
+            e.db.reapable_task_ids(Source::Github).unwrap().is_empty(),
             "a gone row has nothing left to reap"
         );
     }
 
     #[test]
-    fn an_incremental_poll_does_not_reap() {
-        // An incremental response is not the whole set, so absence proves
-        // nothing.
-        let nodes = json!([{
-            "id": "uuid-1", "identifier": "LIN-999", "title": "t", "url": "u",
-            "updatedAt": "2026-07-25T18:00:00.000Z",
-            "state": { "name": "Todo", "type": "unstarted" },
-            "team": { "key": "LIN" }, "labels": { "nodes": [] },
-            "attachments": { "nodes": [] }
-        }]);
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": nodes } }),
-            json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": [] } }),
-        ])) as Box<dyn GraphQl>)));
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
-        // Mark a sweep as just done, so this poll is incremental.
-        e.db.meta_set(meta::LAST_FULL_SWEEP, &crate::db::now())
-            .unwrap();
-        e.db.meta_set(meta::LINEAR_WATERMARK, "2026-07-01T00:00:00Z")
-            .unwrap();
+    fn a_failed_poll_does_not_reap() {
+        // A failed poll is not the whole set, so absence proves nothing: the
+        // issues call answers but the pulls call dies, and the row stays.
+        let e = gh_poll_engine(vec![("/repos/o/r/issues".into(), json!([]))]);
+        seed_gh(&e);
 
-        e.poll_linear();
-        assert_eq!(e.db.load_tasks().unwrap().len(), 2, "nothing reaped");
+        e.poll_github();
+        assert_eq!(e.db.load_tasks().unwrap().len(), 1, "nothing reaped");
     }
 
-    #[test]
-    fn watermark_advances_to_the_newest_issue() {
-        let nodes = json!([{
-            "id": "uuid-1", "identifier": "LIN-142", "title": "t",
-            "url": "u", "updatedAt": "2026-07-25T18:00:00.000Z",
-            "state": { "name": "Todo", "type": "unstarted" },
-            "team": { "key": "LIN" }, "labels": { "nodes": [] },
-            "attachments": { "nodes": [] }
-        }]);
-        let e = engine(Some(Linear::new(Box::new(FixtureTransport::new(vec![
-            json!({ "issues": { "pageInfo": { "hasNextPage": false }, "nodes": nodes } }),
-        ])) as Box<dyn GraphQl>)));
-        e.poll_linear();
-        assert_eq!(
-            e.db.meta_get(meta::LINEAR_WATERMARK).unwrap().as_deref(),
-            Some("2026-07-25T18:00:00.000Z")
-        );
-    }
 
     // ---- GitHub writeback ------------------------------------------------
 
@@ -10150,8 +9823,6 @@ max_duration = "{max_duration}"
             url: "u".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: crate::db::now(),
         })
@@ -10161,7 +9832,7 @@ max_duration = "{max_duration}"
     /// An engine with GitHub writeback enabled — it is off by default, so a
     /// test about writeback has to ask for it.
     fn engine_with_gh_writeback() -> TestEngine {
-        let mut e = engine_with(None, Some(gh_client()));
+        let mut e = engine_with(Some(gh_client()));
         e.cfg.github.writeback = true;
         e
     }
@@ -10174,7 +9845,7 @@ max_duration = "{max_duration}"
     fn merging_moves_the_row_without_waiting_for_a_poll() {
         // The operator just pressed a key; the row has to move now, not in
         // thirty seconds.
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with(Some(gh_client()));
         seed_gh(&e);
         e.db.set_pr(
             "gh:o/r#87",
@@ -10199,7 +9870,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn merging_queues_the_ticket_to_be_closed() {
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with(Some(gh_client()));
         seed_gh(&e);
         e.db.set_pr(
             "gh:o/r#87",
@@ -10226,7 +9897,6 @@ max_duration = "{max_duration}"
     #[test]
     fn a_queued_merge_leaves_the_row_where_it_is() {
         let e = engine_with(
-            None,
             Some(Github::new(Box::new(FixtureRest::new(vec![(
                 "PUT /repos/o/r/pulls/87/merge-async".into(),
                 json!({ "status": "enqueued" }),
@@ -10259,7 +9929,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_github_outcome_leaves_the_same_trail_as_linear() {
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with(Some(gh_client()));
         seed_gh(&e);
         let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
         e.enqueue_outcome(&task, Outcome::Failed, None).unwrap();
@@ -10279,7 +9949,7 @@ max_duration = "{max_duration}"
     /// log calls it dropped rather than delivered, because nothing was.
     #[test]
     fn a_writeback_against_a_gone_task_is_dropped_rather_than_retried_forever() {
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with(Some(gh_client()));
         seed_gh(&e);
         let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
         e.enqueue_outcome(&task, Outcome::Done, None).unwrap();
@@ -10358,8 +10028,6 @@ max_duration = "{max_duration}"
             url: "u".into(),
             labels: vec![],
             source_state: Some("closed".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Terminal,
             updated_at: crate::db::now(),
         })
@@ -10378,7 +10046,7 @@ max_duration = "{max_duration}"
     fn writeback_is_off_unless_asked_for() {
         // Pointing the board at a repo is not the same as asking it to write to
         // your issues.
-        let e = engine_with(None, Some(gh_client()));
+        let e = engine_with(Some(gh_client()));
         assert!(!e.cfg.github.writeback, "writeback must default to off");
         seed_gh(&e);
         e.db.set_local_done("gh:o/r#87", true).unwrap();
@@ -10395,7 +10063,7 @@ max_duration = "{max_duration}"
 
     /// Writeback on globally, off for the production repo.
     fn engine_with_one_read_only_repo() -> TestEngine {
-        let mut e = engine_with(None, Some(gh_client()));
+        let mut e = engine_with(Some(gh_client()));
         e.cfg.github.repos = vec!["bredebjorhovd/OIOS".into(), "Florin-AS/Tally".into()];
         e.cfg.github.writeback = true;
         e.cfg.github.per_repo = vec![crate::config::RepoConfig {
@@ -10471,7 +10139,7 @@ max_duration = "{max_duration}"
     fn a_repo_can_be_written_to_while_the_global_flag_stays_off() {
         // The override goes both ways. Otherwise the safe global default can
         // only be escaped by turning every repo on at once — the same bug.
-        let mut e = engine_with(None, Some(gh_client()));
+        let mut e = engine_with(Some(gh_client()));
         e.cfg.github.repos = vec!["bredebjorhovd/herdr-board".into()];
         e.cfg.github.per_repo = vec![crate::config::RepoConfig {
             name: "bredebjorhovd/herdr-board".into(),
@@ -10522,7 +10190,6 @@ max_duration = "{max_duration}"
         // backlog dump for the repo next to it, and there was no way to say so.
         let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut e = engine_with(
-            None,
             Some(Github::new(
                 Box::new(Recorder(asked.clone())) as Box<dyn Rest>
             )),
@@ -10555,45 +10222,11 @@ max_duration = "{max_duration}"
         );
     }
 
-    // ---- Linear has to be told the work is waiting on a human ------------
+    // ---- legacy Linear rows (gh#471) -------------------------------------
 
-    /// One page of workflow states, as `state_id_named` reads them. `In Review`
-    /// and `In Progress` are both `started`, which is the whole problem.
-    fn states_page() -> Value {
-        json!({
-            "teams": { "nodes": [ { "id": "team-1", "states": { "nodes": [
-                { "id": "s-rev",  "name": "In Review",   "type": "started",   "position": 2.0 },
-                { "id": "s-prog", "name": "In Progress", "type": "started",   "position": 1.0 }
-            ] } } ] }
-        })
-    }
-
-    /// A fixture transport the test can still read after the engine has boxed
-    /// it away, so what was actually sent to Linear can be asserted on.
-    struct Shared(std::rc::Rc<FixtureTransport>);
-
-    impl GraphQl for Shared {
-        fn query(&self, body: &Value) -> Result<Value> {
-            self.0.query(body)
-        }
-    }
-
-    /// A Linear engine that has been told which state means review.
-    fn engine_with_review_state(responses: Vec<Value>) -> TestEngine {
-        recording_engine(responses).0
-    }
-
-    fn recording_engine(responses: Vec<Value>) -> (TestEngine, std::rc::Rc<FixtureTransport>) {
-        let transport = std::rc::Rc::new(FixtureTransport::new(responses));
-        let mut e = engine(Some(Linear::new(
-            Box::new(Shared(transport.clone())) as Box<dyn GraphQl>
-        )));
-        e.cfg.linear.review_state = Some("In Review".into());
-        (e, transport)
-    }
-
-    /// A Linear row with an open pull request — the board derives `review`.
-    fn seed_in_review(e: &SyncEngine) {
+    /// A legacy linear-sourced row with an open pull request — the board
+    /// derives `review` for it exactly as it always did.
+    fn seed_legacy_in_review(e: &SyncEngine) {
         seed(e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         e.db.set_pr(
             "linear:LIN-142",
@@ -10604,36 +10237,13 @@ max_duration = "{max_duration}"
         .unwrap();
     }
 
+    /// The history half of the policy: a linear-sourced row written before the
+    /// connector was removed still loads, still derives, and still renders —
+    /// it just talks to nobody. Reaching `review` queues nothing.
     #[test]
-    fn a_row_that_reaches_review_queues_the_linear_transition() {
-        // Tickets read In Progress in Linear for the whole time their PRs sat
-        // waiting: dispatch moved them, and nothing moved them again until a
-        // merge.
-        let e = engine_with_review_state(vec![]);
-        seed_in_review(&e);
-        e.rederive_all().unwrap();
-
-        assert_eq!(
-            e.db.get_task("linear:LIN-142").unwrap().unwrap().state,
-            BoardState::Review
-        );
-        assert!(
-            e.db.pending_writebacks(10)
-                .unwrap()
-                .iter()
-                .any(|w| w.kind == "review"),
-            "reaching review must tell Linear, not only the board"
-        );
-    }
-
-    #[test]
-    fn with_no_review_state_configured_linear_is_left_where_it_was() {
-        // The default. Linear has no review state *type*, so with nothing named
-        // there is no correct target — and a workspace without such a state must
-        // keep behaving exactly as it did.
-        let e = engine(None);
-        assert!(e.cfg.linear.review_state.is_none(), "unset by default");
-        seed_in_review(&e);
+    fn a_legacy_linear_row_still_derives_and_queues_nothing() {
+        let e = engine();
+        seed_legacy_in_review(&e);
         e.rederive_all().unwrap();
 
         assert_eq!(
@@ -10643,150 +10253,31 @@ max_duration = "{max_duration}"
         assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
     }
 
+    /// The queue half: an existing database may still hold writebacks aimed at
+    /// Linear from before the removal. They leave the queue as dropped — not
+    /// retried, which would back off forever against a source the board can no
+    /// longer reach, and not stuck, which would wedge the drain.
     #[test]
-    fn the_transition_is_queued_once_however_many_times_we_rederive() {
-        let e = engine_with_review_state(vec![]);
-        seed_in_review(&e);
-        for _ in 0..5 {
-            e.rederive_all().unwrap();
-        }
-        assert_eq!(
-            e.db.pending_writebacks(10)
-                .unwrap()
-                .iter()
-                .filter(|w| w.kind == "review")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn a_retry_gets_a_transition_of_its_own() {
-        // Dispatching again moves the ticket back to In Progress, so the attempt
-        // that follows has its own review to announce.
-        let e = engine_with_review_state(vec![]);
-        seed_in_review(&e);
-        e.rederive_all().unwrap();
-        let first = e.db.pending_writebacks(10).unwrap();
-
-        let a = dispatch(&e, "linear:LIN-142", "chat-9");
-        e.db.close_attempt(a, Outcome::Done).unwrap();
-        e.rederive_all().unwrap();
-
-        let after = e.db.pending_writebacks(10).unwrap();
-        assert_eq!(
-            after.iter().filter(|w| w.kind == "review").count(),
-            2,
-            "queued: {:?} then {:?}",
-            first.iter().map(|w| &w.idem_key).collect::<Vec<_>>(),
-            after.iter().map(|w| &w.idem_key).collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn a_ticket_already_in_the_review_state_is_not_moved_again() {
-        // The operator dragged it there themselves, or an earlier tick did. A
-        // mutation that changes nothing is still a write to somebody's tracker.
-        let e = engine_with_review_state(vec![]);
-        seed_in_review(&e);
-        e.db.conn
-            .execute(
-                "UPDATE tasks SET source_state = 'In Review' WHERE id = 'linear:LIN-142'",
-                [],
-            )
-            .unwrap();
-        e.rederive_all().unwrap();
-        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn a_closed_issue_is_never_dragged_back_into_review() {
-        // "mark done" derives Done, not Review, so the case that matters is an
-        // issue closed upstream while its PR is still open.
-        let e = engine_with_review_state(vec![]);
-        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
-        e.db.set_pr("linear:LIN-142", Some("u"), Some(291), true)
-            .unwrap();
-        e.rederive_all().unwrap();
-        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
-    }
-
-    #[test]
-    fn delivering_the_transition_sets_the_named_state() {
-        let (e, transport) = recording_engine(vec![
-            states_page(),
-            json!({ "issueUpdate": { "success": true } }),
-        ]);
-        seed_in_review(&e);
-        e.rederive_all().unwrap();
-        e.drain_writebacks();
-
-        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
-        let sent = transport.sent.borrow();
-        // Not the lowest-position `started` state, which is In Progress and is
-        // where dispatch already put it.
-        assert_eq!(sent[1]["variables"]["stateId"], json!("s-rev"));
-        assert_eq!(sent[1]["variables"]["id"], json!("uuid-1"));
-    }
-
-    #[test]
-    fn a_review_state_that_does_not_exist_is_dropped_rather_than_retried() {
-        // A name that resolves to nothing is a config mistake, and doctor is
-        // where it gets reported. Backing off against Linear forever would only
-        // bury it.
-        let e = engine_with_review_state(vec![json!({
-            "teams": { "nodes": [ { "id": "team-1", "states": { "nodes": [
-                { "id": "s-prog", "name": "Pågår", "type": "started", "position": 1.0 }
-            ] } } ] }
-        })]);
-        seed_in_review(&e);
-        e.rederive_all().unwrap();
-
-        let w = e.db.pending_writebacks(10).unwrap();
-        let w = w.iter().find(|w| w.kind == "review").unwrap();
-        assert!(matches!(e.deliver(w).unwrap(), Sent::Dropped(_)));
-    }
-
-    #[test]
-    fn turning_the_setting_off_stops_a_transition_still_in_the_queue() {
-        let mut e = engine_with_review_state(vec![]);
-        seed_in_review(&e);
-        e.rederive_all().unwrap();
-        e.cfg.linear.review_state = None;
-
-        let w = e.db.pending_writebacks(10).unwrap();
-        let w = w.iter().find(|w| w.kind == "review").unwrap();
-        assert!(matches!(e.deliver(w).unwrap(), Sent::Dropped(_)));
-    }
-
-    /// GitHub has no equivalent gap to close. An issue there is open or closed —
-    /// there is no state between the two to advance to — and the `outcome`
-    /// writeback already comments the PR link on the issue when an attempt
-    /// settles, which is the whole of what GitHub can be told.
-    #[test]
-    fn a_github_row_reaching_review_has_nothing_to_transition() {
-        let mut e = engine_with_gh_writeback();
-        e.cfg.linear.review_state = Some("In Review".into());
-        seed_gh(&e);
-        e.db.set_pr(
-            "gh:o/r#87",
-            Some("https://github.com/o/r/pull/87"),
-            Some(87),
-            true,
-        )
+    fn a_queued_legacy_linear_writeback_is_dropped_not_retried() {
+        let e = engine();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        e.db.enqueue_writeback(&NewWriteback {
+            task_id: "linear:LIN-142".into(),
+            kind: "dispatch".into(),
+            payload: "{}".into(),
+            idem_key: "linear:LIN-142:dispatch:1".into(),
+        })
         .unwrap();
-        e.rederive_all().unwrap();
 
-        assert_eq!(
-            e.db.get_task("gh:o/r#87").unwrap().unwrap().state,
-            BoardState::Review
-        );
-        assert_eq!(
-            e.db.pending_writeback_count().unwrap(),
-            0,
-            "a Linear state name says nothing about a GitHub issue"
-        );
+        let w = e.db.pending_writebacks(10).unwrap().remove(0);
+        match e.deliver(&w).unwrap() {
+            Sent::Dropped(why) => assert!(why.contains("no longer a connected source")),
+            other => panic!("expected Dropped, got {other:?}"),
+        }
+        e.drain_writebacks();
+        assert_eq!(e.db.pending_writeback_count().unwrap(), 0);
     }
+
 
     // ---- ids and routing -------------------------------------------------
 
@@ -10806,7 +10297,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_pull_request_row_routes_like_its_repo() {
-        let e = engine(None);
+        let e = engine();
         e.db.upsert_task(&UpsertTask {
             id: "gh:owner/repo!508".into(),
             source: Source::Github,
@@ -10817,8 +10308,6 @@ max_duration = "{max_duration}"
             url: "u".into(),
             labels: vec![],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: crate::db::now(),
         })
@@ -10827,19 +10316,22 @@ max_duration = "{max_duration}"
         assert_eq!(route_context(&t).gh_repo.as_deref(), Some("owner/repo"));
     }
 
+    /// gh#471: a legacy Linear row names no repo, so its context carries only
+    /// its labels — a `gh_repo` route can never match it, a label route or a
+    /// catch-all still can.
     #[test]
-    fn route_context_derives_team_from_a_linear_identifier() {
-        let e = engine(None);
+    fn route_context_of_a_legacy_linear_row_carries_no_repo() {
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let t = e.db.get_task("linear:LIN-142").unwrap().unwrap();
         let ctx = route_context(&t);
-        assert_eq!(ctx.linear_team.as_deref(), Some("LIN"));
+        assert_eq!(ctx.gh_repo, None);
         assert_eq!(ctx.labels, vec!["herd"]);
     }
 
     #[test]
     fn route_context_derives_repo_from_a_github_id() {
-        let e = engine(None);
+        let e = engine();
         seed_gh_in(&e, "gh:owner/repo#87");
         let t = e.db.get_task("gh:owner/repo#87").unwrap().unwrap();
         assert_eq!(route_context(&t).gh_repo.as_deref(), Some("owner/repo"));
@@ -10908,7 +10400,7 @@ max_duration = "{max_duration}"
         // working. The base recorded before dispatch is the *repo* HEAD, and
         // the reused branch was already four commits ahead of it.
         let (_repo, work) = repo_ahead_of_its_remote();
-        let e = engine(None);
+        let e = engine();
         let wt = work.to_string_lossy().into_owned();
         let sha = |r: &str| {
             String::from_utf8_lossy(
@@ -10952,7 +10444,7 @@ max_duration = "{max_duration}"
     #[test]
     fn an_operators_unpushed_commit_is_not_the_agents_output() {
         let (_repo, work) = repo_ahead_of_its_remote();
-        let e = engine(None);
+        let e = engine();
         let wt = work.to_string_lossy().into_owned();
 
         // Where a dispatch would start from: the repo's HEAD right now.
@@ -10995,7 +10487,7 @@ max_duration = "{max_duration}"
         // all. Attempts predating the column keep this weaker behaviour, so it
         // is documented rather than fixed.
         let (_repo, work) = repo_ahead_of_its_remote();
-        let e = engine(None);
+        let e = engine();
         assert!(
             e.attempt_has_commits(Some(&work.to_string_lossy()), None),
             "the remote-relative count is fooled by unpushed work — this is the bug"
@@ -11093,7 +10585,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_finished_attempts_checkout_is_marked_then_collected_a_week_later() {
-        let e = engine(None);
+        let e = engine();
         let a = spent_attempt(&e);
         let gc = Collector::default();
 
@@ -11129,7 +10621,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_live_attempt_is_never_collected_however_finished_the_task_looks() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
@@ -11149,7 +10641,7 @@ max_duration = "{max_duration}"
         // The retry reuses the branch and lands in the same directory, so the
         // closed attempt's checkout is the live one's. Deleting it would throw
         // away the commits the retry is meant to continue.
-        let e = engine(None);
+        let e = engine();
         let a = spent_attempt(&e);
         let gc = Collector::default();
         e.collect_worktrees(Some(&gc));
@@ -11166,7 +10658,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_pull_request_back_in_review_stops_the_clock() {
-        let e = engine(None);
+        let e = engine();
         let a = spent_attempt(&e);
         let gc = Collector::default();
         e.collect_worktrees(Some(&gc));
@@ -11189,7 +10681,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn retention_off_keeps_every_checkout() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.retain_worktrees = "off".into();
         let a = spent_attempt(&e);
         let gc = Collector::default();
@@ -11209,7 +10701,7 @@ max_duration = "{max_duration}"
         // The stamp is what says the disk space is back. A `git worktree
         // remove` that failed must leave the row uncollected, or the board
         // would report space it never reclaimed.
-        let e = engine(None);
+        let e = engine();
         let a = spent_attempt(&e);
         let gc = Collector {
             refuse: true,
@@ -11227,7 +10719,7 @@ max_duration = "{max_duration}"
     fn a_cycle_without_a_runtime_marks_but_never_deletes() {
         // Only the process that owns the worktrees may remove one; anything
         // else running the cycle is welcome to keep the clock.
-        let e = engine(None);
+        let e = engine();
         let a = spent_attempt(&e);
         e.collect_worktrees(None);
         age_mark(&e, a, 30 * 86_400);
@@ -11326,7 +10818,7 @@ max_duration = "{max_duration}"
     /// its build output is swept (36 GB, and nothing reads it).
     #[test]
     fn build_output_goes_when_the_attempt_ends_and_the_checkout_stays() {
-        let e = engine(None);
+        let e = engine();
         let a = built_attempt(&e);
         let build = Builder {
             bytes: 36 * 1024 * 1024 * 1024,
@@ -11371,7 +10863,7 @@ max_duration = "{max_duration}"
     /// sweep must not have made the row look already reclaimed.
     #[test]
     fn a_swept_checkout_is_still_collected_when_its_own_window_runs_out() {
-        let e = engine(None);
+        let e = engine();
         let a = built_attempt(&e);
         let build = Builder {
             bytes: 1024,
@@ -11403,7 +10895,7 @@ max_duration = "{max_duration}"
     /// the closed attempt's directory is very often the live one's.
     #[test]
     fn nothing_is_swept_while_anybody_is_building() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_attempt_worktree(a, "/wt/board-lin-142").unwrap();
@@ -11434,7 +10926,7 @@ max_duration = "{max_duration}"
     /// skips forever.
     #[test]
     fn a_reopened_attempt_has_its_next_build_swept_too() {
-        let e = engine(None);
+        let e = engine();
         let a = built_attempt(&e);
         let build = Builder {
             bytes: 1024,
@@ -11466,7 +10958,7 @@ max_duration = "{max_duration}"
     /// `on-settle`; the window is a setting like every other one here.
     #[test]
     fn a_window_on_the_cache_is_waited_out() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.retain_build_output = "2h".into();
         let a = built_attempt(&e);
         let build = Builder::default();
@@ -11482,7 +10974,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn sweeping_off_keeps_every_cache() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.retain_build_output = "off".into();
         let a = built_attempt(&e);
         let build = Builder::default();
@@ -11503,7 +10995,7 @@ max_duration = "{max_duration}"
     /// about, from the other end.
     #[test]
     fn a_cache_that_will_not_delete_is_tried_again_next_cycle() {
-        let e = engine(None);
+        let e = engine();
         let a = built_attempt(&e);
         let build = Builder {
             stuck: true,
@@ -11521,7 +11013,7 @@ max_duration = "{max_duration}"
     fn a_cycle_without_a_runtime_marks_but_sweeps_nothing() {
         // Only the process that cut the worktrees may delete inside them;
         // anything else running the cycle keeps the clock.
-        let e = engine(None);
+        let e = engine();
         let a = built_attempt(&e);
         e.sweep_build_output(None);
         e.sweep_build_output(None);
@@ -11537,7 +11029,7 @@ max_duration = "{max_duration}"
     /// child sits on, so the clock does not even start.
     #[test]
     fn a_stacked_child_defers_the_collection_of_the_parents_checkout() {
-        let e = engine(None);
+        let e = engine();
         let parent = spent_attempt(&e);
         seed(&e, "linear:LIN-143", "LIN-143", UpstreamState::Started);
         let child = dispatch(&e, "linear:LIN-143", "chat-10");
@@ -11639,7 +11131,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn a_settled_attempts_chat_is_marked_and_archived_on_the_next_sweep() {
-        let e = engine(None);
+        let e = engine();
         let a = spent_chat(&e);
         let shelf = Shelf::default();
 
@@ -11672,7 +11164,7 @@ max_duration = "{max_duration}"
     /// setting, and only its default changed.
     #[test]
     fn a_route_that_asks_for_a_window_still_waits_it_out() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.archive_chats = "2d".into();
         let a = spent_chat(&e);
         let shelf = Shelf::default();
@@ -11691,7 +11183,7 @@ max_duration = "{max_duration}"
     /// the delivery loop from under itself.
     #[test]
     fn a_chat_in_review_is_never_archived_out_from_under_its_delivery_loop() {
-        let e = engine(None);
+        let e = engine();
         let a = spent_chat(&e);
         let shelf = Shelf::default();
         e.archive_chats(Some(&shelf));
@@ -11716,7 +11208,7 @@ max_duration = "{max_duration}"
     /// away: its attempt is still open, so the sweep never considers it.
     #[test]
     fn a_live_or_blocked_attempt_keeps_its_chat_however_finished_the_task_looks() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Terminal);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_attempt_status(a, AgentStatus::Blocked).unwrap();
@@ -11734,7 +11226,7 @@ max_duration = "{max_duration}"
     /// finished — even though it was dispatched as an attempt like any other.
     #[test]
     fn the_pinned_orchestrator_is_never_archived() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.orchestrator_chat = Some("chat-9".into());
         let a = spent_chat(&e);
         let shelf = Shelf::default();
@@ -11764,7 +11256,7 @@ max_duration = "{max_duration}"
     /// anything.
     #[test]
     fn a_chat_that_released_unfinished_work_is_never_archived() {
-        let e = engine(None);
+        let e = engine();
         // The pane he dispatched from: a settled attempt on a closed issue,
         // which is every bit of what the sweep used to need.
         let dispatcher = spent_chat(&e);
@@ -11819,7 +11311,7 @@ max_duration = "{max_duration}"
     /// minutes between its own settle and the dispatch it made afterwards.
     #[test]
     fn releasing_work_stops_a_shelf_clock_that_had_already_started() {
-        let e = engine(None);
+        let e = engine();
         let dispatcher = spent_chat(&e);
         let shelf = Shelf::default();
         e.archive_chats(Some(&shelf));
@@ -11842,7 +11334,7 @@ max_duration = "{max_duration}"
     /// speak for it — the reader would go and look at the wrong fact.
     #[test]
     fn the_note_names_the_hold_that_is_doing_the_work() {
-        let mut e = engine(None);
+        let mut e = engine();
         let dispatcher = spent_chat(&e);
         seed(&e, "linear:LIN-143", "LIN-143", UpstreamState::Started);
         dispatch_via(&e, "linear:LIN-143", "chat-10", "chat-9");
@@ -11866,7 +11358,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn archiving_off_keeps_every_chat_on_the_shelf() {
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.archive_chats = "off".into();
         let a = spent_chat(&e);
         let shelf = Shelf::default();
@@ -11884,12 +11376,12 @@ max_duration = "{max_duration}"
     #[test]
     fn a_route_can_keep_its_own_chats_longer_than_the_board_does() {
         // The window is read per route at sweep time, not stamped at dispatch.
-        let mut e = engine(None);
+        let mut e = engine();
         e.cfg.defaults.archive_chats = "1d".into();
         e.cfg.routes = vec![
             toml::from_str(
                 r#"
-                match = { linear_team = "LIN" }
+                match = { label = "herd" }
                 workspace = "offhand"
                 repo = "/tmp"
                 runtime = "claude-code"
@@ -11916,7 +11408,7 @@ max_duration = "{max_duration}"
     fn a_cycle_without_a_runtime_marks_but_never_archives() {
         // Only the process hosting the workspace doc may mutate it; anything
         // else running the cycle is welcome to keep the clock.
-        let e = engine(None);
+        let e = engine();
         let a = spent_chat(&e);
         e.archive_chats(None);
         age_shelf_mark(&e, a, 30 * 86_400);
@@ -11927,7 +11419,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn an_archive_that_fails_is_tried_again_next_cycle() {
-        let e = engine(None);
+        let e = engine();
         let a = spent_chat(&e);
         let shelf = Shelf {
             refuse: true,
@@ -11954,7 +11446,7 @@ max_duration = "{max_duration}"
     /// just re-opened.
     #[test]
     fn a_reopened_attempt_gets_its_chat_back_off_the_shelf() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_saw_working(a).unwrap();
@@ -11987,7 +11479,7 @@ max_duration = "{max_duration}"
     /// what its own record says it archived.
     #[test]
     fn a_reopen_does_not_argue_with_a_chat_somebody_archived_by_hand() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_saw_working(a).unwrap();
@@ -12009,7 +11501,7 @@ max_duration = "{max_duration}"
     /// on the same sweep, from the same rule.
     #[test]
     fn a_task_finished_a_week_ago_leaves_neither_a_chat_nor_a_checkout() {
-        let e = engine(None);
+        let e = engine();
         let a = spent_attempt(&e);
         let gc = Collector::default();
         let shelf = Shelf::default();
@@ -12039,7 +11531,7 @@ max_duration = "{max_duration}"
         // missing snapshot must read as "no information", not "every chat is
         // missing" — the difference between skipping a tick and counting one
         // against every live attempt.
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Working)]))
@@ -12059,7 +11551,7 @@ max_duration = "{max_duration}"
 
     #[test]
     fn sync_once_with_a_snapshot_reconciles_and_derives() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         dispatch(&e, "linear:LIN-142", "chat-9");
 
@@ -12140,7 +11632,7 @@ max_duration = "{max_duration}"
     #[test]
     fn the_board_computes_what_the_agent_did_not_account_for() {
         let (_repo, dir, base) = checkout_with_a_base();
-        let e = engine(None);
+        let e = engine();
         attempt_in(&e, &dir, &base);
 
         std::fs::write(dir.join("src/db.rs"), "// base\n// claims column\n").unwrap();
@@ -12215,7 +11707,7 @@ max_duration = "{max_duration}"
         .trim()
         .to_string();
 
-        let e = engine(None);
+        let e = engine();
         let a = attempt_in(&e, &dir, &base);
 
         // The branch: a dependency arrives, the schema moves, a config key is
@@ -12327,7 +11819,7 @@ max_duration = "{max_duration}"
     #[test]
     fn work_that_is_not_committed_yet_is_reported_beside_the_remainder() {
         let (_repo, dir, base) = checkout_with_a_base();
-        let e = engine(None);
+        let e = engine();
         attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// written, not committed\n").unwrap();
         std::fs::write(dir.join("src/new.rs"), "// not even added\n").unwrap();
@@ -12357,7 +11849,7 @@ max_duration = "{max_duration}"
     #[test]
     fn a_second_submission_replaces_the_first() {
         let (_repo, dir, base) = checkout_with_a_base();
-        let e = engine(None);
+        let e = engine();
         let a = attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
         commit_all(&dir, "work");
@@ -12382,7 +11874,7 @@ max_duration = "{max_duration}"
     #[test]
     fn claims_and_the_review_answer_to_the_identifier_the_agent_was_given() {
         let (_repo, dir, base) = checkout_with_a_base();
-        let e = engine(None);
+        let e = engine();
         let a = attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
         commit_all(&dir, "work");
@@ -12407,7 +11899,7 @@ max_duration = "{max_duration}"
     #[test]
     fn prose_is_refused_and_leaves_the_attempt_unclaimed() {
         let (_repo, dir, base) = checkout_with_a_base();
-        let e = engine(None);
+        let e = engine();
         let a = attempt_in(&e, &dir, &base);
         let err = e
             .submit_claims(None, "linear:LIN-142", "I improved the storage layer.")
@@ -12424,7 +11916,7 @@ max_duration = "{max_duration}"
     #[test]
     fn the_remainder_survives_the_checkout_being_reclaimed() {
         let (_repo, dir, base) = checkout_with_a_base();
-        let e = engine(None);
+        let e = engine();
         let a = attempt_in(&e, &dir, &base);
         std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
         std::fs::write(dir.join("Cargo.lock"), "# nobody says\n").unwrap();
@@ -12460,7 +11952,7 @@ max_duration = "{max_duration}"
     /// the opposite of what happened.
     #[test]
     fn a_review_with_no_diff_to_read_says_why_rather_than_showing_none() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_attempt_worktree(a, "/wt/gone-long-ago").unwrap();
@@ -12524,7 +12016,7 @@ max_duration = "{max_duration}"
             }
         }
 
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let attempt = e.db.get_attempt(a).unwrap().unwrap();
@@ -12584,7 +12076,7 @@ max_duration = "{max_duration}"
             }
         }
 
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let attempt = e.db.get_attempt(a).unwrap().unwrap();
@@ -12660,7 +12152,7 @@ max_duration = "{max_duration}"
     /// reports only that (§gh#183) and would drown out every claim finding
     /// these tests are here for.
     fn settled_with(rt: &dyn Runtime) -> (TestEngine, i64, tempfile::TempDir) {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         let (repo, _work) = agent_worked_in(&e, a, Work::Pushed);
@@ -12739,7 +12231,7 @@ max_duration = "{max_duration}"
     /// already submitted keeps what it submitted.
     #[test]
     fn a_harvest_never_overwrites_what_the_agent_submitted() {
-        let e = engine(None);
+        let e = engine();
         seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
         let a = dispatch(&e, "linear:LIN-142", "chat-9");
         e.db.set_pr(
@@ -12881,7 +12373,7 @@ max_duration = "{max_duration}"
     #[test]
     fn a_rebased_branch_is_re_footed_and_stops_counting_the_layer_below() {
         let s = Stacked::cut();
-        let e = engine(None);
+        let e = engine();
         let a = stacked_child(&e, &s);
         let attempt = |e: &SyncEngine| e.db.get_attempt(a).unwrap().unwrap();
 
@@ -13012,7 +12504,7 @@ max_duration = "{max_duration}"
     #[test]
     fn an_agent_whose_branch_was_rewritten_on_origin_is_told_once() {
         let s = Stacked::cut();
-        let e = engine(None);
+        let e = engine();
         // The parent, and the child cut from it.
         seed(&e, "gh:o/r#11", "gh#11", UpstreamState::Terminal);
         let parent = dispatch(&e, "gh:o/r#11", "chat-11");
@@ -13074,7 +12566,7 @@ max_duration = "{max_duration}"
     /// an unstacked attempt is never looked at in the first place.
     #[test]
     fn nothing_is_consumed_without_a_runtime_to_tell() {
-        let e = engine(None);
+        let e = engine();
         e.note_rewritten_branches(None);
         assert!(e.db.meta_get(&meta::rewritten_noted(1)).unwrap().is_none());
     }
@@ -13129,7 +12621,7 @@ max_duration = "{max_duration}"
             "POST /repos/o/r/stacks".into(),
             json!({ "id": 334176, "number": 49, "base": { "ref": "main" } }),
         )]));
-        let e = engine_with(None, Some(Github::new(Box::new(SharedRest(rest.clone())))));
+        let e = engine_with(Some(Github::new(Box::new(SharedRest(rest.clone())))));
         (e, rest)
     }
 
@@ -13201,7 +12693,7 @@ max_duration = "{max_duration}"
         // and `create_stack` finds no number in it — a refusal, as far as the
         // sweep is concerned.
         let rest = std::rc::Rc::new(FixtureRest::new(vec![]));
-        let e = engine_with(None, Some(Github::new(Box::new(SharedRest(rest.clone())))));
+        let e = engine_with(Some(Github::new(Box::new(SharedRest(rest.clone())))));
         let bottom = seed_onto(&e, 44, 47, "main", None);
         seed_onto(&e, 45, 48, "board/gh-44-x", Some(bottom));
 
@@ -13231,7 +12723,7 @@ max_duration = "{max_duration}"
         e.link_dispatched_stacks();
         assert!(rest.wrote.borrow().is_empty());
 
-        let e = engine(None);
+        let e = engine();
         e.link_dispatched_stacks();
     }
 }

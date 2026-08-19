@@ -17,7 +17,7 @@ Nothing below is runtime-specific.
 <!-- BEGIN comet-board conventions -->
 ## The comet-board task board
 
-One global queue across every space: Linear issues and GitHub issues in, comet
+One global queue across every space: GitHub issues in, comet
 chats running coding agents out. The engine puts `comet-board` on the PATH of
 every agent it runs — the copy it shipped with — and `gh` is authenticated once
 per user; neither is specific to the agent you are. If `comet-board` is
@@ -55,8 +55,8 @@ an orchestrator does not have to poll or, worse, go quiet until a human prods
 it:
 
 ```bash
-comet-board dispatch --task linear:AGE-14
-comet-board dispatch --task linear:AGE-15
+comet-board dispatch --task gh:owner/repo#14
+comet-board dispatch --task gh:owner/repo#15
 comet-board wait --timeout 3600 --json    # returns when the first one settles
 ```
 
@@ -73,7 +73,7 @@ task goes `blocked` — that is how you get called back to answer it, instead of
 discovering the question when your own timeout expires:
 
 ```bash
-comet-board wait --task linear:AGE-14 --blocked-is-settled --timeout 3600
+comet-board wait --task gh:owner/repo#14 --blocked-is-settled --timeout 3600
 ```
 
 It adds to the settled states rather than replacing them, so the same call still

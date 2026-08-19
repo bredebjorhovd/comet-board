@@ -257,8 +257,6 @@ mod tests {
             labels: Vec::new(),
             state: BoardState::Ready,
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Started,
             local_done: false,
             pr_url: None,

@@ -210,8 +210,6 @@ mod tests {
             url: format!("https://github.com/{id}"),
             labels: vec![],
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Unstarted,
             updated_at: crate::db::now(),
         })

@@ -174,7 +174,6 @@ pub fn worktrees_root() -> PathBuf {
 /// keys on their next reload.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Credentials {
-    pub(crate) linear_api_key: Option<String>,
     pub(crate) github_token: Option<String>,
     /// The GitHub App's numeric id, and the PEM of its private key on disk
     /// (gh#58). Both or neither: one alone is a half-configured App, which
@@ -263,7 +262,6 @@ impl Credentials {
         I: IntoIterator<Item = (String, String)>,
     {
         Credentials {
-            linear_api_key: credential(paths, "LINEAR_API_KEY", &inherited),
             github_token: credential(paths, "GITHUB_TOKEN", &inherited),
             github_app_id: credential(paths, "GITHUB_APP_ID", &inherited),
             github_app_key_path: credential(paths, "GITHUB_APP_PRIVATE_KEY_PATH", &inherited),
@@ -378,10 +376,6 @@ where
     out
 }
 
-pub fn linear_api_key(paths: &Paths) -> Option<String> {
-    Credentials::load(paths).linear_api_key
-}
-
 pub fn github_token(paths: &Paths) -> Option<String> {
     Credentials::load(paths).github_token
 }
@@ -410,8 +404,6 @@ pub struct RoutingConfig {
     pub defaults: Defaults,
     #[serde(default)]
     pub github: GithubConfig,
-    #[serde(default)]
-    pub linear: LinearConfig,
     #[serde(default)]
     pub adopt: AdoptConfig,
     /// Who the people driving this board are, on GitHub (gh#107).
@@ -514,9 +506,6 @@ pub struct SyncConfig {
     /// Poll interval, e.g. `"30s"`.
     #[serde(default = "default_interval")]
     pub interval: String,
-    /// Linear labels that mean "dispatchable".
-    #[serde(default)]
-    pub labels: Vec<String>,
 }
 
 fn default_interval() -> String {
@@ -527,14 +516,13 @@ impl Default for SyncConfig {
     fn default() -> Self {
         SyncConfig {
             interval: default_interval(),
-            labels: Vec::new(),
         }
     }
 }
 
 impl SyncConfig {
     /// Parse `30s` / `5m` / `90` (bare = seconds). Clamped to a sane floor so a
-    /// typo cannot hammer Linear.
+    /// typo cannot hammer the source.
     pub fn interval_secs(&self) -> u64 {
         parse_duration_secs(&self.interval).unwrap_or(30).max(5)
     }
@@ -798,11 +786,9 @@ pub struct Defaults {
     /// — see [`Defaults::orchestrator`].
     #[serde(default)]
     pub orchestrator_chat: Option<String>,
-    /// Which tracker `comet-board new` writes to: `linear` or `github`.
-    ///
-    /// Not inferable from a label — a label routes work to a repo and says
-    /// nothing about where that project's tickets live. Set the habit here and
-    /// override per ticket with `--source`.
+    /// Which tracker `comet-board new` writes to. `github` is the only
+    /// supported value (gh#471); the key survives so configs that set it
+    /// explicitly keep parsing.
     #[serde(default = "default_new_source")]
     pub new_source: String,
     /// How long a single attempt may stay live before the board warns its chat
@@ -1086,7 +1072,7 @@ fn default_retain_build_output() -> String {
 }
 
 fn default_new_source() -> String {
-    "linear".into()
+    "github".into()
 }
 
 fn default_max_concurrent() -> usize {
@@ -1168,8 +1154,8 @@ pub struct GithubConfig {
     /// about the ones nobody dispatched, which are still work waiting on you.
     #[serde(default = "default_true")]
     pub pull_requests: bool,
-    /// Leave the same trail on GitHub that Linear gets: a comment on dispatch
-    /// and on outcome, and close the issue when the task is done.
+    /// Leave a trail on GitHub: a comment on dispatch and on outcome, and
+    /// close the issue when the task is done.
     ///
     /// **Off by default.** Writing to someone's issues is not a thing to start
     /// doing because they pointed the board at a repo — the first dispatch
@@ -1299,27 +1285,6 @@ impl GithubConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct LinearConfig {
-    /// Name of the workflow state a task moves to when the board derives
-    /// `review` — typically `"In Review"`.
-    ///
-    /// Unset by default, and unset means no transition at all: the ticket stays
-    /// wherever dispatch left it, which is what the board did before this
-    /// existed.
-    ///
-    /// A *name*, unavoidably. Every other Linear state the board touches is
-    /// resolved by type, because teams rename these freely — but Linear has no
-    /// review type. `In Review` and `In Progress` are both `type: started`, so
-    /// the API cannot be asked which one means review, and the lowest-position
-    /// `started` state (what dispatch uses) is `In Progress` precisely because
-    /// review comes after it. Guessing the name would break a renamed or
-    /// non-English workflow silently; naming it here is the only mapping that
-    /// is explicit. `doctor` checks it resolves.
-    #[serde(default)]
-    pub review_state: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Route {
     /// Name shown in the picker and the prompt view. Defaults to the workspace.
@@ -1427,7 +1392,13 @@ impl Route {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct RouteMatch {
+    /// Legacy matchers from the Linear era (gh#471). Still parsed so an old
+    /// routing.toml keeps loading, but no task carries a team or project any
+    /// more, so a route that specifies either matches **nothing** — it goes
+    /// inert rather than becoming a catch-all or a parse error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_team: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub linear_project: Option<String>,
     pub gh_repo: Option<String>,
     pub label: Option<String>,
@@ -1436,7 +1407,9 @@ pub struct RouteMatch {
 impl RouteMatch {
     /// A route with no `match` matches everything, so it must come last —
     /// [`RoutingConfig::validate`] refuses a config where one does not, and the
-    /// adoption writer inserts ahead of it rather than after.
+    /// adoption writer inserts ahead of it rather than after. A legacy
+    /// `linear_team`/`linear_project` matcher counts as a matcher here — it
+    /// matches nothing, which is the opposite of matching everything.
     pub fn is_empty(&self) -> bool {
         self.linear_team.is_none()
             && self.linear_project.is_none()
@@ -1467,8 +1440,7 @@ pub struct Automation {
     /// not have one yet.
     #[serde(default)]
     pub owner: Option<String>,
-    /// Match only tasks from this source (`github` / `linear`). Unset matches
-    /// both.
+    /// Match only tasks from this source (`github`). Unset matches any.
     #[serde(default)]
     pub source: Option<String>,
     /// Labels a task must carry — all of them. At least one is required to
@@ -1567,8 +1539,6 @@ pub fn expand_tilde(p: &str) -> PathBuf {
 /// The facts about a task a route can match on.
 #[derive(Debug, Clone, Default)]
 pub struct RouteContext {
-    pub linear_team: Option<String>,
-    pub linear_project: Option<String>,
     pub gh_repo: Option<String>,
     pub labels: Vec<String>,
 }
@@ -1819,8 +1789,7 @@ impl RoutingConfig {
             {
                 out.push(format!(
                     "automation `{name}` matches source `{source}`, which is not \
-                     a board source. Write `github` or `linear`, or drop the key \
-                     to match both."
+                     a board source. Write `github`, or drop the key."
                 ));
             }
             if let Some(runtime) = &a.runtime
@@ -1901,22 +1870,6 @@ impl RoutingConfig {
     pub fn github_login_for(&self, user: &str) -> Option<String> {
         let author = self.git_author_for(user)?;
         crate::git_identity::noreply_login(&author.email).map(str::to_string)
-    }
-
-    /// The Linear teams this config actually dispatches for, deduplicated.
-    ///
-    /// Empty is the answer that matters: a config no route of which names a
-    /// team is a board that wants nothing from Linear, and `doctor` reads that
-    /// as "GitHub only" rather than as a missing credential (gh#96).
-    pub fn linear_teams(&self) -> Vec<&str> {
-        let mut teams: Vec<&str> = self
-            .routes
-            .iter()
-            .filter_map(|r| r.match_.linear_team.as_deref())
-            .collect();
-        teams.sort_unstable();
-        teams.dedup();
-        teams
     }
 
     /// First matching route wins (impl spec §5).
@@ -2144,14 +2097,9 @@ fn mcp_server_problems(scope: &str, servers: &[comet_proto::McpServer], out: &mu
 
 /// All *specified* keys must match (AND). Unspecified keys are ignored.
 fn route_matches(m: &RouteMatch, ctx: &RouteContext) -> bool {
-    if let Some(team) = &m.linear_team
-        && ctx.linear_team.as_deref() != Some(team.as_str())
-    {
-        return false;
-    }
-    if let Some(project) = &m.linear_project
-        && ctx.linear_project.as_deref() != Some(project.as_str())
-    {
+    // Legacy Linear matchers (gh#471): no task carries a team or project any
+    // more, so a route still keyed on one matches nothing at all.
+    if m.linear_team.is_some() || m.linear_project.is_some() {
         return false;
     }
     if let Some(repo) = &m.gh_repo
@@ -2230,10 +2178,9 @@ mod tests {
     const SAMPLE: &str = r#"
 [sync]
 interval = "30s"
-labels = ["herd"]
 
 [[route]]
-match = { linear_team = "OFF" }
+match = { gh_repo = "florin-as/offhand" }
 workspace = "offhand"
 repo = "~/code/offhand"
 runtime = "claude-code"
@@ -2264,30 +2211,27 @@ branch_template = "board/{identifier_lower}"
         let c = cfg();
         assert_eq!(c.routes.len(), 2);
         assert_eq!(c.sync.interval_secs(), 30);
-        assert_eq!(c.sync.labels, vec!["herd"]);
         assert_eq!(c.defaults.max_concurrent_per_workspace, 3);
     }
 
     #[test]
     fn first_matching_route_wins() {
         let c = cfg();
-        // Matches both the team route and the label route; the team route is
+        // Matches both the repo route and the label route; the repo route is
         // declared first.
         let ctx = RouteContext {
-            linear_team: Some("OFF".into()),
+            gh_repo: Some("florin-as/offhand".into()),
             labels: vec!["fintech".into()],
-            ..Default::default()
         };
         assert_eq!(c.resolve(&ctx).unwrap().workspace, "offhand");
     }
 
     #[test]
-    fn label_route_matches_when_team_does_not() {
+    fn label_route_matches_when_repo_does_not() {
         let c = cfg();
         let ctx = RouteContext {
-            linear_team: Some("TAL".into()),
+            gh_repo: Some("florin-as/tally".into()),
             labels: vec!["fintech".into()],
-            ..Default::default()
         };
         assert_eq!(c.resolve(&ctx).unwrap().workspace, "fintech");
     }
@@ -2296,9 +2240,8 @@ branch_template = "board/{identifier_lower}"
     fn unmatched_task_has_no_route() {
         let c = cfg();
         let ctx = RouteContext {
-            linear_team: Some("TAL".into()),
+            gh_repo: Some("florin-as/tally".into()),
             labels: vec!["chore".into()],
-            ..Default::default()
         };
         assert!(c.resolve(&ctx).is_none());
     }
@@ -2308,22 +2251,21 @@ branch_template = "board/{identifier_lower}"
         let c: RoutingConfig = toml::from_str(
             r#"
 [[route]]
-match = { linear_team = "OFF", label = "herd" }
+match = { gh_repo = "o/r", label = "herd" }
 workspace = "w"
 repo = "/tmp"
 runtime = "claude"
 "#,
         )
         .unwrap();
-        let team_only = RouteContext {
-            linear_team: Some("OFF".into()),
+        let repo_only = RouteContext {
+            gh_repo: Some("o/r".into()),
             ..Default::default()
         };
-        assert!(c.resolve(&team_only).is_none());
+        assert!(c.resolve(&repo_only).is_none());
         let both = RouteContext {
-            linear_team: Some("OFF".into()),
+            gh_repo: Some("o/r".into()),
             labels: vec!["herd".into()],
-            ..Default::default()
         };
         assert!(c.resolve(&both).is_some());
     }
@@ -2423,9 +2365,6 @@ runtime = "claude"
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("routing.example.toml");
         let c = RoutingConfig::load(&path).unwrap();
         assert_eq!(c.routes.len(), 3);
-        // `review_state` ships commented out: the example must not turn on a
-        // transition against a state the reader's workspace may not have.
-        assert!(c.linear.review_state.is_none());
         // Every runtime the example names has to be one comet will accept —
         // including the non-claude one, which is there precisely because it was
         // supported-but-never-exercised for the board's first two dozen
@@ -2443,19 +2382,44 @@ runtime = "claude"
         );
     }
 
+    /// gh#471: Linear-era keys still on disk — the `[linear]` table, a route's
+    /// `linear_team` matcher, `[sync] labels` — must not stop an existing
+    /// board from loading its config. The tables parse as unknown keys; a
+    /// route still matching on a team stays a valid route that matches
+    /// nothing, never a catch-all and never a validation failure.
     #[test]
-    fn the_review_state_is_unset_unless_named() {
-        // Unset means no transition at all, which is what a workflow with no
-        // review state needs — so it cannot have a default.
-        assert!(cfg().linear.review_state.is_none());
-        let c: RoutingConfig = toml::from_str(
-            r#"
+    fn leftover_linear_keys_load_and_route_nothing() {
+        let text = r#"
+[sync]
+labels = ["herd"]
+
 [linear]
 review_state = "In Review"
-"#,
-        )
-        .unwrap();
-        assert_eq!(c.linear.review_state.as_deref(), Some("In Review"));
+
+[[route]]
+match = { linear_team = "OFF" }
+workspace = "w"
+repo = "/tmp"
+runtime = "claude"
+
+[[route]]
+match = { gh_repo = "o/r" }
+workspace = "w2"
+repo = "/tmp"
+runtime = "claude"
+"#;
+        let c: RoutingConfig = toml::from_str(text).unwrap();
+        c.validate()
+            .expect("a legacy linear route is not a route with no match");
+        let ctx = RouteContext {
+            gh_repo: Some("o/r".into()),
+            labels: vec!["herd".into()],
+        };
+        assert_eq!(
+            c.resolve(&ctx).unwrap().workspace,
+            "w2",
+            "the legacy route matches nothing; the GitHub route still wins"
+        );
     }
 
     // ---- per-repo github settings --------------------------------------
@@ -3247,7 +3211,6 @@ runtime = "claude"
     fn interval_has_a_floor() {
         let s = SyncConfig {
             interval: "0s".into(),
-            labels: vec![],
         };
         assert_eq!(s.interval_secs(), 5);
     }
@@ -3271,23 +3234,23 @@ runtime = "claude"
             config_dir: dir.clone(),
             state_dir: dir.clone(),
         };
-        std::fs::write(paths.env_file(), "LINEAR_API_KEY=first\n").unwrap();
+        std::fs::write(paths.env_file(), "GITHUB_TOKEN=first\n").unwrap();
         let first = Credentials::load_with(&paths, no_inherited);
-        assert_eq!(first.linear_api_key.as_deref(), Some("first"));
-        assert_eq!(first.github_token, None);
+        assert_eq!(first.github_token.as_deref(), Some("first"));
+        assert_eq!(first.github_app_id, None);
 
         std::fs::write(
             paths.env_file(),
-            "LINEAR_API_KEY=second\nGITHUB_TOKEN=github\n",
+            "GITHUB_TOKEN=second\nGITHUB_APP_ID=42\n",
         )
         .unwrap();
         let edited = Credentials::load_with(&paths, no_inherited);
-        assert_eq!(edited.linear_api_key.as_deref(), Some("second"));
-        assert_eq!(edited.github_token.as_deref(), Some("github"));
+        assert_eq!(edited.github_token.as_deref(), Some("second"));
+        assert_eq!(edited.github_app_id.as_deref(), Some("42"));
 
-        std::fs::write(paths.env_file(), "GITHUB_TOKEN=github\n").unwrap();
+        std::fs::write(paths.env_file(), "GITHUB_TOKEN=second\n").unwrap();
         let removed = Credentials::load_with(&paths, no_inherited);
-        assert_eq!(removed.linear_api_key, None);
+        assert_eq!(removed.github_app_id, None);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3309,16 +3272,16 @@ runtime = "claude"
         };
         std::fs::write(
             paths.env_file(),
-            "LINEAR_API_KEY=file-linear\nGITHUB_TOKEN=file-github\n",
+            "GITHUB_APP_ID=file-app\nGITHUB_TOKEN=file-github\n",
         )
         .unwrap();
 
         let credentials = Credentials::load_with(&paths, |key| match key {
-            "LINEAR_API_KEY" => Ok("shell-linear".to_string()),
+            "GITHUB_APP_ID" => Ok("shell-app".to_string()),
             "GITHUB_TOKEN" => Ok(String::new()),
             _ => Err(std::env::VarError::NotPresent),
         });
-        assert_eq!(credentials.linear_api_key.as_deref(), Some("shell-linear"));
+        assert_eq!(credentials.github_app_id.as_deref(), Some("shell-app"));
         assert_eq!(credentials.github_token, None);
 
         let _ = std::fs::remove_dir_all(dir);
@@ -3345,25 +3308,23 @@ runtime = "claude"
     }
 
     /// A skipped stage and a board nobody ever configured have to look
-    /// identical (gh#96). The box wizard writes `LINEAR_API_KEY=` when the
+    /// identical (gh#96). The box wizard writes `GITHUB_TOKEN=` when the
     /// stage is skipped with Enter, and an empty string that reads as
     /// "configured" turns a deliberate skip into a credential the board tries
     /// to authenticate with — and, for the App pair, into a "half configured"
     /// failure over two keys nobody set.
     #[test]
     fn an_empty_value_reads_as_never_configured() {
-        let c =
-            creds("LINEAR_API_KEY=\nGITHUB_TOKEN=\nGITHUB_APP_ID=\nGITHUB_APP_PRIVATE_KEY_PATH=\n");
-        assert_eq!(c.linear_api_key, None);
+        let c = creds("GITHUB_TOKEN=\nGITHUB_APP_ID=\nGITHUB_APP_PRIVATE_KEY_PATH=\n");
         assert_eq!(c.github_auth(), GithubAuth::None);
         assert_eq!(c.github_app_half_configured(), None);
 
         // `KEY=""` is the same skip, written by a wizard that quotes.
-        assert_eq!(creds("LINEAR_API_KEY=\"\"\n").linear_api_key, None);
+        assert_eq!(creds("GITHUB_TOKEN=\"\"\n").github_token, None);
 
         // And one real key beside a skipped one is still one real key.
-        let c = creds("LINEAR_API_KEY=\nGITHUB_TOKEN=ghp_real\n");
-        assert_eq!(c.linear_api_key, None);
+        let c = creds("GITHUB_APP_ID=\nGITHUB_TOKEN=ghp_real\n");
+        assert_eq!(c.github_app_id, None);
         assert_eq!(c.github_auth(), GithubAuth::Token("ghp_real".into()));
     }
 

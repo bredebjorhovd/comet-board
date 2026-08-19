@@ -85,8 +85,6 @@ fn main() -> Result<()> {
         url: "https://github.com/bredebjorhovd/comet-board/issues/138".into(),
         labels: vec!["board".into()],
         source_state: Some("open".into()),
-        linear_team: None,
-        linear_project: None,
         upstream: UpstreamState::Started,
         updated_at: comet_board::db::now(),
     })?;
@@ -225,8 +223,6 @@ fn seed_stack(db: &Db) -> Result<()> {
             url: format!("https://github.com/bredebjorhovd/comet-board/issues/{source_id}"),
             labels: vec!["board".into()],
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Started,
             updated_at: comet_board::db::now(),
         })?;

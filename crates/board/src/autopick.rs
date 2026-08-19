@@ -507,8 +507,6 @@ mod tests {
             url: format!("https://github.com/{id}"),
             labels: labels.iter().map(|l| l.to_string()).collect(),
             source_state: Some("open".into()),
-            linear_team: None,
-            linear_project: None,
             upstream: crate::model::UpstreamState::Unstarted,
             updated_at: crate::db::now(),
         })
@@ -808,7 +806,6 @@ mod tests {
                 state_dir: dir.path().to_path_buf(),
             },
             log: std::sync::Arc::new(crate::log::Logger::new("", false)),
-            linear: None,
             github: None,
             push_capabilities: None,
             as_user: std::rc::Rc::new(crate::sources::github::FixtureAsUser::default()),

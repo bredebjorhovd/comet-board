@@ -364,9 +364,10 @@ pub fn routing_gap(cfg: &RoutingConfig, slug: &str) -> Option<Missing> {
 /// - **The space `onboard` makes is named after the checkout's folder.** A
 ///   route asking for any other name would still not match the space it just
 ///   created, so when the two disagree the repair is a rename, not a re-run.
-/// - **`onboard` needs a repo to name.** A route matching a Linear team carries
-///   none, so the checkout's own `origin` is asked before giving up — and a
-///   checkout with no GitHub remote leaves nothing for `onboard` to resolve.
+/// - **`onboard` needs a repo to name.** A route with no `gh_repo` match (a
+///   label match, a catch-all) carries none, so the checkout's own `origin` is
+///   asked before giving up — and a checkout with no GitHub remote leaves
+///   nothing for `onboard` to resolve.
 ///
 /// `checkout` is whether the route's `repo =` is a git checkout, and `remote_of`
 /// resolves that path to its `origin` — injected for the reason
@@ -771,7 +772,6 @@ mod tests {
         done.adopted = Some(Adopted {
             wrote_route: true,
             wrote_repo: true,
-            suggested_label: "r".into(),
             labels: Some(vec!["ready".into()]),
         });
         let s = done.summary();
@@ -841,9 +841,9 @@ mod tests {
         assert!(fix.contains("clones it and makes the space"), "{fix}");
     }
 
-    /// The route names no repo — a Linear team's does not — so the checkout is
-    /// asked instead, and a checkout that cannot answer means `onboard` is not
-    /// the repair at all.
+    /// The route names no repo — a label-matched one does not — so the checkout
+    /// is asked instead, and a checkout that cannot answer means `onboard` is
+    /// not the repair at all.
     #[test]
     fn a_route_that_names_no_repo_asks_the_checkout_and_then_gives_up() {
         let root = Path::new("/box/.comet-native/repos");

@@ -1,6 +1,5 @@
-//! Upstream sources. Linear is read-write and the system of record; GitHub is
-//! read-only in v0.
+//! Upstream sources. GitHub is the system of record; issues are read-only in
+//! v0 and writeback is opt-in per repo.
 
 pub mod github;
 pub mod github_app;
-pub mod linear;

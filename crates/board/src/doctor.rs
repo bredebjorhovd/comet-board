@@ -8,7 +8,7 @@
 //! herdr needed against a mux it distrusted (manifest overrides, daemon
 //! pidfiles) have no equivalent and are gone.
 
-use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig, linear_api_key};
+use crate::config::{Credentials, GithubAuth, Paths, RoutingConfig};
 use crate::conventions;
 use crate::db::Db;
 use crate::gc;
@@ -17,7 +17,6 @@ use crate::git_identity;
 use crate::runtime::harness_for_runtime;
 use crate::skill;
 use crate::sources::github::{CapabilityEvidence, PushCapabilities, WriteCapability};
-use crate::sources::linear::{HttpTransport, Linear};
 use anyhow::Result;
 use comet_proto::view::board::RuntimeOption;
 use comet_proto::{AgentAccount, EdgeHealth, HarnessId, Space};
@@ -47,7 +46,7 @@ pub struct EngineStatus {
     /// "not checked" rather than inventing a verdict about the edge.
     ///
     /// Read from the engine rather than fetched here on purpose: doctor's own
-    /// network calls are to GitHub and Linear, about this box's config, and a
+    /// network calls are to GitHub, about this box's config, and a
     /// second opinion about the release feed would be a second thing that can
     /// disagree with the updater that actually performs updates.
     pub update: Option<comet_update::UpdateStatus>,
@@ -86,8 +85,6 @@ pub struct PeerBoard {
     pub device: String,
     /// The `owner/repo` slugs under its `[github] repos`.
     pub repos: Vec<String>,
-    /// The Linear team keys its routes match on.
-    pub linear_teams: Vec<String>,
     /// Why its config could not be read as a config, when it could not be —
     /// the peer answered, but with a `routing.toml` that does not parse, so
     /// what it polls is unknown rather than empty.
@@ -156,32 +153,7 @@ pub fn doctor(
     // problem, not the reassurance.
     checks.push(runs_check(db_ok.as_ref().ok(), chrono::Utc::now()));
 
-    // Read once and used three times below — the credential's own check, the
-    // review-state check, and the decision whether to mention Linear at all.
-    let linear_key = linear_api_key(paths);
-    // Parsed here rather than only at the `match` below, because whether this
-    // board wants anything from Linear is a question about its routes.
     let routing = RoutingConfig::load_unvalidated(&paths.routing());
-    let linear_teams: Vec<String> = routing
-        .as_ref()
-        .map(|cfg| {
-            cfg.linear_teams()
-                .iter()
-                .map(|t| (*t).to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    checks.push(linear_key_check(
-        paths,
-        linear_key.clone(),
-        &linear_teams,
-        |key| {
-            HttpTransport::new(key)
-                .map(Linear::new)
-                .and_then(|l| l.viewer())
-        },
-    ));
 
     // The engine hosts the board loop (there is no separate daemon), so
     // "reachable" answers both "can I list spaces" and "is anything polling".
@@ -355,19 +327,6 @@ pub fn doctor(
                 &Credentials::load(paths),
                 opener(paths, rest.as_ref().ok()),
             ));
-
-            // The one Linear state the board resolves by name, so the one that
-            // can be wrong. A missing state drops the writeback rather than
-            // retrying it forever, and this is where that becomes visible.
-            //
-            // Only when Linear is in the picture at all, on the same rule the
-            // `account` check follows: a GitHub-only board must not be handed a
-            // line about a Linear setting it has no use for, because the line
-            // reads as something left unconfigured (gh#96).
-            if linear_key.is_some() || !linear_teams.is_empty() || cfg.linear.review_state.is_some()
-            {
-                checks.push(review_state_check(linear_key.clone(), &linear_teams, &cfg));
-            }
 
             for repo in repos {
                 // The same client for every repo, deliberately: under an App
@@ -1189,8 +1148,8 @@ fn harnesses_check(runtimes: Option<&[RuntimeOption]>) -> Check {
 /// polling, and what. A second board is *reported and not failed* — two boards
 /// over disjoint repos is a legitimate setup, and the design's "one host device"
 /// is about where the store lives, not about how many may exist. What fails is
-/// an actual collision: a repo or a Linear team on both lists, which is the race
-/// itself rather than the shape that permits it.
+/// an actual collision: a repo on both lists, which is the race itself rather
+/// than the shape that permits it.
 ///
 /// `local` is `None` when this board's own `routing.toml` does not parse — the
 /// peers are still named, since who else is out there is worth knowing even
@@ -1272,7 +1231,7 @@ fn board_hosts_check(local: Option<&RoutingConfig>, peers: Option<&Peers>) -> Ch
             "{} — polled by this board and by the other. Both see the same issue as \
              ready, either can dispatch it, and neither records the other's attempt: \
              two agents, two worktrees, two branches on one ticket. Take it off one of \
-             the two boards (`[github] repos`, or the route's `linear_team`){unreachable}",
+             the two boards' `[github] repos`{unreachable}",
             clashes.join(" · ")
         ),
     }
@@ -1298,17 +1257,11 @@ pub fn peer_board(device: String, reply: &serde_json::Value) -> PeerBoard {
         Some(cfg) => PeerBoard {
             device,
             repos: cfg.github.repos.clone(),
-            linear_teams: cfg
-                .linear_teams()
-                .iter()
-                .map(|t| (*t).to_string())
-                .collect(),
             unparsed: false,
         },
         None => PeerBoard {
             device,
             repos: Vec::new(),
-            linear_teams: Vec::new(),
             unparsed: true,
         },
     }
@@ -1370,43 +1323,26 @@ fn polls(board: &PeerBoard) -> String {
     if board.unparsed {
         return "its routing.toml does not parse — what it polls is unknown".into();
     }
-    let mut parts = Vec::new();
-    if !board.repos.is_empty() {
-        parts.push(board.repos.join(", "));
-    }
-    if !board.linear_teams.is_empty() {
-        parts.push(format!("linear {}", board.linear_teams.join(", ")));
-    }
-    if parts.is_empty() {
+    if board.repos.is_empty() {
         return "polls nothing".into();
     }
-    parts.join(" · ")
+    board.repos.join(", ")
 }
 
-/// Every source both this board and a peer poll, as sentences naming the peer.
+/// Every repo both this board and a peer poll, as sentences naming the peer.
 ///
-/// Case-insensitively, and for both sources. GitHub treats `Tally` and `tally`
-/// as one repo and so does its API, so a comparison that did not would miss the
-/// collision on exactly the day somebody retyped a slug from memory — and the
-/// point of this check is to catch the one nobody noticed.
+/// Case-insensitively: GitHub treats `Tally` and `tally` as one repo and so
+/// does its API, so a comparison that did not would miss the collision on
+/// exactly the day somebody retyped a slug from memory — and the point of this
+/// check is to catch the one nobody noticed.
 fn overlaps(local: &RoutingConfig, boards: &[PeerBoard]) -> Vec<String> {
     let fold = |s: &String| s.trim().to_ascii_lowercase();
     let repos: Vec<String> = local.github.repos.iter().map(fold).collect();
-    let teams: Vec<String> = local
-        .linear_teams()
-        .iter()
-        .map(|t| t.trim().to_ascii_lowercase())
-        .collect();
     let mut out = Vec::new();
     for board in boards {
         for repo in &board.repos {
             if repos.contains(&fold(repo)) {
                 out.push(format!("{repo} is on {} too", board.device));
-            }
-        }
-        for team in &board.linear_teams {
-            if teams.contains(&fold(team)) {
-                out.push(format!("linear team {team} is on {} too", board.device));
             }
         }
     }
@@ -2614,14 +2550,13 @@ fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Ch
 
 /// What happens upstream when an agent stops and cannot go on (gh#71).
 ///
-/// Unconditional for Linear and gated per repo for GitHub, which is the same
-/// rule every other comment follows — and the reason this is worth a line: a
-/// read-only repo gets no comment, so on those repos the board row really is
-/// the only signal, and an operator should learn that here rather than by
-/// waiting for a comment that is never coming.
+/// Gated per repo, which is the same rule every other comment follows — and
+/// the reason this is worth a line: a read-only repo gets no comment, so on
+/// those repos the board row really is the only signal, and an operator should
+/// learn that here rather than by waiting for a comment that is never coming.
 fn blocked_notice_detail(github: &crate::config::GithubConfig) -> String {
     let mut s = "on — an agent that stops to ask, or whose run dies, leaves one comment \
-                 on its issue per block (Linear always; GitHub where writeback is on)"
+                 on its issue per block (where writeback is on)"
         .to_string();
     let reads = github.read_only_repos();
     if !reads.is_empty() {
@@ -2996,143 +2931,6 @@ fn writeback_detail(github: &crate::config::GithubConfig) -> String {
     }
 }
 
-/// Is there a working Linear credential, and does this board want one (gh#96)?
-///
-/// Three states, and only one of them is a fault. A board with no key and no
-/// route matching on a Linear team is a *GitHub-only board* — a supported
-/// configuration, not a half-finished one, and saying `FAIL … missing` at it
-/// (which is what this check did, inherited from a board where Linear always
-/// existed) sends people looking for a break that is not there. That state
-/// reads like the operator-notice line: `ok`, and worded so nobody mistakes it
-/// for broken.
-///
-/// The two that do fail are the ones with real consequences. A key present but
-/// rejected means every Linear poll is failing in the log; a key absent while a
-/// route matches on `linear_team` means those tickets silently never arrive,
-/// and the route can never fire.
-///
-/// `viewer` is injected so the check is testable without the network — it
-/// answers who a key authenticates as, or why the API would not say.
-fn linear_key_check<P>(paths: &Paths, key: Option<String>, teams: &[String], viewer: P) -> Check
-where
-    P: FnOnce(String) -> Result<String>,
-{
-    let name = "LINEAR_API_KEY".to_string();
-    let Some(key) = key else {
-        return match teams {
-            [] => Check {
-                name,
-                ok: true,
-                detail: format!(
-                    "not configured — the board polls GitHub only (add it to {} to \
-                     poll Linear as well)",
-                    paths.env_file().display()
-                ),
-            },
-            // Not a preference any more: the config asked for Linear.
-            teams => Check {
-                name,
-                ok: false,
-                detail: format!(
-                    "not configured, but {} route(s) match on a Linear team ({}) — \
-                     those tickets never reach the board and the route can never fire. \
-                     Add the key to {}, or drop the `linear_team` match",
-                    teams.len(),
-                    teams.join(", "),
-                    paths.env_file().display()
-                ),
-            },
-        };
-    };
-    match viewer(key) {
-        Ok(who) => Check {
-            name,
-            ok: true,
-            detail: format!("accepted by Linear — polling as {who}"),
-        },
-        // An unreachable API is not a rejected key, and doctor must not report
-        // it as one: a laptop on a train would otherwise fail this check every
-        // time, which is the same false alarm gh#96 is about.
-        Err(e) if unreachable_api(&e) => Check {
-            name,
-            ok: true,
-            detail: format!("configured, not checked — Linear could not be reached ({e})"),
-        },
-        Err(e) => Check {
-            name,
-            ok: false,
-            detail: format!(
-                "rejected by Linear ({e:#}) — every poll fails with this. Replace it in {}, \
-                 or remove it to run the board on GitHub alone",
-                paths.env_file().display()
-            ),
-        },
-    }
-}
-
-/// Did the API decline to answer at all, rather than decline the key?
-///
-/// Transport failures arrive as a `reqwest::Error` straight off the wire; a
-/// rate limit is our own message from a 429. Everything else reached Linear and
-/// came back with something to say about the credential.
-fn unreachable_api(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<reqwest::Error>().is_some() || format!("{e:#}").contains("rate limited")
-}
-
-/// Does `[linear] review_state` name a state the configured teams actually have?
-///
-/// Unset is fine and is the default — it means the ticket stays where dispatch
-/// left it while a PR waits. Set and unresolvable is not fine, and is invisible
-/// otherwise: the writeback is dropped with a log line nobody reads.
-///
-/// Only reached when Linear is in the picture at all; a board with neither a
-/// key nor a Linear route gets no line here (gh#96). `teams` are the teams the
-/// board actually dispatches for — checking every team the key can see would
-/// report states for workspaces this config never touches.
-fn review_state_check(key: Option<String>, teams: &[String], cfg: &RoutingConfig) -> Check {
-    let Some(want) = cfg.linear.review_state.as_deref() else {
-        return Check {
-            name: "linear review state".into(),
-            ok: true,
-            detail: "unset — a finished attempt leaves Linear in its started state \
-                     (`[linear] review_state = \"In Review\"` to move it)"
-                .into(),
-        };
-    };
-
-    let linear = key
-        .and_then(|k| HttpTransport::new(k).ok())
-        .map(Linear::new);
-    let (Some(linear), false) = (linear, teams.is_empty()) else {
-        return Check {
-            name: "linear review state".into(),
-            ok: true,
-            detail: format!("`{want}` — not checked (no key, or no route names a Linear team)"),
-        };
-    };
-
-    let mut missing = Vec::new();
-    for team in teams {
-        match linear.state_id_named(team, want) {
-            Ok(Ok(_)) => {}
-            Ok(Err(have)) => missing.push(format!("{team} has: {}", have.join(", "))),
-            Err(e) => missing.push(format!("{team}: {e}")),
-        }
-    }
-    Check {
-        name: "linear review state".into(),
-        ok: missing.is_empty(),
-        detail: if missing.is_empty() {
-            format!(
-                "`{want}` resolves in {} team(s) — a finished attempt moves the issue there",
-                teams.len()
-            )
-        } else {
-            format!("no state named `{want}` — {}", missing.join("; "))
-        },
-    }
-}
-
 /// The kebab-case id a harness answers to (`ClaudeCode` → `claude-code`) —
 /// read back off its wire form so the report and the wire cannot drift.
 fn harness_name(h: comet_proto::HarnessId) -> String {
@@ -3165,14 +2963,6 @@ mod tests {
     use crate::sources::github_app::{TokenProvider, test_app};
 
     fn tmp() -> (tempfile::TempDir, Paths) {
-        // A `LINEAR_API_KEY` exported into the shell outranks the config
-        // directory, so on a box that has one every `doctor` below would find a
-        // credential these tests never wrote — and since gh#96 would go and ask
-        // the real Linear about it. The config directory each test builds is
-        // the only credential source any of them mean to have.
-        static UNSET: std::sync::Once = std::sync::Once::new();
-        UNSET.call_once(|| unsafe { std::env::remove_var("LINEAR_API_KEY") });
-
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths {
             config_dir: dir.path().to_path_buf(),
@@ -3465,8 +3255,8 @@ mod tests {
 
     // --- board hosts (gh#195) ------------------------------------------------
 
-    fn cfg_polling(repos: &[&str], team: Option<&str>) -> RoutingConfig {
-        let mut text = format!(
+    fn cfg_polling(repos: &[&str]) -> RoutingConfig {
+        let text = format!(
             "[github]\nrepos = [{}]\n",
             repos
                 .iter()
@@ -3474,12 +3264,6 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        if let Some(team) = team {
-            text.push_str(&format!(
-                "\n[[route]]\nmatch = {{ linear_team = \"{team}\" }}\nworkspace = \"w\"\n\
-                 repo = \"/nowhere\"\nruntime = \"claude-code\"\n"
-            ));
-        }
         toml::from_str(&text).expect("the fixture parses")
     }
 
@@ -3487,7 +3271,6 @@ mod tests {
         PeerBoard {
             device: device.into(),
             repos: repos.iter().map(|r| (*r).to_string()).collect(),
-            linear_teams: Vec::new(),
             unparsed: false,
         }
     }
@@ -3502,10 +3285,7 @@ mod tests {
             unreachable: Vec::new(),
             asked: 2,
         };
-        let c = board_hosts_check(
-            Some(&cfg_polling(&["bredebjorhovd/attn"], None)),
-            Some(&peers),
-        );
+        let c = board_hosts_check(Some(&cfg_polling(&["bredebjorhovd/attn"])), Some(&peers));
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("box"), "{}", c.detail);
         // Named, not counted: the operator's next move needs the slugs.
@@ -3522,35 +3302,12 @@ mod tests {
             unreachable: Vec::new(),
             asked: 1,
         };
-        let c = board_hosts_check(
-            Some(&cfg_polling(&["bredebjorhovd/attn"], None)),
-            Some(&peers),
-        );
+        let c = board_hosts_check(Some(&cfg_polling(&["bredebjorhovd/attn"])), Some(&peers));
         // Case-folded: GitHub reads the two spellings as one repo, and a check
         // that did not would miss the collision it exists for.
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("bredebjorhovd/ATTN"), "{}", c.detail);
         assert!(c.detail.contains("box"), "{}", c.detail);
-    }
-
-    /// The same race over the other source. A Linear team is polled by team
-    /// key, so two boards matching on `AGE` collide exactly as two `repos`
-    /// lists do.
-    #[test]
-    fn one_linear_team_on_two_boards_fails() {
-        let peers = Peers {
-            boards: vec![PeerBoard {
-                device: "box".into(),
-                repos: Vec::new(),
-                linear_teams: vec!["AGE".into()],
-                unparsed: false,
-            }],
-            unreachable: Vec::new(),
-            asked: 1,
-        };
-        let c = board_hosts_check(Some(&cfg_polling(&[], Some("AGE"))), Some(&peers));
-        assert!(!c.ok, "{}", c.detail);
-        assert!(c.detail.contains("AGE"), "{}", c.detail);
     }
 
     /// gh#155's lesson on this surface: a device that could not be asked is not
@@ -3564,7 +3321,7 @@ mod tests {
             unreachable: vec!["box".into()],
             asked: 2,
         };
-        let c = board_hosts_check(Some(&cfg_polling(&["o/r"], None)), Some(&peers));
+        let c = board_hosts_check(Some(&cfg_polling(&["o/r"])), Some(&peers));
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("could not ask box"), "{}", c.detail);
         assert!(c.detail.contains("invisible from here"), "{}", c.detail);
@@ -3574,13 +3331,14 @@ mod tests {
     /// no warning to give.
     #[test]
     fn the_only_device_on_the_account_says_so() {
-        let c = board_hosts_check(Some(&cfg_polling(&["o/r"], None)), Some(&Peers::default()));
+        let c = board_hosts_check(Some(&cfg_polling(&["o/r"])), Some(&Peers::default()));
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("only one registered"), "{}", c.detail);
     }
 
     /// What the box would answer: its `routing.toml`, parsed, with the repos it
-    /// polls and the Linear teams its routes match on.
+    /// polls. A legacy `linear_team` route in the peer's file (gh#471) still
+    /// parses and contributes nothing to the census.
     #[test]
     fn a_peers_reply_carries_what_that_board_polls() {
         let reply = serde_json::json!({
@@ -3605,7 +3363,6 @@ mod tests {
         let board = peer_board("box".into(), &reply);
         assert!(!board.unparsed);
         assert_eq!(board.repos, ["tally/Tally", "tally/oppgang"]);
-        assert_eq!(board.linear_teams, ["AGE"]);
     }
 
     /// A peer whose config did not parse answers without one. "Polls nothing"
@@ -3667,7 +3424,6 @@ mod tests {
         let boards = [PeerBoard {
             device: "box".into(),
             repos: Vec::new(),
-            linear_teams: Vec::new(),
             unparsed: true,
         }];
         assert!(already_polled("bredebjorhovd/attn", &boards).is_none());
@@ -3682,13 +3438,12 @@ mod tests {
             boards: vec![PeerBoard {
                 device: "box".into(),
                 repos: Vec::new(),
-                linear_teams: Vec::new(),
                 unparsed: true,
             }],
             unreachable: Vec::new(),
             asked: 1,
         };
-        let c = board_hosts_check(Some(&cfg_polling(&["o/r"], None)), Some(&peers));
+        let c = board_hosts_check(Some(&cfg_polling(&["o/r"])), Some(&peers));
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("unknown"), "{}", c.detail);
     }
@@ -3806,7 +3561,7 @@ mod tests {
         let (_d, p) = tmp();
         std::fs::write(
             p.routing(),
-            "[[route]]\nmatch = { linear_team = \"AGE\" }\nworkspace = \"w\"\n\
+            "[[route]]\nmatch = { gh_repo = \"o/r\" }\nworkspace = \"w\"\n\
              repo = \"/nowhere\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
@@ -3982,7 +3737,7 @@ mod tests {
         let (_d, p) = tmp();
         std::fs::write(
             p.routing(),
-            "[[route]]\nmatch = { linear_team = \"AGE\" }\nworkspace = \"tally\"\n\
+            "[[route]]\nmatch = { gh_repo = \"o/r\" }\nworkspace = \"tally\"\n\
              repo = \"/nowhere\"\nruntime = \"claude-code\"\n",
         )
         .unwrap();
@@ -4609,8 +4364,6 @@ mod tests {
             url: "https://linear.app/x".into(),
             labels: vec![],
             source_state: None,
-            linear_team: Some("LIN".into()),
-            linear_project: None,
             upstream: crate::model::UpstreamState::Started,
             updated_at: crate::db::now(),
         })
@@ -4684,109 +4437,12 @@ mod tests {
         assert!(writeback_detail(&none.github).contains("no repos"));
     }
 
+    /// gh#471: the report as a whole says nothing about Linear. The check
+    /// lines it used to print (`LINEAR_API_KEY`, `linear review state`) are
+    /// gone, not "not configured" — a removed connector must not read as an
+    /// unconfigured one.
     #[test]
-    fn an_unset_review_state_passes_and_says_what_setting_it_would_do() {
-        let cfg: RoutingConfig = toml::from_str("").unwrap();
-        let c = review_state_check(Some("lin_x".into()), &[], &cfg);
-        assert!(c.ok);
-        assert!(c.detail.contains("review_state"), "{}", c.detail);
-    }
-
-    // ── the Linear credential (gh#96) ───────────────────────────────────────
-
-    /// A board with no key and no route matching a Linear team is a
-    /// *GitHub-only board* — a supported configuration, not a half-finished
-    /// one. Inherited from herdr-board, where Linear always existed, this check
-    /// said `FAIL … missing` at it and sent people looking for a break that was
-    /// not there. It passes, and is worded so nobody reads it as broken.
-    #[test]
-    fn a_github_only_board_is_not_failed_over_an_absent_linear_key() {
-        let (_d, p) = tmp();
-        let c = linear_key_check(&p, None, &[], |_| panic!("there is no key to probe"));
-        assert!(c.ok, "{}", c.detail);
-        assert!(c.detail.starts_with("not configured —"), "{}", c.detail);
-        assert!(c.detail.contains("GitHub only"), "{}", c.detail);
-        assert!(
-            !c.detail.contains("missing"),
-            "the word this line failed people with: {}",
-            c.detail
-        );
-    }
-
-    /// The other half of the rule. Once a route matches on `linear_team` the
-    /// key has stopped being optional: without it those tickets never reach the
-    /// board and the route can never fire — silently, which is what `doctor` is
-    /// for. Same shape as the GitHub credential, which fails only once repos
-    /// are configured.
-    #[test]
-    fn a_route_matching_a_linear_team_still_needs_the_key() {
-        let (_d, p) = tmp();
-        let c = linear_key_check(&p, None, &["AGE".into(), "TAL".into()], |_| {
-            panic!("there is no key to probe")
-        });
-        assert!(!c.ok, "{}", c.detail);
-        assert!(
-            c.detail.contains("AGE") && c.detail.contains("TAL"),
-            "{}",
-            c.detail
-        );
-        assert!(c.detail.contains("linear_team"), "{}", c.detail);
-    }
-
-    /// A key that is there is worth checking, and only the API can say whether
-    /// it still works — a revoked string in `.env` looked exactly like a good
-    /// one before this.
-    #[test]
-    fn a_present_key_is_reported_by_what_linear_says_about_it() {
-        let (_d, p) = tmp();
-        let good = linear_key_check(&p, Some("lin_x".into()), &[], |k| {
-            assert_eq!(k, "lin_x");
-            Ok("sam@example.com".into())
-        });
-        assert!(good.ok, "{}", good.detail);
-        assert!(good.detail.contains("sam@example.com"), "{}", good.detail);
-
-        let rejected = linear_key_check(&p, Some("lin_x".into()), &[], |_| {
-            Err(anyhow::anyhow!(
-                "linear GraphQL error: Authentication required, not authenticated"
-            ))
-        });
-        assert!(!rejected.ok, "{}", rejected.detail);
-        assert!(rejected.detail.contains("rejected"), "{}", rejected.detail);
-        assert!(
-            rejected.detail.contains("Authentication required"),
-            "the reason has to travel with the failure: {}",
-            rejected.detail
-        );
-    }
-
-    /// An API that would not answer is not a key that was rejected. Reporting
-    /// one as the other is the same false alarm from the other direction — a
-    /// laptop on a train would fail this check every time.
-    #[test]
-    fn an_unreachable_linear_does_not_condemn_a_configured_key() {
-        let (_d, p) = tmp();
-        let limited = linear_key_check(&p, Some("lin_x".into()), &[], |_| {
-            Err(anyhow::anyhow!("linear rate limited (429)"))
-        });
-        assert!(limited.ok, "{}", limited.detail);
-        assert!(limited.detail.contains("not checked"), "{}", limited.detail);
-
-        // The other arm: nothing on the wire at all. Port 1 on this machine
-        // refuses, so the error is a real `reqwest::Error` and never leaves it.
-        let refused = reqwest::blocking::Client::new()
-            .get("http://127.0.0.1:1/")
-            .send()
-            .expect_err("nothing listens on port 1");
-        let offline = linear_key_check(&p, Some("lin_x".into()), &[], |_| Err(refused.into()));
-        assert!(offline.ok, "{}", offline.detail);
-    }
-
-    /// And the report as a whole agrees: on a GitHub-only board nothing says
-    /// Linear is unconfigured — including the review-state line, which is not
-    /// printed at all, on the same rule the `account` check follows (gh#59).
-    #[test]
-    fn a_github_only_report_is_silent_about_linear() {
+    fn the_report_says_nothing_about_linear() {
         let (_d, p) = tmp();
         std::fs::write(
             p.routing(),
@@ -4795,26 +4451,13 @@ mod tests {
         )
         .unwrap();
         let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
-        assert!(
-            !checks.iter().any(|c| c.name == "linear review state"),
-            "a board with no Linear anywhere must not be handed a Linear setting"
-        );
-        let key = checks
-            .iter()
-            .find(|c| c.name == "LINEAR_API_KEY")
-            .expect("the credential is still reported, just not as a fault");
-        assert!(key.ok, "{}", key.detail);
-
-        // With a Linear route in the file the line comes back — that board does
-        // have a workflow state to get wrong.
-        std::fs::write(
-            p.routing(),
-            "[[route]]\nmatch = { linear_team = \"AGE\" }\nworkspace = \"w\"\n\
-             repo = \"/tmp\"\nruntime = \"claude-code\"\n",
-        )
-        .unwrap();
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
-        assert!(checks.iter().any(|c| c.name == "linear review state"));
+        for c in &checks {
+            assert!(
+                !c.name.to_lowercase().contains("linear"),
+                "no check line mentions Linear: {}",
+                c.name
+            );
+        }
     }
 
     // ── github auth (gh#58) ─────────────────────────────────────────────────
@@ -5739,8 +5382,6 @@ mod tests {
                 url: "https://github.com/o/r/issues/1".into(),
                 labels: vec![],
                 source_state: None,
-                linear_team: None,
-                linear_project: None,
                 upstream: crate::model::UpstreamState::Started,
                 updated_at: crate::db::now(),
             })

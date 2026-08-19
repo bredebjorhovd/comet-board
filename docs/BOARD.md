@@ -1,10 +1,11 @@
 # comet-board — the board fork
 
 This fork adds an autonomous-agent task board to comet, ported from
-[herdr-board](https://github.com/bredebjorhovd/herdr-board). Linear issues
-(read-write) and GitHub issues/PRs come in; a dispatch releases a task into a
-comet chat with a coding agent; session state reconciles back to the board and
-to the trackers. Agents can read the board and dispatch from it themselves —
+[herdr-board](https://github.com/bredebjorhovd/herdr-board). GitHub issues/PRs
+come in; a dispatch releases a task into a comet chat with a coding agent;
+session state reconciles back to the board and to the tracker. (Linear was a
+source too until gh#471 removed it; legacy `linear:` rows remain readable
+history.) Agents can read the board and dispatch from it themselves —
 that is the point, not an escape hatch.
 
 This document is the handoff map: what is ported, what maps to what, and what
@@ -37,9 +38,9 @@ nearly verbatim — it never depended on herdr:
   Unchanged. **`Attempt.pane_id` now stores a comet chat id** — same column,
   new meaning, documented at the type. Rename only with a migration, and only
   if it ever earns one.
-- `sources/linear.rs`, `sources/github.rs` — API clients, state-by-type
-  resolution, label filters. Linear unchanged; `github.rs` keeps its endpoints
-  and gained an auth seam (`sources/github_app.rs`, gh#58 below).
+- `sources/github.rs` — API client, label filters. Keeps its endpoints and
+  gained an auth seam (`sources/github_app.rs`, gh#58 below).
+  `sources/linear.rs` came along in the port and was removed in gh#471.
 - `config.rs` — `routing.toml`, credentials, per-repo overrides. Changed:
   paths live under `~/.comet-native/board` (`COMET_DATA_DIR` respected);
   runtimes validate against comet harnesses; the herdr pane-layout knobs

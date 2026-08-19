@@ -4,14 +4,11 @@
 [sync]
 # How often syncd polls. Floors at 5s.
 interval = "30s"
-# Linear labels that mean "dispatchable". Issues assigned to you are always
-# included; these labels widen that set.
-labels = ["herd"]
 
 # First matching route wins. All keys given in `match` must match (AND).
-# Available keys: linear_team, linear_project, gh_repo, label.
+# Available keys: gh_repo, label.
 [[route]]
-match = { linear_team = "OFF" }
+match = { gh_repo = "you/offhand" }
 workspace = "offhand"          # a comet SPACE name (device + folder pair)
 repo = "~/code/offhand"        # the git repo worktrees are cut from
 runtime = "claude-code"        # display name; mapped to comet harness ClaudeCode
@@ -57,7 +54,7 @@ runtime = "codex"
 # kind of clever that bills the wrong person.
 #
 # [[route]]
-# match = { linear_team = "PLT" }
+# match = { gh_repo = "acme/platform" }
 # workspace = "platform"
 # repo = "~/code/platform"
 # runtime = "claude-code"
@@ -237,28 +234,12 @@ base = "origin/HEAD"
 # the desktop app or the TUI writes this key for you. `docs/orchestrator.md` is
 # the brief to open it with.
 # orchestrator_chat = "chat_01J8Z…"
-# Which tracker `comet-board new` writes to: "linear" or "github". This is not
-# inferable — a label routes work to a repo and says nothing about where that
-# project's tickets live. This board's own backlog may be in Linear while its
-# code is on GitHub; a repo whose issues you already keep on GitHub is the
-# reverse.
-# new_source = "linear"
+# Which tracker `comet-board new` writes to. "github" is the only supported
+# value.
+# new_source = "github"
 
-[linear]
-# Which workflow state means "finished, waiting on a human". When the board
-# derives `review`, the issue moves there — otherwise dispatch leaves it at
-# In Progress and nothing moves it again until the PR merges, so anyone reading
-# Linear rather than the board sees In Progress for the whole review window.
-#
-# A name, not a type, and unavoidably so: `In Review` and `In Progress` are both
-# `type: started`, so the API cannot be asked which one means review. Every other
-# state the board touches is resolved by type. Unset (the default) means no
-# transition at all, which is right if your workflow has no such state.
-# `comet-board doctor` checks the name resolves in each team you route to.
-# review_state = "In Review"
-
-# GitHub is entirely optional. With no repos listed it is never polled, the
-# header omits it, and no GitHub credential is needed at all.
+# GitHub is where the board's issues come from. With no repos listed nothing is
+# polled, the header omits it, and no GitHub credential is needed at all.
 #
 # With repos listed, the credential goes in `.env`, and there are two:
 #
@@ -295,9 +276,9 @@ labels = ["herd"]
 # Show open pull requests as their own `review` rows — work waiting on you that
 # nobody dispatched. A PR from a board dispatch attaches to its task instead.
 pull_requests = true
-# Leave the same trail on GitHub that Linear gets: a comment on dispatch and on
-# outcome, and close the issue on done. Needs a token with `repo` scope, or an
-# App with Issues: read & write.
+# Leave a trail on GitHub: a comment on dispatch and on outcome, and close the
+# issue on done. Needs a token with `repo` scope, or an App with Issues: read &
+# write.
 # Off by default: the board should not start writing to your issues just
 # because you pointed it at a repo.
 #

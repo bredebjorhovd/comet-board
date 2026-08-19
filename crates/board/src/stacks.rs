@@ -892,8 +892,6 @@ mod tests {
             labels: vec![],
             state: BoardState::Review,
             source_state: None,
-            linear_team: None,
-            linear_project: None,
             upstream: UpstreamState::Started,
             local_done: false,
             pr_url: Some(format!("https://github.com/{repo}/pull/{number}")),

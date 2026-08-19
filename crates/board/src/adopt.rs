@@ -51,8 +51,8 @@ impl Missing {
     ///
     /// Says what is present as well as what is not. A bare "no route" on a repo
     /// the board *is* polling reads as "this space cannot be dispatched to",
-    /// which is false whenever the repo's tickets live in Linear and route by
-    /// label.
+    /// which is false whenever another route (a label match, a catch-all)
+    /// already covers it.
     pub fn note(self) -> &'static str {
         match self {
             Missing::Polling => " · routed, not polled",
@@ -367,8 +367,6 @@ pub fn preview<T: crate::sources::github::Rest>(
 pub struct Adopted {
     pub wrote_route: bool,
     pub wrote_repo: bool,
-    /// The label suggested for Linear issues, left commented out in the file.
-    pub suggested_label: String,
     /// The `[[github.repo]] labels` written, if the operator picked any.
     pub labels: Option<Vec<String>>,
 }
@@ -413,7 +411,6 @@ pub fn adopt_with(path: &Path, u: &Unadopted, labels: Option<&[String]>) -> Resu
     Ok(Adopted {
         wrote_route,
         wrote_repo,
-        suggested_label: u.name().to_string(),
         labels: labels.map(<[String]>::to_vec),
     })
 }
@@ -472,23 +469,11 @@ const NEW_GITHUB_TABLE: &str = "\n# Repos polled for issues and pull requests. P
 
 const NEW_ADOPT_TABLE: &str = "\n# Repos with a comet space that the board should stop offering to adopt —\n# ones you are only reading rather than working in. Written by\n# `comet-board adopt --ignore`; delete a line to be offered it again.\n[adopt]\n";
 
-/// The route block, plus the suggestion for what a git remote cannot tell us.
+/// The route block one adoption writes.
 fn route_block(u: &Unadopted, runtime: &str) -> String {
     let repo = shorten_home(Path::new(&u.repo_root));
-    let label = u.name();
     format!(
         "# Adopted from the board's unadopted list.\n\
-         #\n\
-         # A Linear issue carries no repo, so nothing below routes one here.\n\
-         # `{label}` is a *guess* at the label you would use — a git remote cannot\n\
-         # name one. Uncomment and edit to use it. Issues assigned to you arrive\n\
-         # whatever their labels, so the gap is only unassigned ones.\n\
-         #\n\
-         # [[route]]\n\
-         # match = {{ label = \"{label}\" }}\n\
-         # workspace = \"{ws}\"\n\
-         # repo = \"{repo}\"\n\
-         # runtime = \"{runtime}\"\n\
          [[route]]\n\
          match = {{ gh_repo = \"{slug}\" }}\n\
          workspace = \"{ws}\"\n\
@@ -1277,23 +1262,6 @@ runtime = "claude-code"
     }
 
     #[test]
-    fn the_linear_label_is_offered_as_a_comment_and_never_as_config() {
-        // A git remote cannot name a Linear label. Writing a guess as live
-        // config would be inventing one; a commented block says it is a guess
-        // and costs nothing if it is wrong.
-        let out = adopt_text(CATCH_ALL, &unadopted());
-        assert!(
-            out.contains("# match = { label = \"tripletex-mcp\" }"),
-            "{out}"
-        );
-        assert!(
-            !cfg(&out).routes.iter().any(|r| r.match_.label.is_some()),
-            "the guess became real config"
-        );
-        assert!(out.contains("guess"), "it has to say it is a guess:\n{out}");
-    }
-
-    #[test]
     fn a_file_with_no_routes_at_all_still_gets_one() {
         let out = adopt_text("[sync]\ninterval = \"30s\"\n", &unadopted());
         let parsed = cfg(&out);
@@ -1669,7 +1637,6 @@ runtime = "claude-code"
         let tm = found.iter().find(|u| u.name() == "tripletex-mcp").unwrap();
         let done = adopt(&path, tm).unwrap();
         assert!(done.wrote_route && done.wrote_repo);
-        assert_eq!(done.suggested_label, "tripletex-mcp");
 
         // Ignore the one you are only reading.
         let vendor = found.iter().find(|u| u.name() == "vendor").unwrap();
