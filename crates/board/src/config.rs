@@ -1761,8 +1761,10 @@ impl RoutingConfig {
         }
         // Auto-pick rules (gh#490). A *disabled* rule may be half-written —
         // that is what the settings page creates and fills in — so the
-        // enable-gated requirements (owner, labels, account is checked at
-        // dispatch) only bite on `enabled = true`. What is checked on every
+        // enable-gated requirements (owner and labels; the account is refused
+        // at the write seam in `routes.rs` and again at dispatch, never here,
+        // so a hand-written file that predates gh#524 still loads) only bite
+        // on `enabled = true`. What is checked on every
         // rule is what would misbehave silently: a duplicate name would make
         // one history out of two rules, and an unparseable cooldown would
         // read as the default while somebody believes they set it.

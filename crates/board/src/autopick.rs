@@ -58,6 +58,17 @@ impl Verdict {
         }
     }
 
+    /// The word the preview speaks (gh#524) — what the next evaluation
+    /// *would* do, so present tense where the log is past.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            Verdict::Dispatch => "dispatch",
+            Verdict::Skip(_) => "skip",
+            Verdict::Defer(_) => "defer",
+            Verdict::Refuse(_) => "refuse",
+        }
+    }
+
     pub fn reason(&self) -> &str {
         match self {
             Verdict::Dispatch => "matched",
@@ -251,7 +262,40 @@ pub struct AutomationsView {
     /// Seconds until the next periodic reconciliation, when the loop said.
     #[serde(default)]
     pub next_eval_secs: Option<u64>,
+    /// What each agent-account slot has already dispatched (gh#524) — the
+    /// figure shown beside an account when a rule picks who pays. The board's
+    /// own attempts data, never an external usage meter.
+    #[serde(default)]
+    pub accounts: Vec<AccountUsage>,
 }
+
+/// One slot's dispatch total for the current calendar month (gh#524).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsage {
+    pub slot: String,
+    pub dispatches_this_month: usize,
+}
+
+/// One considered task's would-be outcome, computed by the same [`plan`] the
+/// loop runs, addressed at the rule as it stands (gh#524) — enabled or not.
+/// This is how a rule proves itself against the live board before it is
+/// enabled, and how an enabled one says what its next evaluation would do.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreviewRow {
+    pub identifier: String,
+    /// `dispatch` | `skip` | `defer` | `refuse` — [`Verdict::verb`].
+    pub decision: String,
+    /// The planner's reason verbatim; for a dispatch, what it would run —
+    /// "`<runtime>` as `<account>`" — because "matched" tells an operator
+    /// nothing about what is about to spend.
+    pub reason: String,
+}
+
+/// Preview rows one rule carries at most. The count still says how many tasks
+/// the rule considers; the rows past this are the same three verdicts again.
+const PREVIEW_ROWS: usize = 12;
 
 /// One rule with its liveness derived — what the list renders.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -270,6 +314,15 @@ pub struct RuleStatus {
     /// The newest history row about it, for the "most recent action" line.
     #[serde(default)]
     pub last_event: Option<AutomationLogRow>,
+    /// What the rule would do right now, task by task (gh#524) — computed by
+    /// the loop's own planner with the rule treated as enabled, so a paused
+    /// draft shows what enabling would authorize. At most [`PREVIEW_ROWS`]
+    /// rows; `considered` is the true count.
+    #[serde(default)]
+    pub preview: Vec<PreviewRow>,
+    /// How many tasks the rule considers right now (source + label match).
+    #[serde(default)]
+    pub considered: usize,
 }
 
 impl AutomationsView {
@@ -295,23 +348,8 @@ impl SyncEngine {
         }
         let before = rfc3339(chrono::Utc::now() - chrono::Duration::days(LOG_RETENTION_DAYS));
         self.db.prune_automation_log(&before)?;
-        let mut tasks = self.db.load_tasks()?;
-        // Board order (gh#125): the same section sort `board_rows` publishes,
-        // stable within a section — so "first eligible row" here is the same
-        // row an operator sees at the top of Ready.
-        tasks.sort_by_key(|t| {
-            BoardState::SECTION_ORDER
-                .iter()
-                .position(|s| *s == t.state)
-                .unwrap_or(usize::MAX)
-        });
-        let workspace_live = {
-            let mut by_ws: BTreeMap<String, usize> = BTreeMap::new();
-            for a in self.db.live_attempts()? {
-                *by_ws.entry(a.workspace.clone()).or_default() += 1;
-            }
-            by_ws
-        };
+        let tasks = self.board_ordered_tasks()?;
+        let workspace_live = self.live_by_workspace()?;
         let mut out = Vec::new();
         for rule in rules {
             let facts = self.eval_facts(rule, &tasks, workspace_live.clone())?;
@@ -336,6 +374,31 @@ impl SyncEngine {
             }
         }
         Ok(out)
+    }
+
+    /// The board's tasks in board order (gh#125): the same section sort
+    /// `board_rows` publishes, stable within a section — so "first eligible
+    /// row" is the same row an operator sees at the top of Ready. Shared by
+    /// the loop's evaluation and the page's preview, which is what makes the
+    /// preview incapable of disagreeing with the loop (gh#524).
+    fn board_ordered_tasks(&self) -> Result<Vec<Task>> {
+        let mut tasks = self.db.load_tasks()?;
+        tasks.sort_by_key(|t| {
+            BoardState::SECTION_ORDER
+                .iter()
+                .position(|s| *s == t.state)
+                .unwrap_or(usize::MAX)
+        });
+        Ok(tasks)
+    }
+
+    /// Live attempts per workspace — the capacity meter.
+    fn live_by_workspace(&self) -> Result<BTreeMap<String, usize>> {
+        let mut by_ws: BTreeMap<String, usize> = BTreeMap::new();
+        for a in self.db.live_attempts()? {
+            *by_ws.entry(a.workspace.clone()).or_default() += 1;
+        }
+        Ok(by_ws)
     }
 
     fn eval_facts(
@@ -407,11 +470,18 @@ impl SyncEngine {
         }
     }
 
-    /// The rules with their health and history — what `ReadBoardAutomations`
-    /// answers. `next_eval_secs` is the loop's own answer for when the next
-    /// periodic reconciliation runs.
+    /// The rules with their health, history and preview — what
+    /// `ReadBoardAutomations` answers. `next_eval_secs` is the loop's own
+    /// answer for when the next periodic reconciliation runs.
+    ///
+    /// The preview (gh#524) is the loop's own [`plan`] addressed at each rule
+    /// as if enabled, against the same board order and the same measured
+    /// facts the loop would use — so what the page shows under "would" and
+    /// what the loop does next cannot disagree, because they are one function.
     pub fn automations_view(&self, next_eval_secs: Option<u64>) -> Result<AutomationsView> {
         let day_ago = rfc3339(chrono::Utc::now() - chrono::Duration::days(1));
+        let tasks = self.board_ordered_tasks()?;
+        let workspace_live = self.live_by_workspace()?;
         let mut rules = Vec::new();
         for rule in &self.cfg.automations {
             let live = self.db.live_count_for_automation(&rule.name)?;
@@ -421,6 +491,28 @@ impl SyncEngine {
                 .automation_log_recent(Some(&rule.name), 1)?
                 .into_iter()
                 .next();
+            let facts = self.eval_facts(rule, &tasks, workspace_live.clone())?;
+            let as_if_enabled = Automation {
+                enabled: true,
+                ..rule.clone()
+            };
+            let decisions = plan(&self.cfg, &as_if_enabled, &tasks, &facts);
+            let considered = decisions.len();
+            let preview = decisions
+                .into_iter()
+                .take(PREVIEW_ROWS)
+                .map(|d| {
+                    let reason = match &d.verdict {
+                        Verdict::Dispatch => would_run_as(&self.cfg, rule, &tasks, &d.task_id),
+                        other => other.reason().to_string(),
+                    };
+                    PreviewRow {
+                        identifier: d.identifier,
+                        decision: d.verdict.verb().into(),
+                        reason,
+                    }
+                })
+                .collect();
             let mut problems = Vec::new();
             if rule.enabled {
                 if rule.account.as_deref().map(str::trim).unwrap_or("").is_empty() {
@@ -448,14 +540,45 @@ impl SyncEngine {
                 live,
                 dispatched_last_day,
                 last_event,
+                preview,
+                considered,
             });
         }
+        let month_start = chrono::Utc::now().format("%Y-%m-01T00:00:00Z").to_string();
+        let accounts = self
+            .db
+            .account_dispatch_totals(&month_start)?
+            .into_iter()
+            .map(|(slot, dispatches_this_month)| AccountUsage {
+                slot,
+                dispatches_this_month,
+            })
+            .collect();
         Ok(AutomationsView {
             rules,
             recent: self.db.automation_log_recent(None, 40)?,
             next_eval_secs,
+            accounts,
         })
     }
+}
+
+/// What a would-be dispatch runs and spends — the preview's dispatch line
+/// (gh#524). The runtime is the rule's override or the resolved route's; the
+/// account is the rule's own, which a dispatch verdict guarantees is set.
+fn would_run_as(cfg: &RoutingConfig, rule: &Automation, tasks: &[Task], task_id: &str) -> String {
+    let runtime = rule.runtime.clone().or_else(|| {
+        tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .and_then(|t| cfg.resolve(&route_context(t)))
+            .map(|r| r.runtime.clone())
+    });
+    format!(
+        "{} as {}",
+        runtime.as_deref().unwrap_or("the route's runtime"),
+        rule.account.as_deref().unwrap_or("nobody")
+    )
 }
 
 #[cfg(test)]
@@ -986,5 +1109,67 @@ mod tests {
         assert_eq!(view.next_eval_secs, Some(12));
         assert_eq!(view.enabled_count(), 2);
         assert_eq!(view.unhealthy_count(), 1);
+    }
+
+    /// gh#524: every rule carries a preview computed by the loop's own
+    /// planner, addressed at the rule as if enabled — so a paused draft shows
+    /// what enabling would authorize, in the planner's own words, and the
+    /// dispatch line says what it would run and spend.
+    #[test]
+    fn the_view_previews_every_rule_with_the_loops_own_planner() {
+        let mut c = rule_cfg();
+        c.automations.push(Automation {
+            name: "drafted".into(),
+            enabled: false,
+            account: None,
+            ..rule()
+        });
+        let fixture = engine_at(tempfile::tempdir().unwrap(), c);
+        seed(&fixture.e.db, "gh:o/r#1", "gh#1", &["auto"]);
+
+        let view = fixture.e.automations_view(None).unwrap();
+        let of = |name: &str| view.rules.iter().find(|r| r.rule.name == name).unwrap();
+
+        let approved = of("approved");
+        assert_eq!(approved.considered, 1);
+        assert_eq!(approved.preview.len(), 1);
+        assert_eq!(approved.preview[0].identifier, "gh#1");
+        assert_eq!(approved.preview[0].decision, "dispatch");
+        assert_eq!(approved.preview[0].reason, "claude-code as slot-1");
+
+        // The paused draft previews too — as if enabled — and its missing
+        // account speaks in the planner's own refusal sentence, which is the
+        // page's help text by construction.
+        let drafted = of("drafted");
+        assert_eq!(drafted.preview.len(), 1);
+        assert_eq!(drafted.preview[0].decision, "refuse");
+        assert!(
+            drafted.preview[0].reason.contains("billing account missing"),
+            "{}",
+            drafted.preview[0].reason
+        );
+    }
+
+    /// gh#524: the view carries what each agent-account slot dispatched this
+    /// month, off the attempts table — the board's own record, not a usage
+    /// meter — so picking who pays shows what the slot already carries.
+    #[test]
+    fn the_view_reports_what_each_slot_dispatched_this_month() {
+        let fixture = engine_at(tempfile::tempdir().unwrap(), rule_cfg());
+        let e = &fixture.e;
+        seed(&e.db, "gh:o/r#1", "gh#1", &["auto"]);
+        seed(&e.db, "gh:o/r#2", "gh#2", &["auto"]);
+        e.db.insert_attempt(&NewAttempt {
+            account: Some("slot-1".into()),
+            ..attempt("gh:o/r#1")
+        })
+        .unwrap();
+        // The box's own login is nobody's slot and stays out of the list.
+        e.db.insert_attempt(&attempt("gh:o/r#2")).unwrap();
+
+        let view = e.automations_view(None).unwrap();
+        assert_eq!(view.accounts.len(), 1);
+        assert_eq!(view.accounts[0].slot, "slot-1");
+        assert_eq!(view.accounts[0].dispatches_this_month, 1);
     }
 }

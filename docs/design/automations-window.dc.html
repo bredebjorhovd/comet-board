@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist.ttf');font-weight:100 900;font-style:normal;font-display:block}
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist-Medium.ttf');font-weight:500;font-style:normal;font-display:block}
+@font-face{font-family:Geist;src:url('crates/ui/assets/fonts/Geist-SemiBold.ttf');font-weight:600;font-style:normal;font-display:block}
+@font-face{font-family:'Geist Mono';src:url('crates/ui/assets/fonts/GeistMono.ttf');font-weight:100 900;font-style:normal;font-display:block}
+.cw{
+--shell:#0d0d0d;--card:#070707;--raised:#161616;--sel:#191919;--selcard:#191919;
+--hover:rgba(255,255,255,.05);--chip:rgba(255,255,255,.07);
+--line:rgba(255,255,255,.08);--line2:rgba(255,255,255,.13);
+--text:#ededed;--muted:#a8a8a8;--subtle:#808080;--faint:#666666;
+--blocked:oklch(0.74 0.14 25);--working:oklch(0.74 0.14 75);--review:oklch(0.74 0.14 265);--settled:oklch(0.74 0.14 160);
+--lift:none;--sellift:0 0 0 1px rgba(255,255,255,.13);
+--cardshadow:none;--desk:#17191b;--claude:#D97757;
+}
+.cw[data-theme="light"]{
+--shell:#e9e9ec;--card:#ffffff;--raised:#f4f4f7;--sel:#ffffff;--selcard:#eeeef2;
+--hover:rgba(0,0,0,.025);--chip:rgba(0,0,0,.05);
+--line:#e4e4e8;--line2:#d6d6dc;
+--text:#171717;--muted:#545454;--subtle:#6b6b6b;--faint:#8a8a8a;
+--blocked:oklch(0.52 0.16 25);--working:oklch(0.52 0.16 75);--review:oklch(0.52 0.16 265);--settled:oklch(0.52 0.16 160);
+--lift:0 1px 2px rgba(0,0,0,.05);--sellift:0 0 0 1px #dcdce2, 0 1px 2px rgba(0,0,0,.06);
+--cardshadow:0 1px 2px rgba(0,0,0,.04),0 10px 30px -18px rgba(0,0,0,.18);--desk:#c3c6ca;--claude:#c15f3c;
+}
+</style>
+</helmet>
+
+<div class="cw" data-theme="{{ themeAttr }}" style="width:1320px;height:880px;border-radius:12px;overflow:hidden;position:relative;background:var(--shell);color:var(--text);font-family:Geist,system-ui,sans-serif;font-size:13px;-webkit-font-smoothing:antialiased">
+
+  <div style="position:absolute;top:0;bottom:0;left:0;width:256px;border-right:1px solid var(--line)"></div>
+
+  <div style="position:absolute;inset:0;display:flex;flex-direction:column">
+
+    <div style="height:38px;flex:none;display:flex;align-items:center;padding-top:2px;padding-left:172px;padding-right:16px">
+      <span style="font-size:13px;font-weight:500;color:var(--muted)">Settings</span>
+    </div>
+
+    <div style="flex:1;min-height:0;display:flex;flex-direction:row">
+
+      <!-- SETTINGS NAV -->
+      <div style="width:256px;flex:none;height:100%;display:flex;flex-direction:column;padding:0 8px;box-sizing:border-box">
+        <div style="padding:10px 9px 6px;font-size:11px;font-weight:600;color:var(--subtle)">Settings</div>
+        <div style="display:flex;flex-direction:column;gap:3px">
+          <div style="display:flex;align-items:center;gap:9px;border-radius:10px;padding:6px 9px;font-size:13px;color:var(--muted)"><span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 10c0-3.771 0-5.657 1.172-6.828S6.229 2 10 2h4c3.771 0 5.657 0 6.828 1.172S22 6.229 22 10v1c0 2.828 0 4.243-.879 5.121C20.243 17 18.828 17 16 17H8c-2.828 0-4.243 0-5.121-.879C2 15.243 2 13.828 2 11z"></path><path stroke-linecap="round" d="M16 22H8m4-5v5m10-9H2"></path></g></svg></span>Devices</div>
+          <div style="display:flex;align-items:center;gap:9px;border-radius:10px;padding:6px 9px;font-size:13px;color:var(--muted)"><span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"></circle><path stroke-linecap="round" d="M5 20c.6-3.4 3.5-5 7-5s6.4 1.6 7 5"></path></g></svg></span>Accounts</div>
+          <div style="display:flex;align-items:center;gap:9px;border-radius:10px;padding:6px 9px;font-size:13px;color:var(--muted)"><span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5"><path stroke-linejoin="round" d="M2 5.5L3.214 7L7.5 3M2 12.5L3.214 14L7.5 10M2 19.5L3.214 21L7.5 17"></path><path d="M22 19H12m10-7H12m10-7H12"></path></g></svg></span>Routing</div>
+          <div style="display:flex;align-items:center;gap:9px;border-radius:10px;padding:6px 9px;font-size:13px;font-weight:500;color:var(--text);background:var(--sel);box-shadow:var(--sellift)"><span style="display:flex;color:var(--text)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"><path d="M15 4V2m0 20v-2m6-5h2M2 15h2m14.5-8.5L20 5M4 20l6.5-6.5M4 5l1.5 1.5M17 13l1.5 1.5M9 4.5 10 2l1 2.5L13.5 5.5 11 6.5 10 9 9 6.5 6.5 5.5z"></path></g></svg></span>Automations</div>
+          <div style="display:flex;align-items:center;gap:9px;border-radius:10px;padding:6px 9px;font-size:13px;color:var(--muted)"><span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 14.5a3 3 0 1 1 6 0a3 3 0 0 1-6 0Zm-10-5a3 3 0 1 0 6 0a3 3 0 0 0-6 0Z"></path><path stroke-linecap="round" d="M16.959 9V2m-10 13v7m10 0v-2m-10-18v2"></path></g></svg></span>Appearance</div>
+          <div style="display:flex;align-items:center;gap:9px;border-radius:10px;padding:6px 9px;font-size:13px;color:var(--muted)"><span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M3.5 3.5v14.25a2.75 2.75 0 0 0 2.75 2.75H20.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M8 16.5v-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M12 16.5v-8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path><path d="M16 16.5v-5.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"></path></svg></span>Stats</div>
+          <div style="display:flex;align-items:center;gap:9px;border-radius:10px;padding:6px 9px;font-size:13px;color:var(--muted)"><span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 12c0-4.714 0-7.071 1.464-8.536C4.93 2 7.286 2 12 2s7.071 0 8.535 1.464C22 4.93 22 7.286 22 12"></path><path d="M2 14c0-2.8 0-4.2.545-5.27A5 5 0 0 1 4.73 6.545C5.8 6 7.2 6 10 6h4c2.8 0 4.2 0 5.27.545a5 5 0 0 1 2.185 2.185C22 9.8 22 11.2 22 14s0 4.2-.545 5.27a5 5 0 0 1-2.185 2.185C18.2 22 16.8 22 14 22h-4c-2.8 0-4.2 0-5.27-.545a5 5 0 0 1-2.185-2.185C2 18.2 2 16.8 2 14Z"></path><path stroke-linecap="round" stroke-linejoin="round" d="m9.5 14.4l1.429 1.6l3.571-4"></path></g></svg></span>Archived</div>
+        </div>
+        <div style="flex:1"></div>
+        <div style="height:1px;background:var(--line);margin:0 8px"></div>
+        <div style="display:flex;align-items:center;gap:7px;border-radius:10px;padding:6px 9px;font-size:13px;color:var(--muted);margin:8px 0"><span style="display:flex;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m15 5l-6 7l6 7"></path></svg></span>Back</div>
+      </div>
+
+      <!-- AUTOMATIONS PAGE -->
+      <div style="flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden;background:var(--card);border:1px solid var(--line);border-radius:14px;margin:0 8px 8px 8px;box-shadow:var(--cardshadow)">
+        <div style="flex:1;min-height:0;overflow-y:auto;display:flex;justify-content:center;padding:26px 24px 0;box-sizing:border-box">
+          <div style="width:100%;max-width:768px;display:flex;flex-direction:column;gap:16px;padding-bottom:26px">
+
+            <div style="flex:none;display:flex;flex-direction:column;gap:4px">
+              <div style="display:flex;align-items:center;gap:10px">
+                <span style="font-size:15px;font-weight:600;letter-spacing:-.01em;color:var(--text)">Automations</span>
+                <span style="font-size:13px;color:var(--subtle)">2</span>
+                <span style="flex:1"></span>
+                <span style="display:flex;align-items:center;gap:7px;height:26px;padding:0 9px;border-radius:6px;background:var(--chip);font-size:12px;color:var(--muted)">Tokenmaxxer9000<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="m19 9l-7 6l-7-6"></path></svg></span>
+                <span style="height:26px;padding:0 10px;border-radius:6px;background:var(--text);color:var(--card);font-size:12px;font-weight:500;display:flex;align-items:center;gap:6px"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-width="1.5" d="M12 5v14m7-7H5"></path></svg>New rule</span>
+              </div>
+              <div style="font-size:13px;line-height:20px;color:var(--subtle);max-width:620px">Each rule is the sentence the planner executes — click any part of it to change it. A new rule asks three things: label, owner, account. Everything else defaults. Next check in 29s.</div>
+            </div>
+
+            <!-- RULE 1: enabled -->
+            <div style="flex:none;border:1px solid var(--line);border-radius:14px;background:var(--raised);overflow:hidden">
+              <div style="padding:12px 18px 0;display:flex;align-items:center;gap:10px">
+                <span style="font-size:13px;font-weight:600;color:var(--text)">Mylder bug hunt</span>
+                <span style="flex:none;padding:1px 8px;border-radius:6px;font-size:11px;color:var(--settled);background:color-mix(in srgb,var(--settled) 14%,transparent)">Enabled</span>
+                <span style="font-size:12px;color:var(--subtle)">1 live · 2 today</span>
+                <span style="flex:1"></span>
+                <span style="display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--settled)"><svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m5 13l4 4L19 7"></path></svg>saved</span>
+                <span style="width:26px;height:26px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><g fill="currentColor"><circle cx="5" cy="12" r="1.6"></circle><circle cx="12" cy="12" r="1.6"></circle><circle cx="19" cy="12" r="1.6"></circle></g></svg></span>
+              </div>
+              <div style="padding:10px 18px 16px;font-size:13.5px;line-height:30px;color:var(--muted);text-wrap:pretty">
+                When a <span style="color:var(--text)">ready</span> task in <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">comet-board</span> carries label <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">Bug or Mylder</span> and not <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">wip</span>,<br>
+                dispatch it on <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">claude-code</span> as <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">brede@tally.no</span>, owned by <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">Brede</span>,<br>
+                holding to at most <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">1 live</span> · <span style="display:inline-flex;align-items:center;gap:5px;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px;box-shadow:0 0 0 1px color-mix(in srgb,var(--settled) 55%,transparent)">4 per day</span> · <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">30m cooldown</span> after failure.
+              </div>
+              <div style="border-top:1px solid var(--line);background:var(--card);padding:12px 18px 14px;display:flex;flex-direction:column;gap:8px">
+                <div style="display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--subtle)">
+                  <span style="width:6px;height:6px;border-radius:9999px;background:var(--working)"></span>
+                  <span style="font-weight:600;color:var(--muted)">Next evaluation would</span>
+                  <span>· same planner the loop runs · matches 3 ready tasks</span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
+                  <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">gh#469</span><span style="color:var(--settled);font-weight:500;width:96px;flex:none">dispatch</span><span style="color:var(--subtle)">claude-code as brede@tally.no</span></div>
+                  <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">gh#483</span><span style="color:var(--working);font-weight:500;width:96px;flex:none">defer</span><span style="color:var(--subtle)">rule is at 1 of 1 live</span></div>
+                  <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">AGE-13</span><span style="color:var(--subtle);font-weight:500;width:96px;flex:none">skip</span><span style="color:var(--subtle)">no matching route</span></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- RULE 2: draft, incomplete -->
+            <div style="flex:none;border:1px solid var(--line);border-radius:14px;background:var(--raised);overflow:hidden">
+              <div style="padding:12px 18px 0;display:flex;align-items:center;gap:10px">
+                <span style="font-size:13px;font-weight:600;color:var(--text)">Docs sweep</span>
+                <span style="flex:none;padding:1px 8px;border-radius:6px;font-size:11px;color:var(--subtle);border:1px solid var(--line)">Paused</span>
+                <span style="flex:1"></span>
+                <span style="height:26px;padding:0 10px;border-radius:6px;font-size:12px;font-weight:500;display:flex;align-items:center;background:var(--chip);color:var(--faint)">Enable</span>
+              </div>
+              <div style="padding:10px 18px 4px;font-size:13.5px;line-height:30px;color:var(--muted);text-wrap:pretty">
+                When a <span style="color:var(--text)">ready</span> task in <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">comet-board</span> carries label <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">docs</span>,<br>
+                dispatch it on <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">any route</span> as <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;border:1px dashed color-mix(in srgb,var(--blocked) 60%,transparent);font-weight:500;color:var(--blocked);line-height:20px">who pays?</span>, owned by <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">Brede</span>,<br>
+                holding to defaults <span style="display:inline-flex;align-items:center;padding:1px 8px;border-radius:7px;background:var(--chip);font-weight:500;color:var(--text);line-height:20px">1 live · 4 per day · 30m cooldown</span>.
+              </div>
+              <div style="margin:6px 18px 14px;border:1px solid var(--line2);border-radius:10px;background:var(--card);overflow:hidden">
+                <div style="padding:10px 14px 8px;display:flex;flex-direction:column;gap:2px">
+                  <span style="font-size:12px;font-weight:600;color:var(--text)">account</span>
+                  <span style="font-size:12px;line-height:18px;color:var(--subtle)">The slot this rule's dispatches bill. Without one, every candidate is refused.</span>
+                </div>
+                <div style="padding:4px 6px 8px;display:flex;flex-direction:column;gap:2px">
+                  <div style="display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:7px" style-hover="background:var(--hover)">
+                    <span style="width:22px;height:22px;flex:none;border-radius:9999px;border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:500;color:var(--muted)">B</span>
+                    <span style="font-size:12.5px;font-weight:500;color:var(--text)">brede@tally.no</span>
+                    <span style="flex:none;padding:0 7px;border-radius:5px;font-size:10.5px;line-height:16px;color:var(--subtle);border:1px solid var(--line)">Max 20×</span>
+                    <span style="flex:1"></span>
+                    <span style="font-size:11.5px;color:var(--subtle)">62% of 5h window used</span>
+                  </div>
+                  <div style="display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:7px" style-hover="background:var(--hover)">
+                    <span style="width:22px;height:22px;flex:none;border-radius:9999px;border:1px solid var(--line2);display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:500;color:var(--muted)">W</span>
+                    <span style="font-size:12.5px;font-weight:500;color:var(--text)">work@tally.no</span>
+                    <span style="flex:none;padding:0 7px;border-radius:5px;font-size:10.5px;line-height:16px;color:var(--subtle);border:1px solid var(--line)">Pro</span>
+                    <span style="flex:1"></span>
+                    <span style="font-size:11.5px;color:var(--subtle)">idle</span>
+                  </div>
+                </div>
+              </div>
+              <div style="border-top:1px solid var(--line);background:var(--card);padding:12px 18px 14px;display:flex;flex-direction:column;gap:8px">
+                <div style="display:flex;align-items:center;gap:8px;font-size:11.5px;color:var(--subtle)">
+                  <span style="width:6px;height:6px;border-radius:9999px;background:var(--blocked)"></span>
+                  <span style="font-weight:600;color:var(--muted)">Right now this would match 2 ready tasks</span>
+                  <span>· both refused</span>
+                </div>
+                <div style="display:flex;flex-direction:column;gap:6px;font-size:12.5px">
+                  <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">gh#502</span><span style="color:var(--blocked);font-weight:500;width:96px;flex:none">refuse</span><span style="color:var(--subtle)">no account: every candidate is refused</span></div>
+                  <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">gh#511</span><span style="color:var(--blocked);font-weight:500;width:96px;flex:none">refuse</span><span style="color:var(--subtle)">no account: every candidate is refused</span></div>
+                </div>
+                <div style="display:flex;align-items:center;gap:7px;font-size:12px;color:var(--blocked)"><svg xmlns="http://www.w3.org/2000/svg" width="13" height="13" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="10"></circle><path stroke-linecap="round" d="M12 17v-6"></path><path stroke-linecap="round" d="M12 7.5h.01"></path></g></svg>Can't enable — the sentence is missing who pays.</div>
+              </div>
+            </div>
+
+            <!-- RECENT ACTIVITY -->
+            <div style="flex:none;display:flex;flex-direction:column;gap:8px">
+              <div style="display:flex;align-items:center;gap:10px;padding:0 2px">
+                <span style="font-size:13px;font-weight:600;color:var(--text)">Recent activity</span>
+                <span style="flex:1"></span>
+                <span style="font-size:12px;color:var(--subtle)">why every considered task went where it went</span>
+              </div>
+              <div style="border:1px solid var(--line);border-radius:14px;background:var(--raised);overflow:hidden;font-size:12.5px">
+                <div style="padding:9px 18px;display:flex;align-items:center;gap:10px"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);width:44px;flex:none">14:32</span><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">gh#469</span><span style="color:var(--settled);font-weight:500;width:96px;flex:none">dispatched</span><span style="color:var(--subtle);flex:1;min-width:0">claude-code as brede@tally.no · Mylder bug hunt</span></div>
+                <div style="padding:9px 18px;display:flex;align-items:center;gap:10px;border-top:1px solid var(--line)"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);width:44px;flex:none">14:32</span><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">gh#483</span><span style="color:var(--working);font-weight:500;width:96px;flex:none">deferred</span><span style="color:var(--subtle);flex:1;min-width:0">rule is at 1 of 1 live</span><span style="flex:none;padding:0 7px;border-radius:5px;font-size:10.5px;line-height:16px;color:var(--subtle);background:var(--chip)">×3</span></div>
+                <div style="padding:9px 18px;display:flex;align-items:center;gap:10px;border-top:1px solid var(--line)"><span style="font-family:'Geist Mono',monospace;font-size:11.5px;color:var(--faint);width:44px;flex:none">13:58</span><span style="font-family:'Geist Mono',monospace;font-size:12px;color:var(--text);width:64px;flex:none">AGE-13</span><span style="color:var(--subtle);font-weight:500;width:96px;flex:none">skipped</span><span style="color:var(--subtle);flex:1;min-width:0">no matching route</span><span style="flex:none;padding:0 7px;border-radius:5px;font-size:10.5px;line-height:16px;color:var(--subtle);background:var(--chip)">×6</span></div>
+              </div>
+            </div>
+
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="position:absolute;top:0;left:0;height:38px;display:flex;align-items:center;padding:2px 10px 0;gap:2px">
+    <div style="width:78px;flex:none;display:flex;align-items:center;gap:8px;padding-left:4px">
+      <span style="width:12px;height:12px;border-radius:9999px;background:#ff5f57"></span>
+      <span style="width:12px;height:12px;border-radius:9999px;background:#febc2e"></span>
+      <span style="width:12px;height:12px;border-radius:9999px;background:#28c840"></span>
+    </div>
+    <div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 11c0-3.771 0-5.657 1.172-6.828S6.229 3 10 3h4c3.771 0 5.657 0 6.828 1.172S22 7.229 22 11v2c0 3.771 0 5.657-1.172 6.828S17.771 21 14 21h-4c-3.771 0-5.657 0-6.828-1.172S2 16.771 2 13z"></path><path stroke-linecap="round" d="M9 21V3"></path></g></svg></div>
+    <div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--subtle)"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M20 12H4m0 0l6-6m-6 6l6 6"></path></svg></div>
+    <div style="width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:6px;color:var(--faint)"><svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M4 12h16m0 0l-6-6m6 6l-6 6"></path></svg></div>
+  </div>
+</div>
+
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1320,&quot;height&quot;:880},&quot;theme&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;dark&quot;,&quot;light&quot;],&quot;default&quot;:&quot;light&quot;,&quot;tsType&quot;:&quot;'dark'|'light'&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    return { themeAttr: this.props.theme ?? 'light' };
+  }
+}
+</script>
+</body>
+</html>
