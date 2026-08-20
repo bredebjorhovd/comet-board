@@ -789,6 +789,105 @@ impl DocHost {
         opened
     }
 
+    /// §7 nudge entry point: open (or touch) the chat doc, close any orphaned
+    /// streaming turn, kick the drain, and report the chat's drain-relevant
+    /// state for the log — "nudge: chat doc opened" followed by silence was
+    /// undiagnosable (gh#528).
+    pub fn nudge(&self, chat_id: &str) -> Result<String, EngineError> {
+        let handle = self.open(chat_id)?;
+        self.reconcile_orphaned_streams(&handle);
+        // A cached handle got no fresh initial drain: re-kick it, so a command
+        // whose import raced an earlier drain still executes on the nudge.
+        handle
+            .changed_tx
+            .send_modify(|value| *value = value.wrapping_add(1));
+        Ok(self.chat_state_summary(&handle))
+    }
+
+    /// Close a turn a dead run left streaming (gh#528).
+    ///
+    /// The journal-driven boot sweep (`SessionsEngine::recover_stale`) only
+    /// sees chats whose journal is still open; a journal closed by a LATER
+    /// completed turn — or missing entirely — leaves the doc's `streaming`
+    /// entry orphaned forever: the transcript renders a live turn nothing will
+    /// finish, and the fork gate refuses its tail. Reconcile at the doc: a
+    /// streaming entry of ours, on a chat we host, with no live run and no
+    /// still-open journal, is an orphan — stamp it `aborted`, loudly.
+    ///
+    /// Runs on every fresh open (boot warm-open, nudge, watcher) and on every
+    /// nudge of a cached handle. Safe against a live turn twice over: a run
+    /// holds `chat_is_busy` for its whole life, and the run task finalizes its
+    /// segment before deregistering. The journal guard keeps boot ordering
+    /// honest: a still-open journal is `recover_stale`'s case, and its
+    /// auto-resume freshness check reads the same entry this would stamp.
+    pub(crate) fn reconcile_orphaned_streams(&self, handle: &Arc<ChatDocHandle>) {
+        let Some(sessions) = self.inner.sessions.get() else {
+            return;
+        };
+        if !self.is_host(handle) || sessions.chat_is_busy(&handle.chat_id) {
+            return;
+        }
+        let has_orphan = handle.doc().read_entries().ok().is_some_and(|entries| {
+            entries.iter().any(|e| {
+                e.role == MessageRole::Assistant
+                    && e.status == Some(MessageStatus::Streaming)
+                    && e.device_id == handle.device_id
+            })
+        });
+        if !has_orphan || sessions.journal_is_stale(&handle.chat_id) {
+            return;
+        }
+        match handle.mark_abandoned_streams("Turn orphaned by an engine restart") {
+            Ok(stamped) if !stamped.is_empty() => {
+                sessions.note_orphan_cleared(&handle.chat_id);
+                tracing::warn!(chat = %handle.chat_id, stamped = stamped.len(),
+                    "closed orphaned streaming turn (no run owns it)");
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!(chat = %handle.chat_id, error = %err,
+                "orphaned-stream reconcile failed"),
+        }
+    }
+
+    /// One line of drain-relevant state: everything `drain_commands` silently
+    /// declines on, plus what is pending and what the transcript tail says.
+    fn chat_state_summary(&self, handle: &Arc<ChatDocHandle>) -> String {
+        let chat_id = &handle.chat_id;
+        let host = self.is_host(handle);
+        let staged = self
+            .inner
+            .sessions
+            .get()
+            .is_some_and(|s| s.fork_is_staged(chat_id));
+        let running = self.chat_is_running(chat_id);
+        let pending = match handle.doc().read_commands() {
+            Ok(commands) => commands
+                .iter()
+                .filter(|c| {
+                    c.status == SessionCommandStatus::Pending
+                        && !self.inner.store.is_processed(&c.id).unwrap_or(false)
+                })
+                .count()
+                .to_string(),
+            Err(_) => "?".into(),
+        };
+        let tail = handle
+            .doc()
+            .read_entries()
+            .ok()
+            .and_then(|entries| {
+                entries.last().map(|e| {
+                    let status = e
+                        .status
+                        .map(|s| format!("{s:?}"))
+                        .unwrap_or_else(|| "none".into());
+                    format!("{:?}:{status}", e.role)
+                })
+            })
+            .unwrap_or_else(|| "empty".into());
+        format!("host={host} fork_staged={staged} running={running} pending={pending} tail={tail}")
+    }
+
     /// Start the idle-release sweep: every [`RELEASE_SWEEP_INTERVAL`], hand back
     /// the chats nobody is using (gh#395). Needs a runtime — a bare synchronous
     /// assembly (unit tests) skips it rather than panicking.
@@ -1239,9 +1338,11 @@ impl DocHost {
         // being published. Leave them Pending until the creation intent is
         // committed; rejecting a staged Run would consume the first prompt.
         if sessions.fork_is_staged(&handle.chat_id) {
+            tracing::debug!(chat = %handle.chat_id, "drain: fork staged; commands stay pending");
             return;
         }
         if !self.is_host(handle) {
+            tracing::debug!(chat = %handle.chat_id, "drain: not this chat's host");
             return;
         }
         // Entries this pass decided to leave alone (processed dedupe hits).
@@ -1321,6 +1422,11 @@ impl DocHost {
                     Ok(outcome) => outcome,
                     Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                 };
+                if status == SessionCommandStatus::Rejected {
+                    tracing::warn!(chat = %handle.chat_id, command = %entry.id,
+                        resolution = resolution.as_deref().unwrap_or(""),
+                        "run command rejected");
+                }
                 if let Err(err) =
                     self.persist_command_outcome(handle, &entry.id, status, resolution.as_deref())
                 {
@@ -1410,6 +1516,20 @@ impl DocHost {
         status: SessionCommandStatus,
         resolution: Option<&str>,
     ) {
+        // A command that resolves without a turn must say so somewhere a
+        // journal reader can see — a swallowed send was undiagnosable (gh#528).
+        match status {
+            SessionCommandStatus::Rejected => {
+                tracing::warn!(chat = %handle.chat_id, command = %command_id,
+                    resolution = resolution.unwrap_or(""), "command rejected");
+            }
+            SessionCommandStatus::Applied | SessionCommandStatus::Pending => {}
+            _ => {
+                tracing::info!(chat = %handle.chat_id, command = %command_id,
+                    status = ?status, resolution = resolution.unwrap_or(""),
+                    "command resolved without executing");
+            }
+        }
         if let Err(err) = handle
             .doc()
             .set_command_status(command_id, status, resolution)
@@ -1964,6 +2084,7 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
     // mirror stays lazy — it materializes on the first watch attach.
     {
         let Some(handle) = weak.upgrade() else { return };
+        host.reconcile_orphaned_streams(&handle);
         host.drain_commands(&handle).await;
     }
     let mut save_deadline: Option<tokio::time::Instant> = None;

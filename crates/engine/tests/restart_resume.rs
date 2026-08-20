@@ -923,3 +923,146 @@ async fn steer_after_restart_dispatches_new_turn_with_resume() {
     }
     core.shutdown().await;
 }
+
+/// gh#528: a doc whose journal is CLOSED (a later turn completed, or the file
+/// is gone) can still hold a `streaming` entry a dead run left behind —
+/// invisible to `recover_stale`, which only walks stale journals. The chat
+/// went deaf: nudges opened the doc and nothing said why. The doc-level sweep
+/// must close the orphan on the first open after restart, and the chat must
+/// answer a new send.
+#[tokio::test]
+async fn orphaned_streaming_entry_with_closed_journal_heals_and_chat_answers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("device-id"), "dev-orphan").unwrap();
+
+    // The crash artifact: user Complete + assistant Streaming in the doc…
+    {
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m-user".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "hi".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-orphan".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m-orphan".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t1".into(),
+                text: "half an answ".into(),
+            }],
+            created_at: 2,
+            device_id: "dev-orphan".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+        let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+        // …while the journal is CLOSED: its last event is a Done, so
+        // `stale_sessions()` reports nothing and `recover_stale` never looks.
+        let journal = RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: Some("sess-old".into()),
+                },
+            )
+            .unwrap();
+    }
+
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "sess-new".into(),
+            fail_on_resume: false,
+        },
+    );
+    assert_eq!(core.device_id, "dev-orphan");
+
+    // The first open reconciles: the orphan is stamped aborted, with a
+    // visible note saying why.
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.id == "m-orphan" && e.status == Some(MessageStatus::Aborted))
+        },
+        "orphaned streaming entry stamped aborted",
+    )
+    .await;
+
+    // …and the chat is not deaf: a new send runs a turn that completes.
+    pre_title(&core);
+    queue_run(&core, "are you alive?", "/tmp", "msg-user-2");
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "chat answers after restart",
+    )
+    .await;
+}
+
+/// gh#528 (repair affordance): Stop on a chat with no live run closes an
+/// orphaned streaming turn instead of being a silent no-op.
+#[tokio::test]
+async fn stop_with_no_live_run_clears_an_orphaned_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("device-id"), "dev-orphan").unwrap();
+    let requests: RequestLog = Arc::new(Mutex::new(Vec::new()));
+    let core = assemble(
+        dir,
+        RecordingHarness {
+            requests: requests.clone(),
+            session_id: "sess".into(),
+            fail_on_resume: false,
+        },
+    );
+
+    // Nothing to stop on an idle chat.
+    let handle = core.doc_host.open(CHAT).unwrap();
+    assert!(!core.sessions.interrupt(CHAT).await.unwrap());
+
+    // Orphan appears after the open (so the open-time sweep has already run).
+    handle
+        .doc()
+        .push_message(&SessionMessageEntry {
+            id: "m-stuck".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "stuck".into(),
+            }],
+            created_at: 1,
+            device_id: "dev-orphan".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        })
+        .unwrap();
+
+    assert!(
+        core.sessions.interrupt(CHAT).await.unwrap(),
+        "stop must repair the orphaned turn"
+    );
+    let stuck = entries_now(&core)
+        .into_iter()
+        .find(|e| e.id == "m-stuck")
+        .unwrap();
+    assert_eq!(stuck.status, Some(MessageStatus::Aborted));
+}

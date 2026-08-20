@@ -442,8 +442,8 @@ impl EngineCore {
         let on_nudge: comet_rpc::NudgeHandler = Arc::new(move |chat_id: String| {
             // Opening the doc joins its room + syncs; drain fires on the change
             // subscription — the command executes with no standing per-chat socket.
-            match doc_host.open(&chat_id) {
-                Ok(_) => tracing::info!(chat = %chat_id, "nudge: chat doc opened"),
+            match doc_host.nudge(&chat_id) {
+                Ok(state) => tracing::info!(chat = %chat_id, %state, "nudge: chat doc opened"),
                 Err(err) => {
                     tracing::warn!(chat = %chat_id, error = %err, "nudge: open failed")
                 }
