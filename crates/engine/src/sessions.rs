@@ -191,6 +191,22 @@ impl SessionsEngine {
         self.inner.journal.clone()
     }
 
+    /// Is this chat's journal still open — last event not `Done`? Those chats
+    /// belong to [`Self::recover_stale`], which closes the journal and decides
+    /// revival; the doc-level orphan sweep must leave them alone (gh#528).
+    pub(crate) fn journal_is_stale(&self, chat_id: &str) -> bool {
+        matches!(
+            self.inner.journal.last_event(chat_id),
+            Ok(Some((_, event))) if !matches!(event, AgentEvent::Done { .. })
+        )
+    }
+
+    /// The doc-level orphan sweep stamped a dead turn closed (gh#528): settle
+    /// the status row the same way `recover_stale` does.
+    pub(crate) fn note_orphan_cleared(&self, chat_id: &str) {
+        self.set_status(chat_id, SessionStatus::Idle, false);
+    }
+
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
     pub fn set_doc_host(&self, host: DocHost) {
@@ -679,7 +695,20 @@ impl SessionsEngine {
             )
         });
         let Some((run_id, token, cancel, pending)) = target else {
-            return Ok(false);
+            // Stop on a chat with no live run is the user's repair verb
+            // (gh#528): a restart can orphan a turn mid-stream, leaving the
+            // doc's last assistant entry `streaming` forever. Close it here so
+            // the visible affordance for a stuck turn actually fixes the doc.
+            let Ok(handle) = self.doc_handle(chat_id) else {
+                return Ok(false);
+            };
+            let stamped = handle.mark_abandoned_streams("Turn stopped — its run no longer exists")?;
+            if stamped.is_empty() {
+                return Ok(false);
+            }
+            self.set_status(chat_id, SessionStatus::Idle, false);
+            tracing::info!(chat = %chat_id, cleared = stamped.len(), "stop cleared an orphaned turn");
+            return Ok(true);
         };
         // Tell the RUN TASK first (gh#111). Everything below this line — the
         // unparked resolver, the cancelled token — is a way of ending the

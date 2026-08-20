@@ -4,6 +4,7 @@
 //!   inspect-chat      <data_dir> <chat_id>
 //!   inspect-commands  <data_dir> <chat_id>
 //!   cut-chat          <data_dir> <chat_id> <from_index>
+//!   close-streaming   <data_dir> <chat_id>
 //!   plan-recovery     <cloud_data_dir> <local_data_dir> <chat_id>
 //!   write-recovery    <cloud_data_dir> <local_data_dir> <output_data_dir> <chat_id>
 //!   apply-recovery    <cloud_data_dir> <local_data_dir> <target_data_dir> <chat_id>
@@ -207,6 +208,37 @@ fn main() {
             println!(
                 "cut chat {chat_id}: removed entries [{from}..{len}), {} remain; snapshot saved ({} bytes)",
                 from,
+                bytes.len()
+            );
+        }
+        "close-streaming" => {
+            // gh#528: close a turn a dead run left `streaming` — the operator
+            // one-liner for a chat gone deaf after an engine restart.
+            let chat_id = args.get(3).expect("chat id");
+            let doc = load_doc(&store, chat_id);
+            let session = SessionDoc::from_doc(doc);
+            let mut closed = 0usize;
+            for entry in session.read_entries().expect("read entries") {
+                if entry.status == Some(comet_doc::MessageStatus::Streaming) {
+                    session
+                        .set_message_status(&entry.id, comet_doc::MessageStatus::Aborted)
+                        .expect("set status");
+                    session
+                        .append_error_part(
+                            &entry.id,
+                            &format!("{}-surgery", entry.id),
+                            "closed by doc_surgery close-streaming",
+                        )
+                        .expect("append note");
+                    println!("closed streaming entry {} ({:?})", entry.id, entry.role);
+                    closed += 1;
+                }
+            }
+            let bytes = session.export_snapshot().expect("export");
+            store.save_snapshot(chat_id, &bytes).expect("save");
+            println!(
+                "chat {chat_id}: {closed} streaming entr{} closed; snapshot saved ({} bytes)",
+                if closed == 1 { "y" } else { "ies" },
                 bytes.len()
             );
         }
