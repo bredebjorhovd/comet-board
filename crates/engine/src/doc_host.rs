@@ -74,6 +74,16 @@ const MAX_OPEN_CHATS: usize = 32;
 /// How often [`DocHost::spawn_idle_release`] sweeps.
 const RELEASE_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How often an open chat asks whether a recovery is waiting on independent
+/// verification (gh#483). A keyed lookup against a table that is empty on every
+/// chat that has never recovered, which is nearly all of them.
+const CONVERGENCE_VERIFY_POLL: Duration = Duration::from_secs(30);
+
+/// How long the fresh verification client waits for the room to hand it every
+/// stable id. Generous: it is one dial after a rare event, and giving up early
+/// only means keeping the quarantine another 30 seconds.
+const CONVERGENCE_VERIFY_BUDGET: Duration = Duration::from_secs(60);
+
 /// Crash injection for the recoverable-Run protocol. It deliberately leaves
 /// the durable command Pending and the in-memory start claim held, exactly as
 /// abrupt process death would; a newly assembled host has no such claim and
@@ -194,6 +204,21 @@ pub struct DocHostConfig {
     pub edge: Option<EdgeConfig>,
 }
 
+/// Content-convergence counts across this engine's open chats (gh#483).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConvergenceCensus {
+    /// Chats holding content the edge has not acknowledged — recovering and
+    /// blocked chats included, because both are ways of not being converged.
+    pub unconverged: usize,
+    pub recovering: usize,
+    pub blocked: usize,
+    pub unacknowledged_entries: usize,
+    /// The chats behind those counts, named — worst first (blocked, then
+    /// recovering, then merely pending), so a truncated view still shows the
+    /// room an operator most needs to open.
+    pub rooms: Vec<comet_proto::RoomConvergence>,
+}
+
 struct DocHostInner {
     store: Arc<DocsStore>,
     config: DocHostConfig,
@@ -244,6 +269,15 @@ pub struct ChatDocHandle {
     mirror_dirty: AtomicBool,
     /// Last known snapshot blob size — the release byte budget's input.
     snapshot_bytes: AtomicUsize,
+    /// This chat's convergence driver (gh#483): the durable semantic outbox,
+    /// the recovery quarantine, and the truthful content state. Shared with the
+    /// room client, which drives the phases; the host records into it on every
+    /// snapshot save and asks it what is still local-only.
+    convergence: comet_sync::ConvergenceRecovery,
+    /// Document version at the last journal record. Semantic content cannot
+    /// change without the version changing, so an unchanged version means the
+    /// outbox is already current and the save can skip the whole scan.
+    journaled_version: Mutex<Option<Vec<u8>>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: Mutex<loro::Subscription>,
 }
@@ -401,6 +435,63 @@ impl ChatDocHandle {
     fn publish_queue_if_watched(&self) {
         if self.queue_tx.receiver_count() > 0 {
             self.publish_queue();
+        }
+    }
+
+    /// Record everything this document holds into the durable semantic outbox
+    /// (gh#483 §2), on the same beat as the snapshot save.
+    ///
+    /// The outbox is what puts locally committed transcript content back after
+    /// a shallow-history replacement, so it has to be written by the thing that
+    /// makes local content durable — not by the room, which may not exist (an
+    /// offline device commits plenty) and may be replaced mid-recovery.
+    ///
+    /// Cheap when nothing changed: semantic content cannot move without the
+    /// document's version moving, so an unchanged version skips the scan
+    /// entirely — the common case for an open-but-idle chat.
+    fn journal_semantics(&self) {
+        let doc = self.doc();
+        self.journal_semantics_of(&doc);
+    }
+
+    /// [`Self::journal_semantics`] against a document the caller already holds.
+    ///
+    /// The distinction is not cosmetic: `persist_command_outcome_with_hook`
+    /// runs inside `with_current`, i.e. holding the owner read guard, and a
+    /// second acquisition from in there deadlocks against a reseed's pending
+    /// write guard — which is exactly the boundary those tests drive.
+    fn journal_semantics_of(&self, doc: &SessionDoc) {
+        let version = doc.doc().oplog_vv().encode();
+        if lock(&self.journaled_version).as_deref() == Some(version.as_slice()) {
+            return;
+        }
+        match self.convergence.record(doc.doc()) {
+            Ok(_) => *lock(&self.journaled_version) = Some(version),
+            Err(err) => tracing::warn!(
+                chat = %self.chat_id, error = %err,
+                "could not record local content into the convergence outbox"
+            ),
+        }
+    }
+
+    /// What this chat can honestly say about its CONTENT (gh#483 §4).
+    ///
+    /// Read from the room when there is one — it holds the acknowledgement
+    /// accounting — and from the outbox when there is not, because a chat with
+    /// no room still knows perfectly well that its content is local-only. The
+    /// one answer this never gives is "converged because the socket is up".
+    pub fn convergence_state(&self) -> comet_sync::ConvergenceState {
+        if let Some(state) = lock(&self.room).as_ref().map(|room| room.convergence()) {
+            return state;
+        }
+        let unacked = self.convergence.pending();
+        if unacked == 0 {
+            comet_sync::ConvergenceState::Converged
+        } else {
+            comet_sync::ConvergenceState::Pending {
+                unacked,
+                stalled: false,
+            }
         }
     }
 
@@ -636,6 +727,62 @@ impl DocHost {
         (handles.len(), live)
     }
 
+    /// The CONTENT half of [`comet_proto::EdgeHealth`] (gh#483): how many open
+    /// chats are not converged, recovering, or outright blocked, and how many
+    /// semantic entries exist only on this device.
+    ///
+    /// Kept separate from [`Self::room_census`] because they answer different
+    /// questions and the incident was the gap between them — a room can be in
+    /// `chat_rooms_live` and in `unconverged` at the same time, and that pair
+    /// is exactly what nobody could see before.
+    pub fn convergence_census(&self) -> ConvergenceCensus {
+        let mut census = ConvergenceCensus::default();
+        if !self.edge_enabled() {
+            return census;
+        }
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        // (severity, row) — the sort key is dropped before the census leaves.
+        let mut ranked: Vec<(u8, comet_proto::RoomConvergence)> = Vec::new();
+        for handle in handles {
+            let state = handle.convergence_state();
+            census.unacknowledged_entries += state.unacked();
+            let severity = match state {
+                comet_sync::ConvergenceState::Converged => continue,
+                comet_sync::ConvergenceState::Pending { .. } => {
+                    census.unconverged += 1;
+                    0
+                }
+                comet_sync::ConvergenceState::Recovering { .. } => {
+                    census.recovering += 1;
+                    census.unconverged += 1;
+                    1
+                }
+                comet_sync::ConvergenceState::BlockedLocalOnly { .. } => {
+                    census.blocked += 1;
+                    census.unconverged += 1;
+                    2
+                }
+            };
+            ranked.push((
+                severity,
+                comet_proto::RoomConvergence {
+                    chat_id: handle.chat_id.clone(),
+                    state: state.label(),
+                    unacknowledged_entries: state.unacked(),
+                },
+            ));
+        }
+        // Worst first, then by how much content is at stake: a truncated view
+        // still shows the room an operator most needs to open.
+        ranked.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(b.1.unacknowledged_entries.cmp(&a.1.unacknowledged_entries))
+                .then(a.1.chat_id.cmp(&b.1.chat_id))
+        });
+        census.rooms = ranked.into_iter().map(|(_, room)| room).collect();
+        census
+    }
+
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     ///
@@ -682,8 +829,25 @@ impl DocHost {
             last_used: AtomicI64::new(now_ms()),
             mirror_dirty: AtomicBool::new(true),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
+            convergence: comet_sync::ConvergenceRecovery::new(self.inner.store.clone(), chat_id),
+            journaled_version: Mutex::new(None),
             _sub: Mutex::new(sub),
         });
+        // A recovery interrupted by a crash finishes before anything else sees
+        // this document (gh#483 §3/§6). Idempotent, and a no-op for the
+        // overwhelming majority of opens that have no open recovery.
+        match handle.convergence.resume(doc.doc()) {
+            Ok(Some(report)) if !report.is_empty() => tracing::warn!(
+                chat = %chat_id,
+                replayed = report.total(),
+                "finished an interrupted convergence recovery while opening the chat"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::error!(
+                chat = %chat_id, error = %err,
+                "could not finish an interrupted convergence recovery; quarantine retained"
+            ),
+        }
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(existing) = handles.get(chat_id) {
@@ -722,13 +886,91 @@ impl DocHost {
                     }
                 }),
                 None,
+                // The durable outbox and quarantine (gh#483). Without this the
+                // room falls back to a process-local journal, which cannot keep
+                // a promise about surviving a restart — and this is the one
+                // place a restart is the failure mode.
+                Some((
+                    self.inner.store.clone() as Arc<dyn comet_sync::ConvergenceJournal>,
+                    chat_id.to_string(),
+                )),
                 Arc::downgrade(&handle.room),
                 Arc::new(|| {}),
             );
+            self.spawn_convergence_verification(&handle);
         }
 
         tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         Ok(handle)
+    }
+
+    /// Watch for a recovery that has reached
+    /// [`comet_sync::RecoveryPhase::Acknowledged`] and prove convergence with a
+    /// FRESH client before releasing its quarantine (gh#483 §3).
+    ///
+    /// The edge acknowledging our push is its own word for it. The invariant
+    /// asks for someone else's: an independent client, starting from an empty
+    /// document, that can retrieve every stable id the quarantine holds. Only
+    /// then are the quarantined bytes redundant.
+    ///
+    /// Costs one extra dial per recovery, which is a rare event; the poll
+    /// itself is a keyed lookup against an all-but-always-empty table, and the
+    /// task ends with the handle.
+    fn spawn_convergence_verification(&self, handle: &Arc<ChatDocHandle>) {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        let chat_id = handle.chat_id.clone();
+        let convergence = handle.convergence.clone();
+        let weak = Arc::downgrade(handle);
+        let device_id = self.inner.config.device_id.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(CONVERGENCE_VERIFY_POLL).await;
+                if weak.upgrade().is_none() {
+                    return; // chat released — nothing left to verify for
+                }
+                let Some(record) = convergence.open_recovery() else {
+                    continue;
+                };
+                if record.phase != comet_sync::RecoveryPhase::Acknowledged {
+                    continue;
+                }
+                let url =
+                    edge.room_url_as(format!("/session/{chat_id}/ws"), Some(device_id.as_str()));
+                let observed = match RoomClient::observe_stable_ids(
+                    url,
+                    &chat_id,
+                    &record.expected_ids,
+                    CONVERGENCE_VERIFY_BUDGET,
+                )
+                .await
+                {
+                    Ok(observed) => observed,
+                    Err(err) => {
+                        tracing::warn!(chat = %chat_id, error = %err,
+                            "independent convergence check could not reach the room; retrying");
+                        continue;
+                    }
+                };
+                match convergence.confirm_independent(&observed) {
+                    Ok(Some(missing)) if missing.is_empty() => {
+                        tracing::info!(chat = %chat_id,
+                            "shallow-history recovery verified end to end; quarantine released");
+                        return;
+                    }
+                    Ok(Some(missing)) => tracing::error!(
+                        chat = %chat_id,
+                        missing = missing.len(),
+                        "a fresh client cannot retrieve everything this device recovered; \
+                         the quarantine stays until it can"
+                    ),
+                    Ok(None) => return, // released by somebody else
+                    Err(err) => tracing::warn!(chat = %chat_id, error = %err,
+                        "convergence verification bookkeeping failed"),
+                }
+            }
+        });
     }
 
     /// Boot-time warm-open of recent chats (feature-inventory §3.3): open every
@@ -1895,6 +2137,7 @@ impl DocHost {
     fn persist_snapshot(&self, handle: &ChatDocHandle) -> Result<usize, EngineError> {
         let bytes = handle.doc().export_snapshot()?;
         self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+        handle.journal_semantics();
         handle.snapshot_bytes.store(bytes.len(), Ordering::Relaxed);
         Ok(bytes.len())
     }
@@ -1922,6 +2165,11 @@ impl DocHost {
             after_status();
             let bytes = doc.export_snapshot()?;
             self.inner.store.save_snapshot(&handle.chat_id, &bytes)?;
+            // A command outcome is durable local content like any other: it
+            // must be replayable across a shallow-history cut, so it enters
+            // the outbox in the same call that makes the snapshot durable.
+            // Against the doc THIS closure holds — see `journal_semantics_of`.
+            handle.journal_semantics_of(doc);
             Ok(bytes.len())
         })?;
         handle.snapshot_bytes.store(bytes_len, Ordering::Relaxed);

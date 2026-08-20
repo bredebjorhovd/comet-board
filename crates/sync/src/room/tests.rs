@@ -75,6 +75,11 @@ struct FakeEdge {
     dials: AtomicUsize,
     /// `%LOR` DocUpdate messages received (liveness probes must send none).
     loro_doc_updates: AtomicUsize,
+    /// When set, `%LOR` DocUpdates are CONSUMED and neither imported nor
+    /// acked — a room that holds the socket open and takes no content
+    /// (gh#483). The client stays joined, ponging and presence-live, while
+    /// everything it commits stays local-only. That is the incident.
+    swallow_updates: AtomicBool,
 }
 
 impl FakeEdge {
@@ -102,6 +107,7 @@ impl FakeEdge {
             eph_join_requests: AtomicUsize::new(0),
             dials: AtomicUsize::new(0),
             loro_doc_updates: AtomicUsize::new(0),
+            swallow_updates: AtomicBool::new(false),
         })
     }
 
@@ -310,6 +316,9 @@ impl FakeEdge {
             } => {
                 if crdt == CrdtType::Loro {
                     self.loro_doc_updates.fetch_add(1, Ordering::SeqCst);
+                    if self.swallow_updates.load(Ordering::SeqCst) {
+                        return; // taken by the socket, not by the room
+                    }
                 }
                 self.apply(reply_to, crdt, &room_id, batch_id, updates)
                     .await;
@@ -677,7 +686,11 @@ async fn stale_full_client_reseeds_from_shallow_server_without_losing_local_comm
     .expect("connect");
 
     wait_until(|| client.doc().get_list("messages").len() == 5).await;
-    wait_until(|| edge.doc.get_list("commands").len() == 1).await;
+    // gh#483: EVERY locally committed ledger entry crosses the cut, not only
+    // the unresolved intent of the local device. The settled outcome and the
+    // entry relayed from another device are content this replica holds and the
+    // edge does not — dropping either is the loss this module exists to stop.
+    wait_until(|| edge.doc.get_list("commands").len() == 3).await;
     wait_until(|| publication_landed.load(Ordering::SeqCst)).await;
     let replacement = replacement_owner
         .lock()
@@ -688,11 +701,20 @@ async fn stale_full_client_reseeds_from_shallow_server_without_losing_local_comm
     let recovered = comet_doc::SessionDoc::from_doc(client.doc())
         .read_commands()
         .unwrap();
-    assert_eq!(recovered, vec![local_command.clone()]);
+    let recovered_ids: Vec<&str> = recovered.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(
+        recovered_ids,
+        ["local-command", "already-applied", "another-device"],
+        "local ledger order is preserved across the reseed"
+    );
+    assert_eq!(recovered[0], local_command);
     let received = comet_doc::SessionDoc::from_doc(edge.doc.clone())
         .read_commands()
         .unwrap();
-    assert_eq!(received, vec![local_command]);
+    assert_eq!(
+        received, recovered,
+        "the edge holds exactly what we recovered"
+    );
     assert_eq!(
         edge.join_requests.load(Ordering::SeqCst),
         1,
@@ -1470,5 +1492,271 @@ async fn a_swallowed_presence_join_is_retried_until_presence_flows() {
         edge.eph_join_requests.load(Ordering::SeqCst) >= 3,
         "two swallowed + at least one answered"
     );
+    client.shutdown().await.unwrap();
+}
+
+// ── gh#483: the incident, end to end ─────────────────────────────────────────
+
+/// Chat b5b3c796's numbers, as a fixture: `shared` entries the cloud has, then
+/// `offline` entries only the laptop committed.
+fn transcript_entry(id: &str, device: &str, index: usize) -> comet_doc::SessionMessageEntry {
+    comet_doc::SessionMessageEntry {
+        id: id.to_string(),
+        role: if index % 2 == 0 {
+            comet_doc::MessageRole::User
+        } else {
+            comet_doc::MessageRole::Assistant
+        },
+        parts: vec![comet_doc::MessagePart::Text {
+            id: format!("{id}-p0"),
+            text: format!("entry {index} body"),
+        }],
+        created_at: 1_700_000_000_000 + index as i64,
+        device_id: device.to_string(),
+        status: Some(comet_doc::MessageStatus::Complete),
+        continuation_of: None,
+    }
+}
+
+fn entry_ids(doc: &LoroDoc) -> Vec<String> {
+    comet_doc::SessionDoc::from_doc(doc.clone())
+        .read_entries()
+        .expect("read entries")
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect()
+}
+
+/// A cloud room whose history was shallow-trimmed past the laptop's dependency,
+/// exactly as chat b5b3c796-2f3b-4bb2-8341-95d1d7782927 was.
+///
+/// Returns `(shallow server doc, laptop doc, all 323 ids in order)`.
+fn incident_fixture(shared: usize, offline: usize) -> (LoroDoc, LoroDoc, Vec<String>) {
+    let cloud = LoroDoc::new();
+    cloud.set_peer_id(1).unwrap();
+    let cloud_session = comet_doc::SessionDoc::from_doc(cloud.clone());
+    let mut ids = Vec::new();
+    for index in 0..shared {
+        let id = format!("shared-{index:04}");
+        cloud_session
+            .push_message(&transcript_entry(&id, "phone-1", index))
+            .unwrap();
+        ids.push(id);
+    }
+    let full = cloud.export(ExportMode::Snapshot).unwrap();
+
+    // The laptop: the same 249-id prefix, then 74 entries committed offline.
+    let laptop = LoroDoc::new();
+    laptop.import(&full).unwrap();
+    laptop.set_peer_id(2).unwrap();
+    let laptop_session = comet_doc::SessionDoc::from_doc(laptop.clone());
+    for index in 0..offline {
+        let id = format!("offline-{index:04}");
+        laptop_session
+            .push_message(&transcript_entry(&id, "mac-1", shared + index))
+            .unwrap();
+        ids.push(id);
+    }
+
+    // The cloud advances and its history is trimmed at the live frontier: the
+    // visible transcript is still the laptop's exact prefix, but the shallow
+    // root is now newer than the dependency the laptop's appends carry.
+    let marker = cloud.get_text("trim-marker");
+    marker.insert(0, "compaction").unwrap();
+    cloud.commit();
+    marker.delete(0, marker.len_unicode()).unwrap();
+    cloud.commit();
+    let shallow_bytes = cloud
+        .export(ExportMode::shallow_snapshot(&cloud.oplog_frontiers()))
+        .unwrap();
+    let shallow = LoroDoc::new();
+    assert!(shallow.import(&shallow_bytes).unwrap().pending.is_none());
+    assert!(shallow.is_shallow(), "the fixture must really trim history");
+
+    // Pin the incident's own failure signature: the laptop's differential
+    // import is refused, and the shallow snapshot stays pending in the laptop.
+    let clone = LoroDoc::new();
+    clone.import(&shallow_bytes).unwrap();
+    assert!(
+        clone
+            .import(
+                &laptop
+                    .export(ExportMode::updates(&clone.oplog_vv()))
+                    .unwrap()
+            )
+            .is_err(),
+        "the fixture must reproduce ImportUpdatesThatDependsOnOutdatedVersion"
+    );
+    let probe = LoroDoc::new();
+    probe
+        .import(&laptop.export(ExportMode::Snapshot).unwrap())
+        .unwrap();
+    assert!(
+        probe.import(&shallow_bytes).unwrap().pending.is_some(),
+        "and the shallow snapshot must stay pending in the stale laptop replica"
+    );
+
+    (shallow, laptop, ids)
+}
+
+/// **The gh#483 regression.** Server holds a 249-entry shallow snapshot; the
+/// laptop holds that same prefix plus 74 entries committed offline; the
+/// reconnect hits the outdated-history path; and a FRESH client — an empty
+/// document that has only ever spoken to the room — ends up holding exactly all
+/// 323 stable ids, in order, with nothing lost and nothing duplicated.
+///
+/// Deterministic: no wall-clock dependence, fixed peer ids, fixed content.
+#[tokio::test]
+async fn a_shallow_reseed_preserves_all_323_entries_for_a_fresh_client() {
+    let (shallow_server, laptop, expected_ids) = incident_fixture(249, 74);
+    assert_eq!(entry_ids(&shallow_server).len(), 249);
+    assert_eq!(entry_ids(&laptop).len(), 323);
+
+    // The engine's durable outbox, as `DocHost` maintains it: local content is
+    // journaled when the snapshot is saved, before any of this goes wrong.
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::DocsStore::open(dir.path()).unwrap());
+    let outbox = crate::ConvergenceRecovery::new(store.clone(), "chat-483");
+    outbox.record(&laptop).unwrap();
+
+    let edge = FakeEdge::with_doc(shallow_server);
+    let owner = Arc::new(Mutex::new(laptop.clone()));
+    let owner_for_reseed = owner.clone();
+    let client = RoomClient::connect_with_recovery(
+        edge.connector(),
+        "room-483",
+        laptop.clone(),
+        DocRecovery::for_device(
+            "mac-1",
+            Arc::new(move |replacement| {
+                *owner_for_reseed.lock().unwrap() = replacement;
+            }),
+        )
+        .with_journal(store.clone(), "chat-483"),
+    )
+    .await
+    .expect("connect");
+
+    // The room converges on 323 — the cloud is no longer stuck at 249.
+    wait_until(|| entry_ids(&edge.doc).len() == 323).await;
+    assert_eq!(
+        entry_ids(&edge.doc),
+        expected_ids,
+        "the room holds every stable id, in local order"
+    );
+    assert_eq!(entry_ids(&client.doc()), expected_ids);
+    assert_eq!(
+        entry_ids(&owner.lock().unwrap().clone()),
+        expected_ids,
+        "the application's own reference moved to the recovered document"
+    );
+
+    // A FRESH independent client: an empty document that has only ever spoken
+    // to the room. This is the half of the invariant the recovering device
+    // cannot assert about itself.
+    let observed = RoomClient::observe_stable_ids_with(
+        edge.connector(),
+        "room-483",
+        &expected_ids,
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("fresh client joins");
+    assert_eq!(observed, expected_ids, "no loss, no duplication");
+
+    // Every entry survives whole — parts, timestamps, provenance, status.
+    let recovered = comet_doc::SessionDoc::from_doc(edge.doc.clone())
+        .read_entries()
+        .unwrap();
+    assert_eq!(
+        recovered[249],
+        transcript_entry("offline-0000", "mac-1", 249)
+    );
+    assert_eq!(
+        recovered[322],
+        transcript_entry("offline-0073", "mac-1", 322)
+    );
+
+    // The outbox drained on acknowledgement, and the quarantine is retained
+    // until the independent check says otherwise.
+    wait_until(|| outbox.pending() == 0).await;
+    let record = outbox
+        .open_recovery()
+        .expect("quarantine retained until verified");
+    assert!(
+        record.expected_ids.len() >= 323,
+        "the quarantine accounts for every stable id it protected"
+    );
+    assert!(
+        crate::convergence::ConvergenceJournal::open_recovery(store.as_ref(), "chat-483")
+            .unwrap()
+            .is_some(),
+        "and it is DURABLE — a crash here still finds it"
+    );
+    assert_eq!(
+        outbox.confirm_independent(&observed).unwrap(),
+        Some(Vec::new())
+    );
+    assert!(
+        outbox.open_recovery().is_none(),
+        "verified convergence is what releases the quarantine — nothing else"
+    );
+    client.shutdown().await.unwrap();
+}
+
+/// The state a viewport renders must be the truth about CONTENT, not about the
+/// socket (gh#483 §4). A room that takes the socket and none of the content
+/// reads `connected()` — it IS connected — and must NOT read converged; and
+/// the moment the edge actually takes the entries, it must flip.
+#[tokio::test]
+async fn a_live_room_reports_pending_content_until_the_edge_has_it() {
+    let local = comet_doc::SessionDoc::init("chat-state").unwrap();
+    for index in 0..5 {
+        local
+            .push_message(&transcript_entry(
+                &format!("local-{index:04}"),
+                "mac-1",
+                index,
+            ))
+            .unwrap();
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(crate::DocsStore::open(dir.path()).unwrap());
+    let outbox = crate::ConvergenceRecovery::new(store.clone(), "chat-state");
+    outbox.record(local.doc()).unwrap();
+    assert_eq!(outbox.pending(), 5, "five entries exist only here");
+
+    let edge = FakeEdge::new();
+    // The room takes the socket and none of the content.
+    edge.swallow_updates.store(true, Ordering::SeqCst);
+    let client = RoomClient::connect_with_recovery(
+        edge.connector(),
+        "room-state",
+        local.doc().clone(),
+        DocRecovery::for_device("mac-1", Arc::new(|_| {}))
+            .with_journal(store.clone(), "chat-state"),
+    )
+    .await
+    .expect("connect");
+
+    wait_until(|| edge.loro_doc_updates.load(Ordering::SeqCst) > 0).await;
+    assert!(
+        client.connected(),
+        "the socket is up — that was never in doubt"
+    );
+    assert!(
+        !client.convergence().is_converged(),
+        "and the content is not: {:?}",
+        client.convergence()
+    );
+    assert_eq!(client.convergence().unacked(), 5);
+
+    // Now the edge starts taking content: a redial re-pushes from the server's
+    // VV, the ack lands, and the state flips on its own.
+    edge.swallow_updates.store(false, Ordering::SeqCst);
+    edge.kick_all();
+    wait_until(|| entry_ids(&edge.doc).len() == 5).await;
+    wait_until(|| client.convergence().is_converged()).await;
+    assert_eq!(outbox.pending(), 0, "the outbox drains on acknowledgement");
     client.shutdown().await.unwrap();
 }

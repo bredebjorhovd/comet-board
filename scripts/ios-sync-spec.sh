@@ -11,12 +11,19 @@
 # state this account's edge is in whenever the Durable Objects free-tier
 # duration cap is tripped — the outage the schedule exists for.
 #
+# Since gh#483 it also runs the phone's half of convergence recovery: the
+# incident's own 249 + 74 transcript (every stable id survives the shallow
+# reseed, once each, in order), a crash between quarantine and acknowledgement
+# finished by a simulated relaunch, and the content-state rules that keep a live
+# room from being reported as a converged one.
+#
 # The other half of the check needs no simulator and runs in CI:
 #
 #   cargo test -p comet-sync --test ios_room   the constants and the shape, read
 #                                              out of both sources as text
 #   scripts/ios-sync-spec.sh                   this: the schedule those
-#                                              constants produce
+#                                              constants produce, and the
+#                                              recovery those rules produce
 #
 # Usage: scripts/ios-sync-spec.sh [simulator name]
 # Env:   COMET_SPEC_SIM (default "iPhone 17 Pro")

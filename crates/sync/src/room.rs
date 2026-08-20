@@ -32,7 +32,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use comet_doc::{SessionCommandStatus, SessionDoc};
+use crate::convergence::{
+    ConvergenceJournal, ConvergenceRecovery, ConvergenceState, RecoveryPhase, UNACKNOWLEDGED_ALERT,
+};
 use futures::future::BoxFuture;
 use futures::{SinkExt, StreamExt};
 use loro::awareness::EphemeralStore;
@@ -164,6 +166,15 @@ const WAKE_SPREAD: Duration = Duration::from_millis(1000);
 /// session — our history predates the room's shallow start and can never
 /// import; recovery is an app-layer concern (§3.1).
 const MAX_INVALID_REJOINS: u32 = 3;
+/// How often an established session recomputes its convergence state (gh#483).
+///
+/// The outbox is written by the document's owner, not by this actor, so the
+/// count of unacknowledged local content changes without any frame arriving.
+/// A poll is what makes "live but not converged" observable in seconds instead
+/// of at the next room event — the incident's whole failure was that nothing
+/// ever looked. Cheap by construction: an indexed count over a table that is
+/// empty on a converged room.
+const CONVERGENCE_POLL: Duration = Duration::from_secs(15);
 
 /// Errors surfaced by [`RoomClient`].
 #[derive(Debug, Clone, thiserror::Error)]
@@ -227,27 +238,40 @@ pub enum RoomEvent {
     /// Malformed protocol state parked the client; no background redial will
     /// occur until an owner explicitly constructs/starts another client.
     ProtocolParked,
+    /// The room's CONTENT state changed — converged, pending, recovering, or
+    /// blocked. Emitted independently of [`Self::Connected`] on purpose: the
+    /// gh#483 incident is a room that is connected and never converges, and a
+    /// surface that infers one from the other cannot show it.
+    ConvergenceChanged,
 }
 
 /// App-owned state that must move with a room client when a shallow server
 /// snapshot cannot merge into its stale local document.
 ///
-/// The room validates and builds the replacement, then invokes `on_reseed`
-/// before publishing [`RoomEvent::RemoteUpdate`]. Session rooms also name the
-/// local device so unresolved commands authored by that device can be copied
-/// into the replacement before it becomes visible. Workspace/registry rooms
-/// use [`DocRecovery::replacing`] because they have no command ledger.
+/// The room validates the replacement, hands it to [`crate::convergence`] —
+/// which quarantines the stale document and replays every locally committed
+/// semantic entry onto the replacement — and then invokes `on_reseed` before
+/// publishing [`RoomEvent::RemoteUpdate`]. Session rooms also name the local
+/// device (provenance for the command ledger); workspace/registry rooms use
+/// [`DocRecovery::replacing`] because they have no command ledger.
 ///
 /// `on_reseed` is the ownership boundary, not a notification. It must move all
 /// app-owned references synchronously. If command creation can retain the old
 /// document, a device callback must also gate that creation and reconcile the
 /// final old-document command delta before publishing the replacement. The
 /// room cannot close a race in an owner it does not control.
+///
+/// Recovery is ALWAYS convergence-driven: without [`Self::with_journal`] the
+/// outbox and quarantine live in a [`MemoryJournal`], so replay and the state
+/// reporting behave identically and only the surviving-a-restart part is
+/// missing. Anything that persists a document (the engine, the phone) is
+/// expected to pass a durable journal.
 #[derive(Clone)]
 pub struct DocRecovery {
     local_device_id: Option<String>,
     on_reseed: Option<Arc<dyn Fn(LoroDoc) + Send + Sync>>,
     mutation_gate: Option<Arc<std::sync::Mutex<()>>>,
+    convergence: Option<ConvergenceRecovery>,
 }
 
 impl DocRecovery {
@@ -261,6 +285,7 @@ impl DocRecovery {
             local_device_id: Some(device_id.into()),
             on_reseed: Some(on_reseed),
             mutation_gate: None,
+            convergence: None,
         }
     }
 
@@ -270,6 +295,7 @@ impl DocRecovery {
             local_device_id: None,
             on_reseed: Some(on_reseed),
             mutation_gate: None,
+            convergence: None,
         }
     }
 
@@ -280,12 +306,33 @@ impl DocRecovery {
         self
     }
 
+    /// Back this room's outbox and quarantine with a durable journal
+    /// (`DocsStore` in the engine). `doc_id` keys the rows — the chat id for a
+    /// session room, the stable local doc id for a workspace room.
+    pub fn with_journal(
+        mut self,
+        journal: Arc<dyn ConvergenceJournal>,
+        doc_id: impl Into<String>,
+    ) -> Self {
+        self.convergence = Some(ConvergenceRecovery::new(journal, doc_id));
+        self
+    }
+
+    /// The recovery driver this room will use, defaulting to a process-local
+    /// one so behaviour never depends on whether a store was wired.
+    fn convergence(&self, room_id: &str) -> ConvergenceRecovery {
+        self.convergence.clone().unwrap_or_else(|| {
+            ConvergenceRecovery::new(Arc::new(crate::convergence::MemoryJournal::new()), room_id)
+        })
+    }
+
     #[cfg(test)]
     fn disabled() -> Self {
         Self {
             local_device_id: None,
             on_reseed: None,
             mutation_gate: None,
+            convergence: None,
         }
     }
 }
@@ -431,6 +478,7 @@ pub struct RoomClient {
     eph: EphemeralStore,
     events: broadcast::Sender<RoomEvent>,
     connected: watch::Receiver<bool>,
+    convergence: watch::Receiver<ConvergenceState>,
     presence: watch::Receiver<bool>,
     shutdown: watch::Sender<bool>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -517,7 +565,27 @@ impl RoomClient {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (connected_tx, connected_rx) = watch::channel(false);
         let (presence_tx, presence_rx) = watch::channel(false);
+        let (convergence_tx, convergence_rx) = watch::channel(ConvergenceState::Converged);
         let (ready_tx, ready_rx) = oneshot::channel();
+
+        // Crash resume, before the first dial: a recovery interrupted between
+        // quarantine and acknowledgement finishes here, replaying the
+        // quarantined content into whatever document this client was handed.
+        // Idempotent by stable id, so a resume that has nothing to do costs one
+        // journal lookup (gh#483 §6).
+        let convergence = recovery.convergence(room_id);
+        match convergence.resume(&doc) {
+            Ok(Some(report)) if !report.is_empty() => tracing::warn!(
+                room = %room_id,
+                replayed = report.total(),
+                "replayed an interrupted recovery's quarantined content at open"
+            ),
+            Ok(_) => {}
+            Err(err) => tracing::error!(
+                room = %room_id, error = %err,
+                "could not resume an interrupted recovery; the quarantine is retained"
+            ),
+        }
 
         let actor = RoomActor {
             doc: current_doc.clone(),
@@ -525,6 +593,8 @@ impl RoomClient {
             doc_generation,
             doc_sub: doc_sub.clone(),
             recovery,
+            convergence,
+            convergence_tx: Arc::new(convergence_tx),
             eph: eph.clone(),
             room_id: room_id.to_string(),
             connector,
@@ -543,6 +613,7 @@ impl RoomClient {
                 eph,
                 events,
                 connected: connected_rx,
+                convergence: convergence_rx,
                 presence: presence_rx,
                 shutdown: shutdown_tx,
                 task: Some(task),
@@ -610,12 +681,97 @@ impl RoomClient {
         self.presence.clone()
     }
 
+    /// What this room can honestly say about its CONTENT right now (gh#483).
+    ///
+    /// Strictly independent of [`Self::connected`]. A room can be joined,
+    /// ponging, presence-live and still hold 74 transcript entries the edge has
+    /// never taken — that is the incident, and it reads
+    /// [`ConvergenceState::Pending`] here while `connected()` reads true.
+    /// Anything that renders "synced" must read this.
+    pub fn convergence(&self) -> ConvergenceState {
+        self.convergence.borrow().clone()
+    }
+
+    /// Watch [`Self::convergence`]. Closes with the actor, like
+    /// [`Self::watch_connected`].
+    pub fn watch_convergence(&self) -> watch::Receiver<ConvergenceState> {
+        self.convergence.clone()
+    }
+
     /// Watch [`Self::connected`]. The channel CLOSES when the actor task ends
     /// for any reason (clean shutdown, or a panic that would otherwise leave a
     /// client that can never reconnect), so `changed()` returning `Err` is the
     /// supervisor's cue to rebuild this client rather than wait forever.
     pub fn watch_connected(&self) -> watch::Receiver<bool> {
         self.connected.clone()
+    }
+
+    /// Dial `room_id` as a FRESH, independent client and report which of
+    /// `expected` stable ids it can retrieve — the second half of the gh#483
+    /// invariant.
+    ///
+    /// This is deliberately not a check the recovering client can do on itself:
+    /// "my document contains it" and "anyone else asking this room gets it" are
+    /// different claims, and only the second one lets the quarantine go. The
+    /// client starts from an EMPTY document, so everything it sees came from
+    /// the room's own backfill.
+    ///
+    /// Returns as soon as every expected id is present, or when `budget`
+    /// expires — in which case the ids it did see are returned, and the caller
+    /// keeps its quarantine.
+    pub async fn observe_stable_ids(
+        provider: Arc<dyn UrlProvider>,
+        room_id: &str,
+        expected: &[String],
+        budget: Duration,
+    ) -> Result<Vec<String>, SyncError> {
+        let doc = LoroDoc::new();
+        let client = Self::connect_via(
+            provider,
+            room_id,
+            doc.clone(),
+            DocRecovery::replacing(Arc::new(|_| {})),
+        )
+        .await?;
+        let observed = Self::await_stable_ids(&doc, expected, budget).await;
+        let _ = client.shutdown().await;
+        Ok(observed)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn observe_stable_ids_with(
+        connector: Arc<dyn Connector>,
+        room_id: &str,
+        expected: &[String],
+        budget: Duration,
+    ) -> Result<Vec<String>, SyncError> {
+        let doc = LoroDoc::new();
+        let client = Self::connect_with_recovery(
+            connector,
+            room_id,
+            doc.clone(),
+            DocRecovery::replacing(Arc::new(|_| {})),
+        )
+        .await?;
+        let observed = Self::await_stable_ids(&doc, expected, budget).await;
+        let _ = client.shutdown().await;
+        Ok(observed)
+    }
+
+    async fn await_stable_ids(doc: &LoroDoc, expected: &[String], budget: Duration) -> Vec<String> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let wanted: HashSet<&str> = expected.iter().map(String::as_str).collect();
+        loop {
+            let observed = crate::convergence::stable_ids(doc).unwrap_or_default();
+            let seen: HashSet<&str> = observed.iter().map(String::as_str).collect();
+            if wanted.iter().all(|id| seen.contains(id)) {
+                return observed;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return observed;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 
     /// Leave the room (protocol `Leave` frames + close handshake) and stop the
@@ -652,6 +808,11 @@ struct RoomActor {
     doc_generation: Arc<AtomicU64>,
     doc_sub: Arc<Mutex<Option<loro::Subscription>>>,
     recovery: DocRecovery,
+    /// The convergence driver for this room's document: outbox, quarantine,
+    /// replay, and acknowledgement accounting (gh#483).
+    convergence: ConvergenceRecovery,
+    /// Truthful content state, published for [`RoomClient::convergence`].
+    convergence_tx: Arc<watch::Sender<ConvergenceState>>,
     eph: EphemeralStore,
     room_id: String,
     connector: Arc<dyn Connector>,
@@ -860,6 +1021,13 @@ impl RoomActor {
             doc_generation: self.doc_generation.clone(),
             doc_sub: self.doc_sub.clone(),
             recovery: self.recovery.clone(),
+            convergence: self.convergence.clone(),
+            convergence_tx: self.convergence_tx.clone(),
+            events_for_state: self.events.clone(),
+            acked_vv: VersionVector::default(),
+            unacked_since: None,
+            stall_reported: false,
+            blocked: None,
             eph: self.eph.clone(),
             room_id: self.room_id.clone(),
             tx: pipe.tx.clone(),
@@ -880,11 +1048,15 @@ impl RoomActor {
             last_lor_rx: tokio::time::Instant::now(),
         };
 
+        sess.publish_convergence();
         let version = sess.local_version_bytes();
         if let Err(err) = sess.send_join_loro(version).await {
             return SessionOutcome::failed(SessionEnd::Lost(err));
         }
 
+        let mut convergence_poll = tokio::time::interval(CONVERGENCE_POLL);
+        convergence_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        convergence_poll.tick().await; // consume the immediate first tick
         let mut probe_interval = ROOM_PROBE_AFTER;
         let mut last_probe_at: Option<tokio::time::Instant> = None;
         let mut woke = false;
@@ -1002,6 +1174,12 @@ impl RoomActor {
                         break SessionEnd::Lost(err);
                     }
                 }
+                // The document's owner writes the outbox, not this actor, so
+                // "is this room converged?" has to be asked rather than waited
+                // for (gh#483 §4/§7). Nothing here touches the socket.
+                _ = convergence_poll.tick() => {
+                    sess.publish_convergence();
+                }
                 _ = tokio::time::sleep_until(liveness_at) => {
                     if join_outstanding {
                         // The 2026-07-30 hang: a room that accepted the socket
@@ -1061,6 +1239,24 @@ struct Session {
     doc_generation: Arc<AtomicU64>,
     doc_sub: Arc<Mutex<Option<loro::Subscription>>>,
     recovery: DocRecovery,
+    convergence: ConvergenceRecovery,
+    convergence_tx: Arc<watch::Sender<ConvergenceState>>,
+    /// Broadcast handle used only to announce a content-state change; the
+    /// lifecycle events go through `events`.
+    events_for_state: broadcast::Sender<RoomEvent>,
+    /// Everything this session has proof the edge holds: the version it
+    /// advertised on join, merged with the end version of every batch it
+    /// acked. This is what retires outbox rows — never the mere fact that a
+    /// frame was sent.
+    acked_vv: VersionVector,
+    /// When local content first became unacknowledged in this session, and
+    /// whether the alert threshold has already been reported (once per
+    /// session, so a stuck room is a line in the log rather than a stream).
+    unacked_since: Option<tokio::time::Instant>,
+    stall_reported: bool,
+    /// Set when the edge will not take this device's content and recovery
+    /// cannot repair it — the room is live and the document is local-only.
+    blocked: Option<String>,
     eph: EphemeralStore,
     room_id: String,
     tx: mpsc::Sender<Vec<u8>>,
@@ -1109,36 +1305,94 @@ struct Session {
     last_lor_rx: tokio::time::Instant,
 }
 
-fn replay_unresolved_commands(
-    stale: &LoroDoc,
-    replacement: &LoroDoc,
-    device_id: &str,
-) -> Result<usize, SyncError> {
-    let stale_commands = SessionDoc::from_doc(stale.clone())
-        .read_commands()
-        .map_err(|err| SyncError::Loro(err.to_string()))?;
-    let replacement_doc = SessionDoc::from_doc(replacement.clone());
-    let existing: HashSet<String> = replacement_doc
-        .read_commands()
-        .map_err(|err| SyncError::Loro(err.to_string()))?
-        .into_iter()
-        .map(|command| command.id)
-        .collect();
-    let mut replayed = 0;
-    for command in stale_commands.into_iter().filter(|command| {
-        command.status == SessionCommandStatus::Pending
-            && command.issued_by == device_id
-            && !existing.contains(&command.id)
-    }) {
-        replacement_doc
-            .queue_command(&command)
-            .map_err(|err| SyncError::Loro(err.to_string()))?;
-        replayed += 1;
-    }
-    Ok(replayed)
-}
-
 impl Session {
+    /// Recompute and publish [`ConvergenceState`] (gh#483 §4).
+    ///
+    /// Deliberately derived from three durable facts and nothing about the
+    /// socket: how much unacknowledged semantic content the outbox holds,
+    /// whether a recovery is open, and whether the edge has refused this
+    /// device's history. A live socket contributes nothing to it.
+    fn publish_convergence(&mut self) {
+        let unacked = self.convergence.pending();
+        if unacked == 0 {
+            self.unacked_since = None;
+            self.stall_reported = false;
+        } else if self.unacked_since.is_none() {
+            self.unacked_since = Some(tokio::time::Instant::now());
+        }
+        let stalled = self
+            .unacked_since
+            .is_some_and(|since| since.elapsed() >= UNACKNOWLEDGED_ALERT);
+        let state = if let Some(reason) = &self.blocked {
+            ConvergenceState::BlockedLocalOnly {
+                unacked,
+                reason: reason.clone(),
+            }
+        } else if let Some(record) = self
+            .convergence
+            .open_recovery()
+            .filter(|record| record.phase < RecoveryPhase::Acknowledged)
+        {
+            ConvergenceState::Recovering {
+                phase: record.phase,
+                unacked,
+            }
+        } else if unacked > 0 {
+            ConvergenceState::Pending { unacked, stalled }
+        } else {
+            ConvergenceState::Converged
+        };
+        // The diagnostic gh#483 §7 asks for: a room that is JOINED while its
+        // uploads stay unacknowledged past the threshold. Reported once per
+        // session, at error level, naming the count — the state a viewport
+        // renders is the same value, so the log and the UI cannot disagree.
+        if stalled && !self.stall_reported && self.joined_lor {
+            self.stall_reported = true;
+            tracing::error!(
+                room = %self.room_id,
+                unacked,
+                threshold_s = UNACKNOWLEDGED_ALERT.as_secs(),
+                state = %state.label(),
+                "room is joined but local content has been unacknowledged past the \
+                 threshold; transport liveness is NOT convergence"
+            );
+        }
+        if *self.convergence_tx.borrow() != state {
+            self.convergence_tx.send_replace(state);
+            let _ = self.events_for_state.send(RoomEvent::ConvergenceChanged);
+        }
+    }
+
+    /// Fold new proof of what the edge holds into `acked_vv` and retire the
+    /// outbox rows it covers.
+    fn note_acknowledged(&mut self, version: &VersionVector) {
+        self.acked_vv.merge(version);
+        let acked = self.acked_vv.clone();
+        if let Err(err) = self.convergence.acknowledge(&acked) {
+            tracing::warn!(room = %self.room_id, error = %err,
+                "could not retire acknowledged outbox rows");
+        }
+        self.publish_convergence();
+    }
+
+    /// The version an acked batch carried. Derived from the blob itself rather
+    /// than from what we believe we exported: the batch may have been built
+    /// before a reseed, and only the bytes know what is actually in it.
+    fn batch_version(updates: &[Vec<u8>]) -> Option<VersionVector> {
+        let mut merged = VersionVector::default();
+        let mut any = false;
+        for update in updates {
+            match LoroDoc::decode_import_blob_meta(update, false) {
+                Ok(meta) => {
+                    merged.merge(&meta.partial_end_vv);
+                    any = true;
+                }
+                Err(_) => return None,
+            }
+        }
+        any.then_some(merged)
+    }
+
     fn local_version_bytes(&self) -> Vec<u8> {
         let vv = self.doc.oplog_vv();
         // Empty bytes ask the server for a full snapshot (its fresh-doc path).
@@ -1332,6 +1586,12 @@ impl Session {
                 self.joined_lor = true;
                 self.joined_at.get_or_insert_with(tokio::time::Instant::now);
                 self.connected.set(true);
+                // The version the room advertises IS proof of what it holds —
+                // the strongest acknowledgement available, and the one a fresh
+                // client would backfill from. Probe answers count too: that is
+                // how a room converged by another device retires this device's
+                // outbox rows without anything being sent.
+                self.note_acknowledged(&server_vv);
                 if was_probe {
                     // A probe or recovery answer on an established session
                     // proves only that the room is alive and advertises the
@@ -1467,9 +1727,17 @@ impl Session {
     }
 
     /// Import `snapshot` into a fresh doc, validate it against the version the
-    /// server advertised immediately before the backfill, replay unresolved
-    /// commands authored by this device, and atomically move every room-owned
-    /// reference/subscription to the replacement.
+    /// server advertised immediately before the backfill, hand it to
+    /// [`crate::convergence`] — which quarantines the stale document and
+    /// replays every locally committed semantic entry onto the replacement —
+    /// and atomically move every room-owned reference/subscription across.
+    ///
+    /// The ORDER is the safety property (gh#483): quarantine is durable before
+    /// anything is replaced, replay and its verification happen before the swap
+    /// is visible to the owner, and the outbox rows survive until the edge's
+    /// version proves it holds them. A failure anywhere before the swap leaves
+    /// the stale document in place — unmergeable, but complete — which is the
+    /// half of the fork that loses nothing.
     async fn try_reseed(&mut self, snapshot: &[u8]) -> Result<bool, SyncError> {
         let Some(on_reseed) = self.recovery.on_reseed.clone() else {
             // The public API requires an explicit owner. Test-only disabled
@@ -1500,11 +1768,25 @@ impl Session {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
         });
 
-        let replayed = if let Some(device_id) = self.recovery.local_device_id.as_deref() {
-            replay_unresolved_commands(&self.doc, &candidate, device_id)?
-        } else {
-            0
+        let report = match self.convergence.recover(&self.doc, &candidate, &server_vv) {
+            Ok(report) => report,
+            Err(err) => {
+                // The stale document is untouched and the quarantine (if the
+                // failure came after it was written) still holds it. Say so
+                // loudly and stay unmerged rather than swap into a document
+                // that cannot account for local content.
+                tracing::error!(
+                    room = %self.room_id,
+                    error = %err,
+                    "convergence recovery refused the server snapshot; keeping the local document"
+                );
+                self.blocked = Some(format!("recovery refused the server snapshot: {err}"));
+                drop(guard);
+                self.publish_convergence();
+                return Ok(false);
+            }
         };
+        let replayed = report.total();
 
         // Replay happened before subscribing, so explicitly derive the only
         // local delta the server can lack. This also avoids publishing the
@@ -1521,9 +1803,13 @@ impl Session {
 
         // Anything derived from the stale graph is now invalid: discard sent
         // batches and make queued subscription callbacks self-identify as the
-        // old generation. Only the semantic command replay crosses the cut.
+        // old generation. Only the replayed semantic content crosses the cut —
+        // as content, re-committed on the replacement, never as the operations
+        // the edge has already refused.
         self.pending.clear();
         self.invalid_rejoins = 0;
+        // A completed reseed is the repair for a refused history.
+        self.blocked = None;
         let generation = self.doc_generation.fetch_add(1, Ordering::SeqCst) + 1;
         let local_tx = self.local_tx.clone();
         let subscription = candidate.subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
@@ -1547,9 +1833,27 @@ impl Session {
         }
         tracing::warn!(
             room = %self.room_id,
-            replayed_commands = replayed,
-            "reseeded stale local document from validated server snapshot"
+            device = self.recovery.local_device_id.as_deref().unwrap_or("-"),
+            restored_messages = report.restored_messages.len(),
+            extended_messages = report.extended_messages.len(),
+            restored_commands = report.restored_commands.len(),
+            resolved_commands = report.resolved_commands.len(),
+            diverged = report.diverged.len(),
+            "reseeded stale local document from validated server snapshot and replayed \
+             local semantic content"
         );
+        if !report.diverged.is_empty() {
+            // Not data loss — the authoritative copy carries more than ours and
+            // the quarantine holds ours — but it is the one case an operator
+            // may want to look at, so it is named rather than counted away.
+            tracing::warn!(
+                room = %self.room_id,
+                ids = ?report.diverged,
+                "authoritative copies of these entries are ahead of the local ones; \
+                 local bytes retained in the quarantine"
+            );
+        }
+        self.publish_convergence();
         Ok(true)
     }
 
@@ -1594,7 +1898,12 @@ impl Session {
     ) -> Result<(), SyncError> {
         match status {
             UpdateStatusCode::Ok => {
-                self.pending.remove(&ref_id);
+                if let Some(batch) = self.pending.remove(&ref_id)
+                    && crdt == CrdtType::Loro
+                    && let Some(version) = Self::batch_version(&batch)
+                {
+                    self.note_acknowledged(&version);
+                }
             }
             UpdateStatusCode::FragmentTimeout => {
                 // DO hibernated mid-batch and lost reassembly state — resend
@@ -1616,6 +1925,16 @@ impl Session {
                             room = %self.room_id,
                             "updates repeatedly rejected (stale peer past shallow start); giving up resubmission"
                         );
+                        // The room is live and will not take this device's
+                        // history. Before gh#483 that state was invisible —
+                        // every surface said "connected" while the document
+                        // stopped converging for good. Name it.
+                        self.blocked = Some(
+                            "the edge refuses this device's history (shallow start is newer) \
+                             and no server snapshot has repaired it"
+                                .into(),
+                        );
+                        self.publish_convergence();
                         return Ok(());
                     }
                     self.invalid_rejoins += 1;
