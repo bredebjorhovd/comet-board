@@ -100,6 +100,12 @@ final class AppModel {
             DraftsSpecRunner.run()
             return
         }
+        // What the clipboard and the share sheet get (gh#534). Pure string
+        // building over the row model — no network, no session.
+        if args.contains("-copy-spec") {
+            CopySpecRunner.run()
+            return
+        }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return

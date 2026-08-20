@@ -269,6 +269,42 @@ The consequence for this file is the **[manual]** marks: `simctl` cannot hold a
 finger down, so every one of these claims is checked by a human with the
 simulator in front of them, and none of them appears in the committed captures.
 
+## E. Getting text out (gh#534)
+
+Not from the canvas — the canvas does not draw a clipboard. These are the
+affordances gh#534 added after the 2026-08-19 incident, where the operator
+could not copy the failing app's own error string and diagnosis ran on
+paraphrases over SSH. The rule: **any string the app can show, the user can put
+on the clipboard.**
+
+Every claim here is behind a press, so every one is **[manual]** by the rule in
+§"Why this file cannot be verified" — `simctl` cannot hold a finger down. What
+IS mechanically checked is the string each of them produces:
+`scripts/ios-copy-spec.sh` runs `CopySpecRunner` in the simulator against
+`TranscriptText`.
+
+- **E1** Every transcript row answers a long press with Copy and Share…
+  (`transcriptCopyMenu`). What it copies is the WHOLE row — the markdown of a
+  block, a tool group's commands, an error message — not what happens to be on
+  screen. **[manual]**
+- **E2** Transcript prose, headings, table cells, code lines and the user
+  bubble are `.textSelection(.enabled)`: a long press on the glyphs starts a
+  character selection with the system's own Copy. SwiftUI selects one `Text` at
+  a time, so a selection never crosses a row — which is why E1 exists.
+  **[manual, and the one to check first: if the row's menu wins the long press
+  everywhere, E2 is dead and E1 is carrying the feature alone.]**
+- **E3** A fenced block draws a copy chip in its top-right — 24pt, radius
+  `radiusChip`, `Theme.elementHover` bed, `--muted` glyph — that copies the
+  block in one tap and flashes ✓ "Copied" for 1.2s. Overlaid, so neither the
+  press nor the flash moves the code. **[manual]**
+- **E4** An error chip draws a 26pt copy button hard right in
+  `Theme.dangerText` — the chip's own red — which writes the UNTRUNCATED
+  message. The chip shows one line; the clipboard gets all of it. **[manual]**
+- **E5** The session menu (⋯, always present) holds "Copy transcript" and
+  "Share transcript". The export is built from the message PARTS, so an agent's
+  markdown comes out as the agent wrote it — not re-derived from the parsed
+  blocks. **[manual]**
+
 ## Deviations
 
 Three, each a case where the canvas and the locked scale disagree and the scale

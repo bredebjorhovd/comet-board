@@ -92,6 +92,22 @@ pub struct CopyUi {
     pub copied_ix: Option<usize>,
 }
 
+impl CopyUi {
+    /// A copy button with no owning entity to flash "Copied" on — the click
+    /// writes the block and that is all. Markdown outside the transcript (the
+    /// board's issue peek, the review's brief) renders through views that keep
+    /// no per-row copy state; a button that copies is worth more there than the
+    /// 1.2s acknowledgement it cannot show (gh#534).
+    pub fn clipboard_only() -> Self {
+        Self {
+            handler: Rc::new(|_, code: SharedString, _, cx: &mut gpui::App| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(code.to_string()));
+            }),
+            copied_ix: None,
+        }
+    }
+}
+
 impl RenderOptions {
     /// Options for a completed (non-streaming) row — no veil, no cache.
     pub fn settled(row_key: SharedString) -> Self {
@@ -101,6 +117,14 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
+        }
+    }
+
+    /// [`Self::settled`] plus the stateless code-block copy button.
+    pub fn settled_copyable(row_key: SharedString) -> Self {
+        Self {
+            copy: Some(CopyUi::clipboard_only()),
+            ..Self::settled(row_key)
         }
     }
 }
@@ -662,11 +686,37 @@ fn flat_text_element(
     // from the text's own layout handle. Pure paint — never in layout. The
     // same paint pass re-registers the frame-scoped window mouse listeners
     // that drive text selection (round 18; see markdown/selection.rs).
-    let sel_key: std::sync::Arc<str> = format!("{}:{ix}", opts.row_key).into();
-    let code_ranges = flat.code_ranges.clone();
-    let flat_text = flat.text.clone();
-    let code_wash = inline_code_wash(theme);
-    let underlay = canvas(
+    let sel_key = element_key(&opts.row_key, ix);
+    div()
+        .relative()
+        .child(selection_underlay(
+            &sel_key,
+            flat.text.clone(),
+            layout,
+            flat.code_ranges.clone(),
+            inline_code_wash(theme),
+        ))
+        .child(text_el)
+        .into_any_element()
+}
+
+/// The absolute canvas that makes ONE laid-out text element selectable: it
+/// paints the selection wash (and any inline-code washes) under the glyphs,
+/// registers the element in this frame's document-ordered registry, and
+/// re-installs the frame's mouse listeners.
+///
+/// Pure paint — it never participates in layout, so any text element can gain
+/// selection by wrapping it in a `.relative()` div with this as its FIRST
+/// child. `key` must be unique per element and stable across frames.
+fn selection_underlay(
+    key: &str,
+    text: SharedString,
+    layout: gpui::TextLayout,
+    code_ranges: Vec<Range<usize>>,
+    code_wash: Hsla,
+) -> impl IntoElement {
+    let key: std::sync::Arc<str> = key.into();
+    canvas(
         |_, _, _| (),
         move |_, _, window, _| {
             for range in &code_ranges {
@@ -681,7 +731,7 @@ fn flat_text_element(
                     ));
                 }
             }
-            if let Some(range) = super::selection::wash_range(&sel_key) {
+            if let Some(range) = super::selection::wash_range(&key) {
                 for rect in range_rects(&layout, &range, 0.0, 0.0) {
                     window.paint_quad(quad(
                         rect,
@@ -698,21 +748,66 @@ fn flat_text_element(
             // mouse listeners.
             REGISTRY.with(|r| {
                 r.borrow_mut().push(RegEntry {
-                    key: sel_key.clone(),
-                    text: flat_text.clone(),
+                    key: key.clone(),
+                    text: text.clone(),
                     layout: layout.clone(),
                 })
             });
-            register_selection_listeners(window, &sel_key, &flat_text, &layout);
+            register_selection_listeners(window, &key, &text, &layout);
         },
     )
     .absolute()
-    .size_full();
+    .size_full()
+}
+
+/// A plain (non-markdown) string rendered as a SELECTABLE text element.
+///
+/// The transcript is full of strings that never went through the markdown
+/// parser — a user's own message, an error banner's text, a claim sentence —
+/// and gh#534's rule is that any string the app can show, the user can put on
+/// the clipboard. Styling is inherited from the parent (font, size, colour), so
+/// this is a drop-in for `.child(some_string)`.
+///
+/// `key` must be unique in the window and stable across frames; the element
+/// joins the same document-ordered registry as markdown prose, so a drag runs
+/// straight through it.
+pub fn selectable_text(key: impl Into<SharedString>, text: impl Into<SharedString>) -> AnyElement {
+    let key: SharedString = key.into();
+    let text: SharedString = text.into();
+    let styled = StyledText::new(text.clone());
+    let layout = styled.layout().clone();
     div()
         .relative()
-        .child(underlay)
-        .child(text_el)
+        // Load-bearing, same as the bubble that wraps this one: gpui text
+        // answers min-content probes with its UNWRAPPED width, so without it
+        // this wrapper cannot shrink and a long prompt renders as one clipped
+        // line instead of wrapping inside its column cap.
+        .min_w_0()
+        .child(selection_underlay(
+            &key,
+            text,
+            layout,
+            Vec::new(),
+            gpui::transparent_black(),
+        ))
+        .child(styled)
         .into_any_element()
+}
+
+/// The registry key for one flattened prose element of a row.
+///
+/// Keys have to be unique across the whole window and stable across frames —
+/// a collision makes two elements fight over one wash and one anchor. Spelled
+/// here (with [`code_line_key`]) so the two schemes are visibly disjoint.
+fn element_key(row_key: &str, ix: usize) -> String {
+    format!("{row_key}:{ix}")
+}
+
+/// The registry key for one LINE of a code block (gh#534). The `c` prefix is
+/// what keeps it out of [`element_key`]'s space: block index 3 and code block
+/// 3's line 0 are different elements and must not share a key.
+fn code_line_key(row_key: &str, ix: usize, li: usize) -> String {
+    format!("{row_key}:c{ix}.{li}")
 }
 
 /// Selection tint: the accent hue under the glyphs, dark-panel strength.
@@ -1004,6 +1099,7 @@ fn render_code_block(
         None => Vec::new(),
     };
     let scroll_id: SharedString = format!("{}-code{ix}", opts.row_key).into();
+    let row_key = opts.row_key.clone();
     // Copy affordance (round 9; no source counterpart — the original block is
     // header + body only): a small ghost button in the block's top-right,
     // absolutely overlaid so clicking / the "Copied" flash never shifts
@@ -1090,11 +1186,39 @@ fn render_code_block(
                     *off = start + line.len() + 1; // +1 for the '\n'
                     let local = slice_spans(&veil_spans, start, start + line.len());
                     let runs = apply_veil(runs.clone(), &local);
+                    // One registered selection element PER LINE (gh#534): the
+                    // registry's document order is paint order, so lines join
+                    // the same continuous selection as the prose around them
+                    // and a drag runs from a paragraph, through the listing,
+                    // into the next paragraph. Blank lines register too —
+                    // `resolve_spans` keeps their empty span so the paste comes
+                    // back with the gap still in it.
+                    //
+                    // Per LINE and not per block because the block has no one
+                    // text layout to index into — its height is exact precisely
+                    // because each line is its own element. The cost is three
+                    // frame-scoped window listeners per line rather than per
+                    // block; a code block is one un-virtualized row, so a
+                    // 500-line listing registers 1500. Cheap ones (a bounds
+                    // test, an early return on a move that is not a drag) and
+                    // bounded by what is painted, but it is the number to look
+                    // at if a transcript of enormous listings ever drags.
+                    let styled = StyledText::new(line.clone()).with_runs(runs);
+                    let layout = styled.layout().clone();
+                    let key = code_line_key(&row_key, ix, li);
                     Some(
                         div()
                             .h(px(CODE_LINE_HEIGHT))
                             .flex_none()
-                            .child(StyledText::new(line.clone()).with_runs(runs)),
+                            .relative()
+                            .child(selection_underlay(
+                                &key,
+                                line.clone(),
+                                layout,
+                                Vec::new(),
+                                gpui::transparent_black(),
+                            ))
+                            .child(styled),
                     )
                 })),
         )
@@ -1188,6 +1312,29 @@ mod tests {
     use super::*;
     use crate::markdown::highlight::{Lang, tokenize_line};
     use crate::markdown::parser::InlineStyle;
+
+    /// gh#534: a code block registers one selection element per line, sharing
+    /// the registry with the prose around it. Two elements answering to one key
+    /// would fight over the wash and the drag anchor, so the two key schemes
+    /// have to stay disjoint — including the collision that looks most likely,
+    /// prose element N against code block N's first line.
+    #[test]
+    fn code_line_keys_never_collide_with_prose_keys() {
+        let prose: Vec<String> = (0..8).map(|ix| element_key("row-7", ix)).collect();
+        let code: Vec<String> = (0..8)
+            .flat_map(|ix| (0..8).map(move |li| code_line_key("row-7", ix, li)))
+            .collect();
+        for key in &code {
+            assert!(!prose.contains(key), "{key} collides with a prose element");
+        }
+        let mut all: Vec<&String> = prose.iter().chain(code.iter()).collect();
+        all.sort();
+        let before = all.len();
+        all.dedup();
+        assert_eq!(all.len(), before, "every key is unique within a row");
+        // A row's keys are its own: two rows never reach into each other.
+        assert_ne!(code_line_key("a", 0, 0), code_line_key("b", 0, 0));
+    }
 
     #[test]
     fn code_line_runs_cover_exactly() {

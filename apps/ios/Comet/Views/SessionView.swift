@@ -103,23 +103,30 @@ struct SessionView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                // The chat's own menu. It holds one item today — the pin — and
-                // exists because that item has nowhere else to be for a chat
-                // that is not running: an idle orchestrator has no Active row,
-                // and before it is pinned it has no slot either. Absent when the
-                // board dispatched this chat, which is the one chat that must
-                // not be pinned.
-                if orchestratorPinOffered(chatId: chatId, model: model) {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Menu {
+                // The chat's own menu: whole-transcript copy/share, and the pin
+                // when it is offered. The pin is here because it has nowhere
+                // else to be for a chat that is not running — an idle
+                // orchestrator has no Active row, and before it is pinned it
+                // has no slot either; it is absent when the board dispatched
+                // this chat, which is the one chat that must not be pinned.
+                //
+                // The export is here because a session is the unit a person
+                // wants OUT of the phone: during the 2026-08-19 incident the
+                // operator could get nothing off the failing app at all, and
+                // diagnosis ran on paraphrases over SSH (gh#534, gh#527).
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        transcriptExportItems(chat: chat)
+                        if orchestratorPinOffered(chatId: chatId, model: model) {
+                            Divider()
                             orchestratorPinItem(chatId: chatId, model: model,
                                                 request: $pinRequest,
                                                 failure: $pinFailure)
-                        } label: {
-                            Image(systemName: "ellipsis")
                         }
-                        .accessibilityLabel("Session menu")
+                    } label: {
+                        Image(systemName: "ellipsis")
                     }
+                    .accessibilityLabel("Session menu")
                 }
             }
         }
@@ -245,6 +252,29 @@ struct SessionView: View {
             .background(lineage.isShared ? Theme.elementActive : Theme.surface)
             .contentShape(Rectangle())
             .onTapGesture { showForkDetail.toggle() }
+        }
+    }
+
+    /// Copy / share the whole transcript. Built inside a `Menu`, so the
+    /// serialization runs when the menu OPENS rather than on every body
+    /// evaluation — and it walks the entries directly (no markdown re-parse),
+    /// so opening it on a long session does not stall (see TranscriptText).
+    @ViewBuilder
+    private func transcriptExportItems(chat: Chat?) -> some View {
+        if let chat, let store = model.sessionStore(for: chat) {
+            let text = TranscriptText.transcript(entries: store.entries,
+                                                 pendingSends: store.pendingSends)
+            Button {
+                UIPasteboard.general.string = text
+            } label: {
+                Label("Copy transcript", systemImage: "doc.on.doc")
+            }
+            .disabled(text.isEmpty)
+            if !text.isEmpty {
+                ShareLink(item: text, subject: Text(chat.displayTitle)) {
+                    Label("Share transcript", systemImage: "square.and.arrow.up")
+                }
+            }
         }
     }
 
