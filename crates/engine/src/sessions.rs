@@ -1528,6 +1528,75 @@ pub(crate) fn combine_fork_payload(carried: &str, prompt: &str) -> Result<String
     Ok(format!("{carried}{separator}{prompt}"))
 }
 
+/// Say out loud that a killed child was the box running out of memory (gh#533).
+///
+/// The half of gh#529 that is not about keeping the engine alive: with
+/// `OOMPolicy=continue` the engine now *survives* the kill, which means the
+/// only trace left of it is one agent's death — and "claude exited unexpectedly
+/// (killed by signal 9)" is a sentence a person reads as a flaky CLI. On
+/// 2026-08-19 it was read as the phone being flaky, four times, while a swapless
+/// 16G box ran three heavy builds into the ground.
+///
+/// Rewrites the `Done` in place, before the event is journaled or folded into
+/// the doc, so the chat, the run journal and the engine log carry one sentence.
+/// Nothing is invented: the message survives untouched unless the child died on
+/// an OOM signal **and** the kernel's own counters moved while it was running —
+/// see [`comet_board::pressure::oom_attribution`], which owns that judgement and
+/// refuses it on a box it could not measure.
+fn attribute_oom(oom: &comet_board::pressure::OomWatch, chat_id: &str, event: &mut AgentEvent) {
+    // Ask the counters only for a death that could be one. A run that finished
+    // must not pay two file reads for a question with one possible answer.
+    let signalled = matches!(
+        event,
+        AgentEvent::Done { status: DoneStatus::Errored, error: Some(m), .. }
+            if comet_harness::crashed_by_signal(m).is_some()
+    );
+    if !signalled {
+        return;
+    }
+    let Some(kills) = oom.kills() else {
+        return;
+    };
+    if let Some(said) = say_oom(
+        event,
+        &kills,
+        comet_board::pressure::Snapshot::read().memory,
+    ) {
+        tracing::warn!(chat = %chat_id, "run killed: {said}");
+    }
+}
+
+/// The half of [`attribute_oom`] that decides, given the box's facts rather
+/// than reading them — so the sentence a killed run carries is testable on a
+/// machine that has never had a cgroup.
+///
+/// Returns what it wrote, or `None` when it left the message alone.
+fn say_oom(
+    event: &mut AgentEvent,
+    kills: &comet_board::pressure::OomEvent,
+    memory: Option<comet_board::pressure::Memory>,
+) -> Option<String> {
+    let AgentEvent::Done {
+        status: DoneStatus::Errored,
+        error: Some(message),
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let signal = comet_harness::crashed_by_signal(message)?;
+    // The harness names its own child in the message it wrote; the attribution
+    // is about the same process, so it borrows the name rather than guessing at
+    // one from the runtime id.
+    let child = message.split_whitespace().next().unwrap_or("the agent");
+    let said = comet_board::pressure::oom_attribution(child, signal, kills, memory.as_ref())?;
+    // The harness's own sentence is kept behind it. It is what a reader needs to
+    // check the claim — and on the day this attribution is wrong, it is the only
+    // way to find out.
+    *message = format!("{said} ({message})");
+    Some(said)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -1646,9 +1715,14 @@ async fn drive_run(
     // the chat carries limits, which means off for every chat the board did
     // not dispatch.
     let mut spin = comet_board::spin::Watch::new(inner.turn_limits(&chat_id));
+    // What the kernel's OOM-kill counters said when this run started (gh#533).
+    // Armed here for the reason the guardrails are counted here: this task owns
+    // the run's whole life, and the counters only mean something as a delta
+    // across it. Two file reads on Linux, nothing anywhere else.
+    let oom = comet_board::pressure::OomWatch::arm();
 
     let final_status = loop {
-        let event: AgentEvent = tokio::select! {
+        let mut event: AgentEvent = tokio::select! {
             biased;
             changed = cancel_rx.changed(), if !interrupted => {
                 let _ = changed;
@@ -1773,6 +1847,12 @@ async fn drive_run(
         saw_any_event = true;
         stall_at = tokio::time::Instant::now() + STALL;
         inner.touch_session(&chat_id);
+        // A killed child is a loud event (gh#533). Before the journal and before
+        // the doc, so the sentence a person reads in the chat, the one the run
+        // journal keeps, and the one `journalctl` shows are the same sentence.
+        // The night of 2026-08-19 this said "claude exited unexpectedly (killed
+        // by signal 9)" four times and was read as phone flake.
+        attribute_oom(&oom, &chat_id, &mut event);
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
         //
@@ -2254,6 +2334,124 @@ mod tests {
         assert!(
             !sessions.chat_is_busy("chat-a"),
             "a failed turn is over too — nothing is streaming through this doc"
+        );
+    }
+
+    // ---- a killed child is a loud event (gh#533) --------------------------
+
+    fn errored(message: &str) -> AgentEvent {
+        AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: Some(message.into()),
+            session_id: None,
+        }
+    }
+
+    fn message_of(event: &AgentEvent) -> String {
+        match event {
+            AgentEvent::Done { error: Some(m), .. } => m.clone(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn killed_once() -> comet_board::pressure::OomEvent {
+        comet_board::pressure::OomEvent {
+            in_cgroup: 1,
+            boxwide: 1,
+        }
+    }
+
+    fn mylder() -> comet_board::pressure::Memory {
+        comet_board::pressure::Memory {
+            total: 16_316_000 * 1024,
+            available: 419_430_400,
+            swap_total: 0,
+            swap_free: 0,
+        }
+    }
+
+    /// The sentence gh#526 needed. The chat said "claude exited unexpectedly
+    /// (killed by signal 9)" four times on the night of 2026-08-19 and it was
+    /// read as the phone being flaky.
+    #[test]
+    fn a_child_the_kernel_killed_says_the_box_ran_out_of_memory() {
+        let mut event = errored("claude exited unexpectedly (killed by signal 9)");
+        let said = say_oom(&mut event, &killed_once(), Some(mylder())).expect("attributed");
+        assert!(said.starts_with("the box ran out of memory"), "{said}");
+
+        let message = message_of(&event);
+        assert!(
+            message.starts_with("the box ran out of memory"),
+            "{message}"
+        );
+        assert!(message.contains("`claude` died on signal 9"), "{message}");
+        assert!(message.contains("no swap"), "{message}");
+        // The harness's own sentence survives behind it: it is what a reader
+        // checks the claim against on the day the claim is wrong.
+        assert!(
+            message.contains("(claude exited unexpectedly (killed by signal 9))"),
+            "{message}"
+        );
+    }
+
+    /// The stderr tail a real crash carries rides along and must not displace
+    /// the child's name or the signal.
+    #[test]
+    fn the_stderr_tail_a_real_crash_carries_is_kept() {
+        let mut event = errored(
+            "codex exited unexpectedly (killed by signal 9): thread 'main' panicked at \
+             memory allocation of 4194304 bytes failed",
+        );
+        say_oom(&mut event, &killed_once(), None).expect("attributed");
+        let message = message_of(&event);
+        assert!(message.contains("`codex` died on signal 9"), "{message}");
+        assert!(
+            message.contains("memory allocation of 4194304"),
+            "{message}"
+        );
+    }
+
+    /// Every other way a run can end is left exactly as the harness wrote it.
+    /// A board that rewrote an ordinary failure as an out-of-memory would be
+    /// the same bug pointing the other way.
+    #[test]
+    fn nothing_else_is_ever_called_an_out_of_memory() {
+        for message in [
+            "claude exited unexpectedly (exit code 1): usage limit reached",
+            "harness stream ended without Done",
+            "The run hit the maximum number of turns.",
+        ] {
+            let mut event = errored(message);
+            assert!(
+                say_oom(&mut event, &killed_once(), None).is_none(),
+                "{message}"
+            );
+            assert_eq!(message_of(&event), message);
+        }
+        // …nor a run that finished, whatever the box was doing at the time.
+        let mut done = AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: Some("done!".into()),
+            error: None,
+            session_id: None,
+        };
+        assert!(say_oom(&mut done, &killed_once(), None).is_none());
+    }
+
+    /// A box whose counters could not be read claims nothing — the whole
+    /// message is left alone, `kill -9` from a shell included.
+    #[test]
+    fn a_box_that_could_not_be_measured_claims_nothing() {
+        let mut event = errored("claude exited unexpectedly (killed by signal 9)");
+        attribute_oom(
+            &comet_board::pressure::OomWatch::armed_with(None),
+            "chat-1",
+            &mut event,
+        );
+        assert_eq!(
+            message_of(&event),
+            "claude exited unexpectedly (killed by signal 9)"
         );
     }
 }

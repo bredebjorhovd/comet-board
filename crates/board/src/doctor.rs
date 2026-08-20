@@ -199,6 +199,32 @@ pub fn doctor(
     // after the worktree was cut.
     checks.push(harnesses_check(runtimes));
 
+    // …and whether the box has the memory to run any of them (gh#533). Beside
+    // the harness census because it is the same question about the same box
+    // asked one layer down: a harness that could start here is not the same as
+    // a box with room to start it. One reading feeds all four host lines, for
+    // `worktrees_check`'s reason — paying for the measurement twice would only
+    // let one half of it disagree with the other.
+    //
+    // The unit line is here rather than with the engine checks above on purpose:
+    // what it is about is not whether the engine is reachable but whether it
+    // survives its own children, which is what everything under it is counting.
+    let host = crate::pressure::Snapshot::read();
+    let floor = routing
+        .as_ref()
+        .ok()
+        .and_then(crate::config::RoutingConfig::min_memory_headroom);
+    checks.push(host_memory_check(&host, floor));
+    checks.push(swap_check(&host));
+    checks.push(load_check(host.load));
+    checks.push(oom_kills_check(
+        crate::pressure::read_oom_journal(comet_update::service::UNIT, OOM_JOURNAL_DAYS).as_deref(),
+        host.oom,
+    ));
+    checks.push(unit_governance_check(
+        comet_update::service::effective_governance().as_ref(),
+    ));
+
     // And whether anything *else* on this account is a board (gh#195). Beside
     // the engine checks because it is the same conversation — the sweep runs
     // over the same IPC connection, one relayed call per device — and because
@@ -1921,6 +1947,289 @@ fn runs_check(db: Option<&Db>, now: chrono::DateTime<chrono::Utc>) -> Check {
                 gc::human_window(crate::runs::YOUNG_SECS as u64),
             ),
         },
+    }
+}
+
+// ---- what the box has left, and what it has already killed (gh#533) --------
+
+/// How far back the oom-kill question is asked, in days.
+///
+/// A week, which is [`crate::runs`]'s reasoning at a longer scale: a box that
+/// OOM-killed four agents on Tuesday is still a box with too little memory on
+/// Friday, and one that did it last month has since been changed or has not
+/// been busy. The counters cannot answer this at all — they reset with the unit,
+/// and the first thing anybody does to a box that keeps dying is restart it.
+const OOM_JOURNAL_DAYS: u32 = 7;
+
+/// Sustained load per core past which the box is oversubscribed enough to say
+/// so. Two: a build box at 1.5× cores on the fifteen-minute average is working,
+/// and one at 2× has a queue that is not draining.
+const LOAD_PER_CORE_WARN: f64 = 2.0;
+
+/// What the box has left, and what the dispatch gate makes of it (gh#533).
+///
+/// Never red. A box that is momentarily tight is a box that is *working* — the
+/// same rule the build-output check follows, and for the same reason: a line
+/// that goes red every time three agents are building stops being read. What it
+/// is for is the question an operator asks after a deferred dispatch — "why is
+/// nothing being released" — and the answer is the reading, the floor, and
+/// which of the two the box is on the wrong side of.
+fn host_memory_check(snap: &crate::pressure::Snapshot, floor: Option<f64>) -> Check {
+    let Some(mem) = snap.memory else {
+        return Check {
+            name: "host memory".into(),
+            ok: true,
+            detail: "not measurable on this platform — no dispatch is ever held for memory here"
+                .into(),
+        };
+    };
+    let mut parts = vec![format!(
+        "{} of {} available ({:.0}%)",
+        crate::pressure::bytes(mem.available),
+        crate::pressure::bytes(mem.total),
+        mem.available_share() * 100.0,
+    )];
+    if let Some(psi) = snap.psi {
+        parts.push(format!(
+            "{:.1}% of the last 10s stalled on memory (PSI some)",
+            psi.some_avg10
+        ));
+    }
+    parts.push(match floor {
+        None => "min_memory_headroom = off — dispatch does not look at memory".to_string(),
+        Some(floor) => match crate::pressure::headroom(snap, floor) {
+            crate::pressure::Headroom::Tight(reason) => {
+                format!("a dispatch now would defer: {reason}")
+            }
+            _ => format!("floor {:.0}% — there is room to dispatch", floor * 100.0),
+        },
+    });
+    Check {
+        name: "host memory".into(),
+        ok: true,
+        detail: parts.join(" · "),
+    }
+}
+
+/// Whether the box has any slack at all between "busy" and "the kernel picks a
+/// victim" (gh#533).
+///
+/// A warning and not a failure: plenty of boxes run swapless deliberately, and
+/// a board that refused to be green on one would be telling its operator to
+/// change something they decided. What it is not allowed to be is *silent* —
+/// the box on 2026-08-19 had 15.6 GiB, no swap and three heavy builds, and
+/// swaplessness is the reason the kernel's only available response was a kill.
+fn swap_check(snap: &crate::pressure::Snapshot) -> Check {
+    let Some(mem) = snap.memory else {
+        return Check {
+            name: "swap".into(),
+            ok: true,
+            detail: "not checked — this platform does not report swap here".into(),
+        };
+    };
+    if !mem.swapless() {
+        return Check {
+            name: "swap".into(),
+            ok: true,
+            detail: format!(
+                "{} of swap, {} free",
+                crate::pressure::bytes(mem.swap_total),
+                crate::pressure::bytes(mem.swap_free)
+            ),
+        };
+    }
+    Check {
+        name: "swap".into(),
+        ok: true,
+        detail: format!(
+            "warn — no swap on a {} box: the kernel's only answer to a memory spike is to kill \
+             something, and agent builds are what it will find. Add some: `sudo fallocate -l 4G \
+             /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon \
+             /swapfile && echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab`",
+            crate::pressure::bytes(mem.total)
+        ),
+    }
+}
+
+/// Has the kernel been killing things here (gh#533)?
+///
+/// The one red line of the four, because it is the only one that reports
+/// something that has *already happened*. Everything else here is a shape the
+/// box is in; this is a list of times work was destroyed, and gh#526 is what it
+/// costs when nobody is told: four kills over one night, each read as an agent
+/// being flaky.
+///
+/// Evidence, never a verdict on its own. The journal lines carry their
+/// timestamps because "3 oom kills" with no dates is a number an operator
+/// cannot act on, and the live counter is named separately because it means
+/// something different — kills since this unit last started, which is usually
+/// "since the last time somebody restarted it to make the problem go away".
+fn oom_kills_check(
+    journal: Option<&[crate::pressure::OomJournalEntry]>,
+    counters: Option<crate::pressure::OomCounters>,
+) -> Check {
+    let live = counters.map(|c| c.cgroup).unwrap_or(0);
+    let Some(journal) = journal else {
+        // Not Linux, no journalctl, or no such unit. The counter may still have
+        // something to say; if it does not, nothing was checked.
+        return Check {
+            name: "oom kills".into(),
+            ok: live == 0,
+            detail: if live == 0 {
+                "not checked — the engine's unit journal could not be read here".into()
+            } else {
+                format!(
+                    "{live} process(es) of this unit have been OOM-killed since it started — \
+                     the unit journal could not be read for when. See `comet-board doctor`'s \
+                     host memory and swap lines"
+                )
+            },
+        };
+    };
+    if journal.is_empty() && live == 0 {
+        return Check {
+            name: "oom kills".into(),
+            ok: true,
+            detail: format!("none in the last {OOM_JOURNAL_DAYS} days"),
+        };
+    }
+    let latest = journal.last();
+    let mut detail = format!(
+        "{} oom-kill event(s) in the engine's unit journal in the last {OOM_JOURNAL_DAYS} days",
+        journal.len()
+    );
+    if let Some(entry) = latest {
+        detail.push_str(&format!(" — latest {}: {}", entry.at, entry.line));
+    }
+    if live > 0 {
+        detail.push_str(&format!(" · {live} of them since the unit last started"));
+    }
+    detail.push_str(
+        ". The box is running out of memory under its own agents: give it swap, lower \
+         `[defaults] max_concurrent_per_workspace`, or raise `min_memory_headroom` so \
+         dispatch defers sooner",
+    );
+    Check {
+        name: "oom kills".into(),
+        ok: false,
+        detail,
+    }
+}
+
+/// Is the box carrying more than it can run (gh#533)?
+///
+/// The fifteen-minute average and no other, because the word in the question is
+/// *sustained*: one-minute load spikes to twice the cores every time a build
+/// links, and a check that fired on that would fire all afternoon. A warning,
+/// like swap — a box deliberately oversubscribed is a decision, and load is not
+/// what kills a run. It is here because it is the corroborating reading: memory
+/// pressure and a load that never comes down are the same three builds seen
+/// from two directions.
+fn load_check(load: Option<crate::pressure::Load>) -> Check {
+    let Some(load) = load else {
+        return Check {
+            name: "load".into(),
+            ok: true,
+            detail: "not checked — this platform does not report a load average here".into(),
+        };
+    };
+    let per_core = load.per_core();
+    let about = format!(
+        "{:.2} {:.2} {:.2} over {} core(s) — {per_core:.1}× per core sustained",
+        load.one, load.five, load.fifteen, load.cores
+    );
+    Check {
+        name: "load".into(),
+        ok: true,
+        detail: if per_core > LOAD_PER_CORE_WARN {
+            format!(
+                "warn — {about}. Everything on this box is waiting for a turn; agents will \
+                 time out on work they would otherwise finish"
+            )
+        } else {
+            about
+        },
+    }
+}
+
+/// Does the engine's own unit still scope an OOM kill to the process the kernel
+/// chose (gh#529, gh#533)?
+///
+/// The check that exists because a fix can ship and not arrive. gh#529's three
+/// lines are written when a unit is *rendered* — at install, or by `comet daemon
+/// install` — and an engine update rewrites the binary and nothing else, so
+/// every box installed before that release kept `OOMPolicy=stop` and kept dying
+/// for it. Since gh#533 the lines also ship as a drop-in re-asserted on every
+/// update; this is what says whether that reached *this* box, and prints the
+/// paste that fixes it when it did not.
+///
+/// Red, unlike its three neighbours, because the state it names is not a shape
+/// the box is in — it is the engine having no protection against the thing the
+/// line above it is counting.
+fn unit_governance_check(governance: Option<&comet_update::service::Governance>) -> Check {
+    let Some(g) = governance else {
+        return Check {
+            name: "engine unit".into(),
+            ok: true,
+            detail: "not checked — no systemd user manager to ask here".into(),
+        };
+    };
+    if !g.loaded() {
+        return Check {
+            name: "engine unit".into(),
+            ok: true,
+            detail: format!(
+                "{} is {} — the engine is not running as a service on this box, so there is no \
+                 unit to govern",
+                comet_update::service::UNIT,
+                g.load_state
+            ),
+        };
+    }
+    if g.complete() {
+        return Check {
+            name: "engine unit".into(),
+            ok: true,
+            detail: format!(
+                "OOMPolicy={}, MemoryHigh={}, MemoryMax={} — an OOM-killed agent is an event, \
+                 not an engine death",
+                g.oom_policy, g.memory_high, g.memory_max
+            ),
+        };
+    }
+    let mut missing = Vec::new();
+    if !g.survives_an_oom_kill() {
+        missing.push(format!(
+            "OOMPolicy={} — one OOM-killed agent child will stop the whole engine, taking every \
+             warm session and the pinned dispatcher chat with it",
+            if g.oom_policy.is_empty() {
+                "stop (systemd's default)"
+            } else {
+                &g.oom_policy
+            }
+        ));
+    }
+    if !g.throttles() {
+        missing.push(
+            "MemoryHigh is unset — the cgroup never throttles into reclaim before the \
+             kernel acts"
+                .to_string(),
+        );
+    }
+    if !g.capped() {
+        missing.push(
+            "MemoryMax is unset — a breach is resolved boxwide rather than inside this unit"
+                .to_string(),
+        );
+    }
+    Check {
+        name: "engine unit".into(),
+        ok: false,
+        detail: format!(
+            "{}. Fix it with:\n\n{}\n",
+            missing.join(" · "),
+            comet_update::service::resource_dropin_fix()
+        ),
     }
 }
 
@@ -5570,6 +5879,245 @@ mod tests {
         let c = runs_check(Some(&db), chrono::Utc::now());
         assert!(!c.ok);
         assert!(c.detail.contains("of the last 3"), "{}", c.detail);
+    }
+
+    // ---- what the box has left (gh#533) ----------------------------------
+
+    fn gib(n: f64) -> u64 {
+        (n * 1024.0 * 1024.0 * 1024.0) as u64
+    }
+
+    /// The Mylder box on the night of 2026-08-19: 15.6 GiB, no swap, three
+    /// heavy builds, 1.2 GiB left.
+    fn tight_box() -> crate::pressure::Snapshot {
+        crate::pressure::Snapshot {
+            memory: Some(crate::pressure::Memory {
+                total: gib(15.6),
+                available: gib(1.2),
+                swap_total: 0,
+                swap_free: 0,
+            }),
+            psi: Some(crate::pressure::Psi {
+                some_avg10: 34.2,
+                some_avg60: 20.0,
+                full_avg10: 8.1,
+            }),
+            load: Some(crate::pressure::Load {
+                one: 18.5,
+                five: 17.0,
+                fifteen: 16.0,
+                cores: 4,
+            }),
+            oom: Some(crate::pressure::OomCounters {
+                cgroup: 4,
+                boxwide: 4,
+            }),
+        }
+    }
+
+    /// The reading is what the operator came for after a deferred dispatch:
+    /// the numbers, the floor, and which side of it the box is on. Never red —
+    /// a box that is momentarily tight is a box that is working.
+    #[test]
+    fn the_host_memory_line_says_why_a_dispatch_would_defer() {
+        let c = host_memory_check(&tight_box(), Some(0.15));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("1.2 GiB of 15.6 GiB"), "{}", c.detail);
+        assert!(c.detail.contains("PSI some"), "{}", c.detail);
+        assert!(
+            c.detail.contains("a dispatch now would defer"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// The gate turned off has to say so here, or the line reads as a box with
+    /// room when nothing is looking at all.
+    #[test]
+    fn the_host_memory_line_names_a_gate_that_is_off() {
+        let c = host_memory_check(&tight_box(), None);
+        assert!(
+            c.detail.contains("min_memory_headroom = off"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// A box that cannot be measured is described as unmeasured, never as
+    /// healthy.
+    #[test]
+    fn an_unmeasurable_box_is_not_reported_as_a_box_with_room() {
+        let c = host_memory_check(&crate::pressure::Snapshot::default(), Some(0.15));
+        assert!(c.ok);
+        assert!(c.detail.contains("not measurable"), "{}", c.detail);
+        let swap = swap_check(&crate::pressure::Snapshot::default());
+        assert!(swap.detail.contains("not checked"), "{}", swap.detail);
+        let load = load_check(None);
+        assert!(load.detail.contains("not checked"), "{}", load.detail);
+    }
+
+    /// Swaplessness warns and hands over the whole command — the box where this
+    /// fires is a headless VPS being read over ssh.
+    #[test]
+    fn no_swap_warns_with_the_one_liner_that_fixes_it() {
+        let c = swap_check(&tight_box());
+        assert!(c.ok, "a deliberate choice is not a failed check");
+        assert!(c.detail.starts_with("warn — no swap"), "{}", c.detail);
+        assert!(c.detail.contains("mkswap /swapfile"), "{}", c.detail);
+        assert!(c.detail.contains("/etc/fstab"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_box_with_swap_just_says_how_much() {
+        let mut snap = tight_box();
+        snap.memory = Some(crate::pressure::Memory {
+            swap_total: gib(4.0),
+            swap_free: gib(3.5),
+            ..snap.memory.unwrap()
+        });
+        let c = swap_check(&snap);
+        assert!(!c.detail.contains("warn"), "{}", c.detail);
+        assert!(c.detail.contains("4.0 GiB of swap"), "{}", c.detail);
+    }
+
+    /// Sustained, which is the fifteen-minute figure — a one-minute spike is a
+    /// build linking.
+    #[test]
+    fn a_sustained_queue_warns_and_a_busy_afternoon_does_not() {
+        let hot = load_check(Some(crate::pressure::Load {
+            one: 30.0,
+            five: 20.0,
+            fifteen: 16.0,
+            cores: 4,
+        }));
+        assert!(hot.ok);
+        assert!(hot.detail.starts_with("warn —"), "{}", hot.detail);
+        assert!(hot.detail.contains("4.0× per core"), "{}", hot.detail);
+
+        // 1.5× per core sustained is a build box doing its job.
+        let busy = load_check(Some(crate::pressure::Load {
+            one: 9.0,
+            five: 7.0,
+            fifteen: 6.0,
+            cores: 4,
+        }));
+        assert!(!busy.detail.contains("warn"), "{}", busy.detail);
+    }
+
+    /// The one red line: work that has already been destroyed, with the dates
+    /// that make it actionable.
+    #[test]
+    fn oom_kills_fail_the_report_with_their_timestamps() {
+        let journal = crate::pressure::parse_oom_journal(
+            "2026-08-19T23:41:02+0200 mylder systemd[1401]: comet-native.service: A process of \
+             this unit has been killed by the OOM killer.\n\
+             2026-08-20T00:12:44+0200 mylder systemd[1401]: comet-native.service: A process of \
+             this unit has been killed by the OOM killer.\n",
+        );
+        let c = oom_kills_check(
+            Some(&journal),
+            Some(crate::pressure::OomCounters {
+                cgroup: 1,
+                boxwide: 1,
+            }),
+        );
+        assert!(!c.ok, "an OOM kill is worth an exit code");
+        assert!(c.detail.contains("2 oom-kill event(s)"), "{}", c.detail);
+        assert!(
+            c.detail.contains("2026-08-20T00:12:44+0200"),
+            "{}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("1 of them since the unit last started"),
+            "{}",
+            c.detail
+        );
+        // …and what to do about it, which is the whole point of failing.
+        assert!(c.detail.contains("min_memory_headroom"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_quiet_week_is_green() {
+        let c = oom_kills_check(Some(&[]), Some(crate::pressure::OomCounters::default()));
+        assert!(c.ok);
+        assert!(c.detail.contains("none in the last"), "{}", c.detail);
+    }
+
+    /// A journal that could not be read is "not checked" — but a counter that
+    /// still says something is still evidence, and must not be swallowed by the
+    /// journal's silence.
+    #[test]
+    fn an_unreadable_journal_does_not_hide_the_counter() {
+        let quiet = oom_kills_check(None, None);
+        assert!(quiet.ok);
+        assert!(quiet.detail.contains("not checked"), "{}", quiet.detail);
+
+        let counted = oom_kills_check(
+            None,
+            Some(crate::pressure::OomCounters {
+                cgroup: 3,
+                boxwide: 3,
+            }),
+        );
+        assert!(!counted.ok);
+        assert!(
+            counted.detail.contains("3 process(es)"),
+            "{}",
+            counted.detail
+        );
+    }
+
+    // ---- the unit that has to keep being true (gh#529 → gh#533) ----------
+
+    fn governance(text: &str) -> comet_update::service::Governance {
+        comet_update::service::parse_governance(text).unwrap()
+    }
+
+    /// The state every box installed before gh#529 is still in, and the reason
+    /// this check exists: the fix shipped, and it did not arrive.
+    #[test]
+    fn a_unit_that_would_die_with_its_child_fails_and_prints_the_fix() {
+        let c = unit_governance_check(Some(&governance(
+            "LoadState=loaded\nOOMPolicy=stop\nMemoryHigh=infinity\nMemoryMax=infinity\n",
+        )));
+        assert!(!c.ok);
+        assert!(c.detail.contains("OOMPolicy=stop"), "{}", c.detail);
+        assert!(c.detail.contains("MemoryHigh is unset"), "{}", c.detail);
+        assert!(c.detail.contains("MemoryMax is unset"), "{}", c.detail);
+        // The paste, whole — the box this fires on is reached over ssh.
+        assert!(c.detail.contains("mkdir -p"), "{}", c.detail);
+        assert!(c.detail.contains("OOMPolicy=continue"), "{}", c.detail);
+        assert!(c.detail.contains("daemon-reload"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_governed_unit_is_green() {
+        let c = unit_governance_check(Some(&governance(
+            "LoadState=loaded\nOOMPolicy=continue\nMemoryHigh=12252659712\n\
+             MemoryMax=14703191654\n",
+        )));
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("not an engine death"), "{}", c.detail);
+    }
+
+    /// A source build in a terminal has no unit, and a box with no unit is not
+    /// a misconfigured box. Nor is a platform with no systemd to ask.
+    #[test]
+    fn a_box_running_the_engine_by_hand_is_not_failed_for_it() {
+        let none = unit_governance_check(None);
+        assert!(none.ok);
+        assert!(none.detail.contains("not checked"), "{}", none.detail);
+
+        let unloaded = unit_governance_check(Some(&governance(
+            "LoadState=not-found\nOOMPolicy=\nMemoryHigh=\nMemoryMax=\n",
+        )));
+        assert!(unloaded.ok);
+        assert!(
+            unloaded.detail.contains("not running as a service"),
+            "{}",
+            unloaded.detail
+        );
     }
 
     // ---- dispatched pushes: what a recorded failure is allowed to say (gh#515)

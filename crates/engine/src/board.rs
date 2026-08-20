@@ -34,8 +34,8 @@ use comet_board::claims::AttemptReview;
 use comet_board::config::Paths;
 use comet_board::db::NewAttempt;
 use comet_board::dispatch::{
-    DispatchOrigin, DispatchOverrides, RanOn, SpaceRef, build_spec, check_capacity, dispatcher_for,
-    dispatcher_name, route_for, space_matches,
+    DispatchOrigin, DispatchOverrides, RanOn, SpaceRef, build_spec, check_capacity, check_pressure,
+    dispatcher_for, dispatcher_name, route_for, space_matches,
 };
 use comet_board::log::Logger;
 use comet_board::model::{AgentStatus, Outcome};
@@ -953,6 +953,12 @@ fn handle_dispatch(
     }
     let route = route_for(&engine.cfg, &task)?;
     check_capacity(&engine.db, &engine.cfg, route)?;
+    // …and whether the box has the memory for what the slot lets in (gh#533).
+    // Beside the cap because it is the same refusal about the other resource,
+    // and after it because a full space is a fact about the board while a full
+    // box is a fact about the machine — the operator wants the narrower one
+    // when both are true.
+    check_pressure(&engine.cfg.headroom())?;
     // Whose subscription this run spends, and the route's guard on it (gh#101).
     // Here, beside the cap, for the cap's reason: under `require-own` this is a
     // refusal, and a refusal that had already inserted an attempt row would

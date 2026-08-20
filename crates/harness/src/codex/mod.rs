@@ -1368,8 +1368,11 @@ async fn run_session(session: Session) {
         } else if !interrupted && !done_current {
             // A child KILLED mid-turn (OS memory pressure, `killall codex`)
             // must not read as a silent success — codex.ts's signal-death
-            // handling, reduced to the turn-in-flight case.
-            let status = child.try_wait().ok().flatten();
+            // handling, reduced to the turn-in-flight case. Waited for rather
+            // than polled (gh#533): the signal number is what the board reads a
+            // kernel OOM kill off, and a probe taken before the child is
+            // reapable has none in it.
+            let status = crate::settled_exit(&mut child, crate::EXIT_SETTLE_GRACE).await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,

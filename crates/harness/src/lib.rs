@@ -335,6 +335,35 @@ impl StderrTail {
     }
 }
 
+/// How long a crashed child is waited for before its death is described.
+///
+/// Its stdout has already reached EOF, so it is exiting and this returns almost
+/// immediately; the grace exists for the window between the kernel closing a
+/// dying process's file descriptors and it becoming reapable. A bare
+/// `try_wait()` across that window says "still running" about a process that is
+/// already dead — and a status of "still running" carries no signal number,
+/// which is what gh#533's whole attribution is read off. Two seconds is far more
+/// than that window and far less than anything a person waits for.
+pub(crate) const EXIT_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The exit status of a child whose stream has ended — waited for, not polled.
+///
+/// `None` means genuinely unknown: not reapable inside the grace, or a `wait`
+/// that failed (ECHILD and friends). Never a guess.
+pub(crate) async fn settled_exit(
+    child: &mut tokio::process::Child,
+    grace: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    match child.try_wait() {
+        Ok(Some(status)) => Some(status),
+        Err(_) => None,
+        Ok(None) => tokio::time::timeout(grace, child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok),
+    }
+}
+
 /// "exit code 137" / "signal 9 (killed)" / "unknown" — the status half of a
 /// crash message, from a `try_wait` result after the stream ended.
 pub(crate) fn describe_exit(status: Option<std::process::ExitStatus>) -> String {
@@ -365,6 +394,25 @@ pub(crate) fn crash_message(
         Some(tail) => format!("{name} exited unexpectedly ({status}): {tail}"),
         None => format!("{name} exited unexpectedly ({status})"),
     }
+}
+
+/// The signal a crash message reports, when it reports one (gh#533).
+///
+/// The reader of [`describe_exit`]'s own format, kept beside the writer so the
+/// two cannot drift — and public because the thing that has to *act* on a
+/// signalled death is nowhere near here. A `Done { status: Errored }` carries
+/// its status as prose (`AgentEvent` has no field for an exit code), so the
+/// engine's run loop asks this rather than re-deriving the format, and the
+/// round trip is pinned by a test below.
+///
+/// Says nothing about *why* the signal arrived. A `kill -9` from a shell and a
+/// kernel OOM kill are byte-identical here; deciding between them is
+/// `comet_board::pressure`'s job, and it needs evidence this crate does not
+/// have.
+pub fn crashed_by_signal(message: &str) -> Option<i32> {
+    let (_, rest) = message.split_once("killed by signal ")?;
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
 }
 
 pub use claude::ClaudeHarness;
@@ -514,5 +562,36 @@ mod tests {
         let mut opencode = tokio::process::Command::new("opencode");
         account(HarnessId::Opencode).apply(&mut opencode, HarnessId::Opencode);
         assert!(envs(&opencode).is_empty());
+    }
+
+    /// The round trip gh#533 rests on: whatever [`describe_exit`] writes for a
+    /// signalled death, [`crashed_by_signal`] reads back. One test rather than
+    /// two constants, because the format having one writer is the point.
+    #[test]
+    fn a_signalled_death_is_readable_back_off_its_own_message() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            for signal in [9, 15] {
+                let status = std::process::ExitStatus::from_raw(signal);
+                let message = crash_message("claude", Some(status), &StderrTail::default());
+                assert_eq!(crashed_by_signal(&message), Some(signal), "{message}");
+            }
+        }
+        // The stderr tail a real crash carries is appended after the status,
+        // so it must not swallow the number.
+        assert_eq!(
+            crashed_by_signal(
+                "claude exited unexpectedly (killed by signal 9): \
+                 out of memory allocating 4194304 bytes"
+            ),
+            Some(9)
+        );
+        // Everything that is not a signal says nothing at all.
+        assert_eq!(
+            crashed_by_signal("claude exited unexpectedly (exit code 137)"),
+            None
+        );
+        assert_eq!(crashed_by_signal("harness stream ended without Done"), None);
     }
 }

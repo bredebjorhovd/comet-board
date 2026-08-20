@@ -693,7 +693,11 @@ async fn run_session(session: Session) {
                 }))
                 .await;
         } else if !interrupted && !any_done {
-            let status = child.try_wait().ok().flatten();
+            // Waited for rather than polled (gh#533): stdout is at EOF, so the
+            // child is exiting, and a bare probe across the window before it is
+            // reapable reports "still running" — a status with no signal number
+            // in it, which is what the board reads a kernel OOM kill off.
+            let status = crate::settled_exit(&mut child, crate::EXIT_SETTLE_GRACE).await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,

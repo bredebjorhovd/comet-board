@@ -129,6 +129,21 @@ case "$first" in
   emit '{"type":"result","subtype":"error_max_turns","errors":[],"usage":{"input_tokens":1,"output_tokens":2},"session_id":"sess-err"}'
   ;;
 
+*scenario:oomkill*)
+  # A memory hog the kernel takes mid-turn (gh#533). Stands in for the real
+  # thing — a `cargo`/`next build` child whose allocation the OOM killer
+  # answers with SIGKILL — because the arrival is what the harness sees and it
+  # is identical: some output, then the process is gone on signal 9, with no
+  # result frame and no chance to say anything.
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":["Bash"],"cwd":"/tmp","session_id":"sess-oom"}'
+  emit '{"type":"stream_event","parent_tool_use_id":null,"event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Building"}}}'
+  # Nothing on stderr, deliberately: SIGKILL is not deliverable and not
+  # catchable, so a process the OOM killer chooses gets no chance to explain
+  # itself. That silence is the whole difficulty — it is why the death arrives
+  # as a bare signal number and why the board has to attribute it from outside.
+  kill -9 $$
+  ;;
+
 *)
   emit '{"type":"result","subtype":"error_during_execution","errors":["unknown scenario"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-x"}'
   ;;

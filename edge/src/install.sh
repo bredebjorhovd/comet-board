@@ -212,6 +212,12 @@ RestartSec=5
 EnvironmentFile=-%h/.comet-native/env
 # gh#529: the default OOMPolicy=stop turns one OOM-killed agent into a dead
 # engine. Throttle the cgroup before the kernel acts; kill inside it after.
+# The third copy of these three lines, and the only one that cannot share the
+# constant — this file is shell served off the edge. The other two are
+# `comet_update::service::RESOURCE_GOVERNANCE` (rendered by `comet daemon
+# install`, and shipped as a drop-in on every engine update, gh#533); change
+# them together, and `comet-board doctor`'s `engine unit` line is what catches
+# it if they drift.
 OOMPolicy=continue
 MemoryHigh=75%
 MemoryMax=90%

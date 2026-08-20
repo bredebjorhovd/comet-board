@@ -83,6 +83,19 @@ nearly verbatim — it never depended on herdr:
   output *inside* the checkout — the one leaving that is a cache rather than
   evidence, and the only one whose clock does not wait for the task to leave
   the board.
+- `crates/board/src/pressure.rs` — **new** (§gh#533): what the box has left and
+  what an OOM kill looked like, pure over `/proc` text. Two decisions: `headroom`
+  — is there memory to start another agent (`MemAvailable` against
+  `[defaults] min_memory_headroom`, plus PSI for the box that is already
+  thrashing) — and `OomWatch`, armed when a run starts and asked when its child
+  dies, which turns "killed by signal 9" into "the box ran out of memory" from a
+  delta in the kernel's own OOM-kill counters. Every reading is an `Option` and
+  every `None` abstains: a box that cannot be measured (macOS, no PSI) never
+  holds a dispatch and never claims a cause. The machinery is `check_pressure`
+  on the dispatch path, `EvalFacts::host_pressure` in the auto-pick planner,
+  `crates/engine/src/sessions.rs`'s `attribute_oom` in the run loop, and four
+  `doctor` lines (host memory, swap, load, oom kills) beside
+  `comet_update::service`'s `engine unit`.
 - `crates/board/src/settled.rs` — **new** (§settle-logic): the settle decision, pure.
   The evidence hierarchy (PR = the agent's own statement, closes the attempt
   immediately whatever the run's exit said; commits = weaker, close only a
@@ -107,6 +120,11 @@ nearly verbatim — it never depended on herdr:
   minus panes. Task + route → `DispatchSpec` resolution (branch template,
   brief, space matching) plus the pipeline decisions: `check_capacity`
   (`max_concurrent_per_workspace` counts live attempts per space),
+  `check_pressure` (gh#533 — the same refusal about the other resource: a slot
+  is not a memory budget, so a dispatch is *deferred* when the box is under
+  `[defaults] min_memory_headroom` or already stalling on memory; the reading
+  and the decision are `crates/board/src/pressure.rs`, and a box that cannot be
+  measured never holds anything),
   `dispatcher_for` (the `via` chat id → parent-task/chat provenance verdict),
   `dispatcher_name` for the upstream comment. `{worktree}` in a brief resolves
   late, via `DispatchSpec::prompt_at`, once the executor knows the checkout.
