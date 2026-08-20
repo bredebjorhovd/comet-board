@@ -226,18 +226,19 @@ struct ComposerView: View {
     @State private var showPhotoPicker = false
     @State private var showFilePicker = false
     @State private var uploading = false
-    /// The last attachment problem, shown above the pill. Set on a staging
-    /// refusal or a failed upload and cleared by the next successful send —
-    /// an attachment that did not make it is never a silent drop (gh#535).
-    @State private var attachmentError: String?
+    /// Why the last send or staging attempt did not go through, shown above
+    /// the pill and cleared by the next one that does. A file that did not make
+    /// it — refused at the picker, lost on the way to the host, or written to a
+    /// ledger that refused it — is never a silent drop (gh#535).
+    @State private var sendNotice: String?
 
     var body: some View {
         VStack(spacing: 8) {
             if !store.followups.isEmpty || store.followupsPaused {
                 queueTray
             }
-            if let attachmentError {
-                attachmentNotice(attachmentError)
+            if let sendNotice {
+                noticeLine(sendNotice)
             }
             ComposerShell(
                 draft: $text,
@@ -300,7 +301,7 @@ struct ComposerView: View {
     }
 
     /// The failure line above the pill: what did not make it, and what to do.
-    private func attachmentNotice(_ message: String) -> some View {
+    private func noticeLine(_ message: String) -> some View {
         HStack(alignment: .top, spacing: 6) {
             Image(systemName: "exclamationmark.triangle.fill")
                 .font(.system(size: 11))
@@ -314,7 +315,7 @@ struct ComposerView: View {
         .padding(.vertical, 8)
         .background(Theme.danger.opacity(0.12), in: RoundedRectangle(cornerRadius: Theme.radiusChip))
         .padding(.horizontal, 16)
-        .accessibilityLabel("Attachment problem: \(message)")
+        .accessibilityLabel("Send problem: \(message)")
     }
 
     // MARK: Staging
@@ -333,7 +334,7 @@ struct ComposerView: View {
                 attachments.append(staged)
             }
             pickerItems = []
-            attachmentError = failed == 0 ? nil : failed == 1
+            sendNotice = failed == 0 ? nil : failed == 1
                 ? "One photo couldn’t be attached (unreadable, or over 24 MB)."
                 : "\(failed) photos couldn’t be attached (unreadable, or over 24 MB)."
         }
@@ -346,7 +347,7 @@ struct ComposerView: View {
     private func stageFiles(_ result: Result<[URL], Error>) {
         switch result {
         case .failure(let error):
-            attachmentError = "Couldn’t open that file — \(error.localizedDescription)"
+            sendNotice = "Couldn’t open that file — \(error.localizedDescription)"
         case .success(let urls):
             var refused: [String] = []
             for url in urls {
@@ -360,7 +361,7 @@ struct ComposerView: View {
                 }
                 attachments.append(staged)
             }
-            attachmentError = refused.isEmpty
+            sendNotice = refused.isEmpty
                 ? nil
                 : "Couldn’t attach \(refused.joined(separator: ", ")) (unreadable, empty, or over 24 MB)."
         }
@@ -370,11 +371,11 @@ struct ComposerView: View {
     /// app, a file copied in Files, or plain text saved as `.txt`.
     private func pasteAttachment() {
         guard let staged = stageFromPasteboard() else {
-            attachmentError = "Nothing on the clipboard could be attached."
+            sendNotice = "Nothing on the clipboard could be attached."
             return
         }
         attachments.append(staged)
-        attachmentError = nil
+        sendNotice = nil
     }
 
     // MARK: Send
@@ -384,17 +385,37 @@ struct ComposerView: View {
         guard !prompt.isEmpty || !attachments.isEmpty else { return }
         guard !uploading else { return }
         if attachments.isEmpty {
-            deliver(content: prompt, paths: [])
+            guard deliver(content: prompt, paths: []) else {
+                sendNotice = refusedNotice
+                return
+            }
             clearDraft()
             return
         }
         Task { @MainActor in
             guard let paths = await uploadStaged(verb: "sent") else { return }
-            deliver(content: withAttachments(text: prompt, paths: paths), paths: paths)
+            // Gated on the durable append, exactly as the follow-up writes are:
+            // a send the ledger refused must leave the draft AND the staged
+            // files where they were. Losing an upload to a lost socket after
+            // the bytes already crossed the relay is the silent drop gh#535 is
+            // about; the files keep their committed paths, so retrying is one
+            // ledger write, not five uploads.
+            guard deliver(content: withAttachments(text: prompt, paths: paths),
+                          paths: paths) else {
+                sendNotice = refusedNotice
+                return
+            }
             attachments = []
-            attachmentError = nil
+            sendNotice = nil
             clearDraft()
         }
+    }
+
+    /// What a refused durable append says. The files are still staged and still
+    /// committed on the host; only the ledger entry is missing.
+    private var refusedNotice: String {
+        "Not sent — the durable command could not be written. "
+            + "Your draft and attachments are still here. Tap send to retry."
     }
 
     /// Get every staged file onto the chat's host, or report why not.
@@ -410,7 +431,7 @@ struct ComposerView: View {
     /// stream, so the array can shrink under this loop.
     private func uploadStaged(verb: String) async -> [String]? {
         uploading = true
-        attachmentError = nil
+        sendNotice = nil
         defer { uploading = false }
         var failures: [String] = []
         for staged in attachments where staged.state.committedPath == nil {
@@ -438,7 +459,7 @@ struct ComposerView: View {
             }
         }
         guard failures.isEmpty else {
-            attachmentError = failures.count == 1
+            sendNotice = failures.count == 1
                 ? "Not \(verb). \(failures[0]). Tap send to retry."
                 : "Not \(verb). \(failures.count) attachments didn’t reach the host: "
                     + failures.joined(separator: "; ") + ". Tap send to retry."
@@ -447,15 +468,16 @@ struct ComposerView: View {
         return attachments.compactMap(\.state.committedPath)
     }
 
-    private func deliver(content: String, paths: [String]) {
+    /// Returns whether the durable command landed — the caller clears nothing
+    /// until it did.
+    private func deliver(content: String, paths: [String]) -> Bool {
         if runLive {
             // A steer carries no structured attachment list — the trailer is
             // the transport, and the agent opens the paths from the host's
             // disk exactly as it does for a fresh run.
-            store.sendSteer(prompt: content, context: context)
-        } else {
-            store.sendRun(prompt: content, chat: chat, context: context, attachments: paths)
+            return store.sendSteer(prompt: content, context: context)
         }
+        return store.sendRun(prompt: content, chat: chat, context: context, attachments: paths)
     }
 
     private func clearDraft() {
@@ -484,13 +506,17 @@ struct ComposerView: View {
                 guard let uploaded = await uploadStaged(verb: "queued") else { return }
                 paths = uploaded
             }
+            // Every clear below is on the far side of this guard: a refused
+            // write leaves the draft, the context refs AND the staged files
+            // exactly as they were.
             guard store.queueFollowup(prompt: withAttachments(text: prompt, paths: paths),
                                       context: context, attachments: paths) else {
-                followupFailure = "Your draft is still here. Try again after reconnecting."
+                followupFailure = "Your draft and attachments are still here. "
+                    + "Try again after reconnecting."
                 return
             }
             attachments = []
-            attachmentError = nil
+            sendNotice = nil
             text = ""
             context = []
             Task { @MainActor in text = "" }

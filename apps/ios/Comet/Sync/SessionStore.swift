@@ -360,11 +360,17 @@ final class SessionStore {
 
     // MARK: Command plane (ledger rule 1: append-only, own entries only)
 
+    /// Reports whether the durable append landed, like every other write on
+    /// this plane. A caller that clears something on the strength of a send —
+    /// the draft, and since gh#535 the staged attachments — has to know, and an
+    /// optimistic echo for a command the ledger refused is a lie the transcript
+    /// would then have to un-tell.
+    @discardableResult
     func sendRun(prompt: String, chat: Chat, context: [ContextRef] = [],
-                 attachments: [String] = []) {
+                 attachments: [String] = []) -> Bool {
         if offline {
             demoResponder?(prompt)
-            return
+            return true
         }
         let messageId = UUID().uuidString.lowercased()
         let request = RunRequest(prompt: prompt,
@@ -373,28 +379,33 @@ final class SessionStore {
                                  cwd: chat.cwd ?? "",
                                  sandbox: chat.config?.sandbox ?? "workspace-write",
                                  attachments: attachments)
-        queueCommand(kind: "run", payload: [
+        let queued = queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
             "messageId": messageId,
         ], context: context)
+        guard queued else { return false }
         pendingSends.append((messageId, prompt, nowMs()))
         revision &+= 1
+        return true
     }
 
-    func sendSteer(prompt: String, context: [ContextRef] = []) {
+    @discardableResult
+    func sendSteer(prompt: String, context: [ContextRef] = []) -> Bool {
         if offline {
             demoResponder?(prompt)
-            return
+            return true
         }
         let messageId = UUID().uuidString.lowercased()
-        queueCommand(kind: "steer", payload: [
+        let queued = queueCommand(kind: "steer", payload: [
             "kind": "steer",
             "prompt": prompt,
             "messageId": messageId,
         ], context: context)
+        guard queued else { return false }
         pendingSends.append((messageId, prompt, nowMs()))
         revision &+= 1
+        return true
     }
 
     func sendInterrupt() {
