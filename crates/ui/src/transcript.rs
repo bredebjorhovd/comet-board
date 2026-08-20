@@ -1657,7 +1657,13 @@ impl Transcript {
                                 .line_height(px(Theme::PROSE_LINE_HEIGHT))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
-                                .child(text),
+                                // Selectable like the reply it is answering
+                                // (gh#534) — a prompt you cannot copy back out
+                                // is a prompt you have to retype to reuse.
+                                .child(render::selectable_text(
+                                    format!("{}:u", row.id),
+                                    text,
+                                )),
                         ),
                     );
                 }
@@ -1764,7 +1770,10 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip { message } => {
+                let copy = self.copy_ui_for(&row.id, cx);
+                error_chip(message.clone(), &copy, &theme)
+            }
         };
 
         // Hover-revealed timestamp strip (comet chat-view.tsx `Timestamp`):
@@ -2063,9 +2072,52 @@ impl Transcript {
 /// a subtle red-tinted wash, never a bare red-stroke box. The text/icon tone
 /// follows [`Theme::danger_text`]: light red-300 on dark, the darker red-700
 /// on white.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+///
+/// The message TRUNCATES, which is why the chip carries a copy button
+/// (gh#534): the string a person needs out of a failed run is the whole one,
+/// and this row is often the only place the app ever shows it. The button
+/// writes the untruncated message and flashes the same check the code blocks
+/// use — [`CHIP_COPY_IX`] stands in for a code-block index in the row's copy
+/// state, which no code block can ever occupy.
+fn error_chip(message: SharedString, copy: &render::CopyUi, theme: &Theme) -> AnyElement {
     let danger = theme.danger; // red-400
     let red_text = theme.danger_text();
+    let copied = copy.copied_ix == Some(CHIP_COPY_IX);
+    let handler = copy.handler.clone();
+    let full = message.clone();
+    // Hover-fade state is keyed by element, and this button has no index of
+    // its own — the message it copies is what identifies it.
+    let fade_key = format!("errcopy-{}", fnv1a(message.as_bytes()));
+    let copy_button = div()
+        .id(SharedString::from(fade_key.clone()))
+        .flex_none()
+        .h(px(20.0))
+        .px(px(6.0))
+        .rounded(px(Theme::RADIUS_CHIP))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .cursor_pointer()
+        .bg(crate::motion::hover_blend(
+            &fade_key,
+            gpui::transparent_black(),
+            danger.opacity(0.12),
+        ))
+        .on_hover(crate::motion::hover_listener(fade_key))
+        .text_size(px(Theme::TEXT_CAPTION))
+        .text_color(red_text)
+        .on_click(move |_, window, cx| handler(CHIP_COPY_IX, full.clone(), window, cx))
+        .child(
+            crate::icons::icon(if copied {
+                crate::icons::CHECK
+            } else {
+                crate::icons::COPY
+            })
+            .size(px(12.0))
+            .text_color(red_text),
+        )
+        .when(copied, |el| el.child(SharedString::from("Copied")));
     div()
         .py(px(4.0))
         .w_full()
@@ -2112,10 +2164,16 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                         .truncate()
                         .text_color(theme.text_muted)
                         .child(message),
-                ),
+                )
+                .child(copy_button),
         )
         .into_any_element()
 }
+
+/// The copy-state slot the error chip's button occupies in a row's
+/// [`render::CopyUi`]. Code blocks are indexed by their block position, so
+/// `usize::MAX` can never collide with one.
+const CHIP_COPY_IX: usize = usize::MAX;
 
 /// A passive one-line chip marking a question the agent asked — the
 /// interactive controls live in the composer (chat-view.tsx `InputChip`):

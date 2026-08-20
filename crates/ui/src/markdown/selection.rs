@@ -46,7 +46,13 @@ fn state() -> &'static Mutex<Option<MdSelection>> {
 
 /// Resolve the spans for a selection between `a` and `b`, each an
 /// `(element index, byte offset)` into `elements` (document-ordered
-/// `(key, text)` pairs). Handles either direction; empty slices are skipped.
+/// `(key, text)` pairs). Handles either direction.
+///
+/// Every element the range touches gets a span, **including empty ones**: the
+/// document model is "elements joined by `\n`", so an element that contributes
+/// no characters still contributes its line break. That is what keeps a blank
+/// line inside a copied code block (round 19 — code blocks register one element
+/// per line, and dropping the empty ones silently closed up the gaps).
 pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, usize)) -> Vec<Span> {
     let (start, end) = if (a.0, a.1) <= (b.0, b.1) {
         (a, b)
@@ -58,13 +64,11 @@ pub fn resolve_spans(elements: &[(&str, &str)], a: (usize, usize), b: (usize, us
         let from = if ei == start.0 { start.1 } else { 0 };
         let to = if ei == end.0 { end.1 } else { text.len() };
         let (from, to) = (from.min(text.len()), to.min(text.len()));
-        if from < to {
-            spans.push(Span {
-                key: (*key).to_string(),
-                range: from..to,
-                text: (*text).to_string(),
-            });
-        }
+        spans.push(Span {
+            key: (*key).to_string(),
+            range: from..to.max(from),
+            text: (*text).to_string(),
+        });
     }
     spans
 }
@@ -162,13 +166,29 @@ pub fn selected_text() -> Option<String> {
     Some(join_spans(&sel.spans))
 }
 
+/// The selected text: every span's slice, in document order, joined by the line
+/// break that separates two elements. Empty spans are kept — see
+/// [`resolve_spans`]: a blank line in a code block IS an empty span, and
+/// dropping it would copy the block with its gaps closed up.
 fn join_spans(spans: &[Span]) -> String {
     spans
         .iter()
-        .filter(|s| !s.range.is_empty())
         .map(|s| &s.text[s.range.clone()])
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Serializes tests that mutate the process-global selection.
+///
+/// The selection is one static for the whole app — there is one mouse — so any
+/// test that begins a drag is writing to state every other such test can see,
+/// and cargo runs them on parallel threads. Lives here rather than in this
+/// file's `mod tests` because the composer's ⌘C fallback reads the same state
+/// and its tests need the same lock (gh#534).
+#[cfg(test)]
+pub fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Word range around `ix` for double-click selection: an alphanumeric/`_`
@@ -239,13 +259,30 @@ mod tests {
         assert_eq!(resolve_spans(&elems(), (2, 5), (0, 6)), spans);
     }
 
+    /// A code block registers one element per line, so its blank lines are
+    /// EMPTY elements. They have to survive into the copy, or a pasted block
+    /// comes back with its paragraphs closed up (gh#534).
+    #[test]
+    fn blank_lines_between_elements_survive_the_copy() {
+        let lines = vec![
+            ("c0", "fn main() {"),
+            ("c1", ""),
+            ("c2", "    println!(\"hi\");"),
+            ("c3", "}"),
+        ];
+        let spans = resolve_spans(&lines, (0, 0), (3, 1));
+        assert_eq!(spans.len(), 4);
+        assert_eq!(
+            join_spans(&spans),
+            "fn main() {\n\n    println!(\"hi\");\n}"
+        );
+    }
+
     /// The drag tests below mutate the process-global selection state —
     /// serialize them, or the parallel test runner interleaves their
-    /// begin/end_drag calls (long-standing flake).
-    fn state_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: Mutex<()> = Mutex::new(());
-        LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    /// begin/end_drag calls (long-standing flake). Shared with the composer's
+    /// ⌘C tests via [`super::test_lock`], which read the same state.
+    use super::test_lock as state_lock;
 
     #[test]
     fn drag_lifecycle_and_copy_joins() {
