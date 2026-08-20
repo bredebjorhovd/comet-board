@@ -46,6 +46,23 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
     cx.on_action(|_: &Zoom, cx| with_active_window(cx, |window| window.zoom_window()));
     cx.on_action(|_: &CloseWindow, cx| with_active_window(cx, |window| window.remove_window()));
+    cx.on_action(copy_selection);
+}
+
+/// ⌘C with nothing focused that wanted it — copy the text selection.
+///
+/// `composer::Copy` is dispatched down the focus path first, and a window
+/// action listener stops propagation by default in the bubble phase, so this
+/// only ever runs when NO focused element handled the keystroke: the composer
+/// takes it while a chat is up (input selection first, then the transcript's),
+/// and this catches every surface that has no text input in its focus tree —
+/// the board's issue peek, the review screen's brief and claims. Without it,
+/// text on those screens was selectable and then uncopyable, which is worse
+/// than not selectable at all (gh#534).
+fn copy_selection(_: &composer::Copy, cx: &mut App) {
+    if let Some(text) = crate::markdown::selection::selected_text() {
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
 }
 
 fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {

@@ -158,6 +158,14 @@ struct MarkdownBlockView: View {
         case .paragraph(let runs):
             runs.styled()
                 .textRenderer(InlineCodeRenderer())
+                // gh#534. SwiftUI selects one `Text` at a time — there is no
+                // cross-view selection — which is exactly the shape of a
+                // transcript row, one top-level block per row. The row's own
+                // long-press menu (TranscriptView.transcriptCopyMenu) is the
+                // guarantee underneath this: `.textSelection` is honoured
+                // unevenly across iOS versions and lazy containers, and the
+                // string still has to be reachable when it is not.
+                .textSelection(.enabled)
                 .lineSpacing(MD.lineHeight - MD.textSize - 4)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -167,6 +175,7 @@ struct MarkdownBlockView: View {
             let m = MD.headingMetrics(level)
             runs.styled(size: m.size, weight: .semibold)
                 .textRenderer(InlineCodeRenderer())
+                .textSelection(.enabled)
                 .lineSpacing(m.line - m.size - 4)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -199,6 +208,10 @@ struct CodeBlockView: View {
     var cacheKey: String = ""
 
     @State private var spans: [[TokenSpan]] = []
+    /// Transient "Copied" acknowledgement (desktop parity: 1.2s, overlaid so
+    /// the flash never shifts layout).
+    @State private var copied = false
+    @State private var copiedReset: Task<Void, Never>?
 
     private var lines: [String] { code.components(separatedBy: "\n") }
 
@@ -222,6 +235,11 @@ struct CodeBlockView: View {
                         Text(attributedLine(line, spans: ix < spans.count ? spans[ix] : []))
                             .font(Theme.mono(MD.codeTextSize))
                             .lineLimit(1)
+                            // Per line, because that is how the block is built.
+                            // Dragging a selection across lines is not
+                            // something SwiftUI offers; the block's own Copy
+                            // below is how you take the whole listing (gh#534).
+                            .textSelection(.enabled)
                             .frame(height: MD.codeLineHeight, alignment: .leading)
                     }
                 }
@@ -235,11 +253,18 @@ struct CodeBlockView: View {
             RoundedRectangle(cornerRadius: Theme.radiusRow)
                 .strokeBorder(Theme.border, lineWidth: 1)
         )
+        // One TAP copies the block (gh#534) — the desktop's affordance, and the
+        // one a phone needs most: dragging selection handles down a scrolling
+        // listing to get a command out is the interaction this replaces.
+        .overlay(alignment: .topTrailing) { copyButton }
         .contextMenu {
             Button {
-                UIPasteboard.general.string = code
+                copy()
             } label: {
                 Label("Copy code", systemImage: "doc.on.doc")
+            }
+            ShareLink(item: code) {
+                Label("Share…", systemImage: "square.and.arrow.up")
             }
         }
         .task(id: code) {
@@ -249,6 +274,42 @@ struct CodeBlockView: View {
                 Highlighter.highlight(code: source, language: lang)
             }.value
             spans = result
+        }
+    }
+
+    /// The block's copy affordance: a quiet ghost chip in the top-right,
+    /// overlaid so pressing it (and the "Copied" flash) never moves the code.
+    private var copyButton: some View {
+        Button {
+            copy()
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: .medium))
+                if copied {
+                    Text("Copied").font(Theme.sans(Theme.textCaption))
+                }
+            }
+            .foregroundStyle(Theme.textMuted)
+            .padding(.horizontal, 7)
+            .frame(height: 24)
+            .background(Theme.elementHover, in: RoundedRectangle(cornerRadius: Theme.radiusChip))
+            .contentShape(RoundedRectangle(cornerRadius: Theme.radiusChip))
+        }
+        .buttonStyle(.plain)
+        .padding(4)
+        .accessibilityLabel("Copy code block")
+    }
+
+    private func copy() {
+        UIPasteboard.general.string = code
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        copied = true
+        copiedReset?.cancel()
+        copiedReset = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 1_200_000_000)
+            guard !Task.isCancelled else { return }
+            copied = false
         }
     }
 
@@ -400,6 +461,7 @@ struct TableBlockView: View {
             : .leading
         return runs.styled(weight: weight)
             .textRenderer(InlineCodeRenderer())
+            .textSelection(.enabled)
             .lineSpacing(MD.lineHeight - MD.textSize - 4)
             .padding(12)
             .frame(minWidth: 48, maxWidth: .infinity, alignment: alignment)

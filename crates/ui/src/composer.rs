@@ -5048,6 +5048,94 @@ impl Render for Composer {
 mod tests {
     use super::*;
 
+    /// An input in a real window — the clipboard verbs need a `Window`, so
+    /// these run under gpui's test app rather than as pure functions.
+    fn input(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<ComposerInput>, &mut gpui::VisualTestContext) {
+        let cx = cx.add_empty_window();
+        let input = cx.new(|cx| ComposerInput::new("Message", cx));
+        (input, cx)
+    }
+
+    /// gh#534, acceptance line 4: "paste 50 lines into a composer without
+    /// loss". Every line, every blank, every trailing newline — a composer that
+    /// drops any of them is a composer you cannot move a diff or a log through.
+    #[gpui::test]
+    async fn a_fifty_line_paste_lands_verbatim(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = input(cx);
+        // Blank lines and a CRLF included on purpose: both are what real pasted
+        // logs carry, and both are what a line-wise "sanitizer" eats.
+        let mut pasted = (1..=48)
+            .map(|n| if n % 7 == 0 { String::new() } else { format!("line {n}") })
+            .collect::<Vec<_>>()
+            .join("\n");
+        pasted.push_str("\n\tindented\r\ntrailing\n");
+        assert_eq!(pasted.lines().count(), 50);
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(pasted.clone())));
+        cx.update(|window, cx| {
+            input.update(cx, |this, cx| this.paste(&Paste, window, cx));
+        });
+        assert_eq!(cx.read(|cx| input.read(cx).content.clone()), pasted);
+    }
+
+    /// A paste with a selection replaces it rather than appending, and the
+    /// caret lands after the inserted text (so the next keystroke continues it).
+    #[gpui::test]
+    async fn a_paste_replaces_the_selection(cx: &mut gpui::TestAppContext) {
+        let (input, cx) = input(cx);
+        cx.update(|window, cx| {
+            input.update(cx, |this, cx| {
+                this.replace_text_in_range(None, "keep DROP keep", window, cx);
+                this.selected_range = 5..9;
+            });
+            cx.write_to_clipboard(ClipboardItem::new_string("one\ntwo".to_string()));
+        });
+        cx.update(|window, cx| {
+            input.update(cx, |this, cx| this.paste(&Paste, window, cx));
+        });
+        cx.read(|cx| {
+            let this = input.read(cx);
+            assert_eq!(this.content, "keep one\ntwo keep");
+            assert_eq!(this.selected_range, 12..12);
+        });
+    }
+
+    /// ⌘C with no input selection copies the TRANSCRIPT's selection: the
+    /// composer keeps focus while a person reads back through the replies, so
+    /// it is the only element on the focus path when the copy arrives (gh#534).
+    #[gpui::test]
+    async fn copy_falls_through_to_the_transcript_selection(cx: &mut gpui::TestAppContext) {
+        // The markdown selection is one static for the whole app; hold the
+        // same lock selection.rs's own drag tests hold, or they interleave.
+        let _selection = crate::markdown::selection::test_lock();
+        let (input, cx) = input(cx);
+        cx.update(|window, cx| {
+            input.update(cx, |this, cx| {
+                this.replace_text_in_range(None, "draft", window, cx);
+            });
+        });
+        crate::markdown::selection::begin_with_span("p1", "the error string", 4..16);
+        cx.update(|window, cx| {
+            input.update(cx, |this, cx| this.copy(&Copy, window, cx));
+        });
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("error string".to_string()),
+        );
+        // An input selection still wins — the composer's own text is nearer.
+        cx.update(|window, cx| {
+            input.update(cx, |this, cx| {
+                this.selected_range = 0..5;
+                this.copy(&Copy, window, cx);
+            });
+        });
+        assert_eq!(
+            cx.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text())),
+            Some("draft".to_string()),
+        );
+    }
+
     fn question(id: &str, options: &[&str], multi: bool) -> UserInputQuestion {
         UserInputQuestion {
             id: id.into(),

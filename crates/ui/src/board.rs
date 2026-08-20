@@ -4234,9 +4234,9 @@ impl BoardPanel {
             let tree = crate::markdown::parser::parse_full(&text);
             crate::markdown::render::render_tree(
                 &tree,
-                &crate::markdown::render::RenderOptions::settled(SharedString::from(format!(
-                    "board-peek-{id}"
-                ))),
+                &crate::markdown::render::RenderOptions::settled_copyable(SharedString::from(
+                    format!("board-peek-{id}"),
+                )),
                 &theme,
                 window,
                 &|_| None,
@@ -4501,6 +4501,13 @@ impl Render for BoardPanel {
             .size_full()
             .flex()
             .flex_col()
+            // FIRST child ⇒ paints first: the peek renders through the
+            // transcript's markdown pipeline, whose text elements register
+            // themselves for selection on every paint. Without this reset the
+            // registry grows by an element per painted line per frame for as
+            // long as the board is open, and a drag resolves against a stale
+            // document (gh#534).
+            .child(crate::markdown::render::selection_frame_reset())
             .key_context("Board")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))

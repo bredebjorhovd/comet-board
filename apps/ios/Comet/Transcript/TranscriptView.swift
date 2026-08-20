@@ -234,8 +234,48 @@ struct TranscriptView: View {
                 ErrorChipView(message: message)
             }
         }
+        // Long-press → Copy / Share on every row, whatever it holds (gh#534).
+        //
+        // This is the belt to text selection's braces, and both are needed. The
+        // selectable `Text`s inside give character-level selection with the
+        // system's own Copy — a long press ON the glyphs starts a selection,
+        // because the innermost interaction wins UIKit's hit test. A long press
+        // anywhere else in the row — the padding, a chip, the gap beside a
+        // short line — lands here and copies the WHOLE row, which is what you
+        // want for the things selection cannot reach: a truncated error
+        // message, a tool chip's command, a fenced block you would otherwise
+        // have to drag a handle across.
+        .transcriptCopyMenu(TranscriptText.text(for: row.kind))
         .padding(.top, row.topGap)
         .padding(.horizontal, 16)
+    }
+}
+
+// MARK: - Copy / share menu
+
+extension View {
+    /// Attach the transcript's copy/share context menu to one row.
+    ///
+    /// The text is an autoclosure, and that is load-bearing: a `contextMenu`
+    /// builds its content only when it opens, but an eagerly-passed `String`
+    /// would serialize the row's whole block on every body evaluation — and the
+    /// transcript's body re-runs on every scroll frame, for every row the lazy
+    /// stack is holding. Deferred, the serializer runs once, on the long press
+    /// that asked for it.
+    func transcriptCopyMenu(_ text: @escaping @autoclosure () -> String) -> some View {
+        contextMenu {
+            let text = text()
+            Button {
+                UIPasteboard.general.string = text
+            } label: {
+                Label("Copy", systemImage: "doc.on.doc")
+            }
+            if !text.isEmpty {
+                ShareLink(item: text) {
+                    Label("Share…", systemImage: "square.and.arrow.up")
+                }
+            }
+        }
     }
 }
 
@@ -303,18 +343,17 @@ struct UserBubble: View {
                     .font(Theme.sans(MD.textSize))
                     .lineSpacing(MD.lineHeight - MD.textSize - 4)
                     .foregroundStyle(Theme.text)
+                    // A prompt you cannot copy back out is a prompt you have to
+                    // retype to reuse (gh#534). The row carries the whole-message
+                    // menu; this is the character-level half. Selection is on the
+                    // VISIBLE prompt only — dragging a handle across the machine
+                    // trailer would be selecting something nobody wrote.
+                    .textSelection(.enabled)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
                     .background(Theme.surfaceRaised,
                                 in: RoundedRectangle(cornerRadius: Theme.radiusCard))
                     .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
-                    .contextMenu {
-                        Button {
-                            UIPasteboard.general.string = parsed.text
-                        } label: {
-                            Label("Copy", systemImage: "doc.on.doc")
-                        }
-                    }
             }
         }
         .opacity(pending ? 0.65 : 1)
@@ -452,6 +491,9 @@ struct ToolChipRow: View {
 struct ErrorChipView: View {
     let message: String
 
+    @State private var copied = false
+    @State private var copiedReset: Task<Void, Never>?
+
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle")
@@ -467,6 +509,29 @@ struct ErrorChipView: View {
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
             Spacer(minLength: 0)
+            // The message truncates, so selection can never reach the end of
+            // it — this is how the whole string gets out (gh#534). One tap,
+            // because the string a person needs off a failed run is the one
+            // they are about to paste into a search or a thread.
+            Button {
+                UIPasteboard.general.string = message
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                copied = true
+                copiedReset?.cancel()
+                copiedReset = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 1_200_000_000)
+                    guard !Task.isCancelled else { return }
+                    copied = false
+                }
+            } label: {
+                Image(systemName: copied ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(Theme.dangerText)
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Copy error message")
         }
         .padding(.horizontal, 8)
         .frame(height: 34)

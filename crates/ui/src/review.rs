@@ -879,6 +879,7 @@ impl ReviewPanel {
     /// with a filename attached.
     fn claim_row(
         review: &AttemptReview,
+        ix: usize,
         claim: &ClaimView,
         changed: &[ChangedFile],
         theme: &Theme,
@@ -914,7 +915,13 @@ impl ReviewPanel {
                     } else {
                         theme.text
                     })
-                    .child(SharedString::from(claim.text.clone())),
+                    // Selectable (gh#534): a claim sentence is the line a
+                    // reviewer quotes back into a comment, and quoting it by
+                    // retyping it is how a quote stops being one.
+                    .child(crate::markdown::render::selectable_text(
+                        format!("review-claim-{}-{ix}", review.task_id),
+                        claim.text.clone(),
+                    )),
             )
             // The evidence for this one claim, and the anchors it named, on one
             // wrapping row: what checks it and what it is about are the same
@@ -1029,7 +1036,12 @@ impl ReviewPanel {
                     } else {
                         theme.text_muted
                     })
-                    .child(SharedString::from(verdict.text.clone())),
+                    // Selectable (gh#534) — the verdict is the sentence that
+                    // gets pasted into the thread about the run.
+                    .child(crate::markdown::render::selectable_text(
+                        "review-verdict",
+                        verdict.text.clone(),
+                    )),
             )
             .into_any_element()
     }
@@ -1047,10 +1059,9 @@ impl ReviewPanel {
                 let tree = crate::markdown::parser::parse_full(text);
                 crate::markdown::render::render_tree(
                     &tree,
-                    &crate::markdown::render::RenderOptions::settled(SharedString::from(format!(
-                        "review-brief-{}",
-                        review.task_id
-                    ))),
+                    &crate::markdown::render::RenderOptions::settled_copyable(SharedString::from(
+                        format!("review-brief-{}", review.task_id),
+                    )),
                     theme,
                     window,
                     &|_| None,
@@ -1196,7 +1207,8 @@ impl ReviewPanel {
             .remainder
             .claims
             .iter()
-            .map(|claim| Self::claim_row(review, claim, &review.changed, theme))
+            .enumerate()
+            .map(|(ix, claim)| Self::claim_row(review, ix, claim, &review.changed, theme))
             .collect();
         let count = match claims.len() {
             1 => "1 claim".to_string(),
@@ -2480,7 +2492,16 @@ impl Render for ReviewPanel {
         // The card is the shell's; what this renders is its contents, and every
         // band inside it brings its own padding — the top half is full-bleed
         // bands and the bottom half is inset blocks (review.md A6).
-        let card = div().size_full().flex().flex_col();
+        // FIRST child ⇒ paints first: the brief renders through the
+        // transcript's markdown pipeline, whose text elements register
+        // themselves for selection on every paint, and the claim/verdict
+        // sentences below join the same registry. Without this reset it grows
+        // by an element per painted line per frame (gh#534).
+        let card = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .child(crate::markdown::render::selection_frame_reset());
         // The two states with nothing to compose: one message, centred in the
         // card's own gutters rather than in a band that has no label.
         let message = |color: gpui::Hsla, text: SharedString| {
