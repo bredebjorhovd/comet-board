@@ -172,7 +172,12 @@ enum TranscriptText {
     static func text(for kind: RowKind) -> String {
         switch kind {
         case .user(let text):
-            return text
+            // What the person wrote, not what the composer appended: a user row
+            // carries its attachments as a machine trailer of absolute host
+            // paths (gh#535), and copying those back is copying something
+            // nobody typed. An attachment-only send has no prompt to copy, so
+            // it copies the file names instead of an empty string.
+            return userTurnText(text)
         case .markdown(let block, _):
             return markdown(block: block)
         case .toolGroup(let tools, _):
@@ -192,6 +197,15 @@ enum TranscriptText {
         case .errorChip(let message):
             return message
         }
+    }
+
+    /// What the person wrote in a user turn: the visible prompt, or — when the
+    /// attachments WERE the message — the file names, so an attachment-only
+    /// send copies as something rather than as nothing.
+    private static func userTurnText(_ text: String) -> String {
+        let parsed = parseUserMessageAttachments(text)
+        if !parsed.text.isEmpty { return parsed.text }
+        return parsed.attachments.map(\.name).joined(separator: ", ")
     }
 
     /// A whole transcript, turn by turn. Speaker headings only where a turn
@@ -230,7 +244,12 @@ enum TranscriptText {
             for part in entry.parts {
                 switch part {
                 case .text(_, let text):
-                    if !text.isEmpty { body.append(text) }
+                    // A user turn's attachment trailer is machine text (gh#535):
+                    // an export is for reading, and host-local absolute paths
+                    // are not what the person said. The file names stand in when
+                    // the attachments were the whole message.
+                    let visible = entry.role == .user ? userTurnText(text) : text
+                    if !visible.isEmpty { body.append(visible) }
                 case .tool(_, let call, let isError, _):
                     let detail = call.chipDetail
                     let head = "\(call.chipLabel)\(isError ? " (failed)" : "")"

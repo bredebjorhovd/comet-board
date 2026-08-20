@@ -46,6 +46,30 @@ final class SessionStore {
         self.chatId = chatId
         self.config = config
         self.offline = offline
+        AttachmentImageCache.shared.configure(config: config)
+    }
+
+    // MARK: Attachments — uploads go to the device that HOSTS this chat
+
+    @ObservationIgnored private var hostRelay: (deviceId: String, client: DeviceRelayClient)?
+
+    /// Chunked upload of one staged file to the chat's host device; returns the
+    /// durable absolute path THERE, which is what the refs trailer carries.
+    ///
+    /// The phone hosts nothing, so there is no local fast path to fall into and
+    /// no "current device" to default to: a chat on the box uploads to the box,
+    /// a chat on a Mac uploads to that Mac, and a chat whose host we do not yet
+    /// know refuses rather than guessing (gh#535).
+    func uploadAttachment(name: String, data: Data) async throws -> String {
+        guard let hostDeviceId, !hostDeviceId.isEmpty else { throw RelayError.hostOffline }
+        let relay: DeviceRelayClient
+        if let hostRelay, hostRelay.deviceId == hostDeviceId {
+            relay = hostRelay.client
+        } else {
+            relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
+            hostRelay = (hostDeviceId, relay)
+        }
+        return try await uploadAttachmentChunked(relay: relay, name: name, data: data)
     }
 
     /// Demo-mode injection point (also used by previews).
@@ -336,39 +360,52 @@ final class SessionStore {
 
     // MARK: Command plane (ledger rule 1: append-only, own entries only)
 
-    func sendRun(prompt: String, chat: Chat, context: [ContextRef] = []) {
+    /// Reports whether the durable append landed, like every other write on
+    /// this plane. A caller that clears something on the strength of a send —
+    /// the draft, and since gh#535 the staged attachments — has to know, and an
+    /// optimistic echo for a command the ledger refused is a lie the transcript
+    /// would then have to un-tell.
+    @discardableResult
+    func sendRun(prompt: String, chat: Chat, context: [ContextRef] = [],
+                 attachments: [String] = []) -> Bool {
         if offline {
             demoResponder?(prompt)
-            return
+            return true
         }
         let messageId = UUID().uuidString.lowercased()
         let request = RunRequest(prompt: prompt,
                                  model: chat.config?.model,
                                  reasoning: chat.config?.reasoning,
                                  cwd: chat.cwd ?? "",
-                                 sandbox: chat.config?.sandbox ?? "workspace-write")
-        queueCommand(kind: "run", payload: [
+                                 sandbox: chat.config?.sandbox ?? "workspace-write",
+                                 attachments: attachments)
+        let queued = queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
             "messageId": messageId,
         ], context: context)
+        guard queued else { return false }
         pendingSends.append((messageId, prompt, nowMs()))
         revision &+= 1
+        return true
     }
 
-    func sendSteer(prompt: String, context: [ContextRef] = []) {
+    @discardableResult
+    func sendSteer(prompt: String, context: [ContextRef] = []) -> Bool {
         if offline {
             demoResponder?(prompt)
-            return
+            return true
         }
         let messageId = UUID().uuidString.lowercased()
-        queueCommand(kind: "steer", payload: [
+        let queued = queueCommand(kind: "steer", payload: [
             "kind": "steer",
             "prompt": prompt,
             "messageId": messageId,
         ], context: context)
+        guard queued else { return false }
         pendingSends.append((messageId, prompt, nowMs()))
         revision &+= 1
+        return true
     }
 
     func sendInterrupt() {
@@ -384,12 +421,15 @@ final class SessionStore {
     }
 
     @discardableResult
-    func queueFollowup(prompt: String, context: [ContextRef] = []) -> Bool {
+    func queueFollowup(prompt: String, context: [ContextRef] = [],
+                       attachments: [String] = []) -> Bool {
         queueCommand(kind: "queue", payload: [
             "kind": "queue",
             "prompt": prompt,
             "messageId": UUID().uuidString.lowercased(),
-            "attachments": [],
+            // The host stamps these onto the RunRequest when this row's turn
+            // comes — a follow-up's files are its own, never the last turn's.
+            "attachments": attachments,
         ], context: context, expires: false)
     }
 

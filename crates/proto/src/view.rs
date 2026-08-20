@@ -20,6 +20,7 @@ use chrono::{DateTime, Utc};
 use crate::{AuthState, Chat, ChatIndicator, EdgeHealth, Session, SessionStatus, Space};
 
 pub mod account;
+pub mod attachments;
 pub mod board;
 pub mod context;
 pub mod fork;

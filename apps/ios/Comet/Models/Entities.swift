@@ -370,6 +370,12 @@ struct RunRequest: Codable {
     var sandbox: String = "workspace-write"
     var autoApprove: Bool = true
     var resume: String?
+    /// Absolute paths of attachments already committed on the RUN device —
+    /// images or documents (gh#535), staged there by UploadChunk/UploadCommit.
+    /// The same paths ride the prompt text as an `Attached images/files (local
+    /// files …)` trailer, which is what persists in the doc and what the agent
+    /// opens; this field additionally lets a harness inline image bytes.
+    var attachments: [String] = []
 }
 
 enum SessionCommandPayload {

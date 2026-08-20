@@ -71,6 +71,7 @@ enum CopySpecRunner {
         aToolGroupCarriesItsCommands()
         theTranscriptIsTheSourceNotAReparse()
         anEmptyTranscriptIsEmpty()
+        aUserTurnCopiesWhatWasTypedNotItsAttachmentTrailer()
 
         log(failures == 0
             ? "OK \(checks) checks, no drift"
@@ -231,6 +232,28 @@ enum CopySpecRunner {
                                          pendingSends: [(messageId: "m9", text: "and now?", at: 0)]),
                "## You\n\nwhat broke?\n\n## Agent\n\n\(source)\n\n- Read: b/c.rs\n\n## You\n\nand now?",
                "an in-flight send is part of the transcript")
+    }
+
+    /// A prompt with attachments carries a trailer of absolute paths on the
+    /// HOST (gh#535). Copying a row, or exporting the session, must give back
+    /// what the person typed — the paths are machine text, and on a phone they
+    /// name a filesystem the phone does not have. When the attachments were the
+    /// whole message there is no prompt, so the names stand in for it.
+    private static func aUserTurnCopiesWhatWasTypedNotItsAttachmentTrailer() {
+        let withPrompt = withAttachments(text: "what broke here?",
+                                         paths: ["/data/uploads/ab-shot.png"])
+        expect(TranscriptText.text(for: .user(text: withPrompt)), "what broke here?",
+               "a user row copies the prompt, not the trailer")
+        let attachmentsOnly = withAttachments(text: "",
+                                              paths: ["/data/uploads/ab-spec.pdf",
+                                                      "/data/uploads/cd-log.txt"])
+        expect(TranscriptText.text(for: .user(text: attachmentsOnly)),
+               "ab-spec.pdf, cd-log.txt",
+               "an attachment-only send copies its file names, never nothing")
+        expect(TranscriptText.transcript(entries: [
+            entry(role: .user, parts: [.text(id: "p0", text: withPrompt)]),
+        ]), "## You\n\nwhat broke here?",
+               "the export is what was said, not the paths it was said with")
     }
 
     private static func anEmptyTranscriptIsEmpty() {

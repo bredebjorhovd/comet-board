@@ -831,8 +831,17 @@ impl WorkspaceHost {
 
     /// Sidebar freshness on message persist: preview = first 120 chars of the last
     /// message's text. Claims the row first so a pre-workspace chat gains one.
+    ///
+    /// The attachment-ref trailer is machine text, and a message that is only
+    /// attachments is otherwise previewed as `See the attached file(s).` over a
+    /// list of absolute paths, on every surface that reads this row (gh#535).
+    /// The shared rule answers with what the person actually sent; a message
+    /// with no trailer comes back unchanged.
     pub fn note_message(&self, chat_id: &str, text: &str) {
-        let preview: String = text.chars().take(120).collect();
+        let preview: String = comet_proto::view::attachments::user_message_rail_text(text)
+            .chars()
+            .take(120)
+            .collect();
         let result = self.claim_chat(chat_id, None).and_then(|_| {
             self.inner
                 .doc()

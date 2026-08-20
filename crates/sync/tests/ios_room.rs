@@ -64,7 +64,14 @@ fn doc_disk_swift() -> String {
 
 /// The Swift test harness cannot replace Loro's document with an insertion
 /// failure. Keep the source-level ownership rule explicit: durable append
-/// reports a Bool, and both destructive composer transitions are gated on it.
+/// reports a Bool, and every destructive composer transition is gated on it.
+///
+/// Since gh#535 the composer also holds **staged attachments**, and they are
+/// the more expensive half of what a refused write would drop: the bytes have
+/// already crossed the relay to the host by then, so clearing them on a write
+/// that never landed costs the person an upload, not just a retype. So the
+/// pins below check both — the guard exists, and the clears sit on its far
+/// side.
 #[test]
 fn ios_followup_drafts_survive_a_failed_durable_append() {
     let store = session_store_swift();
@@ -76,9 +83,18 @@ fn ios_followup_drafts_survive_a_failed_durable_append() {
             && store.contains("return queued"),
         "SessionStore must report durable command insertion success"
     );
+    // The send plane reports it too: a caller that clears the draft and the
+    // staged files on the strength of a send has to know whether it landed.
     assert!(
-        composer.contains("guard store.queueFollowup(prompt: prompt, context: context) else")
-            && composer.contains("if store.editFollowup(id: row.id, prompt: editText")
+        store.contains("attachments: [String] = []) -> Bool")
+            && store.contains("func sendSteer(prompt: String, context: [ContextRef] = []) -> Bool")
+            && store.matches("guard queued else { return false }").count() == 2,
+        "sendRun/sendSteer must report whether the durable append landed"
+    );
+    assert!(
+        composer.contains(
+            "guard store.queueFollowup(prompt: withAttachments(text: prompt, paths: paths),"
+        ) && composer.contains("if store.editFollowup(id: row.id, prompt: editText")
             && composer.contains("saveQueueControl(store.moveFollowup")
             && composer.contains("saveQueueControl(store.removeFollowup")
             && composer.contains("saveQueueControl(store.runNext")
@@ -86,6 +102,69 @@ fn ios_followup_drafts_survive_a_failed_durable_append() {
             && composer.contains("followupFailure ="),
         "Composer must retain drafts/edits and surface every failed queue write"
     );
+    // …and the send path is gated on the same Bool, with its own notice.
+    assert!(
+        composer.contains("guard deliver(content: prompt, paths: []) else")
+            && composer
+                .contains("guard deliver(content: withAttachments(text: prompt, paths: paths),")
+            && composer.contains("private func deliver(content: String, paths: [String]) -> Bool")
+            && composer.contains("sendNotice = refusedNotice"),
+        "Composer must gate its send clears on the durable append too"
+    );
+    // Presence is not the rule — ORDER is. Read each function's own body and
+    // require the clear to sit after its guard: a scan of the whole file would
+    // pass on a `send()` that cleared first, by finding `queue()`'s clear.
+    for (label, signature, guard_anchor) in [
+        (
+            "send",
+            "private func send() {",
+            "guard deliver(content: withAttachments(text: prompt, paths: paths),",
+        ),
+        (
+            "queue",
+            "private func queue() {",
+            "guard store.queueFollowup(prompt: withAttachments(text: prompt, paths: paths),",
+        ),
+    ] {
+        let body = swift_fn_body(&composer, signature);
+        let at = body
+            .find(guard_anchor)
+            .unwrap_or_else(|| panic!("{label}() no longer guards on the durable write"));
+        let clear = body
+            .find("attachments = []")
+            .unwrap_or_else(|| panic!("{label}() no longer clears the staged attachments"));
+        assert!(
+            at < clear,
+            "{label}() clears the staged attachments before the durable write is known to have \
+             landed — a refused write would drop files already uploaded to the host, which costs \
+             an upload and not just a retype"
+        );
+    }
+}
+
+/// One Swift function body, by brace matching from its signature. Naive on
+/// purpose (no string/comment awareness): the two bodies it is pointed at
+/// contain no braces inside literals, and a test that silently scanned the
+/// wrong span would be worse than one that panics when that stops being true.
+fn swift_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
+    let start = source
+        .find(signature)
+        .unwrap_or_else(|| panic!("ComposerView.swift no longer declares `{signature}`"))
+        + signature.len();
+    let mut depth = 1usize;
+    for (offset, ch) in source[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return &source[start..start + offset];
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("`{signature}` has no matching close brace");
 }
 
 /// `const NAME: Duration = Duration::from_secs(30);` → 30_000 ms.

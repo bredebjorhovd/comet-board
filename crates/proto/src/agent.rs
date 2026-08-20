@@ -217,12 +217,14 @@ pub struct RunRequest {
     pub auto_approve: bool,
     /// Harness-native session id to resume, if any.
     pub resume: Option<String>,
-    /// Absolute paths of image attachments already staged on the run device
-    /// (composer uploads: UploadChunk/UploadCommit → durable path). The same
-    /// paths also ride the prompt text as `Attached images (local files …)`
-    /// refs (comet's `withAttachments` transport — that's what persists in the
-    /// doc); this field additionally lets a harness inline the bytes as image
-    /// content blocks. Additive + serde-defaulted for wire compat.
+    /// Absolute paths of attachments already staged on the run device
+    /// (composer uploads: UploadChunk/UploadCommit → durable path). Images or
+    /// documents — a phone can attach either (gh#535). The same paths ride the
+    /// prompt text as an `Attached images/files (local files …)` trailer
+    /// ([`crate::view::attachments`] — that's what persists in the doc, and
+    /// what a harness that inlines nothing still sees); this field
+    /// additionally lets a harness inline image bytes as content blocks, and
+    /// skip anything it cannot. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
 }

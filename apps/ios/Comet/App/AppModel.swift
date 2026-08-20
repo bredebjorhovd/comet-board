@@ -87,6 +87,13 @@ final class AppModel {
             ReviewSpecRunner.run()
             return
         }
+        // The attachment-ref trailer against the fixture Rust generated
+        // (gh#535): where a prompt ends and the machine trailer begins, which
+        // both viewports have to answer identically.
+        if args.contains("-attachments-spec") {
+            AttachmentsSpecRunner.run()
+            return
+        }
         // The room's redial schedule (gh#405). Arithmetic, not a socket —
         // deliberately, since a reconnect loop cannot be honestly checked
         // against an edge that is failing every request.
