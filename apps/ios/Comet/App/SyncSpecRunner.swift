@@ -75,6 +75,9 @@ enum SyncSpecRunner {
         aWorkingSessionEarnsAFreshLadder()
         onlyALastingSessionCounts()
         aCommandQueuedAgainstReseedSurvives()
+        theIncidentReplaysEveryLocalEntry()
+        anInterruptedRecoveryFinishesOnTheNextLaunch()
+        aLiveRoomIsNotAConvergedRoom()
         githubPushTupleRoundTrips()
 
         log(failures == 0
@@ -221,12 +224,14 @@ enum SyncSpecRunner {
         }
         queueHasOldOwner.wait()
 
+        let recovery = specRecovery(docId: "boundary-chat")
         DispatchQueue.global().async {
             replaceStarted.signal()
             let replacement = LoroDoc()
-            _ = document.replaceReplayingPendingCommands(
-                with: replacement, localDeviceId: "phone-spec"
-            )
+            _ = document.replace(with: replacement) { stale, candidate in
+                recovery.recover(stale: stale, candidate: candidate,
+                                 serverVersion: candidate.oplogVv())
+            }
             replaceDone.signal()
         }
         replaceStarted.wait()
@@ -240,6 +245,110 @@ enum SyncSpecRunner {
         expect(commands.count, 1, "the boundary command crosses the owner swap")
         expect(commands.first?.mapValue?["id"]?.stringValue, "boundary",
                "the recovered command is the one queued against the old owner")
+    }
+
+    // MARK: gh#483 — the phone's half of convergence recovery
+
+    /// The incident, on the phone: a room holding the 249-id prefix and a
+    /// replica holding those plus 74 entries this device committed while it
+    /// could not reach the room. Every one of the 323 stable ids must survive
+    /// the replacement, once each, in order — and replaying again must change
+    /// nothing.
+    private static func theIncidentReplaysEveryLocalEntry() {
+        let (cloud, laptop, expected) = incidentFixture(shared: 249, offline: 74)
+        expect(Convergence.stableIds(cloud).count, 249, "the room is stuck at the prefix")
+        expect(Convergence.stableIds(laptop).count, 323, "the phone holds the whole thing")
+
+        let recovery = specRecovery(docId: "incident-chat")
+        recovery.record(laptop)
+        expect(recovery.pending, 323, "everything is local-only until the edge says otherwise")
+
+        guard let report = recovery.recover(stale: laptop, candidate: cloud,
+                                            serverVersion: cloud.oplogVv()) else {
+            expectTrue(false, "recovery refused the server snapshot")
+            return
+        }
+        expect(report.restoredMessages.count, 74, "the offline entries are replayed as CONTENT")
+        expect(Convergence.stableIds(cloud), expected, "no loss, no duplication, same order")
+
+        // Full fidelity, not a summary: parts, timestamps, status, provenance.
+        let entries = cloud.getList(id: "messages").getDeepValue().listValue ?? []
+        let last = entries.last?.mapValue
+        expect(last?["id"]?.stringValue, "offline-0073", "the last entry is the last local one")
+        expect(last?["deviceId"]?.stringValue, "phone-spec", "provenance survives")
+        expect(last?["status"]?.stringValue, "complete", "status survives")
+        expect(last?["createdAt"]?.i64Value, 1_700_000_000_000 + 322, "timestamp survives")
+        let parts = last?["parts"]?.listValue?.first?.mapValue
+        expect(parts?["text"]?.stringValue, "entry 322 body", "the text body survives")
+
+        // Idempotent: a second pass adds nothing.
+        let again = Convergence.replayInto(cloud, mutations: Convergence.semanticMutations(laptop))
+        expectTrue(again?.isEmpty ?? false, "replay is idempotent by stable id")
+        expect(Convergence.stableIds(cloud), expected, "and the document is unchanged")
+    }
+
+    /// A crash between quarantine and acknowledgement: the next launch — a
+    /// fresh journal instance over the same directory, which is what a relaunch
+    /// gets — replays the quarantined content into whatever document is live.
+    private static func anInterruptedRecoveryFinishesOnTheNextLaunch() {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("convergence-spec-\(UUID().uuidString)", isDirectory: true)
+        let (cloud, laptop, expected) = incidentFixture(shared: 20, offline: 7)
+        let journal = FileConvergenceJournal(root: root)
+        let recovery = ConvergenceRecovery(docId: "restart-chat", journal: journal)
+        recovery.record(laptop)
+        // Quarantine only, then "die" — nothing has been replayed.
+        guard let quarantine = try? laptop.export(mode: .snapshot) else {
+            expectTrue(false, "could not export the quarantine")
+            return
+        }
+        journal.beginRecovery(RecoveryRecord(
+            docId: "restart-chat", phase: .quarantined, quarantine: quarantine,
+            serverVersion: cloud.oplogVv().encode(), expectedIds: expected, startedAt: 0))
+
+        // Relaunch: new journal object, same files, and a live document that is
+        // the bare server snapshot.
+        let relaunched = ConvergenceRecovery(docId: "restart-chat",
+                                             journal: FileConvergenceJournal(root: root))
+        let live = LoroDoc()
+        if let bytes = try? cloud.export(mode: .snapshot) {
+            _ = try? live.importWith(bytes: bytes, origin: "relaunch")
+        }
+        expect(Convergence.stableIds(live).count, 20, "the crash left only the prefix")
+        guard let report = relaunched.resume(into: live) else {
+            expectTrue(false, "the relaunch found no open recovery")
+            return
+        }
+        expect(report.restoredMessages.count, 7, "the interrupted replay finished")
+        expect(Convergence.stableIds(live), expected, "every stable id is back")
+
+        // The quarantine is retained until a fresh client proves convergence —
+        // acknowledgement alone never releases it.
+        expectTrue(relaunched.openRecovery != nil, "the quarantine outlives the replay")
+        expect(relaunched.confirmIndependent(Array(expected.dropLast())),
+               [expected[expected.count - 1]],
+               "a fresh client short of one id keeps the quarantine")
+        expectTrue(relaunched.openRecovery != nil, "and it is still there")
+        expect(relaunched.confirmIndependent(expected), [], "a complete fresh read releases it")
+        expectTrue(relaunched.openRecovery == nil, "the quarantine is gone")
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    /// The state a view renders is about CONTENT. A joined room holding
+    /// unacknowledged entries is not converged, and says so.
+    private static func aLiveRoomIsNotAConvergedRoom() {
+        expect(ConvergenceState.converged.label, "converged", "the quiet case")
+        expect(ConvergenceState.pending(unacked: 74, stalled: false).label, "pending 74",
+               "the incident's count, named")
+        expectTrue(ConvergenceState.pending(unacked: 74, stalled: true).needsAttention,
+                   "past the threshold, a human is wanted")
+        expectTrue(ConvergenceState.blockedLocalOnly(unacked: 74, reason: "refused")
+                       .needsAttention,
+                   "blocked always wants a human")
+        expect(ConvergenceState.recovering(phase: .replayed, unacked: 3).unacked, 3,
+               "a recovering room still reports what is local-only")
+        expectTrue(!ConvergenceState.pending(unacked: 1, stalled: false).isConverged,
+                   "pending is never converged")
     }
 
     /// gh#440: a phone-side model/reasoning edit serializes the whole config
@@ -258,6 +367,63 @@ enum SyncSpecRunner {
         } catch {
             expectTrue(false, "iOS ChatConfig push tuple round trip: \(error)")
         }
+    }
+}
+
+/// A convergence driver on a throwaway directory — the spec must never write
+/// into the real device's outbox.
+@MainActor
+private func specRecovery(docId: String) -> ConvergenceRecovery {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("convergence-spec-\(UUID().uuidString)", isDirectory: true)
+    return ConvergenceRecovery(docId: docId, journal: FileConvergenceJournal(root: root))
+}
+
+/// Chat b5b3c796's shape: a room holding `shared` entries, and a phone holding
+/// those plus `offline` entries it committed locally.
+@MainActor
+private func incidentFixture(shared: Int, offline: Int) -> (LoroDoc, LoroDoc, [String]) {
+    let cloud = LoroDoc()
+    try? cloud.setPeerId(peer: 1)
+    var expected: [String] = []
+    for index in 0..<shared {
+        let id = String(format: "shared-%04d", index)
+        appendSyncSpecEntry(to: cloud, id: id, deviceId: "phone-spec", index: index)
+        expected.append(id)
+    }
+    let laptop = LoroDoc()
+    if let bytes = try? cloud.export(mode: .snapshot) {
+        _ = try? laptop.importWith(bytes: bytes, origin: "spec")
+    }
+    try? laptop.setPeerId(peer: 2)
+    for index in 0..<offline {
+        let id = String(format: "offline-%04d", index)
+        appendSyncSpecEntry(to: laptop, id: id, deviceId: "phone-spec", index: shared + index)
+        expected.append(id)
+    }
+    return (cloud, laptop, expected)
+}
+
+/// One transcript entry in the doc schema `schema.rs` writes — text bodies as
+/// LoroText containers, never LWW value rewrites.
+@MainActor
+private func appendSyncSpecEntry(to doc: LoroDoc, id: String, deviceId: String, index: Int) {
+    do {
+        let map = try doc.getList(id: "messages").pushContainer(child: LoroMap())
+        try map.insert(key: "id", v: id)
+        try map.insert(key: "role", v: index % 2 == 0 ? "user" : "assistant")
+        try map.insert(key: "createdAt", v: Int64(1_700_000_000_000 + index))
+        try map.insert(key: "deviceId", v: deviceId)
+        try map.insert(key: "status", v: "complete")
+        let parts = try map.insertContainer(key: "parts", child: LoroList())
+        let part = try parts.pushContainer(child: LoroMap())
+        try part.insert(key: "id", v: "\(id)-p0")
+        try part.insert(key: "kind", v: "text")
+        let text = try part.insertContainer(key: "text", child: LoroText())
+        try text.insert(pos: 0, s: "entry \(index) body")
+        doc.commit()
+    } catch {
+        preconditionFailure("could not construct spec entry: \(error)")
     }
 }
 

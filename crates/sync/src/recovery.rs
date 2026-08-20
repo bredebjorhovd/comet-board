@@ -1,5 +1,16 @@
-//! Safe reconstruction of a session document whose local CRDT history can no
-//! longer be imported into the edge's shallow snapshot.
+//! OFFLINE doc surgery: safe reconstruction of a session document whose local
+//! CRDT history can no longer be imported into the edge's shallow snapshot.
+//!
+//! This is the operator tool (`cargo run -p comet-sync --example doc_surgery`),
+//! run by hand against two snapshot files, and it is deliberately stricter than
+//! anything a running client may do: it refuses every shape but "the
+//! authoritative transcript is an exact prefix of the local one", so a person
+//! reaching for it cannot be handed a silent choice between two histories.
+//!
+//! **It is not the room-sync seam.** Everything a live client does — quarantine,
+//! semantic outbox, idempotent replay, crash resume, truthful state — lives in
+//! [`crate::convergence`] (gh#483), which is the one module allowed to replace a
+//! document in flight. Read that one first.
 //!
 //! The edge snapshot is the compatible CRDT base. Locally committed semantic
 //! entries are replayed onto that base only when the edge transcript is an

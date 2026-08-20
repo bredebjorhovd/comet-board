@@ -146,6 +146,32 @@ executed by the chat's **host** device (executor gated on chat ownership; mark-p
 execute; steer with no live run dispatches as the next turn). Offline sends queue in the doc.
 This is comet's proven design, kept verbatim.
 
+### Convergence recovery (gh#483)
+The edge's daily **history trim** discards op history and keeps state (§3.1). A replica whose
+local commits depend on ops behind that new shallow root can no longer merge with the room —
+`ImportUpdatesThatDependsOnOutdatedVersion` — and the only repair is to adopt the server's
+snapshot and put local content back on top of it. `crates/sync/src/convergence.rs` is the one
+place either client may do that, and `apps/ios/Comet/Sync/Convergence.swift` is the phone's copy
+of it (held to the same shape by `crates/sync/tests/ios_room.rs`). The invariant:
+
+> No locally committed semantic entry may be discarded until the edge has acknowledged it and a
+> fresh independent client can retrieve its stable id.
+
+Three mechanisms, in order of how much they are trusted: a durable **quarantine** of the whole
+pre-replacement document, retained until a fresh client (not the recovering one) reads every
+stable id back out of the room; a durable **semantic outbox** of locally committed entries and
+commands *as content* — parts, timestamps, statuses, continuations, attachment refs, provenance —
+which survives losing the graph that carried them, and drains only when the edge's advertised
+version proves it holds them; and **replay that is idempotent by stable id**, so a crash between
+any two phases (quarantined → reseeded → replayed → acknowledged) is finished by the next open
+rather than stranding content. Retaining more history at the edge makes the reseed rarer; it is
+not the safety mechanism.
+
+Truthful state rides with it: `RoomClient::convergence()` — converged / pending N / recovering /
+blocked-local-only — is independent of `connected()`, and `EdgeHealth` counts the two separately,
+because the incident was a Mac whose room was joined, ponging and presence-live for a week while
+the cloud sat 74 transcript entries behind it. Transport liveness is not content convergence.
+
 ## 3. Cargo workspace
 
 ```
@@ -160,7 +186,8 @@ comet-native/
                                  # parts fold, continuations, command ledger, sidecars
     sync/         comet-sync     # loro room client (join/VV backfill/fragments/backoff),
                                  # ephemeral presence, DocsStore (SQLite snapshots +
-                                 # processed-command ledger)
+                                 # processed-command ledger + the semantic outbox and
+                                 # recovery quarantine), convergence recovery (gh#483)
     harness/      comet-harness  # Harness trait + claude-code (stream-json subprocess),
                                  # codex (app-server JSON-RPC), mock; steering mailbox,
                                  # requestInput, models/reasoning/options catalogs

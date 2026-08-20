@@ -57,8 +57,13 @@ final class WorkspaceStore {
         if DocDisk.loadWorkspace(into: doc, orgId: config.orgId, userId: config.userId) {
             project()
         }
-        saver = DocSaver(docId: diskId, document: document)
-        let client = RoomClient(roomId: roomId, document: document) { [config] in
+        // Keyed by the STABLE disk id, not the room name, for the same gh#148
+        // reason the snapshot is: a room generation bump must not orphan the
+        // local state — or, now, the outbox and quarantine protecting it.
+        let convergence = ConvergenceRecovery(docId: diskId)
+        saver = DocSaver(docId: diskId, document: document, convergence: convergence)
+        let client = RoomClient(roomId: roomId, document: document,
+                                convergence: convergence) { [config] in
             await config.workspaceSocketURL()
         } events: { [weak self] event in
             Task { @MainActor [weak self] in self?.handle(event) }
@@ -111,6 +116,10 @@ final class WorkspaceStore {
             saver?.poke()
         case .ephemeralUpdate:
             projectPresence()
+        case .convergenceChanged:
+            // The sidebar has no per-room content badge; the state is logged by
+            // the room itself and read by whoever asks it (gh#483).
+            break
         }
     }
 

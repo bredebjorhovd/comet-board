@@ -62,6 +62,38 @@ fn doc_disk_swift() -> String {
     read("apps/ios/Comet/Sync/DocDisk.swift")
 }
 
+fn convergence_rs() -> String {
+    read("crates/sync/src/convergence.rs")
+}
+
+fn convergence_swift() -> String {
+    read("apps/ios/Comet/Sync/Convergence.swift")
+}
+
+/// `let convergenceUnacknowledgedAlertNs: UInt64 = 120_000_000_000` → the
+/// number. Top-level `let`, as opposed to the `static let` inside a type that
+/// [`swift_number`] reads.
+fn swift_named_number(source: &str, name: &str) -> u64 {
+    let needle = format!("let {name}");
+    let line = source
+        .lines()
+        .find(|l| l.trim_start().starts_with(&needle))
+        .unwrap_or_else(|| panic!("Convergence.swift no longer declares {name}"));
+    let rhs = line
+        .split_once('=')
+        .unwrap_or_else(|| panic!("{name} has no value: {line}"))
+        .1;
+    let digits: String = rhs
+        .chars()
+        .skip_while(|c| c.is_whitespace())
+        .take_while(|c| c.is_ascii_digit() || *c == '_')
+        .filter(|c| *c != '_')
+        .collect();
+    digits
+        .parse()
+        .unwrap_or_else(|_| panic!("{name} is not a plain literal: {line}"))
+}
+
 /// The Swift test harness cannot replace Loro's document with an insertion
 /// failure. Keep the source-level ownership rule explicit: durable append
 /// reports a Bool, and every destructive composer transition is gated on it.
@@ -167,12 +199,16 @@ fn swift_fn_body<'a>(source: &'a str, signature: &str) -> &'a str {
     panic!("`{signature}` has no matching close brace");
 }
 
-/// `const NAME: Duration = Duration::from_secs(30);` → 30_000 ms.
+/// `const NAME: Duration = Duration::from_secs(30);` → 30_000 ms. Reads
+/// whichever Rust source it is handed (room.rs, convergence.rs).
 fn rust_duration_ms(source: &str, name: &str) -> u64 {
     let line = source
         .lines()
-        .find(|l| l.trim_start().starts_with(&format!("const {name}:")))
-        .unwrap_or_else(|| panic!("room.rs no longer declares {name}"));
+        .find(|l| {
+            let l = l.trim_start();
+            l.starts_with(&format!("const {name}:")) || l.starts_with(&format!("pub const {name}:"))
+        })
+        .unwrap_or_else(|| panic!("the Rust source no longer declares {name}"));
     let call = line
         .split("Duration::from_")
         .nth(1)
@@ -304,12 +340,13 @@ fn the_phone_ladder_has_one_owner() {
 /// gh#450 is another hand-ported room rule, but this time the false-success
 /// value comes from Loro itself: importing a shallow snapshot into an older
 /// full-history doc returns `ImportStatus.pending` instead of throwing. Keep
-/// the iOS implementation pinned to the three safety gates that make replacing
-/// a session doc sound: reject pending imports, validate a fresh candidate
-/// against the edge's advertised VV, and replay pending commands before the
-/// shared owner swaps to that candidate.
+/// the iOS implementation pinned to the safety gates that make replacing a
+/// session doc sound: reject pending imports, validate a fresh candidate
+/// against the edge's advertised VV, and — since gh#483 — put every locally
+/// committed SEMANTIC entry back on the replacement before the shared owner
+/// swaps to it, not merely this device's unresolved command intent.
 #[test]
-fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_intent() {
+fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_content() {
     let client = room_client_swift();
     let store = session_store_swift();
     let disk = doc_disk_swift();
@@ -323,18 +360,21 @@ fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_intent() {
         "a fresh replacement must reach the VV advertised by the edge"
     );
     assert!(
-        client.contains("private static func replayUnresolvedLocalCommands")
-            && client.contains("replaceReplayingPendingCommands"),
-        "device-local pending commands must move before replacement"
+        client.contains("document.replace(with: replacement, recover:")
+            && client.contains(
+                "convergence.recover(stale: stale, candidate: candidate, serverVersion: serverVv)"
+            ),
+        "the reseed must go through the convergence module, which quarantines the stale \
+         document and replays local semantic content (gh#483)"
     );
     assert!(
-        client.contains("command[\"issuedBy\"]?.stringValue == localDeviceId")
-            && client.contains("command[\"status\"]?.stringValue == \"pending\""),
-        "replay must be limited to this device's unresolved intent"
+        !client.contains("replayUnresolvedLocalCommands"),
+        "the command-intent-only replay is the gh#483 regression; it must not come back"
     );
     assert!(
-        client.contains("document.replaceReplayingPendingCommands("),
-        "the room must swap the shared owner, not only its private doc reference"
+        client.contains("guard let convergence else {")
+            && client.contains("refusing to replace the local document"),
+        "without a journal there is no quarantine, and refusing is the only safe answer"
     );
     assert!(
         client.contains("guard !fullResyncRequested else { return }")
@@ -353,22 +393,126 @@ fn the_phone_reseeds_incomplete_shallow_imports_without_dropping_intent() {
         "SessionStore command creation must hold the shared document gate"
     );
     assert!(
-        client.contains("replaceReplayingPendingCommands")
-            && client.contains("from: doc, into: replacement")
+        client.contains("func replace(with replacement: LoroDoc,")
+            && client.contains("recover: (LoroDoc, LoroDoc) -> ReplayReport?")
             && client.contains("func withCurrent<T>"),
-        "RoomDocument replacement must make the final replay and owner swap atomic"
+        "RoomDocument replacement must make the recovery and owner swap atomic"
     );
     let sync_spec = read("apps/ios/Comet/App/SyncSpecRunner.swift");
     assert!(
         sync_spec.contains("aCommandQueuedAgainstReseedSurvives")
             && sync_spec.contains("queueHasOldOwner")
-            && sync_spec.contains("replaceReplayingPendingCommands"),
+            && sync_spec.contains("document.replace(with: replacement)"),
         "the phone runtime spec must exercise concurrent queue-vs-reseed ownership"
     );
     assert!(
         disk.contains("candidateStatus.pending == nil")
             && disk.contains("installedStatus.pending == nil"),
         "a pending disk import must not mutate or be accepted by the live document"
+    );
+}
+
+/// gh#483: the convergence module is the one place either client may replace a
+/// document, and the phone has to run the same one.
+///
+/// It cannot literally share the Rust — no Rust runs on that device — so this
+/// holds the Swift copy to the four things the invariant depends on: a durable
+/// quarantine before any replacement, a semantic outbox that survives losing
+/// the graph, replay that is idempotent by stable id, and a content state that
+/// is never inferred from the socket. Plus the two numbers, which is exactly
+/// the drift gh#405 caught a release late.
+#[test]
+fn the_phone_convergence_module_mirrors_the_rust_one() {
+    let rust = convergence_rs();
+    let swift = convergence_swift();
+    let client = room_client_swift();
+
+    // The invariant itself, in both files, so a reader of either finds it.
+    for (label, text) in [("Rust", &rust), ("Swift", &swift)] {
+        assert!(
+            text.contains("acknowledged it and a fresh independent client can retrieve its"),
+            "{label} convergence must state the invariant it exists to hold"
+        );
+    }
+
+    // Phases, spelled the same, because they are written to disk.
+    for phase in ["quarantined", "reseeded", "replayed", "acknowledged"] {
+        assert!(
+            rust.contains(&format!("\"{phase}\"")) && swift.contains(&format!("case {phase}")),
+            "recovery phase `{phase}` must exist on both sides"
+        );
+    }
+
+    // The outbox rules that make acknowledgement safe.
+    assert!(
+        swift.contains("func rebase(docId: String") && rust.contains("fn rebase("),
+        "both journals must re-key rows onto a replacement's version after a replay"
+    );
+    assert!(
+        swift.contains(
+            "guard let recorded = try? VersionVector.decode(bytes: version) else { return false }"
+        ) && rust.contains("Err(_) => false,"),
+        "undecodable version bytes must never read as acknowledged on either side"
+    );
+    assert!(
+        swift.contains("if rows[position].payload == mutation.payload { continue }")
+            && rust.contains("row.payload == mutation.payload")
+            && read("crates/sync/src/store.rs")
+                .contains("WHERE semantic_journal.payload <> excluded.payload"),
+        "unchanged content must keep its original version — in both journals on both sides"
+    );
+
+    // Replay: idempotent by stable id, and never rolls a richer remote back.
+    assert!(
+        swift.contains("if sameContent(remote, local) { continue }")
+            && swift.contains("report.diverged.append"),
+        "the phone's replay must skip equal entries and refuse to roll back richer ones"
+    );
+
+    // Independent verification is what releases the quarantine — on both.
+    assert!(
+        swift.contains("func confirmIndependent") && rust.contains("fn confirm_independent"),
+        "a fresh client's read, not the edge's ack, releases the quarantine"
+    );
+    assert!(
+        swift.contains("func resume(into current: LoroDoc)") && rust.contains("pub fn resume("),
+        "both sides must finish an interrupted recovery on restart"
+    );
+
+    // Content state is not socket state.
+    assert!(
+        swift.contains("case blockedLocalOnly(unacked: Int, reason: String)")
+            && swift.contains("case pending(unacked: Int, stalled: Bool)")
+            && swift.contains("case recovering(phase: RecoveryPhase, unacked: Int)")
+            && rust.contains("BlockedLocalOnly { unacked: usize, reason: String }"),
+        "both sides must expose converged / pending N / recovering / blocked-local-only"
+    );
+    assert!(
+        client.contains("func contentState() -> ConvergenceState"),
+        "the phone's room must be able to answer what its CONTENT state is"
+    );
+
+    // The two numbers.
+    assert_eq!(
+        swift_named_number(&swift, "convergenceUnacknowledgedAlertNs"),
+        rust_duration_ms(&rust, "UNACKNOWLEDGED_ALERT") * 1_000_000,
+        "the unacknowledged-content alert threshold must match room-for-room"
+    );
+    assert_eq!(
+        swift_number(&client, "livenessTickNs") * swift_number(&client, "convergencePollTicks"),
+        rust_duration_ms(&room_rs(), "CONVERGENCE_POLL") * 1_000_000,
+        "the phone must recompute its content state on the desktop's cadence"
+    );
+
+    // And the phone actually exercises it, in the simulator, on the incident's
+    // own numbers.
+    let sync_spec = read("apps/ios/Comet/App/SyncSpecRunner.swift");
+    assert!(
+        sync_spec.contains("theIncidentReplaysEveryLocalEntry")
+            && sync_spec.contains("incidentFixture(shared: 249, offline: 74)")
+            && sync_spec.contains("anInterruptedRecoveryFinishesOnTheNextLaunch")
+            && sync_spec.contains("aLiveRoomIsNotAConvergedRoom"),
+        "the phone spec must run the 249+74 recovery, a crash restart, and the state rules"
     );
 }
 

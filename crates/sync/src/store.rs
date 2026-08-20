@@ -10,6 +10,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::convergence::{
+    ConvergenceError, ConvergenceJournal, RecoveryPhase, RecoveryRecord, SemanticKind,
+    SemanticMutation,
+};
+
 /// Errors surfaced by [`DocsStore`].
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -31,6 +36,38 @@ const MIGRATIONS: &[&str] = &[
      CREATE TABLE processed_commands (
         command_id   TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
+     ) STRICT;",
+    // v2 — the semantic outbox and the recovery quarantine (gh#483).
+    //
+    // `semantic_journal` holds locally committed transcript entries and
+    // commands AS CONTENT, keyed by stable id: a row survives losing the CRDT
+    // history that carried it, which is the whole point. Rows are deleted when
+    // the edge's advertised version proves it holds them, so the table is an
+    // outbox — bounded by what is unacknowledged, not by transcript length.
+    //
+    // `recovery_state` is one row per document undergoing a shallow-history
+    // replacement: the quarantined pre-replacement snapshot plus the phase it
+    // reached. It outlives a crash on purpose — a process that dies between
+    // quarantine and acknowledgement must be able to finish, and until it has,
+    // these bytes are the only complete copy of the document.
+    "CREATE TABLE semantic_journal (
+        doc_id      TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        stable_id   TEXT NOT NULL,
+        seq         INTEGER NOT NULL,
+        payload     TEXT NOT NULL,
+        version     BLOB NOT NULL,
+        recorded_at INTEGER NOT NULL,
+        PRIMARY KEY (doc_id, kind, stable_id)
+     ) STRICT;
+     CREATE INDEX semantic_journal_order ON semantic_journal (doc_id, kind, seq);
+     CREATE TABLE recovery_state (
+        doc_id         TEXT PRIMARY KEY,
+        phase          TEXT NOT NULL,
+        quarantine     BLOB NOT NULL,
+        server_version BLOB NOT NULL,
+        expected_ids   TEXT NOT NULL,
+        started_at     INTEGER NOT NULL
      ) STRICT;",
 ];
 
@@ -120,6 +157,251 @@ impl DocsStore {
         // connection itself is still usable.
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// The durable half of [`crate::convergence`]: the semantic outbox and the
+/// recovery quarantine, in the same database as the snapshots they protect.
+///
+/// One database means one fsync discipline for "what this device committed"
+/// and "what this device is holding for a recovery" — a snapshot save and the
+/// journal rows that account for it cannot end up on opposite sides of a crash
+/// in different files.
+impl ConvergenceJournal for DocsStore {
+    fn record(
+        &self,
+        doc_id: &str,
+        mutations: &[SemanticMutation],
+    ) -> Result<usize, ConvergenceError> {
+        if mutations.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(journal_error)?;
+        let now = now_ms();
+        let mut written = 0;
+        for mutation in mutations {
+            // Rewrite only when the CONTENT changed: an idle doc re-recorded
+            // every save would otherwise churn the whole outbox once a second,
+            // and re-stamping unchanged rows with the document's current
+            // version would make every entry wait on the newest local op.
+            let changed = tx
+                .execute(
+                    "INSERT INTO semantic_journal
+                        (doc_id, kind, stable_id, seq, payload, version, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                     ON CONFLICT(doc_id, kind, stable_id) DO UPDATE SET
+                        seq = excluded.seq,
+                        payload = excluded.payload,
+                        version = excluded.version,
+                        recorded_at = excluded.recorded_at
+                     WHERE semantic_journal.payload <> excluded.payload",
+                    params![
+                        doc_id,
+                        mutation.kind.as_str(),
+                        mutation.stable_id,
+                        mutation.seq,
+                        mutation.payload,
+                        mutation.version,
+                        now
+                    ],
+                )
+                .map_err(journal_error)?;
+            written += changed;
+        }
+        tx.commit().map_err(journal_error)?;
+        Ok(written)
+    }
+
+    fn rebase(
+        &self,
+        doc_id: &str,
+        mutations: &[SemanticMutation],
+    ) -> Result<usize, ConvergenceError> {
+        if mutations.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(journal_error)?;
+        let now = now_ms();
+        for mutation in mutations {
+            // Unconditional: after a replay the content is carried by NEW
+            // operations, so its version must move even though its payload did
+            // not. See `ConvergenceJournal::rebase`.
+            tx.execute(
+                "INSERT INTO semantic_journal
+                    (doc_id, kind, stable_id, seq, payload, version, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(doc_id, kind, stable_id) DO UPDATE SET
+                    seq = excluded.seq,
+                    payload = excluded.payload,
+                    version = excluded.version,
+                    recorded_at = excluded.recorded_at",
+                params![
+                    doc_id,
+                    mutation.kind.as_str(),
+                    mutation.stable_id,
+                    mutation.seq,
+                    mutation.payload,
+                    mutation.version,
+                    now
+                ],
+            )
+            .map_err(journal_error)?;
+        }
+        tx.commit().map_err(journal_error)?;
+        Ok(mutations.len())
+    }
+
+    fn unacknowledged(&self, doc_id: &str) -> Result<Vec<SemanticMutation>, ConvergenceError> {
+        let conn = self.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT kind, stable_id, seq, payload, version
+                 FROM semantic_journal WHERE doc_id = ?1 ORDER BY kind, seq",
+            )
+            .map_err(journal_error)?;
+        let rows = stmt
+            .query_map(params![doc_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                ))
+            })
+            .map_err(journal_error)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (kind, stable_id, seq, payload, version) = row.map_err(journal_error)?;
+            let Some(kind) = SemanticKind::parse(&kind) else {
+                // A row written by a newer schema: leave it in place (it is
+                // unacknowledged content) rather than replaying it wrongly.
+                tracing::warn!(%doc_id, %kind, "skipping journal row of unknown kind");
+                continue;
+            };
+            out.push(SemanticMutation {
+                kind,
+                stable_id,
+                payload,
+                version,
+                seq,
+            });
+        }
+        Ok(out)
+    }
+
+    fn acknowledge(
+        &self,
+        doc_id: &str,
+        acked: &loro::VersionVector,
+    ) -> Result<usize, ConvergenceError> {
+        let covered: Vec<(String, String)> = self
+            .unacknowledged(doc_id)?
+            .into_iter()
+            .filter(|mutation| mutation.acknowledged_by(acked))
+            .map(|mutation| (mutation.kind.as_str().to_string(), mutation.stable_id))
+            .collect();
+        if covered.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn();
+        let tx = conn.transaction().map_err(journal_error)?;
+        for (kind, stable_id) in &covered {
+            tx.execute(
+                "DELETE FROM semantic_journal
+                 WHERE doc_id = ?1 AND kind = ?2 AND stable_id = ?3",
+                params![doc_id, kind, stable_id],
+            )
+            .map_err(journal_error)?;
+        }
+        tx.commit().map_err(journal_error)?;
+        Ok(covered.len())
+    }
+
+    fn begin_recovery(&self, record: &RecoveryRecord) -> Result<(), ConvergenceError> {
+        let expected = serde_json::to_string(&record.expected_ids)?;
+        self.conn()
+            .execute(
+                "INSERT INTO recovery_state
+                    (doc_id, phase, quarantine, server_version, expected_ids, started_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(doc_id) DO UPDATE SET
+                    phase = excluded.phase,
+                    quarantine = excluded.quarantine,
+                    server_version = excluded.server_version,
+                    expected_ids = excluded.expected_ids,
+                    started_at = excluded.started_at",
+                params![
+                    record.doc_id,
+                    record.phase.as_str(),
+                    record.quarantine,
+                    record.server_version,
+                    expected,
+                    record.started_at
+                ],
+            )
+            .map_err(journal_error)?;
+        Ok(())
+    }
+
+    fn advance_recovery(&self, doc_id: &str, phase: RecoveryPhase) -> Result<(), ConvergenceError> {
+        self.conn()
+            .execute(
+                "UPDATE recovery_state SET phase = ?2 WHERE doc_id = ?1",
+                params![doc_id, phase.as_str()],
+            )
+            .map_err(journal_error)?;
+        Ok(())
+    }
+
+    fn open_recovery(&self, doc_id: &str) -> Result<Option<RecoveryRecord>, ConvergenceError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT phase, quarantine, server_version, expected_ids, started_at
+                 FROM recovery_state WHERE doc_id = ?1",
+                params![doc_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(journal_error)?;
+        let Some((phase, quarantine, server_version, expected_ids, started_at)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(RecoveryRecord {
+            doc_id: doc_id.to_string(),
+            // An unreadable phase must not read as "finished": treat it as the
+            // earliest phase, which replays from the quarantine.
+            phase: RecoveryPhase::parse(&phase).unwrap_or(RecoveryPhase::Quarantined),
+            quarantine,
+            server_version,
+            expected_ids: serde_json::from_str(&expected_ids)?,
+            started_at,
+        }))
+    }
+
+    fn release_recovery(&self, doc_id: &str) -> Result<(), ConvergenceError> {
+        self.conn()
+            .execute(
+                "DELETE FROM recovery_state WHERE doc_id = ?1",
+                params![doc_id],
+            )
+            .map_err(journal_error)?;
+        Ok(())
+    }
+}
+
+fn journal_error(err: rusqlite::Error) -> ConvergenceError {
+    ConvergenceError::Journal(err.to_string())
 }
 
 fn migrate(conn: &mut Connection) -> Result<(), StoreError> {

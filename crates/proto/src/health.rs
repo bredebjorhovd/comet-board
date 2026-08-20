@@ -57,6 +57,45 @@ pub struct EdgeHealth {
     pub chat_rooms_open: usize,
     #[serde(default)]
     pub chat_rooms_live: usize,
+    /// Chat rooms holding content the edge has not acknowledged (gh#483).
+    ///
+    /// A LIVE room can be in here — that is the whole point. gh#483's incident
+    /// was a Mac whose session room was joined, ponging and presence-live while
+    /// the cloud sat 74 transcript entries behind it, permanently. Socket
+    /// liveness is [`Self::chat_rooms_live`]; whether what was typed here
+    /// exists anywhere else is this.
+    #[serde(default)]
+    pub chat_rooms_unconverged: usize,
+    /// Chat rooms mid shallow-history recovery right now.
+    #[serde(default)]
+    pub chat_rooms_recovering: usize,
+    /// Chat rooms the edge refuses content from: live, and local-only.
+    #[serde(default)]
+    pub chat_rooms_blocked: usize,
+    /// Semantic entries (transcript + ledger) across all open chats that exist
+    /// only on this device.
+    #[serde(default)]
+    pub unacknowledged_entries: usize,
+    /// The rooms behind those counts, named. A count tells an operator that
+    /// something is stuck; only the name tells them which chat to open — the
+    /// same reason [`Self::summary`] names down connections instead of
+    /// counting them. Converged rooms are omitted, so this is empty in the
+    /// ordinary case and short in the bad one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unconverged_rooms: Vec<RoomConvergence>,
+}
+
+/// One room that is not converged, as the census sees it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomConvergence {
+    pub chat_id: String,
+    /// `converged` / `pending N` / `recovering (phase, N local-only)` /
+    /// `blocked/local-only (…)` — the room's own words
+    /// (`comet_sync::ConvergenceState::label`), not a re-derivation.
+    pub state: String,
+    /// Semantic entries in this room that exist only on this device.
+    pub unacknowledged_entries: usize,
 }
 
 impl EdgeHealth {
@@ -88,6 +127,13 @@ impl EdgeHealth {
     /// engine that knows it is offline is fine; this one does not.
     pub fn dark(&self) -> bool {
         self.online_mode() && self.expected() > 0 && self.live() == 0
+    }
+
+    /// The state gh#483 went quiet in: sockets up, content stuck. Every surface
+    /// that renders "synced" from [`Self::live`] alone has to ask this too —
+    /// a room can be live for hours while the transcript on it goes nowhere.
+    pub fn live_but_unconverged(&self) -> bool {
+        self.live() > 0 && (self.chat_rooms_unconverged > 0 || self.chat_rooms_blocked > 0)
     }
 
     /// One line for `comet status` and `comet-board doctor`. Says what is
@@ -139,6 +185,47 @@ impl EdgeHealth {
                 presence_down.join(", ")
             ));
         }
+        // Content, not sockets (gh#483). Named after the socket clauses on
+        // purpose: an operator reading "12 of 12 live" has to see, in the same
+        // line, that one of those live rooms is holding 74 entries the edge has
+        // never taken. A live room is not a converged one.
+        if self.chat_rooms_blocked > 0 {
+            detail.push_str(&format!(
+                " — {} chat room(s) BLOCKED/local-only: the edge refuses this device's \
+                 history and {} entr(ies) exist nowhere else",
+                self.chat_rooms_blocked, self.unacknowledged_entries
+            ));
+        } else if self.chat_rooms_unconverged > 0 {
+            detail.push_str(&format!(
+                " — {} chat room(s) not converged: {} local entr(ies) unacknowledged \
+                 by the edge",
+                self.chat_rooms_unconverged, self.unacknowledged_entries
+            ));
+        }
+        if self.chat_rooms_recovering > 0 {
+            detail.push_str(&format!(
+                ", {} recovering from a shallow-history cut",
+                self.chat_rooms_recovering
+            ));
+        }
+        // Name them, up to a line's worth. "1 chat room not converged" sends an
+        // operator looking; "chat abc123: pending 74" sends them to the chat.
+        if !self.unconverged_rooms.is_empty() {
+            let named: Vec<String> = self
+                .unconverged_rooms
+                .iter()
+                .take(3)
+                .map(|room| format!("{}: {}", room.chat_id, room.state))
+                .collect();
+            detail.push_str(&format!(" [{}", named.join("; ")));
+            if self.unconverged_rooms.len() > named.len() {
+                detail.push_str(&format!(
+                    "; +{} more",
+                    self.unconverged_rooms.len() - named.len()
+                ));
+            }
+            detail.push(']');
+        }
         if self.dark() {
             detail.push_str(
                 " — this engine believes it is online but holds NO edge connections; \
@@ -163,6 +250,7 @@ mod tests {
             org_presence: Some(true),
             chat_rooms_open: 2,
             chat_rooms_live: 2,
+            ..EdgeHealth::default()
         }
     }
 
@@ -248,6 +336,64 @@ mod tests {
         let health = EdgeHealth::default();
         assert!(!health.dark());
         assert!(health.summary().contains("not syncing"));
+    }
+
+    /// The gh#483 shape, and the reason this crate learned a second axis: every
+    /// socket is up — `live()` says so, `dark()` says no — while a chat room
+    /// holds 74 transcript entries the edge has never taken. The summary must
+    /// say that in the same breath as "5 of 5 live", because an operator
+    /// reading only the first half concluded the Mac was fine for a week.
+    #[test]
+    fn a_live_engine_with_unconverged_content_says_so() {
+        let health = EdgeHealth {
+            chat_rooms_unconverged: 1,
+            unacknowledged_entries: 74,
+            unconverged_rooms: vec![RoomConvergence {
+                chat_id: "b5b3c796".into(),
+                state: "pending 74".into(),
+                unacknowledged_entries: 74,
+            }],
+            ..online()
+        };
+        assert!(!health.dark(), "the sockets really are up");
+        assert!(health.live_but_unconverged());
+        let summary = health.summary();
+        assert!(summary.contains("5 of 5 live"), "{summary}");
+        assert!(
+            summary.contains("1 chat room(s) not converged"),
+            "{summary}"
+        );
+        assert!(summary.contains("74 local entr(ies)"), "{summary}");
+        assert!(
+            summary.contains("[b5b3c796: pending 74]"),
+            "the room is NAMED, not only counted: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_blocked_room_outranks_a_merely_pending_one() {
+        let health = EdgeHealth {
+            chat_rooms_unconverged: 2,
+            chat_rooms_blocked: 1,
+            chat_rooms_recovering: 1,
+            unacknowledged_entries: 74,
+            ..online()
+        };
+        let summary = health.summary();
+        assert!(summary.contains("BLOCKED/local-only"), "{summary}");
+        assert!(summary.contains("1 recovering"), "{summary}");
+        assert!(
+            !summary.contains("not converged"),
+            "blocked is the headline, not a second clause: {summary}"
+        );
+    }
+
+    /// Converged is the quiet case: no content clause at all.
+    #[test]
+    fn a_converged_engine_adds_no_content_clause() {
+        let summary = online().summary();
+        assert!(!summary.contains("converged"), "{summary}");
+        assert!(!online().live_but_unconverged());
     }
 
     /// An edge with nothing attempted against it: no connections are

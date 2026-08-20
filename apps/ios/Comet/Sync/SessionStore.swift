@@ -79,6 +79,15 @@ final class SessionStore {
     }
 
     @ObservationIgnored private var saver: DocSaver?
+    /// This chat's convergence driver (gh#483): the durable semantic outbox,
+    /// the recovery quarantine, and the truthful content state. Shared with the
+    /// room client, which drives the recovery phases; the store records into it
+    /// whenever local content becomes durable.
+    @ObservationIgnored private lazy var convergence = ConvergenceRecovery(docId: chatId)
+
+    /// What this chat can honestly say about its CONTENT — never inferred from
+    /// `connected`, which is only the socket (gh#483 §4).
+    private(set) var convergenceState: ConvergenceState = .converged
 
     func start() {
         guard room == nil, !offline else { return }
@@ -87,9 +96,10 @@ final class SessionStore {
         if DocDisk.load(into: doc, id: chatId) {
             project()
         }
-        saver = DocSaver(docId: chatId, document: document)
+        saver = DocSaver(docId: chatId, document: document, convergence: convergence)
         let client = RoomClient(roomId: chatId, document: document,
-                                localDeviceId: config.deviceId) { [config, chatId] in
+                                localDeviceId: config.deviceId,
+                                convergence: convergence) { [config, chatId] in
             await config.sessionSocketURL(chatId: chatId)
         } events: { [weak self] event in
             Task { @MainActor [weak self] in self?.handle(event) }
@@ -132,6 +142,16 @@ final class SessionStore {
             saver?.poke()
         case .ephemeralUpdate:
             break
+        case .convergenceChanged:
+            // Content state, not socket state: a joined room holding entries
+            // the edge has never taken reads `.pending` here while `connected`
+            // stays true, which is the whole point (gh#483).
+            if let room {
+                Task { @MainActor [weak self] in
+                    let state = await room.contentState()
+                    self?.convergenceState = state
+                }
+            }
         }
     }
 

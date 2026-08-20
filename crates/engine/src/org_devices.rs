@@ -172,6 +172,10 @@ impl OrgDevices {
                 }
             }),
             None,
+            Some((
+                self.inner.store.clone() as Arc<dyn comet_sync::ConvergenceJournal>,
+                ORG_DEVICES_DOC_ID.to_string(),
+            )),
             Arc::downgrade(&self.inner.room),
             Arc::new(move || {
                 let hook = weak

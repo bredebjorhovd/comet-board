@@ -280,6 +280,13 @@ enum RoomExit {
 /// presence beat: publish `presence/{ourDeviceId}` on every (re)join, because
 /// the ephemeral store's 30s TTL had forgotten our entry. Nothing is published
 /// on join now — the edge derives presence from the socket the join arrived on.
+///
+/// `journal` is the durable convergence journal for this room's document —
+/// the semantic outbox and the recovery quarantine (gh#483), keyed by the
+/// local doc id (which is NOT always the room name: see `DocDisk::workspaceId`
+/// on the phone and `WORKSPACE_DOC_ID` here for why a room generation bump
+/// must not orphan local state). `None` falls back to a process-local journal,
+/// which behaves identically minus the surviving-a-restart part.
 pub(crate) fn spawn_room_join(
     url: Arc<dyn comet_sync::UrlProvider>,
     room_id: String,
@@ -287,6 +294,7 @@ pub(crate) fn spawn_room_join(
     local_device_id: Option<String>,
     on_reseed: Arc<dyn Fn(loro::LoroDoc) + Send + Sync>,
     mutation_gate: Option<Arc<Mutex<()>>>,
+    journal: Option<(Arc<dyn comet_sync::ConvergenceJournal>, String)>,
     slot: Weak<Mutex<Option<RoomClient>>>,
     on_event: Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -316,6 +324,9 @@ pub(crate) fn spawn_room_join(
             };
             if let Some(gate) = mutation_gate.clone() {
                 recovery = recovery.with_mutation_gate(gate);
+            }
+            if let Some((journal, doc_id)) = journal.clone() {
+                recovery = recovery.with_journal(journal, doc_id);
             }
             match RoomClient::connect_via(url.clone(), &room_id, doc, recovery).await {
                 Ok(client) => {
@@ -599,6 +610,13 @@ impl WorkspaceHost {
             None,
             self.room_reseed_callback(),
             Some(self.inner.owner_gate.clone()),
+            // Keyed by the STABLE local doc id, not the room name, for the
+            // gh#148 reason: a room generation bump must not orphan the local
+            // state that reseeds the virgin room.
+            Some((
+                self.inner.store.clone() as Arc<dyn comet_sync::ConvergenceJournal>,
+                WORKSPACE_DOC_ID.to_string(),
+            )),
             Arc::downgrade(&self.inner.room),
             // Presence rides `%EPH`, never the doc — the room's answer must
             // re-publish the device watch itself (the signal that distinguishes

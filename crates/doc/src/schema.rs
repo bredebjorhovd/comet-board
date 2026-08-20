@@ -496,6 +496,53 @@ impl SessionDoc {
         Ok(false)
     }
 
+    /// Rewrite an existing entry from a locally committed copy — convergence
+    /// recovery only (`comet_sync::convergence`).
+    ///
+    /// Normal writers never call this: an entry belongs to the device that
+    /// authored it, and the fold in [`SegmentWriter`] owns it while it streams.
+    /// It exists for the one case the CRDT cannot express — the authoritative
+    /// snapshot carries a TRUNCATED copy of an entry this device finished
+    /// locally (the shallow-history cut landed mid-stream), so the entry's id
+    /// is present but its parts are a prefix of what was committed here. The
+    /// scalar fields and the whole parts list are replaced with `entry`;
+    /// nothing else in the doc is touched.
+    ///
+    /// Returns `false` when no entry with that id exists (the caller should
+    /// append instead).
+    #[doc(hidden)]
+    pub fn overwrite_recovered_message(
+        &self,
+        entry: &SessionMessageEntry,
+    ) -> Result<bool, DocError> {
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(map))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let id_matches = matches!(
+                map.get("id"),
+                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == entry.id
+            );
+            if !id_matches {
+                continue;
+            }
+            write_entry_scalar_fields(&map, entry)?;
+            // A fresh container rather than an in-place edit of the old one:
+            // the truncated remote copy may hold parts this device never had,
+            // and a partial overwrite would interleave the two.
+            let parts = map.insert_container("parts", LoroList::new())?;
+            for part in &entry.parts {
+                push_part(&parts, part)?;
+            }
+            self.doc.commit();
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
     /// Export a snapshot (persistence) — `ExportMode::Snapshot`.
     pub fn export_snapshot(&self) -> Result<Vec<u8>, DocError> {
         self.doc

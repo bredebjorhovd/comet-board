@@ -580,6 +580,7 @@ fn edge_health(
     doc_host: &DocHost,
 ) -> comet_proto::EdgeHealth {
     let (chat_rooms_open, chat_rooms_live) = doc_host.room_census();
+    let convergence = doc_host.convergence_census();
     let online = edge_url.is_some();
     comet_proto::EdgeHealth {
         edge_url: edge_url.clone(),
@@ -594,6 +595,11 @@ fn edge_health(
         org_presence: online.then(|| workspace.org_devices().presence_connected()),
         chat_rooms_open,
         chat_rooms_live,
+        chat_rooms_unconverged: convergence.unconverged,
+        chat_rooms_recovering: convergence.recovering,
+        chat_rooms_blocked: convergence.blocked,
+        unacknowledged_entries: convergence.unacknowledged_entries,
+        unconverged_rooms: convergence.rooms,
     }
 }
 

@@ -111,12 +111,20 @@ enum DocDisk {
 final class DocSaver {
     private let docId: String
     private let document: RoomDocument
+    /// The semantic outbox is written on the same beat as the snapshot: what
+    /// makes local content durable is what has to account for it (gh#483 §2).
+    private let convergence: ConvergenceRecovery?
+    /// Document version at the last journal record. Semantic content cannot
+    /// change without the version changing, so an unchanged version skips the
+    /// scan — the common case for an open-but-idle chat.
+    private var journaledVersion: Data?
     private var generation = 0
     private var dirty = false
 
-    init(docId: String, document: RoomDocument) {
+    init(docId: String, document: RoomDocument, convergence: ConvergenceRecovery? = nil) {
         self.docId = docId
         self.document = document
+        self.convergence = convergence
     }
 
     func poke() {
@@ -133,6 +141,12 @@ final class DocSaver {
     func flush() {
         guard dirty else { return }
         dirty = false
-        DocDisk.save(doc: document.current(), id: docId)
+        let doc = document.current()
+        DocDisk.save(doc: doc, id: docId)
+        guard let convergence else { return }
+        let version = doc.oplogVv().encode()
+        guard version != journaledVersion else { return }
+        convergence.record(doc)
+        journaledVersion = version
     }
 }
