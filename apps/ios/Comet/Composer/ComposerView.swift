@@ -139,8 +139,23 @@ struct ComposerView: View {
         _ in ContextSearch(matches: [], truncated: false)
     }
 
-    @State private var text = ""
-    @State private var context: [ContextRef] = []
+    /// The composer's contents are the CHAT's, not this view's (gh#536). A
+    /// `@State` string here died every time the view did — navigating away,
+    /// the question panel taking the composer's place, the system reclaiming a
+    /// backgrounded app — and took a half-written prompt with it.
+    private var drafts: DraftStore { .shared }
+    private var draftKey: String { DraftStore.key(chat: chat.id) }
+
+    private var text: String {
+        get { drafts.text(for: draftKey) }
+        nonmutating set { drafts.setText(newValue, for: draftKey) }
+    }
+
+    private var context: [ContextRef] {
+        get { drafts.context(for: draftKey) }
+        nonmutating set { drafts.setContext(newValue, for: draftKey) }
+    }
+
     @State private var contextMatches: [ContextRef] = []
     @State private var contextCheckoutId: String?
     @State private var showContextPicker = false
@@ -154,7 +169,7 @@ struct ComposerView: View {
                 queueTray
             }
             ComposerShell(
-                draft: $text,
+                draft: drafts.textBinding(for: draftKey),
                 sendEnabled: true,
                 showStop: runLive,
                 onSend: send,
@@ -197,8 +212,7 @@ struct ComposerView: View {
         } else {
             store.sendRun(prompt: prompt, chat: chat, context: context)
         }
-        text = ""
-        context = []
+        drafts.clear(draftKey)
         // The clear above is unconditional, so a prompt left sitting in the
         // composer after a successful send is not this path failing to run —
         // it is the text view writing the pre-send string back. A focused
@@ -216,8 +230,7 @@ struct ComposerView: View {
             followupFailure = "Your draft is still here. Try again after reconnecting."
             return
         }
-        text = ""
-        context = []
+        drafts.clear(draftKey)
         Task { @MainActor in text = "" }
     }
 
