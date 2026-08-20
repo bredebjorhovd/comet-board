@@ -207,7 +207,10 @@ struct TranscriptView: View {
         Group {
             switch row.kind {
             case .user(let text):
-                UserBubble(text: text, pending: row.timestamp == nil)
+                // The host is where the files are: attachment thumbnails read
+                // back from the device that runs this chat, not from the phone.
+                UserBubble(text: text, pending: row.timestamp == nil,
+                           deviceId: store.hostDeviceId ?? "")
 
             case .markdown(let block, let streaming):
                 MarkdownRowView(row: row, block: block, streaming: streaming, veils: veils)
@@ -281,27 +284,40 @@ final class VeilStore {
 struct UserBubble: View {
     let text: String
     var pending = false
+    /// The chat's host device — where the attachment files live, and so the
+    /// device a thumbnail is read back from.
+    var deviceId = ""
 
     var body: some View {
-        HStack {
-            Spacer(minLength: 0)
-            Text(text)
-                .font(Theme.sans(MD.textSize))
-                .lineSpacing(MD.lineHeight - MD.textSize - 4)
-                .foregroundStyle(Theme.text)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.radiusCard))
-                .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
-                .opacity(pending ? 0.65 : 1)
-                .contextMenu {
-                    Button {
-                        UIPasteboard.general.string = text
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
+        // Attachment refs ride the message text (the trailer transport in
+        // `comet_proto::view::attachments`); split them out and draw them above
+        // the bubble, as the desktop's user rows do. An attachment-only send
+        // has no bubble at all.
+        let parsed = parseUserMessageAttachments(text)
+        VStack(alignment: .trailing, spacing: 8) {
+            if !parsed.attachments.isEmpty, !deviceId.isEmpty {
+                UserAttachmentsStrip(deviceId: deviceId, attachments: parsed.attachments)
+            }
+            if !parsed.text.isEmpty {
+                Text(parsed.text)
+                    .font(Theme.sans(MD.textSize))
+                    .lineSpacing(MD.lineHeight - MD.textSize - 4)
+                    .foregroundStyle(Theme.text)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Theme.surfaceRaised,
+                                in: RoundedRectangle(cornerRadius: Theme.radiusCard))
+                    .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
+                    .contextMenu {
+                        Button {
+                            UIPasteboard.general.string = parsed.text
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
                     }
-                }
+            }
         }
+        .opacity(pending ? 0.65 : 1)
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }

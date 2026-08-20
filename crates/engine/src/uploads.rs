@@ -15,10 +15,13 @@
 //! reads local-first (`read_chunk` proxies through the owning device), so the
 //! GET fallback is the disaster path, not the hot path.
 //!
-//! `read_chunk` serves transcript images back in 45KB base64 chunks. Path jail:
-//! only files under the uploads dir or a workspace-known chat cwd are readable
-//! (the RPC layer supplies the cwd roots) — and only supported image types, as
-//! in comet.
+//! `read_chunk` serves attachments back in 45KB base64 chunks. Path jail: only
+//! files under the uploads dir or a workspace-known chat cwd are readable (the
+//! RPC layer supplies the cwd roots). Inside the uploads dir any type reads
+//! back — those bytes were handed to this device as an attachment, and since
+//! gh#535 a phone can hand over a PDF or a log as easily as a photo. Outside
+//! it, images only: a chat cwd is somebody's checkout, and this RPC must not
+//! become a way to read source (or `.env`) off another device.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -242,8 +245,21 @@ impl Uploads {
         if meta.len() > MAX_BYTES {
             return Err(EngineError::Other("Attachment is too large".into()));
         }
-        let mime_type = mime_by_ext(&resolved)
-            .ok_or_else(|| EngineError::Other("Attachment is not a supported image".into()))?;
+        // Two jails, not one. Anything COMMITTED here — a PDF, a log, a design
+        // file the phone sent (gh#535) — is a file this device was handed for
+        // this purpose, so any type reads back. A file merely sitting inside a
+        // chat's checkout is not: it is somebody's source tree, and the widened
+        // type table must not turn a thumbnail RPC into `cat ~/repo/.env`.
+        // Images only, out there, exactly as before.
+        let in_uploads = std::fs::canonicalize(&self.inner.dir)
+            .map(|dir| resolved.starts_with(&dir))
+            .unwrap_or(false);
+        let mime_type = if in_uploads {
+            mime_by_ext(&resolved).unwrap_or("application/octet-stream")
+        } else {
+            image_mime_by_ext(&resolved)
+                .ok_or_else(|| EngineError::Other("Attachment is not a supported image".into()))?
+        };
         Ok(InspectedFile {
             name: resolved
                 .file_name()
@@ -360,7 +376,10 @@ fn sanitize(file_name: &str) -> String {
     }
 }
 
-fn mime_by_ext(path: &Path) -> Option<&'static str> {
+/// The image types every viewport can decode — the set
+/// `comet_proto::view::attachments::is_image_path` calls thumbnailable, and the
+/// only set readable from outside the uploads dir.
+pub fn image_mime_by_ext(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
@@ -375,6 +394,29 @@ fn mime_by_ext(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Content type for an attachment of any kind: images first, then the document
+/// types a phone can hand over (gh#535), then `None` — callers inside the
+/// uploads dir fall back to `application/octet-stream`, since the bytes are
+/// already ours and the extension is only a hint to whoever opens them.
+fn mime_by_ext(path: &Path) -> Option<&'static str> {
+    if let Some(image) = image_mime_by_ext(path) {
+        return Some(image);
+    }
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "pdf" => Some("application/pdf"),
+        "txt" | "log" | "text" => Some("text/plain"),
+        "md" | "markdown" => Some("text/markdown"),
+        "csv" => Some("text/csv"),
+        "html" | "htm" => Some("text/html"),
+        "json" => Some("application/json"),
+        "xml" => Some("application/xml"),
+        "yml" | "yaml" => Some("application/yaml"),
+        "toml" => Some("application/toml"),
+        "zip" => Some("application/zip"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +426,85 @@ mod tests {
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("my photo (1).png"), "my_photo__1_.png");
         assert_eq!(sanitize(""), "upload");
+    }
+
+    fn uploads_in(dir: &Path) -> Uploads {
+        Uploads::new(dir, None)
+    }
+
+    /// The phone's half of gh#535: a PDF uploaded from iOS commits, and reads
+    /// back with a content type that says what it is.
+    #[test]
+    fn a_committed_document_commits_and_reads_back() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let uploads = uploads_in(tmp.path());
+        let bytes = b"%PDF-1.7\nnot really a pdf, but the bytes are ours\n";
+        uploads
+            .append("upload1", &BASE64.encode(bytes), Some(0))
+            .expect("append");
+        let path = uploads.commit("upload1", "spec.pdf").expect("commit");
+        let chunk = uploads.read_chunk(&path, 0, &[]).expect("read");
+        assert_eq!(chunk.mime_type, "application/pdf");
+        assert!(chunk.done);
+        assert_eq!(BASE64.decode(chunk.data).expect("base64"), bytes);
+    }
+
+    /// An extension nobody has a type for still reads back — the bytes are in
+    /// the uploads dir, which is the whole authorization.
+    #[test]
+    fn an_unknown_extension_inside_the_uploads_dir_is_octet_stream() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let uploads = uploads_in(tmp.path());
+        uploads
+            .append("upload2", &BASE64.encode(b"blob"), Some(0))
+            .expect("append");
+        let path = uploads.commit("upload2", "design.dc.html").expect("commit");
+        let chunk = uploads.read_chunk(&path, 0, &[]).expect("read");
+        assert_eq!(chunk.mime_type, "text/html");
+        let path = {
+            uploads
+                .append("upload3", &BASE64.encode(b"blob"), Some(0))
+                .expect("append");
+            uploads.commit("upload3", "thing.qqq").expect("commit")
+        };
+        assert_eq!(
+            uploads.read_chunk(&path, 0, &[]).expect("read").mime_type,
+            "application/octet-stream"
+        );
+    }
+
+    /// The line the widened type table must not cross: a chat's checkout is
+    /// readable for images (transcript thumbnails) and nothing else.
+    #[test]
+    fn a_checkout_root_still_serves_images_only() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let uploads = uploads_in(&tmp.path().join("data"));
+        let checkout = tmp.path().join("checkout");
+        std::fs::create_dir_all(&checkout).expect("checkout dir");
+        let secret = checkout.join(".env");
+        std::fs::write(&secret, b"TOKEN=hunter2").expect("write");
+        let shot = checkout.join("shot.png");
+        std::fs::write(&shot, b"\x89PNG\r\n\x1a\n").expect("write");
+        let roots = vec![checkout.clone()];
+
+        let refused = uploads
+            .read_chunk(&secret.to_string_lossy(), 0, &roots)
+            .expect_err("a checkout secret is not an attachment");
+        assert!(refused.to_string().contains("not a supported image"));
+        // A .pdf sitting in the checkout is refused for the same reason.
+        let doc = checkout.join("notes.pdf");
+        std::fs::write(&doc, b"%PDF").expect("write");
+        assert!(
+            uploads
+                .read_chunk(&doc.to_string_lossy(), 0, &roots)
+                .is_err()
+        );
+        assert_eq!(
+            uploads
+                .read_chunk(&shot.to_string_lossy(), 0, &roots)
+                .expect("images still read")
+                .mime_type,
+            "image/png"
+        );
     }
 }

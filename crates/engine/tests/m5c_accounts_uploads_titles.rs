@@ -504,11 +504,29 @@ async fn uploads_chunk_commit_readback_and_jail() {
         .read_chunk(&outside.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
         .expect("cwd-rooted read");
     assert_eq!(BASE64.decode(&ok.data).expect("data"), b"nope");
-    // Non-image extensions are refused even inside the jail (comet parity).
+    // …but only for images. A cwd root is somebody's checkout, and the
+    // document types gh#535 added must not turn this RPC into a way to read
+    // source (or a `.env`) off another device.
+    let secret = tmp.path().join("notes.pdf");
+    std::fs::write(&secret, b"%PDF").expect("checkout doc");
+    assert!(
+        uploads
+            .read_chunk(&secret.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
+            .is_err(),
+        "a checkout serves images and nothing else"
+    );
+
+    // Inside the uploads dir, any type reads back: those bytes were handed to
+    // this device AS an attachment, which is the whole authorization (gh#535 —
+    // a phone can attach a PDF or a log, not only a photo).
     let text = PathBuf::from(uploads.dir()).join("notes.txt");
     std::fs::create_dir_all(uploads.dir()).expect("uploads dir");
     std::fs::write(&text, b"text").expect("txt");
-    assert!(uploads.read_chunk(&text.to_string_lossy(), 0, &[]).is_err());
+    let read = uploads
+        .read_chunk(&text.to_string_lossy(), 0, &[])
+        .expect("a committed document reads back");
+    assert_eq!(read.mime_type, "text/plain");
+    assert_eq!(BASE64.decode(&read.data).expect("data"), b"text");
 
     // Bogus upload ids never become paths.
     assert!(uploads.append("../evil", "aGk=", None).is_err());

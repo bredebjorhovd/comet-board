@@ -169,6 +169,70 @@ enum E2ERunner {
         }
     }
 
+    /// The attachment path from the phone to a HOST device, end to end
+    /// (gh#535): stage bytes, `UploadChunk`/`UploadCommit` over that device's
+    /// relay, then `ReadAttachmentChunk` them back and compare.
+    ///
+    /// This exists because the picker cannot be driven headlessly — `simctl`
+    /// has no touch input — and the interesting half of this feature is not the
+    /// picker anyway. It is whether a file leaves the phone and lands on the
+    /// device that runs the agent, which is exactly what these two calls
+    /// answer, for whichever devices the workspace currently shows: a Mac, the
+    /// box, or both. A photo and a document, because until gh#535 the second
+    /// kind could not be sent at all and the host refused to serve it back.
+    static func probeAttachments(config: AppConfig, devices: [DeviceRow]) async {
+        struct Chunk: Decodable {
+            var name: String
+            var mimeType: String
+            var data: String
+            var nextOffset: UInt64
+            var done: Bool
+        }
+        // A real 1×1 PNG (an image the host will serve back from anywhere in
+        // its jail) and a text file (which it serves only from its uploads
+        // dir — so a round trip proves the file landed THERE, not merely
+        // somewhere readable).
+        let png = Data(base64Encoded: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")!
+        let txt = Data("comet e2e attachment probe\n".utf8)
+
+        for device in devices where device.platform != "ios" {
+            let relay = DeviceRelayClient(deviceId: device.id, config: config)
+            let label = "\(device.name)/\(device.id.prefix(8))"
+            for (name, bytes) in [("comet-e2e-probe.png", png), ("comet-e2e-probe.txt", txt)] {
+                do {
+                    let path = try await uploadAttachmentChunked(relay: relay, name: name,
+                                                                 data: bytes)
+                    var b64 = ""
+                    var offset: UInt64 = 0
+                    var done = false
+                    var mime = ""
+                    while !done {
+                        let chunk: Chunk = try await relay.call(
+                            method: "ReadAttachmentChunk",
+                            params: ["path": path, "offset": offset],
+                            timeoutSeconds: 20)
+                        b64 += chunk.data
+                        mime = chunk.mimeType
+                        done = chunk.done
+                        if done { break }
+                        guard chunk.nextOffset > offset else {
+                            log("FAIL attachment[\(label)] \(name): read stalled at \(offset)")
+                            break
+                        }
+                        offset = chunk.nextOffset
+                    }
+                    let same = done && Data(base64Encoded: b64) == bytes
+                    log(same
+                        ? "OK attachment[\(label)] \(name) → \(path) (\(mime), \(bytes.count) bytes round-tripped)"
+                        : "FAIL attachment[\(label)] \(name): committed to \(path) but read back wrong")
+                } catch {
+                    log("FAIL attachment[\(label)] \(name): \(error.localizedDescription)")
+                }
+            }
+            await relay.close()
+        }
+    }
+
     /// The dispatch half of gh#114, end to end against a real board: make the
     /// route's space, wait for the board to call a row dispatchable, release it,
     /// and watch the row move. Launch with `-e2e-board <repoPath>` against a
@@ -342,6 +406,7 @@ extension E2ERunner {
             }
         }
         await probeBoardStream(config: config, devices: workspace.devices)
+        await probeAttachments(config: config, devices: workspace.devices)
         log("done")
     }
 }

@@ -200,9 +200,11 @@ pub enum RowKind {
     User {
         /// Visible prompt (attachment-ref trailer already stripped).
         text: SharedString,
-        /// Image refs parsed out of the message text (message-attachments.ts):
-        /// thumbnails load from the owning device via ReadAttachmentChunk.
-        attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
+        /// Attachment refs parsed out of the message text
+        /// (message-attachments.ts): image refs load from the owning device
+        /// via ReadAttachmentChunk, non-image refs render as name chips —
+        /// nothing to thumbnail, and the host's jail would refuse the read.
+        attachments: Arc<Vec<crate::attachments::UserAttachmentRef>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
     },
@@ -333,7 +335,7 @@ pub fn rows_for_entry(
             .join("\n\n");
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
-        let parsed = crate::attachments::parse_user_message_images(&raw);
+        let parsed = crate::attachments::parse_user_message_attachments(&raw);
         return vec![Row {
             id: entry.id.clone().into(),
             version: (raw.len() as u64) << 1 | pending as u64,
@@ -1529,7 +1531,7 @@ impl Transcript {
     fn render_user_attachments(
         &mut self,
         row_id: &SharedString,
-        atts: &[crate::attachments::UserImageAttachment],
+        atts: &[crate::attachments::UserAttachmentRef],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
@@ -1547,13 +1549,44 @@ impl Transcript {
             .px(px(4.0))
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
-            let state = self.attachment_state(&device_ids, &att.path, cx);
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
                 .h(px(ATT_THUMB_H))
                 .rounded(px(Theme::RADIUS_ROW))
                 .overflow_hidden();
+            // A PDF sent from the phone has no thumbnail and no read-back (the
+            // host serves non-image bytes only out of its uploads dir, and
+            // nothing here could decode them anyway): show what it is by name,
+            // rather than a load that spins and then fails (gh#535).
+            if !att.is_image {
+                strip = strip.child(
+                    frame
+                        .border_1()
+                        .border_color(theme.white_alpha(0.11))
+                        .bg(theme.white_alpha(0.035))
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .px(px(8.0))
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text)
+                                .truncate()
+                                .child(SharedString::from(att.name.clone())),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.white_alpha(0.45))
+                                .child(SharedString::from("file")),
+                        ),
+                );
+                continue;
+            }
+            let state = self.attachment_state(&device_ids, &att.path, cx);
             let thumb: AnyElement = match state {
                 AttachmentSnapshot::Loaded(image) => {
                     let preview = crate::attachments::PreviewImage {
