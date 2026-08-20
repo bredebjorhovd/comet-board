@@ -210,6 +210,11 @@ ExecStart=%h/.comet-native/app/current/comet headless
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=-%h/.comet-native/env
+# gh#529: the default OOMPolicy=stop turns one OOM-killed agent into a dead
+# engine. Throttle the cgroup before the kernel acts; kill inside it after.
+OOMPolicy=continue
+MemoryHigh=75%
+MemoryMax=90%
 
 [Install]
 WantedBy=default.target

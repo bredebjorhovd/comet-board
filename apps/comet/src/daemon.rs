@@ -236,9 +236,21 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.comet-native/env\n\n[Install]\nWantedBy=default.target\n",
+        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.comet-native/env\n",
         systemd_exec_path(exe)
     ));
+    // Resource governance (gh#529). The default OOMPolicy=stop turns one
+    // OOM-killed agent child into a dead engine: systemd sees the kill in the
+    // unit's cgroup and stops the whole service. `continue` scopes the kernel's
+    // kill to the process it chose. MemoryHigh throttles the cgroup's
+    // allocations (reclaim pressure lands on the big allocators — the agent
+    // builds) before the kernel acts at MemoryMax, and a cap breach then kills
+    // inside the cgroup rather than boxwide. Percentages scale to the box.
+    // No negative OOMScoreAdjust here: a user manager lacks CAP_SYS_RESOURCE
+    // to lower scores, and a value systemd cannot apply fails the start.
+    unit.push_str(
+        "OOMPolicy=continue\nMemoryHigh=75%\nMemoryMax=90%\n\n[Install]\nWantedBy=default.target\n",
+    );
     unit
 }
 
@@ -396,6 +408,11 @@ mod tests {
         assert!(unit.contains("Environment=\"RUST_LOG=info,comet=\\\"debug\\\"\"\n"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("EnvironmentFile=-%h/.comet-native/env"));
+        // gh#529: an OOM-killed agent must not take the engine's unit down,
+        // and the cgroup must throttle before the kernel kills.
+        assert!(unit.contains("OOMPolicy=continue\n"));
+        assert!(unit.contains("MemoryHigh=75%\n"));
+        assert!(unit.contains("MemoryMax=90%\n"));
         assert!(unit.contains("WantedBy=default.target"));
     }
 
