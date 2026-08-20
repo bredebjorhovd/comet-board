@@ -28,8 +28,10 @@
 //! the same class of fact as the environment the run is given, and deliberately
 //! not the token, not the prompt, and not the URL git was talking to.
 //!
-//! Two readers. [`crate::doctor`] shows the last failure, so a broken box says
-//! so when somebody asks it. And the settle path ([`crate::sync`]) compares
+//! Two readers. [`crate::doctor`] shows the last failure that is still
+//! standing, so a broken box says so when somebody asks it — and, since
+//! gh#515, so a box whose last failure was GitHub's own outage two days ago
+//! does *not*. And the settle path ([`crate::sync`]) compares
 //! `Handed` against `Minted` for the chat that just finished: a branch that
 //! reached origin on a run the board handed a credential to, with the helper
 //! never once asked, was pushed with a credential the board did not issue.
@@ -49,6 +51,31 @@ pub const LEDGER_FILE: &str = "credentials.jsonl";
 /// are about the run that just ended, so losing the far tail costs nothing —
 /// and losing a `Handed` can only make the settle check quieter, never louder.
 const MAX_BYTES: u64 = 1024 * 1024;
+
+/// Past this age a recorded failure is history rather than news (gh#515).
+///
+/// `doctor` is what an operator runs when the board looks wrong, so a red line
+/// that is neither current nor actionable costs exactly what the check exists
+/// to save: attention, spent on infrastructure that is fine. A day is long
+/// enough that this morning's failed dispatch still shouts, and short enough
+/// that the one from the day before yesterday has stopped.
+pub const FRESH_SECS: i64 = 24 * 3_600;
+
+/// Whose problem a recorded failure was (gh#515).
+///
+/// The distinction is the whole difference between the two things an operator
+/// can do with a `doctor` line. One of them they can act on; the other one
+/// they can only wait out, and a check that cannot tell them apart spends a
+/// morning looking for a broken wrapper that was never broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// GitHub answered for itself — a 5xx, a gateway timeout, a rate limit.
+    /// Nothing on this box caused it and nothing on this box will fix it.
+    Upstream,
+    /// Everything else: a shim that will not exec, no credential configured,
+    /// an App that is not installed on the repo. These have a fix on this box.
+    Local,
+}
 
 /// What happened to the credential path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +137,13 @@ impl Entry {
 
     /// One line for a log or a doctor row.
     pub fn summary(&self) -> String {
-        let mut s = format!("{} {}", self.at, self.event.as_str());
+        format!("{} {}", self.at, self.what())
+    }
+
+    /// The same line without the stamp [`Entry::summary`] leads with, for a
+    /// reader that has already said how long ago this was (gh#515).
+    pub fn what(&self) -> String {
+        let mut s = self.event.as_str().to_string();
         if !self.repo.is_empty() {
             s.push_str(&format!(" {}", self.repo));
         }
@@ -120,6 +153,76 @@ impl Entry {
         }
         s
     }
+
+    /// When this was recorded, or `None` if the stamp will not parse — which
+    /// only a hand-edited ledger produces, and which callers should read as
+    /// "no idea how old", never as "new".
+    pub fn at_utc(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(&self.at)
+            .ok()
+            .map(|t| t.with_timezone(&chrono::Utc))
+    }
+
+    /// Seconds since this was recorded.
+    pub fn age_secs(&self, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+        self.at_utc().map(|at| (now - at).num_seconds().max(0))
+    }
+
+    /// Recorded within [`FRESH_SECS`]. An age nobody can compute is not fresh:
+    /// the point of the window is to stop an old failure shouting, and a stamp
+    /// that will not parse is the one case where it might be arbitrarily old.
+    pub fn is_fresh(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        self.age_secs(now).is_some_and(|secs| secs < FRESH_SECS)
+    }
+
+    /// Whose problem this was, read off the error the caller quoted (gh#515).
+    ///
+    /// Read rather than recorded, because the callers that write these lines
+    /// are inside git's credential prompt with a string somebody else handed
+    /// them; asking each of them to classify would be asking the layer with
+    /// the least context. Unclassifiable means [`Cause::Local`] — the reading
+    /// that keeps the check loud, so a cause this does not recognise is a
+    /// quiet false alarm rather than a silent real one.
+    pub fn cause(&self) -> Cause {
+        let Some(error) = self.error.as_deref() else {
+            return Cause::Local;
+        };
+        let error = error.to_ascii_lowercase();
+        if http_status(&error).is_some_and(|status| (500..600).contains(&status)) {
+            return Cause::Upstream;
+        }
+        const UPSTREAM: [&str; 8] = [
+            "bad gateway",
+            "service unavailable",
+            "gateway timeout",
+            "internal server error",
+            "temporarily unavailable",
+            "timed out",
+            "timeout",
+            "rate limit",
+        ];
+        if UPSTREAM.iter().any(|marker| error.contains(marker)) {
+            Cause::Upstream
+        } else {
+            Cause::Local
+        }
+    }
+}
+
+/// The status in an error that quotes one — `github HTTP 504 for /repos/…`,
+/// which is the shape [`crate::sources::github`] errors take. Only that shape:
+/// a bare `504` somewhere in a path or a token is not a status and must not be
+/// read as one. `https://` does not match, since the `s` eats the space.
+fn http_status(lowercased: &str) -> Option<u16> {
+    lowercased.match_indices("http ").find_map(|(at, marker)| {
+        lowercased[at + marker.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u16>()
+            .ok()
+            .filter(|status| (100..600).contains(status))
+    })
 }
 
 /// Where the ledger lives.
@@ -199,12 +302,25 @@ pub fn entries(paths: &Paths) -> Vec<Entry> {
         .collect()
 }
 
-/// The most recent entry that says the path did not work — what
-/// [`crate::doctor`] shows and what an operator actually wants to read.
-pub fn last_failure(paths: &Paths) -> Option<Entry> {
-    entries(paths)
-        .into_iter()
-        .rfind(|e| matches!(e.event, Event::Failed | Event::Unusable))
+/// The last recorded failure the path has not since worked past (gh#515).
+///
+/// [`Event::Minted`] is the helper answering a real prompt on somebody's real
+/// run, which is a stronger statement about the credential path than anything
+/// that went wrong before it. So a failure with a mint after it is not a fact
+/// about now, and this returns `None` for it: the ledger has already shown the
+/// path working since. What comes back is a failure that is still the last
+/// thing the path is known to have done — which is the most a file of history
+/// can say about the present, and why [`crate::doctor`] probes as well.
+pub fn standing_failure(paths: &Paths) -> Option<Entry> {
+    for entry in entries(paths).into_iter().rev() {
+        match entry.event {
+            Event::Failed | Event::Unusable => return Some(entry),
+            Event::Minted => return None,
+            // Being handed the path says nothing about whether it works.
+            Event::Handed => {}
+        }
+    }
+    None
 }
 
 /// What the ledger knows about one chat's run.
@@ -318,7 +434,7 @@ mod tests {
             Some("chat-1"),
             "no GitHub credential to push o/r with",
         );
-        let last = last_failure(&p).expect("a failure");
+        let last = standing_failure(&p).expect("a failure");
         assert_eq!(last.event, Event::Failed);
         assert!(last.summary().contains("no GitHub credential"), "{last:?}");
         // A path the board could not even hand over is the same accusation as
@@ -351,6 +467,95 @@ mod tests {
         assert!(text.contains("\"event\":\"minted\""), "{text}");
         assert!(text.contains("\"chat\":\"chat-1\""), "{text}");
         assert_eq!(text.lines().count(), 2);
+    }
+
+    /// gh#515's first half: a failure the path has since worked past is not a
+    /// fact about now, and the reader `doctor` uses must not return it.
+    #[test]
+    fn a_mint_after_a_failure_retires_it() {
+        let (_tmp, p) = paths("superseded");
+        unusable(&p, "o/r", Some("chat-1"), "the shim will not exec");
+        assert!(standing_failure(&p).is_some());
+
+        // Being handed the path again says nothing either way — only using it.
+        handed(&p, "o/r", Some("chat-2"));
+        assert!(standing_failure(&p).is_some());
+
+        minted(&p, "git-askpass", "o/r", Some("chat-2"));
+        assert_eq!(standing_failure(&p), None);
+
+        // And a failure after that mint stands again: this is the last thing
+        // the path is known to have done.
+        failed(&p, "gh-token", "o/r", Some("chat-3"), "github said 401");
+        assert_eq!(standing_failure(&p).map(|e| e.event), Some(Event::Failed));
+    }
+
+    /// gh#515's second half: an operator can act on a broken shim and can only
+    /// wait out a 504, so the ledger has to tell them apart.
+    #[test]
+    fn a_failure_knows_whether_it_was_githubs_or_this_boxs() {
+        let upstream = [
+            "github HTTP 504 for /repos/o/r: We couldn't respond to your request in time.",
+            "github HTTP 502 for /repos/o/r: Bad gateway",
+            "minting a token timed out after 30s",
+            "github HTTP 403: You have exceeded a secondary rate limit",
+            "503 Service Unavailable",
+        ];
+        for error in upstream {
+            let (_tmp, p) = paths("upstream");
+            failed(&p, "gh-token", "o/r", Some("c"), error);
+            let entry = standing_failure(&p).unwrap();
+            assert_eq!(entry.cause(), Cause::Upstream, "{error}");
+        }
+
+        let local = [
+            "cannot exec the askpass shim",
+            "no GitHub credential to push o/r with",
+            "github HTTP 404 for /repos/o/r: Not Found",
+            // A digit that is not a status, in a path that is not a failure of
+            // GitHub's: nothing here may be read as a 5xx.
+            "cannot exec /opt/homebrew/504/bin/gh",
+        ];
+        for error in local {
+            let (_tmp, p) = paths("local");
+            failed(&p, "gh-token", "o/r", Some("c"), error);
+            let entry = standing_failure(&p).unwrap();
+            assert_eq!(entry.cause(), Cause::Local, "{error}");
+        }
+
+        // A failure with no error text at all is nobody's problem in
+        // particular, which means it is treated as this box's.
+        let (_tmp, p) = paths("bare");
+        let bare = Entry::new(Event::Unusable, "dispatch", "o/r", None);
+        assert_eq!(bare.cause(), Cause::Local);
+        append(&p, bare);
+        assert_eq!(standing_failure(&p).unwrap().cause(), Cause::Local);
+    }
+
+    /// The stamp is what makes a failure history, so it has to be readable —
+    /// and an unreadable one must never pass for fresh.
+    #[test]
+    fn an_entry_reports_its_own_age() {
+        let (_tmp, p) = paths("age");
+        failed(&p, "gh-token", "o/r", Some("c"), "boom");
+        let entry = standing_failure(&p).unwrap();
+        let now = entry.at_utc().unwrap();
+        assert_eq!(entry.age_secs(now), Some(0));
+        assert!(entry.is_fresh(now));
+        assert!(entry.is_fresh(now + chrono::Duration::seconds(FRESH_SECS - 1)));
+        assert!(!entry.is_fresh(now + chrono::Duration::seconds(FRESH_SECS)));
+        // A clock that went backwards is zero seconds ago, not negative.
+        assert_eq!(entry.age_secs(now - chrono::Duration::hours(1)), Some(0));
+
+        let mut bent = entry.clone();
+        bent.at = "not a timestamp".into();
+        assert_eq!(bent.age_secs(now), None);
+        assert!(!bent.is_fresh(now));
+
+        // `what` is `summary` without the stamp, and carries the same facts.
+        assert_eq!(entry.summary(), format!("{} {}", entry.at, entry.what()));
+        assert!(entry.what().contains("o/r"), "{}", entry.what());
+        assert!(entry.what().contains("boom"), "{}", entry.what());
     }
 
     /// A truncated tail is a normal state for an append-only file two
