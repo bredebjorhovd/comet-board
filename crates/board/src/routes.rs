@@ -287,6 +287,10 @@ const ROUTE_KEYS: &[(&str, Kind)] = &[
 /// The keys [`Edit::Default`] may set.
 const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("max_concurrent_per_workspace", Kind::Int),
+    // The other half of the cap (gh#533). A string, not a number, because `off`
+    // is a value it takes — and the one somebody reaches for over ssh when the
+    // gate is holding a queue they know the box can carry.
+    ("min_memory_headroom", Kind::Str),
     ("branch_template", Kind::Str),
     ("base", Kind::Str),
     ("notify", Kind::Bool),

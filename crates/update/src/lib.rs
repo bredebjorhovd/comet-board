@@ -34,6 +34,8 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::sync::watch;
 use wait_timeout::ChildExt as _;
 
+pub mod service;
+
 /// The version compiled into this binary (the workspace version).
 pub const fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -482,6 +484,17 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
 /// Restart the installed engine service (the same units `comet daemon` and the
 /// curl|sh installer manage). Called after a symlink swap so the running daemon
 /// picks up the new binary.
+///
+/// On Linux this is also where the unit's resource governance is re-asserted
+/// (gh#533). The three lines gh#529 added reach only a box whose unit is
+/// re-*rendered*, and an update rewrites the binary, not the unit — so every box
+/// installed before that release would have kept `OOMPolicy=stop` forever. The
+/// drop-in is written here, immediately before the reload and restart that make
+/// it take effect, because this is the one moment on the update path where the
+/// service is already being interrupted. A failure to write it is logged and
+/// not fatal: an engine that will not restart because its drop-in could not be
+/// saved is a worse outcome than one running without the drop-in, and `doctor`
+/// says so loudly either way.
 pub fn restart_service() -> anyhow::Result<()> {
     if cfg!(target_os = "macos") {
         let output = std::process::Command::new("id").arg("-u").output()?;
@@ -491,10 +504,16 @@ pub fn restart_service() -> anyhow::Result<()> {
             &["kickstart", "-k", &format!("gui/{uid}/sh.zeron.comet")],
         )
     } else {
-        run(
-            "systemctl",
-            &["--user", "restart", "comet-native.service"],
-        )
+        match service::ensure_resource_governance() {
+            Ok(service::DropIn::Written) => {
+                println!("Refreshed the unit's resource governance (gh#529).");
+                // A drop-in systemd has not re-read is a file, not a setting.
+                let _ = run("systemctl", &["--user", "daemon-reload"]);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("could not write the resource-governance drop-in: {e}"),
+        }
+        run("systemctl", &["--user", "restart", "comet-native.service"])
     }
 }
 

@@ -550,6 +550,53 @@ async fn error_codes_map_to_readable_messages() {
     );
 }
 
+/// The gh#533 regression, in the two halves the incident had: the supervisor
+/// **survives** a child the kernel took, and the death is **reported with the
+/// signal in it**.
+///
+/// The signal number is the load-bearing part. It is the only thing in the
+/// harness's own sentence that the board can read an OOM kill off
+/// (`comet_harness::crashed_by_signal` → `comet_board::pressure`), and it is
+/// what a bare `try_wait()` loses when the probe lands in the window between
+/// stdout reaching EOF and the child becoming reapable — a run described as
+/// "still running" instead, which no attribution can rescue.
+///
+/// What this cannot prove is the kernel's part: no test may fill a CI runner's
+/// memory to make a real OOM killer choose, so the fixture kills itself the same
+/// way the kernel would. Everything downstream of the signal — the counter
+/// delta, the sentence, the chat — is proved where it is decided, in
+/// `comet_board::pressure` and `comet_engine::sessions`.
+#[tokio::test]
+async fn a_child_the_kernel_kills_ends_the_run_loudly_and_the_supervisor_lives() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:oomkill"), controls).await;
+
+    // Reaching this line at all is the first half: the child died on SIGKILL and
+    // this process — the harness's supervisor, the engine's stand-in — is still
+    // running to make an assertion.
+    let last = events.last().expect("the run ended");
+    let AgentEvent::Done {
+        status,
+        error: Some(error),
+        ..
+    } = last
+    else {
+        panic!("a killed child must still end in a Done that says so: {last:?}");
+    };
+    assert_eq!(*status, DoneStatus::Errored, "{events:?}");
+    // The signal, verbatim — the board reads its attribution off this number.
+    assert!(error.contains("killed by signal 9"), "{error}");
+    assert_eq!(comet_harness::crashed_by_signal(error), Some(9), "{error}");
+    // What it managed before dying is still the run's: a killed turn loses its
+    // ending, not its transcript.
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "Building".into()
+        }),
+        "{events:?}"
+    );
+}
+
 #[tokio::test]
 async fn missing_binary_is_not_installed() {
     let harness = ClaudeHarness::new().with_executable("/nonexistent/claude-nowhere");

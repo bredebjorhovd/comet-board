@@ -592,6 +592,43 @@ pub fn parse_turn_limit(s: &str, floor: u32) -> std::result::Result<Option<u32>,
     }
 }
 
+/// Parse a `min_memory_headroom` value into the share of the box's memory that
+/// must still be available before a dispatch may start (gh#533).
+///
+/// `Ok(None)` is *no memory gate*, said out loud — `off`, `none`, `never` or
+/// `0%`. A percentage is the only other spelling: a byte count would have to be
+/// re-decided every time the box is resized, and the whole point of the floor is
+/// that it scales with `MemTotal`. Anything at or over 100% — or below zero —
+/// is refused rather than clamped: a floor no box can ever be over is a board
+/// that dispatches nothing, and finding that out at 02:00 is the failure this
+/// guard exists to prevent, not to cause.
+///
+/// An unparseable value is an `Err` for [`parse_max_duration`]'s reason: a typo
+/// and "no gate" look identical from the board, and only one of them is what
+/// anybody meant.
+pub fn parse_memory_headroom(s: &str) -> std::result::Result<Option<f64>, String> {
+    let t = s.trim();
+    if matches!(t.to_ascii_lowercase().as_str(), "off" | "none" | "never") {
+        return Ok(None);
+    }
+    let number = t.strip_suffix('%').unwrap_or(t).trim();
+    let Ok(n) = number.parse::<f64>() else {
+        return Err(format!(
+            "`{s}` is not a percentage; write it like `15%`, `25%`, or `off`"
+        ));
+    };
+    if n == 0.0 {
+        return Ok(None);
+    }
+    if !(0.0..100.0).contains(&n) {
+        return Err(format!(
+            "is `{n}%` — a floor below zero or at 100% or more is a board that can never \
+             dispatch; write it like `15%` or `off`"
+        ));
+    }
+    Ok(Some(n / 100.0))
+}
+
 /// Parse a `retain_worktrees` value into a retention window in seconds (gh#72).
 ///
 /// `Ok(None)` is *keep forever*, said out loud — `off`, `none`, `never` or `0`
@@ -687,6 +724,29 @@ pub fn parse_build_retention(s: &str) -> std::result::Result<Option<u64>, String
 pub struct Defaults {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_per_workspace: usize,
+    /// How much of the box's memory must still be available before a dispatch
+    /// may start (gh#533) — a percentage of `MemTotal`, or `off`.
+    ///
+    /// The cap above counts *slots*, and a slot is not a memory budget: three
+    /// slots of Next.js builds is not three slots of doc edits, and on
+    /// 2026-08-19 a swapless 16G box sat at 3-of-3 heavy builds until the
+    /// kernel's OOM killer reached inside the engine's unit (gh#526). This is
+    /// the meter the slot count cannot be — measured on the box, at the moment
+    /// of the dispatch, from what the last three agents actually left.
+    ///
+    /// 15% by default. Below it a dispatch is **deferred**, not refused: the
+    /// board's word for eligible-but-held by a limit that time will lift
+    /// (gh#490), which is exactly what a build finishing does to this one. The
+    /// same reading also defers when the box is already stalling on memory
+    /// whatever it claims is free — see [`crate::pressure`].
+    ///
+    /// `off` (or `0%`) is the escape hatch, and the honest spelling of what
+    /// every board did before this existed. A box that cannot be measured at
+    /// all — macOS, a kernel that does not answer — is `off` by construction:
+    /// nothing is guessed, and no dispatch is ever held for a reading nobody
+    /// took.
+    #[serde(default = "default_memory_headroom")]
+    pub min_memory_headroom: String,
     #[serde(default = "default_branch_template")]
     pub branch_template: String,
     /// The ref every dispatch's branch is cut from, fetched from origin first
@@ -1079,6 +1139,10 @@ fn default_max_concurrent() -> usize {
     3
 }
 
+fn default_memory_headroom() -> String {
+    format!("{:.0}%", crate::pressure::DEFAULT_HEADROOM * 100.0)
+}
+
 /// Impl spec §5. The design fixtures show `lin-145-altinn-retry`, and gh#364
 /// has now arrived at that from the other end — `{identifier_lower}` carries
 /// the identifier and a slug of the title, so the default renders
@@ -1107,6 +1171,7 @@ impl Default for Defaults {
     fn default() -> Self {
         Defaults {
             max_concurrent_per_workspace: default_max_concurrent(),
+            min_memory_headroom: default_memory_headroom(),
             branch_template: default_branch_template(),
             base: default_base(),
             notify: true,
@@ -1683,6 +1748,12 @@ impl RoutingConfig {
         if let Err(e) = crate::billing::parse_guard_mode(&self.defaults.billing_guard) {
             out.push(format!("[defaults] billing_guard {e}"));
         }
+        // Same reasoning as the cap above, in both directions: a typo that read
+        // as `off` would leave the box unguarded on the night it matters, and
+        // one that read as a floor no box clears would stop the board dead.
+        if let Err(e) = parse_memory_headroom(&self.defaults.min_memory_headroom) {
+            out.push(format!("[defaults] min_memory_headroom {e}"));
+        }
         if let Err(e) = parse_turn_limit(
             &self.defaults.max_tool_failures,
             crate::spin::MIN_TOOL_FAILURES,
@@ -1896,6 +1967,39 @@ impl RoutingConfig {
         route
             .max_concurrent
             .unwrap_or(self.defaults.max_concurrent_per_workspace)
+    }
+
+    /// The share of the box's memory that must still be available before a
+    /// dispatch may start (gh#533). `None` is the gate off.
+    ///
+    /// Board-wide and not per route, unlike every cap beside it: memory is the
+    /// one resource routes cannot have their own budget of, because they all
+    /// spend the same box. A per-route floor would only mean whichever route
+    /// dispatched next got to decide how full the box may be.
+    ///
+    /// Validation has already refused an unparseable value; a config that
+    /// reached here with one is one `load_or_default` fell back on, so the
+    /// default floor is the honest answer rather than no gate at all — the same
+    /// rule [`Self::max_duration_secs`] follows, and for the same reason.
+    pub fn min_memory_headroom(&self) -> Option<f64> {
+        parse_memory_headroom(&self.defaults.min_memory_headroom).unwrap_or_else(|_| {
+            parse_memory_headroom(&default_memory_headroom())
+                .ok()
+                .flatten()
+        })
+    }
+
+    /// What the box says about starting one more agent right now (gh#533), or
+    /// [`crate::pressure::Headroom::Unknown`] when the gate is off.
+    ///
+    /// One call rather than two so the reading and the floor it is judged
+    /// against cannot be taken from different configs — and so `off` never
+    /// reaches `/proc` at all.
+    pub fn headroom(&self) -> crate::pressure::Headroom {
+        match self.min_memory_headroom() {
+            Some(floor) => crate::pressure::headroom(&crate::pressure::Snapshot::read(), floor),
+            None => crate::pressure::Headroom::Unknown,
+        }
     }
 
     /// The wall-clock cap for attempts on a route, in seconds — the route's
@@ -2862,6 +2966,69 @@ runtime = "claude"
                 .to_string()
                 .contains("[defaults] max_duration")
         );
+    }
+
+    // ---- the memory floor (gh#533) ---------------------------------------
+
+    #[test]
+    fn the_memory_floor_defaults_to_fifteen_percent_of_the_box() {
+        let c = RoutingConfig::default();
+        assert_eq!(c.defaults.min_memory_headroom, "15%");
+        assert_eq!(
+            c.min_memory_headroom(),
+            Some(crate::pressure::DEFAULT_HEADROOM)
+        );
+    }
+
+    #[test]
+    fn the_memory_floor_is_written_as_a_percentage_and_turned_off_by_name() {
+        assert_eq!(parse_memory_headroom("25%"), Ok(Some(0.25)));
+        // The `%` is how anybody writes it, and leaving it off means the same.
+        assert_eq!(parse_memory_headroom(" 25 "), Ok(Some(0.25)));
+        for spelling in ["off", "OFF", "none", "never", "0%", "0"] {
+            assert_eq!(parse_memory_headroom(spelling), Ok(None), "{spelling}");
+        }
+    }
+
+    /// A floor no box can ever be over is a board that dispatches nothing, and
+    /// finding that out at 02:00 is the failure this guard exists to prevent —
+    /// so it is refused where every other typo is, rather than clamped.
+    #[test]
+    fn a_floor_no_box_could_clear_is_refused_rather_than_clamped() {
+        assert!(parse_memory_headroom("100%").is_err());
+        assert!(parse_memory_headroom("150%").is_err());
+        // …and a negative one is a typo, never "off".
+        assert!(parse_memory_headroom("-5%").is_err());
+        let c: RoutingConfig =
+            toml::from_str("[defaults]\nmin_memory_headroom = \"100%\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[defaults] min_memory_headroom"), "{err}");
+    }
+
+    #[test]
+    fn a_mistyped_floor_is_refused_rather_than_read_as_off() {
+        assert!(parse_memory_headroom("a lot").is_err());
+        let c: RoutingConfig =
+            toml::from_str("[defaults]\nmin_memory_headroom = \"plenty\"\n").unwrap();
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("[defaults] min_memory_headroom"), "{err}");
+        assert!(err.contains("plenty"), "it names the offender: {err}");
+        // …and a config that reached the accessor with one falls back to the
+        // default floor, never to no gate at all.
+        assert_eq!(
+            c.min_memory_headroom(),
+            Some(crate::pressure::DEFAULT_HEADROOM)
+        );
+    }
+
+    /// The gate off must never reach `/proc`: `headroom()` is the only caller
+    /// that reads the box, and `off` is answered before it does.
+    #[test]
+    fn a_gate_that_is_off_holds_no_dispatch() {
+        let c = github("[defaults]\nmin_memory_headroom = \"off\"\n");
+        assert_eq!(c.min_memory_headroom(), None);
+        assert_eq!(c.headroom(), crate::pressure::Headroom::Unknown);
+        assert!(crate::dispatch::check_pressure(&c.headroom()).is_ok());
     }
 
     // ---- the turn guardrails (gh#270) ------------------------------------

@@ -100,6 +100,16 @@ pub struct EvalFacts {
     pub workspace_live: BTreeMap<String, usize>,
     /// Per considered task: when its failure/refusal cooldown ends.
     pub cooldown_until: BTreeMap<String, String>,
+    /// Why the box has no room for another agent right now (gh#533), or `None`
+    /// when it has — or when nothing could be measured.
+    ///
+    /// One reading for the whole evaluation, taken with the other facts, for
+    /// the reason every other field here is snapshotted: a planner that read
+    /// `/proc` per task would decide the first three tasks of one tick against
+    /// three different boxes. It is a fact about the *box*, so it is not keyed
+    /// by task — every eligible task defers on the same sentence, which is what
+    /// makes the log readable on the night it fires.
+    pub host_pressure: Option<String>,
 }
 
 /// Does this rule consider this task at all — the source and required-label
@@ -228,6 +238,15 @@ fn decide(
             route.workspace
         ));
     }
+    // Last of the capacity family, and deliberately after the slot cap (gh#533).
+    // The order is what makes the log mean something: a task held because its
+    // space is full is held by a rule somebody wrote, and only a task that has
+    // a free slot waiting for it is being held by the *box*. Checking memory
+    // first would report "the box is tight" against every ineligible task on
+    // the board and bury the one line that matters.
+    if let Some(reason) = &facts.host_pressure {
+        return Verdict::Defer(reason.clone());
+    }
     if planned >= rule.max_per_eval.max(1) {
         return Verdict::Defer(format!(
             "evaluation limit of {} reached",
@@ -350,9 +369,14 @@ impl SyncEngine {
         self.db.prune_automation_log(&before)?;
         let tasks = self.board_ordered_tasks()?;
         let workspace_live = self.live_by_workspace()?;
+        // One look at the box for the whole evaluation (gh#533) — the automation
+        // refilling a slot a settle just freed is the exact caller this exists
+        // for, because it is the one nobody is watching.
+        let host_pressure = self.cfg.headroom().reason().map(str::to_string);
         let mut out = Vec::new();
         for rule in rules {
-            let facts = self.eval_facts(rule, &tasks, workspace_live.clone())?;
+            let facts =
+                self.eval_facts(rule, &tasks, workspace_live.clone(), host_pressure.clone())?;
             for decision in plan(&self.cfg, rule, &tasks, &facts) {
                 match &decision.verdict {
                     Verdict::Dispatch => out.push(PlannedDispatch {
@@ -401,11 +425,16 @@ impl SyncEngine {
         Ok(by_ws)
     }
 
+    /// `host_pressure` is taken once per evaluation by the caller and handed
+    /// down, so every rule in one tick is judged against one reading of one box
+    /// (gh#533) — and so the preview shows the same sentence the loop would
+    /// record, which is the whole contract between them.
     fn eval_facts(
         &self,
         rule: &Automation,
         tasks: &[Task],
         workspace_live: BTreeMap<String, usize>,
+        host_pressure: Option<String>,
     ) -> Result<EvalFacts> {
         let day_ago = rfc3339(chrono::Utc::now() - chrono::Duration::days(1));
         let mut cooldown_until = BTreeMap::new();
@@ -429,6 +458,7 @@ impl SyncEngine {
             dispatched_last_day: self.db.automation_dispatches_since(&rule.name, &day_ago)?,
             workspace_live,
             cooldown_until,
+            host_pressure,
         })
     }
 
@@ -482,6 +512,7 @@ impl SyncEngine {
         let day_ago = rfc3339(chrono::Utc::now() - chrono::Duration::days(1));
         let tasks = self.board_ordered_tasks()?;
         let workspace_live = self.live_by_workspace()?;
+        let host_pressure = self.cfg.headroom().reason().map(str::to_string);
         let mut rules = Vec::new();
         for rule in &self.cfg.automations {
             let live = self.db.live_count_for_automation(&rule.name)?;
@@ -491,7 +522,8 @@ impl SyncEngine {
                 .automation_log_recent(Some(&rule.name), 1)?
                 .into_iter()
                 .next();
-            let facts = self.eval_facts(rule, &tasks, workspace_live.clone())?;
+            let facts =
+                self.eval_facts(rule, &tasks, workspace_live.clone(), host_pressure.clone())?;
             let as_if_enabled = Automation {
                 enabled: true,
                 ..rule.clone()
@@ -844,6 +876,54 @@ mod tests {
         let plan = plan(&cfg, &wide, &tasks(&db), &facts());
         assert_eq!(plan[0].verdict, Verdict::Dispatch);
         match &plan[1].verdict {
+            Verdict::Defer(reason) => assert!(reason.contains("`ws` is at 1 of 1"), "{reason}"),
+            other => panic!("expected defer, got {other:?}"),
+        }
+    }
+
+    /// A box with a free slot and no memory to put an agent in defers, in the
+    /// board's own words (gh#533). The slot count said yes — that is the whole
+    /// point of the meter existing.
+    #[test]
+    fn a_box_with_no_memory_left_defers_the_task_its_slot_was_free_for() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#1", "gh#1", &["auto"]);
+        let plan = plan(
+            &cfg(),
+            &rule(),
+            &tasks(&db),
+            &EvalFacts {
+                host_pressure: Some("the box has 1.2 GiB of 15.6 GiB available".into()),
+                ..facts()
+            },
+        );
+        match verdict_of(&plan, "gh:o/r#1") {
+            Verdict::Defer(reason) => assert!(reason.contains("1.2 GiB"), "{reason}"),
+            other => panic!("expected defer, got {other:?}"),
+        }
+    }
+
+    /// …and the box is asked *after* the caps: a task whose space is already
+    /// full is held by the rule somebody wrote, not by the box. Reporting the
+    /// memory reason against every ineligible row is how the one line that
+    /// matters gets buried.
+    #[test]
+    fn a_full_space_is_still_reported_as_a_full_space_on_a_tight_box() {
+        let db = Db::open_in_memory().unwrap();
+        seed(&db, "gh:o/r#1", "gh#1", &["auto"]);
+        let mut cfg = cfg();
+        cfg.defaults.max_concurrent_per_workspace = 1;
+        let plan = plan(
+            &cfg,
+            &rule(),
+            &tasks(&db),
+            &EvalFacts {
+                workspace_live: [("ws".to_string(), 1usize)].into_iter().collect(),
+                host_pressure: Some("the box has 1.2 GiB of 15.6 GiB available".into()),
+                ..facts()
+            },
+        );
+        match verdict_of(&plan, "gh:o/r#1") {
             Verdict::Defer(reason) => assert!(reason.contains("`ws` is at 1 of 1"), "{reason}"),
             other => panic!("expected defer, got {other:?}"),
         }

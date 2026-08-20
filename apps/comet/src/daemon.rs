@@ -239,18 +239,14 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.comet-native/env\n",
         systemd_exec_path(exe)
     ));
-    // Resource governance (gh#529). The default OOMPolicy=stop turns one
-    // OOM-killed agent child into a dead engine: systemd sees the kill in the
-    // unit's cgroup and stops the whole service. `continue` scopes the kernel's
-    // kill to the process it chose. MemoryHigh throttles the cgroup's
-    // allocations (reclaim pressure lands on the big allocators — the agent
-    // builds) before the kernel acts at MemoryMax, and a cap breach then kills
-    // inside the cgroup rather than boxwide. Percentages scale to the box.
-    // No negative OOMScoreAdjust here: a user manager lacks CAP_SYS_RESOURCE
-    // to lower scores, and a value systemd cannot apply fails the start.
-    unit.push_str(
-        "OOMPolicy=continue\nMemoryHigh=75%\nMemoryMax=90%\n\n[Install]\nWantedBy=default.target\n",
-    );
+    // Resource governance (gh#529) — the three keys that scope an OOM kill to
+    // the process the kernel chose, from the one place that spells them
+    // (gh#533). The same lines ship as a drop-in on every engine update, for the
+    // boxes whose unit this function never gets to write again; sharing the
+    // constant is what keeps a freshly installed box and an upgraded one on the
+    // same settings. See `comet_update::service::RESOURCE_GOVERNANCE`.
+    unit.push_str(comet_update::service::RESOURCE_GOVERNANCE);
+    unit.push_str("\n[Install]\nWantedBy=default.target\n");
     unit
 }
 

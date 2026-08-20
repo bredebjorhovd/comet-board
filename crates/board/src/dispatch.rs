@@ -4,7 +4,8 @@
 //!
 //! Deliberately only the *decisions* live here: task → route → branch → brief,
 //! plus the refusals a dispatch owes its caller before anything is created
-//! ([`check_capacity`], [`route_for`], [`stack_parent`]) and the provenance
+//! ([`check_capacity`], [`check_pressure`], [`route_for`], [`stack_parent`])
+//! and the provenance
 //! verdict ([`dispatcher_for`]) — pure functions over config and stored rows.
 //! Executing the spec is [`crate::runtime::Runtime::dispatch`]'s job; the
 //! attempt-row lifecycle around it lives with the board loop in the engine.
@@ -27,6 +28,7 @@ use crate::billing::{Attribution, Billing};
 use crate::config::{Route, RoutingConfig, interpolate, slugify};
 use crate::db::Db;
 use crate::model::{Dispatcher, Task, UpstreamState};
+use crate::pressure::Headroom;
 use crate::runtime::{DispatchSpec, harness_for_runtime};
 use crate::sources::github::{CapabilityEvidence, PushCapabilities, WriteCapability};
 use crate::sync::route_context;
@@ -458,6 +460,37 @@ pub fn check_capacity(db: &Db, cfg: &RoutingConfig, route: &Route) -> Result<()>
         bail!(
             "space `{}` is at {live} of {cap} working — cancel one first",
             route.workspace
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a dispatch the box has no memory for (gh#533).
+///
+/// Beside [`check_capacity`] because it is the same refusal asked of the other
+/// resource, and it has to be *both*: the slot count bounds how many agents run
+/// at once, and this bounds what they are allowed to run into. Three slots of
+/// Next.js builds is not three slots of doc edits, and a box at 3-of-3 heavy
+/// builds passes the cap check every time — which is how a swapless 16G box
+/// stayed at three until the kernel's OOM killer reached the engine (gh#526).
+///
+/// The word is the same one the auto-pick vocabulary uses for this (gh#490):
+/// **deferred**, not refused. Nothing about the task is wrong and nothing about
+/// the box is broken — a build finishing lifts it, which is why the sentence
+/// says what to wait for rather than what to fix.
+///
+/// [`Headroom::Unknown`] releases. A box that cannot be measured is every box
+/// comet ran on before this shipped, and a gate that refused what it could not
+/// see would stop work on macOS entirely.
+pub fn check_pressure(headroom: &Headroom) -> Result<()> {
+    if let Some(reason) = headroom.reason() {
+        // The escape hatch is named in the refusal, because the person reading
+        // it is the one who may know better than the meter — a box that is
+        // tight for a reason that has nothing to do with the agents, or work
+        // small enough that the floor is beside the point.
+        bail!(
+            "deferred — {reason}; waiting for the box to free up \
+             (`[defaults] min_memory_headroom` lowers the floor, `off` removes it)"
         );
     }
     Ok(())
@@ -2107,6 +2140,29 @@ mod tests {
         let live = db.live_attempt_for_pane("chat-1").unwrap().unwrap();
         db.close_attempt(live.id, Outcome::Done).unwrap();
         assert!(check_capacity(&db, &cfg, &r).is_ok());
+    }
+
+    /// The other half of the cap (gh#533): a free slot on a full box is still
+    /// no room. The refusal says `deferred`, because a build finishing lifts it
+    /// — the auto-pick vocabulary's word for exactly this (gh#490).
+    #[test]
+    fn a_box_with_no_memory_left_holds_a_dispatch_its_slot_would_allow() {
+        let held = check_pressure(&Headroom::Tight(
+            "the box has 1.2 GiB of 15.6 GiB available (8%, floor 15%) and no swap".into(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(held.starts_with("deferred —"), "{held}");
+        assert!(held.contains("1.2 GiB of 15.6 GiB"), "{held}");
+        assert!(held.contains("waiting for the box to free up"), "{held}");
+    }
+
+    /// A box that could not be measured is every box comet ran on before this
+    /// shipped. A gate that cannot see must never be the thing that stops work.
+    #[test]
+    fn an_unmeasurable_box_never_holds_a_dispatch() {
+        assert!(check_pressure(&Headroom::Unknown).is_ok());
+        assert!(check_pressure(&Headroom::Clear).is_ok());
     }
 
     /// gh#161: where the claim stops mattering. A relayed frame carries an
