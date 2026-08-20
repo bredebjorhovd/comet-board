@@ -575,7 +575,7 @@ pub fn doctor(
         }
     }
 
-    checks.push(dispatched_push_check(paths));
+    checks.push(dispatched_push_check(paths, chrono::Utc::now()));
     checks.push(agent_path_check(
         &crate::config::data_dir().join("app"),
         git_credentials::agent_bin_dir().as_deref(),
@@ -2260,50 +2260,148 @@ fn span_secs(from: &str, to: &str) -> Option<i64> {
 /// needs no credential and no network — which username does a GitHub App push
 /// with — in a scratch directory, so a `doctor` run by the wrong user cannot
 /// leave a file the engine then cannot rewrite.
-fn dispatched_push_check(paths: &Paths) -> Check {
+///
+/// The ledger is read as well as probed, because a failure that happened during
+/// somebody's real run is a fact the probe cannot reach (gh#233). But *only*
+/// the probe is present tense, which is what gh#515 got wrong: any recorded
+/// failure, of any age and any cause, turned the line red. A GitHub outage from
+/// two days ago read as "`gh` has dropped off this box", and the healthy
+/// present-tense clause sat in front of it where nobody looked.
+/// [`push_verdict`] is the rule that replaced it.
+fn dispatched_push_check(paths: &Paths, now: chrono::DateTime<chrono::Utc>) -> Check {
     let credential = !matches!(Credentials::load(paths).github_auth(), GithubAuth::None);
     let exe = git_credentials::resolve_board_exe();
     let gh = git_credentials::resolve_gh(None);
-    let mut ok = exe.is_some() && credential;
-    let detail = match (&exe, credential) {
-        (None, _) => format!(
+    let live = match (&exe, credential) {
+        (None, _) => Live::Broken(format!(
             "no comet-board binary found beside the engine or on PATH — agents push with \
              this box's own git credentials (set {})",
             git_credentials::BOARD_EXE_ENV
+        )),
+        (Some(_), false) => Live::Broken(
+            "no GitHub credential — agents push with this box's own git credentials".to_string(),
         ),
-        (Some(_), false) => "no GitHub credential — agents push with this box's own git \
-             credentials"
-            .to_string(),
         (Some(exe), true) => match askpass_answers(exe) {
-            Ok(()) => format!(
+            Ok(()) => Live::Working(format!(
                 "the askpass helper answers, and mints per push{}",
                 match &gh {
                     Some(gh) => format!("; `gh` at {} is wrapped to mint per call", gh.display()),
                     None => "; no `gh` installed, so pull requests are opened by hand".into(),
                 }
-            ),
-            Err(err) => {
-                ok = false;
-                format!(
-                    "the credential path does not work — no dispatched agent on this box can \
-                     push with the board's App: {err:#}"
-                )
-            }
+            )),
+            Err(err) => Live::Broken(format!(
+                "the credential path does not work — no dispatched agent on this box can \
+                 push with the board's App: {err:#}"
+            )),
         },
     };
-    // Whatever the live check says, a failure the path already recorded is the
-    // more useful fact: it happened during somebody's run (gh#233).
-    let detail = match crate::credential_ledger::last_failure(paths) {
-        Some(last) => {
-            ok = false;
-            format!("{detail} · last recorded failure: {}", last.summary())
-        }
-        None => detail,
-    };
-    Check {
+    push_verdict(live, crate::credential_ledger::standing_failure(paths), now)
+}
+
+/// What the probe found — the only present-tense fact the check above has.
+enum Live {
+    /// The shim built, and answered git's username prompt.
+    Working(String),
+    /// It did not, or there was nothing to build it from.
+    Broken(String),
+}
+
+/// Turn the probe and the ledger into one line an operator can act on (gh#515).
+///
+/// Four readings, and the ordering of the sentence follows the reading rather
+/// than the order the facts were gathered in:
+///
+/// - The probe fails: red, and the probe's sentence leads, because it is the
+///   one naming a thing to fix. History trails it as context.
+/// - The probe passes and the ledger's last standing failure is GitHub's own —
+///   a 5xx, a timeout, a rate limit: **not** red at any age. There is nothing
+///   on this box to act on and never was; the only move it could ask for is
+///   "wait", and red does not mean wait.
+/// - The probe passes and a *local* failure is younger than
+///   [`crate::credential_ledger::FRESH_SECS`]: still red. The probe is not the
+///   whole path — it cannot mint against the API, and it cannot be the run that
+///   failed — so a fresh failure it cannot reproduce is exactly the gh#233
+///   shape and still leads the sentence.
+/// - Anything older, or with a mint after it (which
+///   [`crate::credential_ledger::standing_failure`] has already dropped):
+///   history, on an `ok` line, phrased in the past tense.
+fn push_verdict(
+    live: Live,
+    standing: Option<crate::credential_ledger::Entry>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Check {
+    use crate::credential_ledger::Cause;
+
+    let check = |ok: bool, detail: String| Check {
         name: "dispatched pushes".into(),
         ok,
         detail,
+    };
+    let (live_ok, live_detail) = match live {
+        Live::Working(detail) => (true, detail),
+        Live::Broken(detail) => (false, detail),
+    };
+    let Some(entry) = standing else {
+        return check(live_ok, live_detail);
+    };
+    let when = match entry.age_secs(now) {
+        Some(secs) => human_age(secs),
+        None => format!("at {}", entry.at),
+    };
+    let what = clip(&entry.what(), 160);
+
+    if !live_ok {
+        // The actionable sentence is already first; the failure is context for
+        // it, and reads as history because it is dated.
+        return check(
+            false,
+            format!("{live_detail} · last failure {when}: {what}"),
+        );
+    }
+    match entry.cause() {
+        Cause::Upstream => check(
+            true,
+            format!("{live_detail} · history: the last failure was GitHub's own, {when} — {what}"),
+        ),
+        Cause::Local if entry.is_fresh(now) => check(
+            false,
+            format!(
+                "a dispatched run could not use the credential path {when} — {what}. The live \
+                 check cannot reproduce it, so read that run's own log rather than this box's \
+                 config · {live_detail}"
+            ),
+        ),
+        // Past the window, and — since `standing_failure` stops at a mint —
+        // demonstrably the last thing that went wrong rather than the newest of
+        // many. Both halves of "not happening now" are in the ledger.
+        Cause::Local => check(
+            true,
+            format!("{live_detail} · history: last failure {when} and none since — {what}"),
+        ),
+    }
+}
+
+/// How long ago, at the resolution a `doctor` line is read at: `2d ago`,
+/// `5h ago`, `12m ago`, `just now`.
+///
+/// Not [`gc::human_window`], which spells a *configured* window and so refuses
+/// to round — an age is never a round number of days, and `179100s ago` is not
+/// a sentence.
+fn human_age(secs: i64) -> String {
+    match secs {
+        s if s >= 86_400 => format!("{}d ago", s / 86_400),
+        s if s >= 3_600 => format!("{}h ago", s / 3_600),
+        s if s >= 60 => format!("{}m ago", s / 60),
+        _ => "just now".into(),
+    }
+}
+
+/// A quoted error, cut to something that fits on a `doctor` row. GitHub's 5xx
+/// bodies are prose and the whole of one buries every other check on screen.
+fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((at, _)) => format!("{}…", text[..at].trim_end()),
+        None => text.to_string(),
     }
 }
 
@@ -6020,6 +6118,172 @@ mod tests {
             "{}",
             unloaded.detail
         );
+    }
+
+    // ---- dispatched pushes: what a recorded failure is allowed to say (gh#515)
+
+    /// The live clause from the box gh#515 was reported on: healthy, and said
+    /// so in the present tense.
+    const HEALTHY: &str = "the askpass helper answers, and mints per push; `gh` at \
+                           /opt/homebrew/bin/gh is wrapped to mint per call";
+
+    fn ledger_failure(
+        now: chrono::DateTime<chrono::Utc>,
+        ago: chrono::Duration,
+        error: &str,
+    ) -> crate::credential_ledger::Entry {
+        crate::credential_ledger::Entry {
+            at: (now - ago).to_rfc3339(),
+            event: crate::credential_ledger::Event::Unusable,
+            tool: "dispatch".into(),
+            repo: "bredebjorhovd/comet-board".into(),
+            chat: Some("chat-1".into()),
+            error: Some(error.into()),
+        }
+    }
+
+    /// gh#515, exactly as printed: a two-day-old GitHub outage rendered as a
+    /// red FAIL, with the healthy present-tense state buried in front of it.
+    /// The operator went looking for a `gh` that had dropped off the PATH.
+    #[test]
+    fn a_two_day_old_github_outage_is_history_and_not_a_failure() {
+        let now = chrono::Utc::now();
+        let c = push_verdict(
+            Live::Working(HEALTHY.into()),
+            Some(ledger_failure(
+                now,
+                chrono::Duration::days(2),
+                "the askpass credential handoff … exited exit status: 1: Error: github HTTP 504 \
+                 for /repos/bredebjorhovd/comet-board: We couldn't respond to your request in \
+                 time.",
+            )),
+            now,
+        );
+        assert!(c.ok, "{}", c.detail);
+        // Said as history, dated, and attributed to the side that caused it.
+        assert!(c.detail.contains("history"), "{}", c.detail);
+        assert!(c.detail.contains("2d ago"), "{}", c.detail);
+        assert!(c.detail.contains("GitHub's own"), "{}", c.detail);
+        // And the healthy state is still there — it was never the wrong fact,
+        // only the wrong colour.
+        assert!(c.detail.starts_with(HEALTHY), "{}", c.detail);
+    }
+
+    /// An outage is not this box's problem at any age: the only action it could
+    /// ask for is "wait", and red does not mean wait.
+    #[test]
+    fn a_fresh_github_outage_is_still_not_this_boxs_fault() {
+        let now = chrono::Utc::now();
+        let c = push_verdict(
+            Live::Working(HEALTHY.into()),
+            Some(ledger_failure(
+                now,
+                chrono::Duration::minutes(20),
+                "github HTTP 503 for /repos/o/r: Service Unavailable",
+            )),
+            now,
+        );
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("20m ago"), "{}", c.detail);
+    }
+
+    /// The gh#233 shape survives: a run failed on something this box can fix,
+    /// it failed today, and the probe cannot reproduce it. Still red — and now
+    /// the actionable sentence leads instead of trailing.
+    #[test]
+    fn a_fresh_local_failure_the_probe_cannot_reproduce_still_leads_in_red() {
+        let now = chrono::Utc::now();
+        let c = push_verdict(
+            Live::Working(HEALTHY.into()),
+            Some(ledger_failure(
+                now,
+                chrono::Duration::hours(3),
+                "cannot exec the askpass shim",
+            )),
+            now,
+        );
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail
+                .starts_with("a dispatched run could not use the credential path 3h ago"),
+            "{}",
+            c.detail
+        );
+        // The healthy clause is context now, not the opening.
+        assert!(c.detail.contains(HEALTHY), "{}", c.detail);
+    }
+
+    /// Same failure, past the window. Nothing about the box changed, but a day
+    /// of nothing going wrong is the answer to "is this happening now".
+    #[test]
+    fn a_local_failure_ages_out_of_red() {
+        let now = chrono::Utc::now();
+        let c = push_verdict(
+            Live::Working(HEALTHY.into()),
+            Some(ledger_failure(
+                now,
+                chrono::Duration::hours(30),
+                "cannot exec the askpass shim",
+            )),
+            now,
+        );
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.starts_with(HEALTHY), "{}", c.detail);
+        assert!(c.detail.contains("and none since"), "{}", c.detail);
+    }
+
+    /// When the probe itself fails there is something to fix on this box right
+    /// now, so it opens the line and the ledger trails as context.
+    #[test]
+    fn a_broken_probe_leads_and_the_ledger_trails_it() {
+        let now = chrono::Utc::now();
+        let broken = "the credential path does not work — no dispatched agent on this box can \
+                      push with the board's App: cannot exec";
+        let c = push_verdict(
+            Live::Broken(broken.into()),
+            Some(ledger_failure(
+                now,
+                chrono::Duration::days(2),
+                "github HTTP 504 for /repos/o/r: We couldn't respond in time.",
+            )),
+            now,
+        );
+        assert!(!c.ok);
+        assert!(c.detail.starts_with(broken), "{}", c.detail);
+        assert!(c.detail.contains("last failure 2d ago"), "{}", c.detail);
+
+        // With nothing recorded, the probe's sentence is the whole line.
+        let c = push_verdict(Live::Broken(broken.into()), None, now);
+        assert!(!c.ok);
+        assert_eq!(c.detail, broken);
+    }
+
+    /// A healthy box with nothing standing against it says one thing.
+    #[test]
+    fn a_healthy_path_with_no_standing_failure_says_only_that() {
+        let c = push_verdict(Live::Working(HEALTHY.into()), None, chrono::Utc::now());
+        assert!(c.ok);
+        assert_eq!(c.detail, HEALTHY);
+    }
+
+    #[test]
+    fn an_age_is_written_the_way_it_is_read() {
+        assert_eq!(human_age(0), "just now");
+        assert_eq!(human_age(59), "just now");
+        assert_eq!(human_age(60), "1m ago");
+        assert_eq!(human_age(3_599), "59m ago");
+        assert_eq!(human_age(3_600), "1h ago");
+        assert_eq!(human_age(179_100), "2d ago");
+    }
+
+    /// GitHub's 5xx bodies are prose; the whole of one buries every check under
+    /// it. Clipping happens on a character boundary, whatever the bytes.
+    #[test]
+    fn a_quoted_error_is_clipped_without_splitting_a_character() {
+        assert_eq!(clip("short", 10), "short");
+        assert_eq!(clip("exactly-10", 10), "exactly-10");
+        assert_eq!(clip("more than ten", 10), "more than…");
+        assert_eq!(clip("måltid på øya", 6), "måltid…");
     }
 
     /// These checks read the provider, never the wire. Answering at all would

@@ -10,8 +10,9 @@
 //!
 //! - **Is there room to start another agent?** [`headroom`] — a slot count is
 //!   not a memory budget. Three slots of Next.js builds is not three slots of
-//!   doc edits, and the Mylder rule (§gh#526) held a swapless 16G box at 3-of-3
-//!   heavy builds until the kernel took the engine.
+//!   doc edits, and the Mylder rule held a swapless 16G box at 3-of-3 heavy
+//!   builds until the kernel took the engine (gh#526 — an incident, so no `§`:
+//!   it names no file in `docs/board/`).
 //! - **Did this run die because the box ran out?** [`OomWatch`] — armed when a
 //!   run starts, asked when its child dies on a signal. The answer is a delta
 //!   in the kernel's own OOM-kill counters, not a guess from the signal number.
