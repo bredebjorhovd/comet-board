@@ -36,6 +36,7 @@ use comet_proto::{
 use comet_rpc::methods;
 
 use crate::attachments::{self, StagedAttachment};
+use crate::drafts::DraftStore;
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
@@ -170,12 +171,29 @@ fn replace_with_queued_context(
 }
 
 fn clear_draft_provenance(
-    drafts: &mut HashMap<String, String>,
+    drafts: &mut DraftStore,
     context: &mut HashMap<String, Vec<ContextSelection>>,
     draft_key: &str,
 ) {
     drafts.remove(draft_key);
     context.remove(draft_key);
+}
+
+/// The key a draft (and its attachments, and its reference provenance) is
+/// filed under: the chat, or — on the new-chat canvas, which has no chat yet —
+/// the SPACE the canvas belongs to.
+///
+/// Space-scoped rather than one shared `""`, because the canvas is per space:
+/// a key that could not tell two spaces apart showed the prompt typed for one
+/// repo sitting in another repo's composer, one keypress from being sent
+/// there. (`ensure_skills` keys its own answers the same way, for the same
+/// reason.) A chat id is a uuid, so the `new:` prefix can never collide.
+fn draft_key(selected_chat: Option<&str>, selected_space: Option<&str>) -> String {
+    match (selected_chat, selected_space) {
+        (Some(chat), _) => chat.to_string(),
+        (None, Some(space)) => format!("new:{space}"),
+        (None, None) => String::new(),
+    }
 }
 
 fn take_context_selections(
@@ -1880,8 +1898,15 @@ pub struct Composer {
     input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
     pickers: Entity<Pickers>,
-    /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
-    drafts: HashMap<String, String>,
+    /// Unsent text per draft key ([`draft_key`]) — the composer's contents are
+    /// a per-chat draft, not per-view transient state, so every navigation
+    /// files the current text here and unfiles the destination's (gh#536).
+    /// Persisted device-locally: a draft outlives a quit, and never syncs.
+    drafts: DraftStore,
+    /// Where [`Self::drafts`] is written; `None` in tests that don't care.
+    data_dir: Option<PathBuf>,
+    /// In-flight debounced draft write.
+    draft_save_task: Option<Task<()>>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
@@ -1889,6 +1914,7 @@ pub struct Composer {
     preview: Option<attachments::PreviewImage>,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
+    /// What the composer is currently filed under — see [`draft_key`].
     current_key: String,
     /// Skills invocable by a run started from here (gh#134), as the chat's HOST
     /// answered — never this device's own `~/.claude`, which for a chat on the
@@ -1939,6 +1965,11 @@ pub struct Composer {
     /// The queued row the composer is editing, if any. Sending commits an edit
     /// against this id instead of queueing a new row.
     editing: Option<String>,
+    /// What the composer held before a queued-row edit borrowed it — the
+    /// draft and its reference provenance, handed back when the edit ends
+    /// (gh#536). Editing a follow-up is neither sending nor deleting, so it is
+    /// not one of the two things allowed to clear a prompt in progress.
+    edit_stash: Option<(crate::drafts::Draft, Option<Vec<ContextSelection>>)>,
     sending: bool,
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
@@ -1980,12 +2011,17 @@ pub struct Composer {
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
+    /// Flush the drafts on the way out — the debounced write is a task, and a
+    /// task does not survive the app it was scheduled in (gh#536).
+    _quit: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
-    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+    /// `data_dir` is where drafts are persisted (gh#536) — `None` keeps them
+    /// in memory only, which is what a test that never quits wants.
+    pub fn new(state: Entity<AppState>, data_dir: Option<PathBuf>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| ComposerInput::new("Do anything…", cx));
         let pickers = cx.new(|cx| Pickers::new(state.clone(), cx));
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
@@ -2004,6 +2040,11 @@ impl Composer {
                 if let Some(edit) = edit {
                     this.apply_context_edit(edit);
                 }
+                // Every keystroke updates the chat's draft. Filing it here
+                // rather than only on navigation is what makes a draft survive
+                // the ways of leaving that are not navigations at all — ⌘W,
+                // ⌘Q, a crash (gh#536).
+                this.record_draft(cx);
                 this.sync_menus(cx);
                 cx.notify();
             }
@@ -2027,12 +2068,29 @@ impl Composer {
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
         });
-        let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
+        let current_key = {
+            let s = state.read(cx);
+            draft_key(s.selected_chat.as_deref(), s.selected_space.as_deref())
+        };
+        // Drafts come off disk before the first paint, so the composer opens
+        // holding whatever was left in it — including across a full quit.
+        let drafts = data_dir
+            .as_deref()
+            .map(DraftStore::load)
+            .unwrap_or_default();
+        let restored = drafts.get(&current_key).cloned();
+        // ⌘Q inside the debounce window is still a quit with typing in it.
+        let quit = cx.on_app_quit(|composer: &mut Self, cx| {
+            composer.flush_drafts(cx);
+            async {}
+        });
         let mut composer = Self {
             state,
             input,
             pickers,
-            drafts: HashMap::new(),
+            drafts,
+            data_dir,
+            draft_save_task: None,
             attachments: HashMap::new(),
             preview: None,
             picker_task: None,
@@ -2059,6 +2117,7 @@ impl Composer {
             pending_queue_gestures: HashMap::new(),
             pending_queue_message_ids: HashMap::new(),
             editing: None,
+            edit_stash: None,
             sending: false,
             failure: None,
             wizard: None,
@@ -2080,7 +2139,13 @@ impl Composer {
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
+            _quit: quit,
         };
+        if let Some(draft) = restored {
+            composer.input.update(cx, |input, cx| {
+                input.set_text_with_caret(draft.text, draft.caret, cx)
+            });
+        }
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `COMET_ATTACH=/path/a.png[,/path/b.png]`, and
         // `COMET_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
@@ -2181,9 +2246,104 @@ impl Composer {
 
     /// Drop a deleted chat's per-chat composer state — staged attachments hold
     /// raw image bytes, and a deleted chat's stage could never be sent again.
-    pub fn purge_chat(&mut self, chat_id: &str) {
+    ///
+    /// Deleting the chat IS the user deleting the draft: one of the exactly
+    /// two things allowed to clear one (gh#536).
+    pub fn purge_chat(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         self.attachments.remove(chat_id);
-        self.drafts.remove(chat_id);
+        if self.drafts.remove(chat_id) {
+            self.schedule_draft_save(cx);
+        }
+        // The shell deselects a deleted chat before it purges, so the input is
+        // normally already showing something else. If it is not, the text on
+        // screen belongs to a chat that no longer exists — leaving it would
+        // re-file it under the next key the composer takes.
+        if self.current_key == chat_id {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+        }
+    }
+
+    // ---- drafts (gh#536) ----
+
+    /// File the input's current text under the current key, and schedule the
+    /// write. Called on every edit and before every navigation, so the store
+    /// is never behind what is on screen by more than a keystroke.
+    fn record_draft(&mut self, cx: &mut Context<Self>) {
+        // The wizard's free-text override and a queued-row edit both borrow
+        // the same input for text that is not this chat's prompt; neither may
+        // overwrite the draft the user had going. Both hand it back when they
+        // are done.
+        if self.wizard.is_some() || self.editing.is_some() {
+            return;
+        }
+        let (text, caret) = {
+            let input = self.input.read(cx);
+            (input.text().to_string(), input.caret())
+        };
+        let key = self.current_key.clone();
+        if self
+            .drafts
+            .set(&key, &text, caret, chrono::Utc::now().timestamp_millis())
+        {
+            self.schedule_draft_save(cx);
+        }
+    }
+
+    /// Hand back the draft a queued-row edit borrowed the composer from. With
+    /// nothing stashed this is the plain clear the edit paths used to do.
+    fn restore_stashed_draft(&mut self, cx: &mut Context<Self>) {
+        let Some((draft, provenance)) = self.edit_stash.take() else {
+            self.clear_input_and_provenance(cx);
+            return;
+        };
+        // The edit's own reference provenance goes with the edit.
+        self.context_ref_checkouts.remove(&self.current_key);
+        if let Some(provenance) = provenance {
+            self.context_ref_checkouts
+                .insert(self.current_key.clone(), provenance);
+        }
+        let caret = draft.caret;
+        self.input.update(cx, |input, cx| {
+            input.set_text_with_caret(draft.text, caret, cx)
+        });
+    }
+
+    /// Debounced write of the whole store (it is a few kilobytes of text; the
+    /// debounce is about not touching the disk on every keystroke, not about
+    /// the cost of the write itself). Re-scheduling cancels the pending timer.
+    fn schedule_draft_save(&mut self, cx: &mut Context<Self>) {
+        let Some(dir) = self.data_dir.clone() else {
+            return;
+        };
+        self.draft_save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(crate::drafts::SAVE_DEBOUNCE_MS))
+                .await;
+            let Ok(snapshot) = this.update(cx, |composer, _| composer.drafts.clone()) else {
+                return;
+            };
+            cx.background_executor()
+                .spawn(async move {
+                    if let Err(err) = snapshot.save(&dir) {
+                        tracing::warn!(error = %err, "failed to persist composer drafts");
+                    }
+                })
+                .await;
+        }));
+    }
+
+    /// Write the drafts NOW, on the calling thread. The debounce above is a
+    /// task, and a task does not outlive the app that scheduled it: ⌘Q inside
+    /// the debounce window would otherwise drop the last thing typed.
+    pub fn flush_drafts(&mut self, cx: &mut Context<Self>) {
+        self.record_draft(cx);
+        self.draft_save_task = None;
+        let Some(dir) = self.data_dir.as_deref() else {
+            return;
+        };
+        if let Err(err) = self.drafts.save(dir) {
+            tracing::warn!(error = %err, "failed to persist composer drafts");
+        }
     }
 
     /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
@@ -2282,19 +2442,19 @@ impl Composer {
         let (key, pending) = {
             let s = self.state.read(cx);
             (
-                s.selected_chat.clone().unwrap_or_default(),
+                draft_key(s.selected_chat.as_deref(), s.selected_space.as_deref()),
                 pending_input_request(&s.transcript),
             )
         };
 
         // Draft swap on chat navigation — the input entity itself survives.
         if key != self.current_key {
-            let old_text = self.input.read(cx).text().to_string();
-            if old_text.is_empty() {
-                self.drafts.remove(&self.current_key);
-            } else {
-                self.drafts.insert(self.current_key.clone(), old_text);
-            }
+            // A queued-row edit belongs to the chat whose plan the row is in:
+            // leaving ends it, handing that chat's own draft back before the
+            // swap files it. (Carried across, the next Enter would have
+            // committed an edit against another chat's queue.)
+            self.stop_editing(cx);
+            self.record_draft(cx);
             let draft = self.drafts.get(&key).cloned().unwrap_or_default();
             self.current_key = key;
             self.failure = None;
@@ -2311,7 +2471,11 @@ impl Composer {
             self.flip_morph = None;
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
-            self.input.update(cx, |input, cx| input.set_text(draft, cx));
+            // Text AND caret: a draft comes back where it was left, not with
+            // the caret dumped at its end.
+            self.input.update(cx, |input, cx| {
+                input.set_text_with_caret(draft.text, draft.caret, cx)
+            });
         }
 
         // Question panel lifecycle (wizard state cached per request id).
@@ -2834,6 +2998,7 @@ impl Composer {
             &mut self.context_ref_checkouts,
             &self.current_key,
         );
+        self.schedule_draft_save(cx);
     }
 
     fn apply_context_edit(&mut self, edit: &ComposerTextEdit) {
@@ -3017,6 +3182,15 @@ impl Composer {
             return;
         };
         let prompt = row.prompt.clone();
+        // Park the prompt in progress (and whose checkout its references came
+        // from) for the length of the edit.
+        self.edit_stash = Some((
+            self.drafts
+                .get(&self.current_key)
+                .cloned()
+                .unwrap_or_default(),
+            self.context_ref_checkouts.remove(&self.current_key),
+        ));
         replace_with_queued_context(
             &mut self.context_ref_checkouts,
             &self.current_key,
@@ -3036,7 +3210,7 @@ impl Composer {
         if self.editing.take().is_none() {
             return;
         }
-        self.clear_input_and_provenance(cx);
+        self.restore_stashed_draft(cx);
         self.input
             .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
         cx.notify();
@@ -3333,8 +3507,10 @@ impl Composer {
             cx.notify();
         });
 
+        // Sending it is one of the two things that may clear a draft.
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&draft_key);
+        self.schedule_draft_save(cx);
         self.failure = None;
         self.sending = true;
         cx.emit(ComposerEvent::Sent {
@@ -3551,7 +3727,25 @@ impl Composer {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         cx.notify();
                     });
-                    composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    // The prompt goes back to the chat it was written for, not
+                    // to whatever is on screen when the failure lands: a send
+                    // can outlive the navigation away from it, and handing one
+                    // chat's prompt to another chat's composer is how a draft
+                    // gets sent somewhere it was never meant to go. If that
+                    // chat IS on screen the input shows it again, as before.
+                    let caret = restore_text.len();
+                    composer.drafts.set(
+                        &err_chat_id,
+                        &restore_text,
+                        caret,
+                        chrono::Utc::now().timestamp_millis(),
+                    );
+                    composer.schedule_draft_save(cx);
+                    if composer.current_key == err_chat_id {
+                        composer
+                            .input
+                            .update(cx, |input, cx| input.set_text(restore_text, cx));
+                    }
                     if let Some(provenance) = picked_provenance {
                         composer
                             .context_ref_checkouts
@@ -5338,10 +5532,11 @@ mod tests {
             token_start: 5,
             token_end: text.len(),
         };
-        let mut drafts = HashMap::from([("chat-a".into(), text.into())]);
+        let mut drafts = DraftStore::default();
+        drafts.set("chat-a", text, text.len(), 0);
         let mut context = HashMap::from([("chat-a".into(), vec![selection])]);
         clear_draft_provenance(&mut drafts, &mut context, "chat-a");
-        assert!(!drafts.contains_key("chat-a"));
+        assert!(drafts.get("chat-a").is_none());
         assert!(selected_context_refs(text, context.get("chat-a")).is_empty());
     }
 
@@ -5559,5 +5754,243 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    // ---- drafts (gh#536) -------------------------------------------------
+    //
+    // The composer's contents belong to the chat, not to the view: these tests
+    // are the four acceptance cases from the ticket, minus the phone.
+
+    fn draft_chat(id: &str, space: &str) -> comet_proto::Chat {
+        comet_proto::Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: Some(space.into()),
+            last_seen_at: None,
+            forked_from: None,
+        }
+    }
+
+    /// A composer over a temp data dir, with two chats in one space to
+    /// navigate between.
+    fn draft_fixture(
+        cx: &mut gpui::TestAppContext,
+        dir: &std::path::Path,
+    ) -> (Entity<AppState>, Entity<Composer>) {
+        let state = cx.new(|_| {
+            let mut state = AppState::new();
+            state.chats = vec![
+                draft_chat("chat-a", "space-1"),
+                draft_chat("chat-b", "space-1"),
+            ];
+            state.selected_space = Some("space-1".into());
+            state
+        });
+        let composer = cx.new(|cx| Composer::new(state.clone(), Some(dir.to_path_buf()), cx));
+        (state, composer)
+    }
+
+    fn type_into(composer: &Entity<Composer>, text: &str, cx: &mut gpui::TestAppContext) {
+        composer.update(cx, |composer, cx| {
+            let input = composer.input.clone();
+            input.update(cx, |input, cx| input.set_text(text, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    fn select(state: &Entity<AppState>, chat: Option<&str>, cx: &mut gpui::TestAppContext) {
+        state.update(cx, |s, cx| {
+            s.select_chat(chat.map(str::to_string), cx);
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn queued_row(id: &str, prompt: &str) -> comet_doc::QueueRow {
+        comet_doc::QueueRow {
+            id: id.into(),
+            prompt: prompt.into(),
+            context: Vec::new(),
+            attachments: Vec::new(),
+            message_id: "m1".into(),
+            issued_by: "dev".into(),
+            issued_at: 0,
+            edited: false,
+        }
+    }
+
+    fn shown(composer: &Entity<Composer>, cx: &mut gpui::TestAppContext) -> String {
+        composer.read_with(cx, |composer, cx| {
+            composer.input.read(cx).text().to_string()
+        })
+    }
+
+    #[gpui::test]
+    async fn a_draft_survives_navigation_and_comes_back_with_its_caret(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, composer) = draft_fixture(cx, dir.path());
+        select(&state, Some("chat-a"), cx);
+        type_into(&composer, "three\nlines\nhere", cx);
+        // Park the caret in the middle: leaving is not an excuse to move it.
+        composer.update(cx, |composer, cx| {
+            let input = composer.input.clone();
+            input.update(cx, |input, cx| {
+                input.set_text_with_caret("three\nlines\nhere", 6, cx)
+            });
+        });
+        cx.run_until_parked();
+
+        select(&state, Some("chat-b"), cx);
+        assert_eq!(shown(&composer, cx), "", "chat-b has no draft of its own");
+        type_into(&composer, "b's own words", cx);
+
+        select(&state, Some("chat-a"), cx);
+        assert_eq!(shown(&composer, cx), "three\nlines\nhere");
+        assert_eq!(
+            composer.read_with(cx, |composer, cx| composer.input.read(cx).caret()),
+            6,
+            "the caret comes back where it was left"
+        );
+        // Two chats, two drafts, each still its own.
+        select(&state, Some("chat-b"), cx);
+        assert_eq!(shown(&composer, cx), "b's own words");
+    }
+
+    #[gpui::test]
+    async fn a_draft_survives_a_quit(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let (state, composer) = draft_fixture(cx, dir.path());
+            select(&state, Some("chat-a"), cx);
+            type_into(&composer, "half a thought", cx);
+            // What ⌘Q runs.
+            composer.update(cx, |composer, cx| composer.flush_drafts(cx));
+        }
+        // A fresh app over the same data dir: the composer opens holding it.
+        let (state, composer) = draft_fixture(cx, dir.path());
+        select(&state, Some("chat-a"), cx);
+        assert_eq!(shown(&composer, cx), "half a thought");
+    }
+
+    #[gpui::test]
+    async fn the_two_things_that_clear_a_draft(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, composer) = draft_fixture(cx, dir.path());
+        select(&state, Some("chat-a"), cx);
+        type_into(&composer, "typed then deleted", cx);
+        // (1) The user empties it.
+        type_into(&composer, "", cx);
+        select(&state, Some("chat-b"), cx);
+        select(&state, Some("chat-a"), cx);
+        assert_eq!(shown(&composer, cx), "");
+        // (2) Sending it — `send` needs an engine, so this is the clear the
+        // send path performs, which is also the queue-edit/wizard clear.
+        type_into(&composer, "sent", cx);
+        composer.update(cx, |composer, cx| composer.clear_input_and_provenance(cx));
+        cx.run_until_parked();
+        select(&state, Some("chat-b"), cx);
+        select(&state, Some("chat-a"), cx);
+        assert_eq!(shown(&composer, cx), "");
+        // Deleting the chat takes its draft with it.
+        type_into(&composer, "about to be deleted", cx);
+        composer.update(cx, |composer, cx| composer.purge_chat("chat-a", cx));
+        select(&state, Some("chat-b"), cx);
+        select(&state, Some("chat-a"), cx);
+        assert_eq!(shown(&composer, cx), "");
+    }
+
+    #[gpui::test]
+    async fn each_space_canvas_keeps_its_own_new_chat_draft(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, composer) = draft_fixture(cx, dir.path());
+        // The new-chat canvas of space-1.
+        select(&state, None, cx);
+        type_into(&composer, "for the first repo", cx);
+        // The same canvas in another space is another canvas.
+        state.update(cx, |s, cx| {
+            s.selected_space = Some("space-2".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            shown(&composer, cx),
+            "",
+            "one space's prompt must not turn up in another space's composer"
+        );
+        type_into(&composer, "for the second repo", cx);
+        state.update(cx, |s, cx| {
+            s.selected_space = Some("space-1".into());
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(&composer, cx), "for the first repo");
+    }
+
+    #[gpui::test]
+    async fn a_queued_row_edit_hands_the_draft_back(cx: &mut gpui::TestAppContext) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, composer) = draft_fixture(cx, dir.path());
+        select(&state, Some("chat-a"), cx);
+        type_into(&composer, "half a thought", cx);
+
+        composer.update(cx, |composer, cx| {
+            composer.queue = QueueView {
+                rows: vec![queued_row("row-1", "the queued follow-up")],
+                ..QueueView::default()
+            };
+            composer.start_editing("row-1", cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(shown(&composer, cx), "the queued follow-up");
+
+        // Cancelling the edit is neither sending nor deleting, so the prompt
+        // in progress comes back rather than being cleared.
+        composer.update(cx, |composer, cx| composer.stop_editing(cx));
+        cx.run_until_parked();
+        assert_eq!(shown(&composer, cx), "half a thought");
+    }
+
+    #[gpui::test]
+    async fn leaving_mid_edit_ends_the_edit_in_the_chat_it_started_in(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, composer) = draft_fixture(cx, dir.path());
+        select(&state, Some("chat-a"), cx);
+        type_into(&composer, "half a thought", cx);
+        composer.update(cx, |composer, cx| {
+            composer.queue = QueueView {
+                rows: vec![queued_row("row-1", "the queued follow-up")],
+                ..QueueView::default()
+            };
+            composer.start_editing("row-1", cx);
+        });
+        cx.run_until_parked();
+
+        select(&state, Some("chat-b"), cx);
+        assert!(
+            composer.read_with(cx, |composer, _| composer.editing.is_none()),
+            "the edit does not follow you into another chat's queue"
+        );
+        assert_eq!(shown(&composer, cx), "", "chat-b's own composer is empty");
+        select(&state, Some("chat-a"), cx);
+        assert_eq!(
+            shown(&composer, cx),
+            "half a thought",
+            "and chat-a kept its draft"
+        );
     }
 }

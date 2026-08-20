@@ -213,8 +213,23 @@ struct ComposerView: View {
         _ in ContextSearch(matches: [], truncated: false)
     }
 
-    @State private var text = ""
-    @State private var context: [ContextRef] = []
+    /// The composer's contents are the CHAT's, not this view's (gh#536). A
+    /// `@State` string here died every time the view did — navigating away,
+    /// the question panel taking the composer's place, the system reclaiming a
+    /// backgrounded app — and took a half-written prompt with it.
+    private var drafts: DraftStore { .shared }
+    private var draftKey: String { DraftStore.key(chat: chat.id) }
+
+    private var text: String {
+        get { drafts.text(for: draftKey) }
+        nonmutating set { drafts.setText(newValue, for: draftKey) }
+    }
+
+    private var context: [ContextRef] {
+        get { drafts.context(for: draftKey) }
+        nonmutating set { drafts.setContext(newValue, for: draftKey) }
+    }
+
     @State private var contextMatches: [ContextRef] = []
     @State private var contextCheckoutId: String?
     @State private var showContextPicker = false
@@ -241,7 +256,7 @@ struct ComposerView: View {
                 noticeLine(sendNotice)
             }
             ComposerShell(
-                draft: $text,
+                draft: drafts.textBinding(for: draftKey),
                 sendEnabled: true,
                 showStop: runLive,
                 busy: uploading,
@@ -480,9 +495,11 @@ struct ComposerView: View {
         return store.sendRun(prompt: content, chat: chat, context: context, attachments: paths)
     }
 
+    /// Called only once a send is known to have landed (gh#535): the draft is
+    /// the chat's, so clearing it on a write the ledger refused would lose a
+    /// prompt that was never sent.
     private func clearDraft() {
-        text = ""
-        context = []
+        drafts.clear(draftKey)
         // The clear above is unconditional, so a prompt left sitting in the
         // composer after a successful send is not this path failing to run —
         // it is the text view writing the pre-send string back. A focused
@@ -517,9 +534,7 @@ struct ComposerView: View {
             }
             attachments = []
             sendNotice = nil
-            text = ""
-            context = []
-            Task { @MainActor in text = "" }
+            clearDraft()
         }
     }
 

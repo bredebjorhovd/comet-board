@@ -101,6 +101,12 @@ final class AppModel {
             SyncSpecRunner.run()
             return
         }
+        // The composer's per-chat drafts (gh#536). A file and a dictionary —
+        // no network, no session.
+        if args.contains("-drafts-spec") {
+            DraftsSpecRunner.run()
+            return
+        }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return
