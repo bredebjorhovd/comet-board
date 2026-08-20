@@ -94,6 +94,12 @@ final class AppModel {
             SyncSpecRunner.run()
             return
         }
+        // The composer's per-chat drafts (gh#536). A file and a dictionary —
+        // no network, no session.
+        if args.contains("-drafts-spec") {
+            DraftsSpecRunner.run()
+            return
+        }
         // What the clipboard and the share sheet get (gh#534). Pure string
         // building over the row model — no network, no session.
         if args.contains("-copy-spec") {

@@ -17,7 +17,17 @@ struct NewSessionView: View {
     @AppStorage("newSessionModel") private var storedModel = ""
     @AppStorage("newSessionReasoning") private var storedReasoning = ""
 
-    @State private var draft = ""
+    /// The canvas's prompt is the SPACE's draft, not this view's (gh#536):
+    /// pushing a chat, backgrounding the app, or coming back tomorrow all keep
+    /// what was typed for this repo — and keep it out of the next repo's
+    /// canvas.
+    private var drafts: DraftStore { .shared }
+    private var draftKey: String { DraftStore.key(newSessionIn: spaceId) }
+    private var draft: String {
+        get { drafts.text(for: draftKey) }
+        nonmutating set { drafts.setText(newValue, for: draftKey) }
+    }
+
     @State private var showPicker = false
     @State private var showRefPicker = false
     @State private var showCheckoutPicker = false
@@ -141,7 +151,7 @@ struct NewSessionView: View {
 
     private var composer: some View {
         ComposerShell(
-            draft: $draft,
+            draft: drafts.textBinding(for: draftKey),
             placeholder: "Do anything…",
             sendEnabled: space != nil,
             showStop: false,
@@ -318,7 +328,7 @@ struct NewSessionView: View {
             }
             store.sendRun(prompt: prompt, chat: chat)
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            draft = ""
+            drafts.clear(draftKey)
             busy = false
             // Replace the canvas with the live session (in-place swap, no
             // back-through-canvas).

@@ -24,6 +24,10 @@ struct CometApp: App {
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .background {
                         model.flushDocs()
+                        // Backgrounding is where a phone's "quit" happens: the
+                        // system can reclaim the app without warning, and the
+                        // draft debounce is a task that dies with it (gh#536).
+                        DraftStore.shared.flush()
                     }
                     // Coming back to the app IS the presence poll (gh#145):
                     // rooms no longer beat, so the answer is refreshed when
