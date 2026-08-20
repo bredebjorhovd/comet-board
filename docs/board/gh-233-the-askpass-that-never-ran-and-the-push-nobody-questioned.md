@@ -77,7 +77,10 @@ anything odd.
 - **`doctor` runs the path** rather than counting its parts. The old check —
   a credential exists, a binary resolves — is exactly the check gh#233 passed.
   It also surfaces the last recorded failure, because a failure that happened
-  inside somebody's run beats one synthesised for a diagnostic.
+  inside somebody's run beats one synthesised for a diagnostic. Since gh#515 it
+  surfaces only the one still *standing* — the probe is the present tense, and
+  a failure the path has since minted past, or one GitHub caused two days ago,
+  is history and is coloured as history.
 - **The conventions say it outright.** `docs/agent-conventions.md` and the
   shipped skill now tell a dispatched agent that a push which cannot
   authenticate is a stop, not a puzzle to route around: say so, and do not write
