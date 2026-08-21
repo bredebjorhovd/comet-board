@@ -291,6 +291,11 @@ actor RoomClient {
     func start() {
         closed = false
         protocolParked = false
+        // Known from the moment it is opened, so the banner's denominator is
+        // the rooms this app holds rather than only the ones already in
+        // trouble — "8 of 22" needs the 22 (gh#527).
+        let room = roomId
+        Task { @MainActor in RoomHealth.shared.opening(room: room) }
         // Crash resume, before the first dial: a recovery interrupted between
         // quarantine and acknowledgement finishes here, replaying the
         // quarantined content into whatever document this client holds.
@@ -306,6 +311,10 @@ actor RoomClient {
     func stop() {
         closed = true
         generation += 1
+        // Closed on purpose: drop it from the health census rather than
+        // leaving a room the app no longer holds on the ladder forever.
+        let room = roomId
+        Task { @MainActor in RoomHealth.shared.forget(room: room) }
         receiveTask?.cancel()
         pingTask?.cancel()
         livenessTask?.cancel()
@@ -408,11 +417,23 @@ actor RoomClient {
         // died redialed at 250ms with no ceiling — see
         // `ReconnectBackoff.healthySessionNs`.
         let healthy = ReconnectBackoff.isHealthy(joinedAt: joinedAt)
+        let joined = joinedLor
         let delay = backoff.nextDelayMs(healthy: healthy)
         // The decision, in the log, because "why is this room quiet" is
         // answered by `healthy` and nothing else: a false there is a room that
         // is climbing the ladder rather than stuck.
         roomLog.warning("room \(self.roomId, privacy: .public): redialing in \(delay)ms (joined=\(self.joinedLor), healthy=\(healthy), rung=\(self.backoff.rungMs)ms)")
+        // …and in the UI (gh#527). This exact line, 22 times, is what the app
+        // knew on 2026-08-19 while showing a transcript that merely looked
+        // quiet. `joined && !healthy` is the join-then-die shape — the edge
+        // answering and then dropping — which is a different fault from an
+        // edge that cannot be reached, and the banner has to be able to say
+        // which one it is.
+        let rung = backoff.rungMs
+        let room = roomId
+        Task { @MainActor in
+            RoomHealth.shared.redialing(room: room, rungMs: rung, joined: joined, healthy: healthy)
+        }
         Task {
             try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
             await self.connect()
@@ -620,6 +641,12 @@ actor RoomClient {
                 }
             }
             roomLog.info("room \(self.roomId, privacy: .public): joined")
+            // Off the ladder (gh#527). Note this fires on the JOIN, not on a
+            // healthy session: the banner's job is to clear the moment the
+            // room is usable again, while the ladder's own reset still waits
+            // for a session that lasted — the two answer different questions.
+            let joinedRoom = roomId
+            Task { @MainActor in RoomHealth.shared.joined(room: joinedRoom) }
             // Join presence once the doc room is up.
             await send(.joinRequest(crdt: .loroEphemeral, roomId: roomId, auth: [], version: []))
             events(.connected)

@@ -78,6 +78,7 @@ enum SyncSpecRunner {
         theIncidentReplaysEveryLocalEntry()
         anInterruptedRecoveryFinishesOnTheNextLaunch()
         aLiveRoomIsNotAConvergedRoom()
+        aSilentTranscriptSaysWhyItIsSilent()
         githubPushTupleRoundTrips()
 
         log(failures == 0
@@ -200,6 +201,63 @@ enum SyncSpecRunner {
         // The subtraction is unsigned; an underflow would read as healthy.
         expect(ReconnectBackoff.isHealthy(joinedAt: after(1_000_000_000), now: joined), false,
                "a clock that ran backwards is not a working session")
+    }
+
+    /// gh#527: the app knew, and said nothing.
+    ///
+    /// 22 rooms on a maxed-out ladder, logged 22 times, and a transcript that
+    /// read as a conversation nobody had answered yet. These are the rules that
+    /// turn that into a sentence on screen: one dropped socket is not a
+    /// degraded app, a room that answers and then dies is a different fault
+    /// from one that cannot be reached, and whatever the banner knows must come
+    /// off the phone as text — during the incident nothing could.
+    private static func aSilentTranscriptSaysWhyItIsSilent() {
+        let health = RoomHealth.shared
+        let now = Date()
+        for index in 0..<22 { health.opening(room: "chat-\(index)") }
+        expectTrue(!health.snapshot.degraded, "22 healthy rooms are not a degraded app")
+
+        // One room, one dropped socket: ordinary life on a phone (a lid, a
+        // tunnel, an edge deploy). A banner here is a banner people scroll past.
+        health.redialing(room: "chat-0", rungMs: ReconnectBackoff.baseMs * 2,
+                         joined: true, healthy: true, now: now)
+        expectTrue(!health.snapshot.degraded,
+                   "one room mid-reconnect is not a degraded app")
+
+        // The incident: every room joining, dying inside 30s, and laddering.
+        for index in 0..<22 {
+            health.redialing(room: "chat-\(index)", rungMs: ReconnectBackoff.capMs,
+                             joined: true, healthy: false, now: now)
+        }
+        let degraded = health.snapshot
+        expectTrue(degraded.degraded, "22 rooms on the ladder is a degraded app")
+        expect(degraded.laddered, 22, "every room is counted")
+        expect(degraded.known, 22, "and the denominator is the rooms held")
+        expect(degraded.diedYoungLastHour, 22,
+               "a room that ANSWERS and dies is counted as churn, not as unreachable")
+        expectTrue(degraded.headline.contains("replies delayed"),
+                   "the headline says the consequence first: \(degraded.headline)")
+        expectTrue(degraded.headline.contains("22 of 22 rooms"),
+                   "and the count that only the log had: \(degraded.headline)")
+        expectTrue(degraded.detail.contains("answering and then dropping"),
+                   "the detail names WHICH failure this is: \(degraded.detail)")
+
+        // What comes off the phone. Tonight's version of this was a paraphrase
+        // over SSH.
+        let report = RoomHealth.diagnosticsText(snapshot: degraded, at: now)
+        expectTrue(report.contains("rooms on the backoff ladder: 22"), "the ladder count")
+        expectTrue(report.contains("worst rung: 30000ms"), "the rung it is stuck at")
+        expectTrue(report.contains("joined and died inside 30s, last hour: 22"),
+                   "the churn, in the same words every other side uses")
+        expectTrue(report.contains("chat-0"), "and the rooms, named")
+
+        // A room that comes back clears itself — the banner must not outlive
+        // the fault, or it becomes the next thing nobody reads.
+        for index in 0..<22 { health.joined(room: "chat-\(index)") }
+        expectTrue(!health.snapshot.degraded, "rooms that rejoin clear the banner")
+        expect(health.snapshot.diedYoungLastHour, 22,
+               "though the hour's churn is still counted, because it still happened")
+        for index in 0..<22 { health.forget(room: "chat-\(index)") }
     }
 
     /// gh#450 review: queueing may already hold the old document when recovery

@@ -78,6 +78,12 @@ import { AlarmArmer } from "./alarm";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { createMetaStore, type MetaStore } from "./meta";
 import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
+import {
+  YOUNG_SOCKET_MS,
+  createSocketLedger,
+  type SocketDeath,
+  type SocketLedger
+} from "./socket-log";
 import { AUTH_ORG_HEADER, AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -141,6 +147,10 @@ let wasmPoisonStrikes = 0;
  * thrash. Aborting early turns a silent hours-long wedge into a seconds-long
  * blip (sockets close, clients redial into a fresh isolate). */
 const WASM_POISON_ABORT_AFTER = 3;
+/** How long the abort waits for its own reason to become durable (gh#527).
+ * Short: the abort is the point, the marker is a courtesy to whoever reads the
+ * room next. Long enough for one storage sync on a healthy DO. */
+const ABORT_SYNC_GRACE_MS = 250;
 /** Free a quiet room's materialized doc after this long. Wasm linear memory
  * NEVER shrinks and outlives DO instances (one wasm module per isolate), so
  * docs held resident until instance eviction leak permanently — every
@@ -167,6 +177,51 @@ const IMPORT_PENALTY_MS = 10 * 60 * 1000;
  * silence — the box exists to stop ~1MB doomed reassemblies, and a bounded
  * small import costs ~nothing even when it fails. */
 const PENALTY_PROBE_MAX_BYTES = 4096;
+/** Persisted bytes (snapshot + update log) one cold materialization may
+ * attempt to import (gh#527).
+ *
+ * The failure this bounds is the one that cannot be caught: a doc big enough
+ * that importing it exceeds the DO's CPU/memory budget takes the whole
+ * invocation with it, so `ensureDoc` never returns, no catch runs, and the
+ * client sees a socket that answered the join and then died 1006 — the same
+ * signature as the duration cap and the `ctx.abort()` escalation, which is why
+ * the 2026-08-19 incident could not tell the three apart. A room past this
+ * line therefore refuses to load AT ALL, cheaply and before any wasm call, and
+ * says so ([`DocLoadRefused`] → `JoinError`): a clean refusal a client backs
+ * off from is strictly better than an abort loop nobody can read.
+ *
+ * The number is the inbound bound this room already enforces
+ * (`MAX_REASSEMBLED_BYTES`): no single push above 32MB is accepted, so a
+ * persisted doc above it is not something the fleet can legitimately have
+ * produced. Real rooms live three orders of magnitude below it — the
+ * 2026-08-04 whale imports were ~2MB and TRIM_FORCE_BYTES presses rooms toward
+ * 512KB — so this is a backstop, not a policy. */
+export const MAX_DOC_LOAD_BYTES = 32 * 1024 * 1024;
+/** Consecutive load refusals before the room evicts its own stored state and
+ * lets the fleet reseed it (gh#148/#207).
+ *
+ * Same shape and the same reasoning as `REPLAY_CRASH_LIMIT`: a room whose
+ * stored doc cannot be loaded is a room no client can ever repair by dialing
+ * it, and every engine holds the full doc locally and re-uploads what the
+ * server lacks on its next join. Bounded so a refusal that heals on its own
+ * (a corrupt blob replaced by a fold) never costs the room its history. */
+export const LOAD_REFUSAL_LIMIT = 3;
+
+/** The room refuses to materialize its doc — too large to import, or stored
+ * bytes that will not decode. Carried out to the join as a `JoinError` rather
+ * than left to kill the invocation, which is the whole point (see
+ * [`MAX_DOC_LOAD_BYTES`]). Never a wasm-poisoning strike: nothing about this
+ * says the heap is unwell. */
+export class DocLoadRefused extends Error {
+  constructor(
+    readonly detail: string,
+    readonly bytes: number
+  ) {
+    super(`doc load refused (${bytes}B): ${detail}`);
+    this.name = "DocLoadRefused";
+  }
+}
+
 /** A wasm-bindgen wrapper whose `free()` already ran has `__wbg_ptr === 0`;
  * any method call on it throws `Error("null pointer passed to rust")`. Several
  * flows (trim, fold, alarm, idle release) free-and-replace the cached doc
@@ -204,6 +259,13 @@ interface SocketState {
   /** Accept time — the liveness floor until the socket's first auto-pong,
    * mirroring `DeviceRoom`'s `SocketState.joinedAt`. */
   joinedAt?: number;
+  /** This socket's ledger id (gh#527). The attachment is the ONLY place it can
+   * live: it survives hibernation and instance eviction with the socket, which
+   * is what lets the next wake tell a socket that closed from one that
+   * vanished when the instance was killed under it (see socket-log.ts).
+   * Absent on sockets attached by a deploy older than gh#527 — those simply
+   * contribute nothing to the census. */
+  sid?: string;
 }
 
 /** Ephemeral key prefix for device presence (`presence/{deviceId}` → ms).
@@ -383,6 +445,9 @@ export class SessionRoom implements DurableObject {
   private readonly env: Env;
   private readonly blobs: BlobStore;
   private readonly meta: MetaStore;
+  /** Socket lifecycle census (gh#527) — the record of WHY sockets died, kept
+   * durably because the deaths that matter take the invocation with them. */
+  private readonly sockets: SocketLedger;
   private readonly dailyAlarm: AlarmArmer;
   /** Lazily materialized doc — the log is authoritative; this is a cache. */
   private doc: LoroDoc | undefined;
@@ -421,6 +486,7 @@ export class SessionRoom implements DurableObject {
     this.dailyAlarm = new AlarmArmer(ctx.storage);
     ensureUpdateLog(ctx.storage.sql);
     this.meta = createMetaStore(ctx.storage.sql);
+    this.sockets = createSocketLedger(ctx.storage.sql, this.meta);
     this.blobs = createBlobStore(ctx.storage.sql);
     // Protocol-designed hibernation keepalive: ping → pong without waking us.
     // NOTE (2026-07-30 incident): precisely BECAUSE the runtime answers these
@@ -458,17 +524,29 @@ export class SessionRoom implements DurableObject {
       const chatId = url.searchParams.get("chatId") ?? "";
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
       const deviceId = url.searchParams.get("deviceId") ?? "";
+      // A dial is a wake, and a wake is the moment to ask what happened to the
+      // sockets we thought we had. A room killed mid-life (duration cap,
+      // eviction, ctx.abort) ran no close handler for any of them, so this is
+      // the only place their deaths are ever recorded (gh#527).
+      this.reconcileSockets();
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
+      const now = Date.now();
+      const sid = this.newSocketId();
       const state: SocketState = {
         userId,
         rooms: [],
-        joinedAt: Date.now(),
+        joinedAt: now,
+        sid,
         ...(orgId ? { orgId } : {}),
         ...(workspace ? { workspace } : {}),
         ...(deviceId ? { deviceId } : {})
       };
       pair[1].serializeAttachment(state);
+      // Written AFTER the accept but before anything that can die: an accept
+      // row that outlives its socket is the signal, so a missing row would
+      // silently un-count exactly the deaths this exists to catch.
+      this.sockets.opened(sid, deviceId || undefined, now);
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -512,6 +590,11 @@ export class SessionRoom implements DurableObject {
       // every other read (org-membership-gated for workspace and shared rooms).
       if (!mayRead) return refuse();
       try {
+        // Attribute vanished sockets before reporting: /stats is often the
+        // FIRST thing anyone asks a room after an incident, and a census that
+        // still counted the dead as open would be the same lie the engine's
+        // "N of N live" gauge told all evening (gh#527).
+        this.reconcileSockets();
         await this.flush();
         const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
           ?.n as number;
@@ -553,7 +636,25 @@ export class SessionRoom implements DurableObject {
           replayAttempts: Number(this.getMeta("replayAttempts") ?? "0"),
           // Per-device %LOR attribution (in-memory: since this instance woke).
           importPenalty: [...this.importPenalty].map(([device, e]) => ({ device, ...e })),
-          pushOutcomes: [...this.pushOutcomes].map(([device, e]) => ({ device, ...e }))
+          pushOutcomes: [...this.pushOutcomes].map(([device, e]) => ({ device, ...e })),
+          // WHY SOCKETS DIED (gh#527). Durable, unlike everything above it that
+          // is scoped to this instance — which is the point: the deaths worth
+          // reading about are the ones that took an instance with them.
+          // `vanished` is the killer that logs nothing; `diedYoungLastHour` is
+          // the churn rate the engine's live-connection gauge cannot see.
+          sockets: this.sockets.census(Date.now()),
+          // The load guard and the last time this room refused to materialize
+          // (see MAX_DOC_LOAD_BYTES).
+          docLoad: {
+            guardBytes: MAX_DOC_LOAD_BYTES,
+            storedBytes: this.storedDocBytes(),
+            refusals: Number(this.getMeta("loadRefusals") ?? "0"),
+            limit: LOAD_REFUSAL_LIMIT,
+            lastRefusal: this.readJsonMeta("lastLoadRefusal")
+          },
+          // The last time THIS room aborted its own instance, and why — the
+          // half of a 1006 storm that is our doing rather than the platform's.
+          lastAbort: this.readJsonMeta("lastAbort")
         });
       } catch (e) {
         // The one observability surface must never die as a bare 1101/500 —
@@ -706,6 +807,29 @@ export class SessionRoom implements DurableObject {
           ws.close(1002, "Unsupported message");
       }
     } catch (e) {
+      if (e instanceof DocLoadRefused) {
+        // A refusal is an ANSWER (gh#527), not a failure: the room has already
+        // logged why it will not load and counted it toward the reseed. Say so
+        // on the wire so the client parks on its long backoff instead of
+        // hot-dialing a room that cannot serve it, and never strike the wasm
+        // tripwire — the heap is fine, the stored doc is not.
+        console.warn(
+          "refusing a join: this room will not load",
+          `room=${this.getMeta("chatId") ?? "?"}`,
+          `device=${state?.deviceId ?? "unattributed"}`,
+          e.message
+        );
+        if (decoded.type === MessageType.JoinRequest) {
+          this.send(ws, {
+            type: MessageType.JoinError,
+            crdt: decoded.crdt,
+            roomId: decoded.roomId,
+            code: JoinErrorCode.AppError,
+            message: e.message
+          });
+        }
+        return;
+      }
       // A handler that dies pre-answer used to fail in SILENCE: the client
       // waits out its 15s join deadline, redials, and dies the same way —
       // the 2026-08-04 fleet-wide join wedge. Log attributed, answer an
@@ -732,7 +856,19 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  async webSocketClose(ws: WebSocket): Promise<void> {
+  async webSocketClose(
+    ws: WebSocket,
+    code?: number,
+    reason?: string,
+    wasClean?: boolean
+  ): Promise<void> {
+    // THE ASK of gh#527: the edge must say why a socket died. The runtime hands
+    // us the code and reason and this handler used to drop both on the floor,
+    // so even the deaths we DO observe were unattributed — a tail full of
+    // `canceled` invocations and nothing to say whether the peer went away, we
+    // closed it (4410 room reset, 1011 broadcast failure), or the transport
+    // broke.
+    this.noteSocketDeath(ws, "close", code, reason, wasClean);
     this.fragments.delete(ws);
     // A socket leaving IS the presence event — and it already woke us, so
     // announcing it costs nothing beyond the wake we were paying anyway.
@@ -749,7 +885,8 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  async webSocketError(ws: WebSocket): Promise<void> {
+  async webSocketError(ws: WebSocket, error?: unknown): Promise<void> {
+    this.noteSocketDeath(ws, "error", undefined, error === undefined ? undefined : String(error));
     this.fragments.delete(ws);
     this.publishPresence(ws);
     try {
@@ -758,6 +895,102 @@ export class SessionRoom implements DurableObject {
       console.error("flush on socket error failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
       this.escalateWasmPoisoning(e);
     }
+  }
+
+  /** Record an OBSERVED socket death and say so in the journal (gh#527).
+   *
+   * The log line carries what the 2026-08-19 diagnosis had to guess at: the
+   * close code and reason, how long the socket lived, whose device it was, and
+   * how big this room's stored doc is — the three-way discriminator between a
+   * peer that went away, a room we closed on purpose, and a room whose own doc
+   * is the thing killing it. Never throws: a close handler that dies is
+   * invisible, and this is the surface that exists to end invisibility. */
+  private noteSocketDeath(
+    ws: WebSocket,
+    kind: "close" | "error",
+    code?: number,
+    reason?: string,
+    wasClean?: boolean
+  ): void {
+    try {
+      const state = ws.deserializeAttachment() as SocketState | null;
+      const death = this.sockets.died(state?.sid, kind, Date.now(), code, reason);
+      const young = death !== undefined && death.ageMs >= 0 && death.ageMs < YOUNG_SOCKET_MS;
+      const line = [
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${state?.deviceId ?? "unattributed"}`,
+        `kind=${kind}`,
+        `code=${code ?? "-"}`,
+        `reason=${reason ?? "-"}`,
+        `wasClean=${wasClean ?? "-"}`,
+        `ageMs=${death?.ageMs ?? "unknown"}`,
+        `docBytes=${this.storedDocBytes()}`
+      ];
+      // A young death is the incident shape (a room that answers the join and
+      // dies), so it is a warning; an ordinary hang-up is a log line.
+      if (young) console.warn("session socket died young", ...line);
+      else console.log("session socket closed", ...line);
+    } catch (e) {
+      console.error("socket death bookkeeping failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+    }
+  }
+
+  /** Attribute the sockets that died with NO handler — the killer that does
+   * not log (see socket-log.ts). Runs on wakes, never throws. */
+  private reconcileSockets(): void {
+    try {
+      const liveIds: string[] = [];
+      for (const ws of this.ctx.getWebSockets()) {
+        const state = ws.deserializeAttachment() as SocketState | null;
+        if (state?.sid) liveIds.push(state.sid);
+      }
+      const deaths = this.sockets.reconcile(liveIds, Date.now());
+      if (deaths.length === 0) return;
+      // The line the tail did not have. "Vanished" is a claim about the ROOM,
+      // not the client: nothing in this instance closed these sockets, so
+      // whatever ended them ended an invocation too.
+      console.error(
+        "sockets vanished with no close event (the instance was killed under them)",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `count=${deaths.length}`,
+        `devices=${[...new Set(deaths.map((d) => d.deviceId ?? "unattributed"))].join(",")}`,
+        `ages=${deaths.map((d: SocketDeath) => d.ageMs).join(",")}`,
+        `docBytes=${this.storedDocBytes()}`,
+        `lastAbort=${this.getMeta("lastAbort") || "none"}`
+      );
+    } catch (e) {
+      console.error("socket reconcile failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+    }
+  }
+
+  /** Persisted doc size (snapshot + update log) without materializing either —
+   * the cheap number every death line carries, because "how big is this room"
+   * is the first question asked of a room that keeps dying. */
+  private storedDocBytes(): number {
+    try {
+      return this.blobs.size("snapshot") + Number(this.getMeta("updateBytes") ?? "0");
+    } catch {
+      return -1;
+    }
+  }
+
+  /** A JSON meta value, or null. Never throws: these are diagnostics, and
+   * /stats is the surface that must answer when everything else has stopped
+   * (see the catch below it). */
+  private readJsonMeta(key: string): unknown {
+    const raw = this.getMeta(key);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      return { unparseable: raw.slice(0, 200) };
+    }
+  }
+
+  private newSocketId(): string {
+    const bytes = new Uint8Array(8);
+    crypto.getRandomValues(bytes);
+    return bytesToHex(bytes);
   }
 
   /** RangeError("Invalid array buffer length") / wasm RuntimeError are the
@@ -780,7 +1013,37 @@ export class SessionRoom implements DurableObject {
       /* already poisoned beyond freeing */
     }
     this.doc = undefined;
-    this.ctx.abort("loro-wasm heap exhausted; recycling isolate");
+    // gh#527: leave the reason DURABLY behind before the instance dies. An
+    // abort severs every socket — the clients read 1006 — and takes the
+    // invocation with it, so the console line above is the only account and
+    // may never ship. This marker is what lets the next wake's socket
+    // reconcile say "we did this, and here is why" instead of leaving
+    // `vanished` sockets to be blamed on the duration cap. `sync()` is what
+    // makes it survive: an abort discards uncommitted writes.
+    this.recordAbort(`wasm heap poisoned after ${wasmPoisonStrikes} strikes: ${String(e)}`);
+  }
+
+  /** Persist why this instance is about to die, then die (gh#527).
+   *
+   * Ordered on purpose: mark → sync → abort, with a bounded fallback so a
+   * storage sync that never settles cannot leave a poisoned instance running.
+   * Aborting twice is harmless; not aborting at all is the wedge this
+   * escalation exists to break. */
+  private recordAbort(reason: string): void {
+    const abortNow = (): void => {
+      try {
+        this.ctx.abort(reason);
+      } catch {
+        /* already aborted / already gone */
+      }
+    };
+    try {
+      this.setMeta("lastAbort", JSON.stringify({ at: Date.now(), reason }).slice(0, 512));
+    } catch {
+      /* storage refused the marker; the abort still has to happen */
+    }
+    setTimeout(abortNow, ABORT_SYNC_GRACE_MS);
+    this.ctx.storage.sync().then(abortNow, abortNow);
   }
 
   private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
@@ -1238,10 +1501,36 @@ export class SessionRoom implements DurableObject {
     // redialing on their join deadline (crates/sync/src/room.rs) supply the
     // attempts, and the room self-heals within REPLAY_CRASH_LIMIT dials.
     await this.ctx.storage.sync();
+    // LOAD GUARD (gh#527), before any wasm call: a doc whose stored bytes are
+    // past MAX_DOC_LOAD_BYTES is refused rather than attempted. Sized off the
+    // chunk rows, so asking the question costs nothing like answering it.
+    const storedBytes = this.blobs.size("snapshot") + Number(this.getMeta("updateBytes") ?? "0");
+    if (storedBytes > MAX_DOC_LOAD_BYTES) {
+      this.refuseLoad(`stored doc exceeds the load guard (${MAX_DOC_LOAD_BYTES}B)`, storedBytes);
+    }
     const started = Date.now();
     const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
-    if (snapshot && snapshot.length > 0) doc.import(snapshot);
+    if (snapshot && snapshot.length > 0) {
+      try {
+        doc.import(snapshot);
+      } catch (e) {
+        // Heap poisoning is a different fault with its own escalation — never
+        // let it be mistaken for a corrupt blob, or a pressed isolate would
+        // talk healthy rooms into evicting their history.
+        if (e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e)) {
+          doc.free();
+          throw e;
+        }
+        // Stored bytes that will not decode. Every cold start dies here
+        // forever otherwise — the room answers each join and then throws,
+        // which is the 1006 loop from the client's side and, when the throw
+        // happens to be a RangeError, an abort loop from ours. Refuse
+        // cleanly instead; LOAD_REFUSAL_LIMIT then evicts and reseeds.
+        doc.free();
+        this.refuseLoad(`snapshot will not import: ${String(e)}`, storedBytes);
+      }
+    }
     let rows = 0;
     for (const update of readUpdateRows(this.ctx.storage.sql)) {
       rows++;
@@ -1276,6 +1565,10 @@ export class SessionRoom implements DurableObject {
     const replayMs = Date.now() - started;
     this.setMeta("lastReplayMs", String(replayMs));
     this.setMeta("lastReplayRows", String(rows));
+    // The doc loaded: whatever the guard was refusing is gone (a fold replaced
+    // the bad snapshot, a trim shrank the room, an eviction reseeded it).
+    // Consecutive, like every other budget here.
+    this.setMeta("loadRefusals", "0");
     console.log(
       `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`,
       `room=${this.getMeta("chatId") ?? "?"}`
@@ -1303,6 +1596,59 @@ export class SessionRoom implements DurableObject {
       console.log(`history trimmed on cold start room=${this.getMeta("chatId") ?? "?"}`);
     }
     return this.doc;
+  }
+
+  /** Refuse to materialize, and count it (gh#527).
+   *
+   * The refusal itself is the fix: an unloadable doc that is ATTEMPTED kills
+   * the invocation, and a killed invocation is a socket that died 1006 with
+   * nothing logged and a client that redials into the identical death. A
+   * refusal is a `JoinError` the client can back off from, a line in the
+   * journal, and a number on `/stats`.
+   *
+   * Past LOAD_REFUSAL_LIMIT consecutive refusals the room evicts its own
+   * stored state (gh#148/#207): a doc no instance can load is a doc no client
+   * can repair by dialing, and every engine holds the full document locally
+   * and re-uploads what the server lacks on its next join. `dropLog` sets
+   * `postReset`, so the R2 disaster copy is NOT overwritten by the emptied
+   * doc — the eviction is recoverable in both directions.
+   *
+   * Never returns. */
+  private refuseLoad(detail: string, bytes: number): never {
+    const refusals = Number(this.getMeta("loadRefusals") ?? "0") + 1;
+    this.setMeta("loadRefusals", String(refusals));
+    this.setMeta(
+      "lastLoadRefusal",
+      JSON.stringify({ at: Date.now(), detail, bytes }).slice(0, 512)
+    );
+    console.error(
+      "refusing to load this room's doc",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `bytes=${bytes}`,
+      `guard=${MAX_DOC_LOAD_BYTES}`,
+      `refusals=${refusals}/${LOAD_REFUSAL_LIMIT}`,
+      detail
+    );
+    if (refusals >= LOAD_REFUSAL_LIMIT) {
+      console.error(
+        "evicting unloadable stored state; the fleet reseeds this room on rejoin",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `bytes=${bytes}`
+      );
+      this.dropLog();
+      this.setMeta("loadRefusals", "0");
+      // Boot attached sockets exactly like the wedge break does: a redial with
+      // an empty VV re-uploads full state, where a live session's next writes
+      // would carry deps the emptied doc lacks and fail forever.
+      for (const sock of this.ctx.getWebSockets()) {
+        try {
+          sock.close(4411, "room reseed");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+    throw new DocLoadRefused(detail, bytes);
   }
 
   /** Idle-doc release (see DOC_IDLE_RELEASE_MS): a debounced timer frees the
@@ -1590,6 +1936,10 @@ export class SessionRoom implements DurableObject {
    * join, /tail read, or write revives it — see [`reviveAlarm`]. `backupDirty`
    * is deliberately left set through all of this: the work is still owed. */
   async alarm(): Promise<void> {
+    // The one wake with no client behind it — and therefore the only chance a
+    // room that lost every socket at 03:00 has to record that it happened
+    // before the next dial (gh#527).
+    this.reconcileSockets();
     const failures = Number(this.getMeta("alarmFailures") ?? "0");
     if (failures >= ALARM_FAILURE_LIMIT) {
       // Reached only when the runtime retries an invocation that died where

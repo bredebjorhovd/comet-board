@@ -20,4 +20,4 @@ pub use fork::{
     ChatLineage, CopyReason, ForkCheckout, ForkContext, ForkPoint, ForkRequest, ForkResult,
     TranscriptTruncation, decide_context,
 };
-pub use health::{EdgeHealth, RoomConvergence};
+pub use health::{EdgeHealth, RoomChurn, RoomConvergence};

@@ -1066,12 +1066,21 @@ fn agent_instructions_check(
 
 /// Which edge connections the engine on this box actually holds (gh#116).
 ///
-/// Fails on exactly one state — [`EdgeHealth::dark`]: an engine wired to an
-/// edge, holding none of it. That is the state nobody could see. A room or two
-/// down is reported and not failed, because a client that has just dropped is
-/// already redialing and doctor must not cry wolf at every edge deploy; an
-/// engine that could not be asked is not failed either, since the `engine`
-/// check above already says so, loudly and once.
+/// Fails on two states, both of which are "this engine is not reachable and
+/// does not know it".
+///
+/// [`EdgeHealth::dark`] — wired to an edge, holding none of it — is the state
+/// gh#116 could not see. [`EdgeHealth::churning`] is the state gh#527 could
+/// not see, and it is the more dangerous of the two precisely because every
+/// other reading is green: the rooms keep JOINING, so a point-in-time census
+/// counts them live, and they keep dying, so nothing typed on a phone is ever
+/// answered. On 2026-08-19 this check printed "10 of 10 live" and passed for
+/// an entire evening while the fleet was in a dial/die/redial loop.
+///
+/// A room or two down is still reported and not failed: a client that has just
+/// dropped is already redialing and doctor must not cry wolf at every edge
+/// deploy. An engine that could not be asked is not failed either, since the
+/// `engine` check above already says so, loudly and once.
 fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
     let Some(edge) = edge else {
         return Check {
@@ -1087,9 +1096,17 @@ fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
              a few minutes; if this persists, restart the engine (`comet daemon restart`)",
         );
     }
+    if edge.churning() {
+        detail.push_str(
+            ". Rooms that answer a join and then die are the edge failing MID-SESSION, not \
+             refusing: check the edge's own account of it (a room's `/stats` now reports \
+             which sockets vanished and whether it aborted itself), and check whether the \
+             Workers plan's duration cap is the thing killing them",
+        );
+    }
     Check {
         name: "edge connections".into(),
-        ok: !edge.dark(),
+        ok: !edge.dark() && !edge.churning(),
         detail,
     }
 }
@@ -3948,6 +3965,50 @@ mod tests {
         assert!(
             check.detail.contains("workspace room down"),
             "{}",
+            check.detail
+        );
+    }
+
+    /// gh#527: the state the box was actually in on 2026-08-19 — every socket
+    /// live when asked, every room dying a second later, nothing reaching the
+    /// phone. Doctor passed this all evening. It must not any more.
+    #[test]
+    fn an_engine_whose_rooms_keep_dying_fails_even_though_every_socket_is_live() {
+        let (_d, p) = tmp();
+        let churning = EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            host_relay: Some(true),
+            workspace_room: Some(true),
+            org_registry: Some(true),
+            chat_rooms_open: 7,
+            chat_rooms_live: 7,
+            rooms_churning: 8,
+            sessions_died_young_last_hour: 61,
+            churning_rooms: vec![comet_proto::RoomChurn {
+                room_id: "ws4/org/user".into(),
+                died_young_last_hour: 22,
+                sessions_last_hour: 22,
+            }],
+            ..EdgeHealth::default()
+        };
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            Some(&churning),
+            None,
+            None,
+        )
+        .unwrap();
+        let check = edge_check_in(&checks);
+        assert!(!churning.dark(), "the sockets really are live");
+        assert!(!check.ok, "{}", check.detail);
+        assert!(check.detail.contains("10 of 10 live"), "{}", check.detail);
+        assert!(check.detail.contains("CHURNING"), "{}", check.detail);
+        assert!(
+            check.detail.contains("duration cap"),
+            "the check has to say where to look: {}",
             check.detail
         );
     }

@@ -9,6 +9,11 @@ export const CHUNK_BYTES = 1_500_000;
 export interface BlobStore {
   put(name: string, bytes: Uint8Array): void;
   get(name: string): Uint8Array | undefined;
+  /** Byte length without materializing the blob — `SUM(LENGTH(bytes))` over
+   * the chunk rows. The load guard (gh#527) has to know how big a snapshot is
+   * BEFORE deciding whether to import it, and a size read that costs a full
+   * `get` would be the same hazard it is trying to bound. */
+  size(name: string): number;
   delete(name: string): void;
 }
 
@@ -36,6 +41,12 @@ export const createBlobStore = (sql: SqlStorage): BlobStore => {
         off += p.length;
       }
       return out;
+    },
+    size(name) {
+      const rows = [
+        ...sql.exec("SELECT COALESCE(SUM(LENGTH(bytes)), 0) AS n FROM blobs WHERE name = ?", name)
+      ];
+      return Number(rows[0]?.n ?? 0);
     },
     delete(name) {
       sql.exec("DELETE FROM blobs WHERE name = ?", name);

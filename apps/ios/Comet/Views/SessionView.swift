@@ -282,6 +282,13 @@ struct SessionView: View {
         let status = liveStatus(chat: chat)
         return VStack(spacing: 0) {
             forkStrip(chat: chat)
+            // Above the transcript, for the same reason the fork strip is:
+            // it changes how everything below it should be read. A transcript
+            // with nothing in it means one thing when the rooms are up and
+            // another entirely when they are not, and until gh#527 the app
+            // knew which and did not say (the 22/22 ladder count lived only in
+            // the log).
+            SyncDegradedStrip()
             // The status strip floats over the transcript's faded bottom edge
             // instead of stacking below it — the loader sits on the
             // transparent zone and content is never pushed around.
