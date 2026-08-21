@@ -1066,16 +1066,29 @@ fn agent_instructions_check(
 
 /// Which edge connections the engine on this box actually holds (gh#116).
 ///
-/// Fails on two states, both of which are "this engine is not reachable and
-/// does not know it".
+/// Fails on three states, each of them "this box is not doing its job and does
+/// not know it". They are three because the ways of failing are three, and
+/// every one of them was found the same way: by being green through an
+/// incident.
 ///
-/// [`EdgeHealth::dark`] — wired to an edge, holding none of it — is the state
-/// gh#116 could not see. [`EdgeHealth::churning`] is the state gh#527 could
-/// not see, and it is the more dangerous of the two precisely because every
-/// other reading is green: the rooms keep JOINING, so a point-in-time census
-/// counts them live, and they keep dying, so nothing typed on a phone is ever
-/// answered. On 2026-08-19 this check printed "10 of 10 live" and passed for
-/// an entire evening while the fleet was in a dial/die/redial loop.
+/// - [`EdgeHealth::dark`] — wired to an edge, holding none of it (gh#116);
+/// - [`EdgeHealth::churning`] — the rooms keep JOINING, so a point-in-time
+///   census counts them live, and they keep dying, so nothing typed on a phone
+///   is ever answered (gh#527). On 2026-08-19 this check printed "10 of 10
+///   live" and passed all evening;
+/// - [`EdgeHealth::content_stuck`] — the sockets are up and the CONTENT is not
+///   moving (gh#483). An engine at "18 of 18 live" with 262 entries that exist
+///   on one device passed this check too, which is the gh#527 review's finding:
+///   churn blindness was fixed and convergence blindness was not.
+///
+/// The third one is graded on the narrow predicate rather than on
+/// [`EdgeHealth::live_but_unconverged`], and that is the whole reason it can be
+/// graded at all: "unacknowledged" includes the write somebody made half a
+/// second ago. A check that failed on that would be red all day and read by
+/// nobody, which is a worse outcome than the blindness it replaces. Refused
+/// content, or content unacknowledged past the alert threshold on a live
+/// socket, is a different claim — and the summary still SAYS the in-flight case
+/// either way.
 ///
 /// A room or two down is still reported and not failed: a client that has just
 /// dropped is already redialing and doctor must not cry wolf at every edge
@@ -1104,9 +1117,18 @@ fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
              Workers plan's duration cap is the thing killing them",
         );
     }
+    if edge.content_stuck() {
+        detail.push_str(
+            ". Sockets being up is not content moving: this device holds entries that exist \
+             NOWHERE else, and the named rooms above are where they are. Open one and check \
+             its convergence state (`comet status`); a blocked room needs the edge to accept \
+             this device's history, a stalled one needs someone to find out why the acks \
+             stopped",
+        );
+    }
     Check {
         name: "edge connections".into(),
-        ok: !edge.dark() && !edge.churning(),
+        ok: !edge.dark() && !edge.churning() && !edge.content_stuck(),
         detail,
     }
 }
@@ -4011,6 +4033,80 @@ mod tests {
             "the check has to say where to look: {}",
             check.detail
         );
+    }
+
+    /// The gh#527 review's finding, which is gh#483's state: 18 of 18 rooms
+    /// live, and 262 entries that exist on one device. Doctor printed ok.
+    #[test]
+    fn an_engine_whose_content_is_stuck_fails_even_though_every_socket_is_live() {
+        let (_d, p) = tmp();
+        let stuck = EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            host_relay: Some(true),
+            workspace_room: Some(true),
+            org_registry: Some(true),
+            chat_rooms_open: 15,
+            chat_rooms_live: 15,
+            chat_rooms_unconverged: 1,
+            chat_rooms_stalled: 1,
+            unacknowledged_entries: 262,
+            unconverged_rooms: vec![comet_proto::RoomConvergence {
+                chat_id: "b5b3c796".into(),
+                state: "pending 262".into(),
+                unacknowledged_entries: 262,
+            }],
+            ..EdgeHealth::default()
+        };
+        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&stuck), None, None)
+            .unwrap();
+        let check = edge_check_in(&checks);
+        assert!(!stuck.dark() && !stuck.churning(), "sockets and rooms are fine");
+        assert!(!check.ok, "{}", check.detail);
+        assert!(check.detail.contains("18 of 18 live"), "{}", check.detail);
+        assert!(check.detail.contains("STALLED"), "{}", check.detail);
+        assert!(
+            check.detail.contains("NOWHERE else"),
+            "the check has to say what is at stake: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("b5b3c796"),
+            "and which chat to open: {}",
+            check.detail
+        );
+    }
+
+    /// The other half of that grade, and the reason it is not simply
+    /// `live_but_unconverged`: a write made a moment ago is what a working box
+    /// looks like. Reported, never failed.
+    #[test]
+    fn content_in_flight_is_reported_but_does_not_fail() {
+        let (_d, p) = tmp();
+        let in_flight = EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            host_relay: Some(true),
+            workspace_room: Some(true),
+            org_registry: Some(true),
+            chat_rooms_open: 3,
+            chat_rooms_live: 3,
+            chat_rooms_unconverged: 1,
+            unacknowledged_entries: 2,
+            ..EdgeHealth::default()
+        };
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            Some(&in_flight),
+            None,
+            None,
+        )
+        .unwrap();
+        let check = edge_check_in(&checks);
+        assert!(in_flight.live_but_unconverged(), "it is still SAID");
+        assert!(check.ok, "{}", check.detail);
+        assert!(check.detail.contains("not converged"), "{}", check.detail);
     }
 
     /// No answer from the engine is the `engine` check's failure to report, not

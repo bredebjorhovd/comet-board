@@ -69,6 +69,18 @@ pub struct EdgeHealth {
     /// Chat rooms mid shallow-history recovery right now.
     #[serde(default)]
     pub chat_rooms_recovering: usize,
+    /// Chat rooms whose content has been unacknowledged past
+    /// `comet_sync::UNACKNOWLEDGED_ALERT` while the socket stayed live.
+    ///
+    /// The subset of [`Self::chat_rooms_unconverged`] that is a FAULT rather
+    /// than a moment (gh#527 review). A write in flight is what a healthy fleet
+    /// looks like most seconds of the day; two minutes of it on a live socket
+    /// is gh#483's incident happening again, and the difference is the only
+    /// thing that lets a health check grade content at all without failing on
+    /// every keystroke. Zero from an engine too old to report it, which is the
+    /// right fallback: it cannot see the state, so it must not be failed for it.
+    #[serde(default)]
+    pub chat_rooms_stalled: usize,
     /// Chat rooms the edge refuses content from: live, and local-only.
     #[serde(default)]
     pub chat_rooms_blocked: usize,
@@ -170,6 +182,27 @@ impl EdgeHealth {
         self.live() > 0 && (self.chat_rooms_unconverged > 0 || self.chat_rooms_blocked > 0)
     }
 
+    /// Content that is not merely in flight but STUCK: the edge refuses it, or
+    /// it has gone unacknowledged past the alert threshold on a live socket.
+    ///
+    /// [`Self::live_but_unconverged`] is the honest description of the gh#483
+    /// state and the right thing to SAY; this is the narrower thing a health
+    /// check may FAIL on. The distinction is the whole reason doctor could
+    /// grade churn but not convergence: "unacknowledged" includes the write
+    /// somebody made half a second ago, and a check that failed on that would
+    /// be red all day and read by nobody. Two minutes on a live socket, or an
+    /// outright refusal, is a different claim — and it is the one that was true
+    /// of an engine sitting at 18 of 18 live with 262 entries that existed
+    /// nowhere else.
+    ///
+    /// This is the fleet-wide form of `ConvergenceState::needs_attention` —
+    /// "blocked always; pending only once it has outlasted the alert
+    /// threshold", which gh#483 already wrote per room. The rule was there; no
+    /// health surface was asking it.
+    pub fn content_stuck(&self) -> bool {
+        self.chat_rooms_blocked > 0 || self.chat_rooms_stalled > 0
+    }
+
     /// The state gh#527 went dark in: sockets that keep coming back and rooms
     /// that never stay up. Distinct from both [`Self::dark`] (nothing live at
     /// all) and [`Self::live_but_unconverged`] (live, and content stuck) — a
@@ -267,6 +300,17 @@ impl EdgeHealth {
                 " — {} chat room(s) BLOCKED/local-only: the edge refuses this device's \
                  history and {} entr(ies) exist nowhere else",
                 self.chat_rooms_blocked, self.unacknowledged_entries
+            ));
+        } else if self.chat_rooms_stalled > 0 {
+            // The distinction a health check can act on (gh#527 review): this
+            // content is not in flight, it has been sitting on a LIVE socket
+            // past the alert threshold. Said in its own words rather than
+            // folded into "not converged", because the two grade differently
+            // and an operator reading the line is deciding whether to look.
+            detail.push_str(&format!(
+                " — {} chat room(s) STALLED: {} local entr(ies) unacknowledged by the edge \
+                 past the alert threshold on a live socket (this is not lag)",
+                self.chat_rooms_stalled, self.unacknowledged_entries
             ));
         } else if self.chat_rooms_unconverged > 0 {
             detail.push_str(&format!(
@@ -488,6 +532,55 @@ mod tests {
         let summary = online().summary();
         assert!(!summary.contains("CHURNING"), "{summary}");
         assert!(!online().churning());
+    }
+
+    /// The gh#527 review's finding: churn blindness was fixed and convergence
+    /// blindness was not. `live_but_unconverged` is the honest description and
+    /// the right thing to say; `content_stuck` is the narrower thing a health
+    /// check may fail on, and the difference is a write in flight versus a
+    /// write that has been in flight for two minutes on a live socket.
+    #[test]
+    fn content_in_flight_and_content_stuck_are_different_claims() {
+        let in_flight = EdgeHealth {
+            chat_rooms_unconverged: 1,
+            unacknowledged_entries: 3,
+            ..online()
+        };
+        assert!(in_flight.live_but_unconverged(), "it IS unconverged");
+        assert!(
+            !in_flight.content_stuck(),
+            "…and a check that failed on this would be red on every keystroke"
+        );
+
+        let stalled = EdgeHealth {
+            chat_rooms_unconverged: 1,
+            chat_rooms_stalled: 1,
+            unacknowledged_entries: 262,
+            ..online()
+        };
+        assert!(stalled.content_stuck());
+        let summary = stalled.summary();
+        assert!(summary.contains("5 of 5 live"), "{summary}");
+        assert!(summary.contains("1 chat room(s) STALLED"), "{summary}");
+        assert!(summary.contains("262 local entr(ies)"), "{summary}");
+        assert!(
+            summary.contains("this is not lag"),
+            "the line has to say which of the two it is: {summary}"
+        );
+
+        // Refusal needs no threshold: the edge has said no.
+        let blocked = EdgeHealth {
+            chat_rooms_unconverged: 1,
+            chat_rooms_blocked: 1,
+            unacknowledged_entries: 74,
+            ..online()
+        };
+        assert!(blocked.content_stuck());
+        assert!(blocked.summary().contains("BLOCKED/local-only"));
+
+        // And an engine too old to report stalled-ness is not failed for a
+        // state it cannot see.
+        assert!(!online().content_stuck());
     }
 
     #[test]

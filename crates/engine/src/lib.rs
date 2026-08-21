@@ -603,6 +603,7 @@ fn edge_health(
         chat_rooms_live,
         chat_rooms_unconverged: convergence.unconverged,
         chat_rooms_recovering: convergence.recovering,
+        chat_rooms_stalled: convergence.stalled,
         chat_rooms_blocked: convergence.blocked,
         unacknowledged_entries: convergence.unacknowledged_entries,
         unconverged_rooms: convergence.rooms,

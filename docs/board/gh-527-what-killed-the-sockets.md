@@ -94,6 +94,30 @@ names the worst rooms in its one-line summary, and `comet-board doctor` now
 **fails** on it — with the two places to look, because the reading that precedes
 it is the one that talked an operator out of looking.
 
+### 3b. …and the same check stopped being blind to stuck content
+
+Review finding on this ticket: the new grade was `!dark() && !churning()` and
+still did not consult convergence, so an engine at "18 of 18 live" holding 262
+entries that exist on one device — gh#483's own state — printed `ok`. Churn
+blindness fixed, convergence blindness not.
+
+It is graded now, on `content_stuck()` rather than on
+`live_but_unconverged()`, and the difference is why it could be graded at all:
+"unacknowledged" includes the write somebody made half a second ago, and a check
+that failed on that would be red all day and read by nobody — a worse outcome
+than the blindness it replaces. `content_stuck()` is the fleet-wide form of the
+rule gh#483 already wrote per room (`ConvergenceState::needs_attention`:
+blocked always, pending only once it has outlasted the alert threshold). The
+rule was there; no health surface was asking it. `chat_rooms_stalled` carries it
+up through the census, defaulting to zero from an engine too old to report it,
+which is the right fallback — it cannot see the state, so it must not be failed
+for it.
+
+Still not done, and still gh#483's: the phone renders neither. It has
+`SessionStore.convergenceState` and no view reads it, so a stranded transcript
+on the phone looks exactly like a converged one. gh#527's strip says why a room
+is not connected, not why a connected room's content is not moving.
+
 ### 4. The phone says it out loud
 
 `apps/ios/Comet/Sync/RoomHealth.swift` and the strip above the transcript. The
