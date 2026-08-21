@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 /// resets at UTC midnight, so a per-hour rate is what distinguishes a cap just
 /// hit from a room that has been dying all day. Matches `CHURN_WINDOW_MS` in
 /// edge/src/socket-log.ts, which counts the same deaths from the other end.
-pub const CHURN_WINDOW: Duration = Duration::from_secs(60 * 60);
+pub const CHURN_WINDOW: Duration = Duration::from_secs(3_600);
 
 /// Ends retained per room. The ladder caps at one dial per 30s, so an hour of
 /// the worst possible churn is ~120 — this is that with room to spare, and it

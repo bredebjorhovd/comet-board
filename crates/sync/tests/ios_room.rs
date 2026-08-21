@@ -294,8 +294,10 @@ fn the_rust_still_gates_the_reset_and_jitters_the_wait() {
 
 /// The shape on the phone: one type owns the ladder, and the redial path asks
 /// it for both decisions. The defect gh#405 fixed was an assignment of the base
-/// rung sitting in the join handler — so the base is nameable in exactly one
-/// file, and a second one is the bug growing back.
+/// rung sitting in the join handler — so the ladder is DECIDED in exactly one
+/// file, and a second decision is the bug growing back. Reading
+/// `ReconnectBackoff.baseMs` from elsewhere is the opposite of that defect (one
+/// source of truth, consulted), and is allowed; assigning from it is not.
 #[test]
 fn the_phone_ladder_has_one_owner() {
     let client = room_client_swift();
@@ -324,7 +326,24 @@ fn the_phone_ladder_has_one_owner() {
             for (ix, line) in text.lines().enumerate() {
                 // The comment in RoomClient that names the old defect is
                 // prose, not a schedule.
-                if line.contains("baseMs") && !line.trim_start().starts_with("//") {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                // A QUALIFIED read of the owner's constant is the healthy
+                // pattern, not the defect (gh#527's degraded-state threshold
+                // is derived from the base rung, which is exactly how a second
+                // reader should get it). What gh#405 fixed was an
+                // ASSIGNMENT — a second place that decides the ladder — so
+                // strip the qualified reads and flag whatever is left, plus
+                // any mutation of a rung that is not a fresh declaration.
+                let residue = line.replace("ReconnectBackoff.baseMs", "");
+                let mutates_the_ladder = line.contains("ReconnectBackoff.baseMs")
+                    && line.contains('=')
+                    && !trimmed.starts_with("let ")
+                    && !trimmed.starts_with("static let ")
+                    && !trimmed.starts_with("private static let ");
+                if residue.contains("baseMs") || mutates_the_ladder {
                     offenders.push(format!("{}:{} {}", path.display(), ix + 1, line.trim()));
                 }
             }
@@ -524,5 +543,103 @@ fn the_phone_parks_instead_of_redialing_malformed_server_versions() {
             && client.contains("invalid server version vector; parking room")
             && client.contains("guard !closed, !protocolParked else { return }"),
         "malformed room protocol must trip a finite circuit rather than reconnect"
+    );
+}
+
+/// gh#527: the phone must SAY when its rooms are dying, and count the deaths
+/// the way the other two implementations do.
+///
+/// The incident was not that the app did not know. It logged "redialing in
+/// 30000ms" 22 times and rendered a transcript that read as a conversation
+/// nobody had answered yet — and a person cannot tell that from "nothing you
+/// type will arrive until this clears". So: the count reaches the UI, the
+/// churn rule is the same 30s line everywhere, and the state is exportable,
+/// because during the incident nothing could be got off the phone at all.
+///
+/// Three implementations now count the same thing — `comet_sync::churn` here,
+/// `RoomHealth` on the phone, and the socket census on the edge — so the
+/// window and the young-session line are pinned across all three.
+#[test]
+fn the_phone_says_when_its_rooms_are_dying() {
+    let health = read("apps/ios/Comet/Sync/RoomHealth.swift");
+    let client = room_client_swift();
+    let strip = read("apps/ios/Comet/Views/SyncDegradedStrip.swift");
+    let session_view = read("apps/ios/Comet/Views/SessionView.swift");
+    let edge = read("edge/src/socket-log.ts");
+
+    // The room loop reports its redial decision — the same pair the ladder is
+    // decided on, so the banner and the backoff cannot disagree about what
+    // happened.
+    assert!(
+        client.contains("RoomHealth.shared.redialing(room: room, rungMs: rung, joined: joined, healthy: healthy)")
+            && client.contains("RoomHealth.shared.joined(room:")
+            && client.contains("RoomHealth.shared.opening(room:"),
+        "RoomClient must report open/join/redial into the health census"
+    );
+
+    // A room that ANSWERS and dies is churn; a room that cannot be reached is
+    // a different fault, and the banner has to name which one it is.
+    assert!(
+        health.contains("if joined && !healthy {"),
+        "the phone must count join-then-die separately from unreachable"
+    );
+    assert!(
+        health.contains("var degraded: Bool { laddered > 0 }"),
+        "degraded must mean the ladder has CLIMBED, not that a socket dropped"
+    );
+
+    // On screen, above the transcript, with the count that used to live only
+    // in the log.
+    assert!(
+        session_view.contains("SyncDegradedStrip()"),
+        "the session screen must render the degraded state"
+    );
+    assert!(
+        health.contains("Rooms reconnecting — replies delayed"),
+        "the headline must state the consequence, not the mechanism"
+    );
+
+    // And it comes off the phone as text.
+    assert!(
+        strip.contains("Copy diagnostics") && strip.contains("Share diagnostics"),
+        "the degraded state must be copyable and shareable from where it is shown"
+    );
+    assert!(
+        health.contains("static func diagnosticsText(snapshot:"),
+        "the report must be a pure function of the snapshot, so it can be asserted"
+    );
+
+    // The two numbers, across all three implementations.
+    let rust_window_ms = rust_duration_ms(&read("crates/sync/src/churn.rs"), "CHURN_WINDOW");
+    let swift_window_ms = {
+        // `static let churnWindow: TimeInterval = 60 * 60`
+        let line = health
+            .lines()
+            .find(|l| l.trim_start().starts_with("static let churnWindow"))
+            .expect("RoomHealth.swift no longer declares churnWindow");
+        let rhs = line.split_once('=').expect("a value").1;
+        let seconds: u64 = rhs
+            .split('*')
+            .map(|part| {
+                part.trim()
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| panic!("churnWindow is not a plain product: {line}"))
+            })
+            .product();
+        seconds * 1_000
+    };
+    assert_eq!(
+        swift_window_ms, rust_window_ms,
+        "the phone's churn window must match comet_sync::churn::CHURN_WINDOW"
+    );
+    assert!(
+        edge.contains("export const CHURN_WINDOW_MS = 60 * 60 * 1000;"),
+        "and the edge's socket census must count over the same hour"
+    );
+    assert!(
+        edge.contains("export const YOUNG_SOCKET_MS = 30_000;")
+            && rust_duration_ms(&room_rs(), "HEALTHY_SESSION") == 30_000,
+        "a socket that died young on the edge and a session that earned no reset on \
+         a client must be the same 30 seconds"
     );
 }
