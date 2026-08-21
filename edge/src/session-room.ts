@@ -650,15 +650,11 @@ export class SessionRoom implements DurableObject {
             storedBytes: this.storedDocBytes(),
             refusals: Number(this.getMeta("loadRefusals") ?? "0"),
             limit: LOAD_REFUSAL_LIMIT,
-            lastRefusal: this.getMeta("lastLoadRefusal")
-              ? (JSON.parse(this.getMeta("lastLoadRefusal") as string) as unknown)
-              : null
+            lastRefusal: this.readJsonMeta("lastLoadRefusal")
           },
           // The last time THIS room aborted its own instance, and why — the
           // half of a 1006 storm that is our doing rather than the platform's.
-          lastAbort: this.getMeta("lastAbort")
-            ? (JSON.parse(this.getMeta("lastAbort") as string) as unknown)
-            : null
+          lastAbort: this.readJsonMeta("lastAbort")
         });
       } catch (e) {
         // The one observability surface must never die as a bare 1101/500 —
@@ -975,6 +971,19 @@ export class SessionRoom implements DurableObject {
       return this.blobs.size("snapshot") + Number(this.getMeta("updateBytes") ?? "0");
     } catch {
       return -1;
+    }
+  }
+
+  /** A JSON meta value, or null. Never throws: these are diagnostics, and
+   * /stats is the surface that must answer when everything else has stopped
+   * (see the catch below it). */
+  private readJsonMeta(key: string): unknown {
+    const raw = this.getMeta(key);
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch {
+      return { unparseable: raw.slice(0, 200) };
     }
   }
 

@@ -80,7 +80,11 @@ export interface SocketDeath {
 
 /** The room's socket-lifecycle census, as `/stats` reports it. */
 export interface SocketCensus {
-  /** Sockets accepted since this room first ran a build with the ledger. */
+  /** Sockets accepted since this room first ran a build with the ledger.
+   * DERIVED (deaths + still open) rather than counted: an accept would
+   * otherwise cost a meta row of its own on every dial, and a room in a
+   * dial/die loop is exactly where extra writes are least affordable
+   * (gh#373/gh#377). Every socket ends up in one bucket or the other. */
   accepted: number;
   closed: number;
   errored: number;
@@ -96,7 +100,6 @@ export interface SocketCensus {
 }
 
 interface CensusRow {
-  accepted: number;
   closed: number;
   errored: number;
   vanished: number;
@@ -107,7 +110,6 @@ interface CensusRow {
 }
 
 const EMPTY: CensusRow = {
-  accepted: 0,
   closed: 0,
   errored: 0,
   vanished: 0,
@@ -153,7 +155,6 @@ export const createSocketLedger = (sql: SqlStorage, meta: MetaStore): SocketLedg
     try {
       const parsed = JSON.parse(raw) as Partial<CensusRow>;
       return {
-        accepted: parsed.accepted ?? 0,
         closed: parsed.closed ?? 0,
         errored: parsed.errored ?? 0,
         vanished: parsed.vanished ?? 0,
@@ -198,9 +199,6 @@ export const createSocketLedger = (sql: SqlStorage, meta: MetaStore): SocketLedg
         at,
         deviceId ?? null
       );
-      const row = read();
-      row.accepted++;
-      write(row);
     },
 
     died(socketId, kind, at, code, reason) {
@@ -255,7 +253,7 @@ export const createSocketLedger = (sql: SqlStorage, meta: MetaStore): SocketLedg
         [...sql.exec("SELECT COUNT(*) AS n FROM open_sockets")][0]?.n ?? 0
       );
       return {
-        accepted: row.accepted,
+        accepted: row.closed + row.errored + row.vanished + open,
         closed: row.closed,
         errored: row.errored,
         vanished: row.vanished,
