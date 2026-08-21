@@ -581,6 +581,12 @@ fn edge_health(
 ) -> comet_proto::EdgeHealth {
     let (chat_rooms_open, chat_rooms_live) = doc_host.room_census();
     let convergence = doc_host.convergence_census();
+    // Churn (gh#527) is read from `comet_sync::churn` rather than from the
+    // handles: it is a property of the ROOM across every client that has held
+    // it, and a supervisor rebuilding a sick room's client — which is exactly
+    // what happens during an outage — would zero anything kept per-handle.
+    // That also makes it cover the workspace and registry rooms for free.
+    let churn = comet_sync::churn::census();
     let online = edge_url.is_some();
     comet_proto::EdgeHealth {
         edge_url: edge_url.clone(),
@@ -600,6 +606,17 @@ fn edge_health(
         chat_rooms_blocked: convergence.blocked,
         unacknowledged_entries: convergence.unacknowledged_entries,
         unconverged_rooms: convergence.rooms,
+        rooms_churning: churn.rooms_churning,
+        sessions_died_young_last_hour: churn.died_young_last_hour,
+        churning_rooms: churn
+            .rooms
+            .into_iter()
+            .map(|room| comet_proto::RoomChurn {
+                room_id: room.room_id,
+                died_young_last_hour: room.died_young_last_hour,
+                sessions_last_hour: room.sessions_last_hour,
+            })
+            .collect(),
     }
 }
 

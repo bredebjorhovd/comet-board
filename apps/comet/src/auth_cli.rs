@@ -172,6 +172,20 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
                          (`comet daemon restart`)."
                     );
                 }
+                // The gh#527 line. The summary above already counts the rooms
+                // that keep dying; this says what a person is to DO about it,
+                // because the reading that precedes it ("N of N live") is the
+                // one that talked an operator out of looking for a whole
+                // evening.
+                if health.churning() {
+                    println!(
+                        "          These rooms are joining and then dying, which is the edge \
+                         failing mid-session rather than refusing. Replies will not arrive \
+                         while it lasts. Check the room's own account (`/stats` now reports \
+                         which sockets vanished and whether it aborted itself) and the \
+                         Workers plan's duration cap."
+                    );
+                }
             }
             Err(err) => println!("Rooms:    could not ask the engine ({err:#})"),
         }

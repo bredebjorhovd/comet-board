@@ -635,6 +635,94 @@ async fn health_reports_the_dark_window_rather_than_hiding_it() {
     .await;
 }
 
+/// The gh#527 exit criterion: an engine whose rooms keep dying must stop
+/// reporting itself healthy.
+///
+/// This is the state the box was in on the evening of 2026-08-19 — every
+/// socket answered, every room died a second or two later, and the census said
+/// "10 of 10 live" for hours while nothing typed on a phone was ever answered.
+/// The gauge was not broken: a room in a join-then-die loop genuinely IS joined
+/// at a fair share of the instants you might sample. A sample cannot see a
+/// sequence, so the sequence is counted separately (`comet_sync::churn`).
+///
+/// Repeated redeploys are that loop: each one kills sockets that had joined
+/// moments earlier, which is precisely a session that answered and did not
+/// last. Assertions are lower bounds — the churn registry is process-global
+/// (deliberately: it must survive a supervisor rebuilding a sick room's
+/// client), so a sibling test's redeploy can only ever add.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rooms_that_join_and_die_are_reported_even_though_every_socket_is_live() {
+    let edge = fake_edge().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let core = assemble(dir.path(), &edge.url);
+    let _relay = core.start_host_relay(&edge.url);
+    core.doc_host.open("chat-churn").expect("open chat");
+
+    wait_until("the first joins", || {
+        edge.joins("chat-churn") >= 1 && core.edge_health().live() > 0
+    })
+    .await;
+    // Nothing has died yet: a healthy room must not read as churning, or the
+    // gauge becomes one operators learn to scroll past. Asserted on THIS
+    // test's own room rather than on the fleet, because the registry is shared
+    // with the sibling tests redeploying their own edges alongside this one.
+    assert!(
+        !core
+            .edge_health()
+            .churning_rooms
+            .iter()
+            .any(|room| room.room_id == "chat-churn"),
+        "{}",
+        core.edge_health().summary()
+    );
+
+    // Three rounds of join-then-die. Every session here is well inside the 30s
+    // that would have earned a backoff reset, which is the same line the
+    // clients draw and the same line the edge's socket census draws.
+    for round in 1..=3 {
+        let before = edge.joins("chat-churn");
+        edge.redeploy();
+        wait_until("the room to come back", || {
+            edge.joins("chat-churn") > before
+        })
+        .await;
+        wait_until("health to have counted the deaths", || {
+            core.edge_health().sessions_died_young_last_hour >= round
+        })
+        .await;
+    }
+
+    let health = core.edge_health();
+    assert!(
+        health.churning(),
+        "a fleet whose rooms keep dying is not healthy: {}",
+        health.summary()
+    );
+    assert!(
+        health.rooms_churning >= 1 && health.sessions_died_young_last_hour >= 3,
+        "{health:?}"
+    );
+    // And the sockets really are back up — which is the whole point. Every
+    // other reading on this census is green.
+    wait_until("the sockets to be live again", || {
+        let health = core.edge_health();
+        health.live() == health.expected() && !health.dark()
+    })
+    .await;
+    let summary = core.edge_health().summary();
+    assert!(
+        summary.contains("CHURNING"),
+        "the one clause that contradicts the number above it: {summary}"
+    );
+    assert!(
+        core.edge_health()
+            .churning_rooms
+            .iter()
+            .any(|room| room.room_id == "chat-churn"),
+        "the churning room is NAMED: {summary}"
+    );
+}
+
 /// The gh#126 exit criterion, over the gh#145 mechanism: a box whose engine is
 /// up and roomed never reads offline on another device for longer than one
 /// staleness window.

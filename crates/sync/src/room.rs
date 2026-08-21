@@ -851,6 +851,14 @@ struct SessionOutcome {
     /// immediate but spread over [`WAKE_SPREAD`], because every room on the box
     /// got the same broadcast.
     woke: bool,
+    /// The session reached `JoinResponseOk` at least once.
+    ///
+    /// Separate from `healthy` because the pair is the whole diagnosis
+    /// (gh#527): `joined && !healthy` is a room that ANSWERS and then dies,
+    /// which no point-in-time "N of N live" census can see, while `!joined` is
+    /// a room that is simply down and already visible as such. See
+    /// [`crate::churn`].
+    joined: bool,
 }
 
 impl SessionOutcome {
@@ -861,6 +869,7 @@ impl SessionOutcome {
             end,
             healthy: false,
             woke: false,
+            joined: false,
         }
     }
 }
@@ -900,6 +909,16 @@ impl RoomActor {
             // is the one case the eviction backoff exists to prevent.
             if outcome.healthy {
                 backoff = BACKOFF_BASE;
+            }
+            // Count the SEQUENCE, not the sample (gh#527). A room that answers
+            // every join and dies a second later reads live to anything that
+            // asks "are you connected?" at a moment of its choosing — which is
+            // how the engine reported "10 of 10 live" through an evening in
+            // which no reply reached a phone. Recorded only once this client
+            // has joined at least once: a first-dial failure is returned to
+            // `connect()` and belongs to the supervisor, not to the room.
+            if ready.is_none() && !matches!(outcome.end, SessionEnd::Shutdown) {
+                crate::churn::record(&self.room_id, outcome.joined, outcome.healthy);
             }
             match outcome.end {
                 SessionEnd::Shutdown => {
@@ -1215,11 +1234,17 @@ impl RoomActor {
         let healthy = sess
             .joined_at
             .is_some_and(|at| at.elapsed() >= HEALTHY_SESSION);
+        let joined = sess.joined_at.is_some();
         // The session is over whatever the reason; nothing is live again until
         // the next JoinResponseOk raises these.
         self.connected.set(false);
         self.presence.set(false);
-        SessionOutcome { end, healthy, woke }
+        SessionOutcome {
+            end,
+            healthy,
+            woke,
+            joined,
+        }
     }
 }
 

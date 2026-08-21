@@ -76,6 +76,26 @@ pub struct EdgeHealth {
     /// only on this device.
     #[serde(default)]
     pub unacknowledged_entries: usize,
+    /// Rooms that JOINED AND DIED at least once in the last hour (gh#527).
+    ///
+    /// The axis this census was missing. Everything above is a point-in-time
+    /// reading, and on the evening of 2026-08-19 every one of them was green —
+    /// "10 of 10 live", "14 of 14 live" — while the whole fleet was in a
+    /// dial/die/redial loop and the phone held 22 rooms on maxed-out backoff.
+    /// Nothing was wrong with the arithmetic: a room in a join-then-die loop
+    /// genuinely IS joined a fair share of the instants you might ask about.
+    /// A sample cannot see a sequence, so the sequence has to be counted
+    /// separately — see `comet_sync::churn`.
+    #[serde(default)]
+    pub rooms_churning: usize,
+    /// Joined sessions across all rooms that ended inside 30s in the last hour
+    /// — the rate, not a total, so a healed fleet reads healthy again.
+    #[serde(default)]
+    pub sessions_died_young_last_hour: usize,
+    /// The churning rooms, worst first, named for the same reason
+    /// [`Self::unconverged_rooms`] are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub churning_rooms: Vec<RoomChurn>,
     /// The rooms behind those counts, named. A count tells an operator that
     /// something is stuck; only the name tells them which chat to open — the
     /// same reason [`Self::summary`] names down connections instead of
@@ -83,6 +103,20 @@ pub struct EdgeHealth {
     /// ordinary case and short in the bad one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unconverged_rooms: Vec<RoomConvergence>,
+}
+
+/// One room that keeps dying, as the census sees it (gh#527).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RoomChurn {
+    /// The room's own id — a chat id, or `ws4/…` / `orgdev1/…` for the two
+    /// org-wide docs.
+    pub room_id: String,
+    /// Joined sessions that ended inside 30s in the last hour.
+    pub died_young_last_hour: usize,
+    /// Every joined session that ended in the last hour: the denominator, so
+    /// "7 of 8" and "7 of 400" do not read the same.
+    pub sessions_last_hour: usize,
 }
 
 /// One room that is not converged, as the census sees it.
@@ -136,6 +170,16 @@ impl EdgeHealth {
         self.live() > 0 && (self.chat_rooms_unconverged > 0 || self.chat_rooms_blocked > 0)
     }
 
+    /// The state gh#527 went dark in: sockets that keep coming back and rooms
+    /// that never stay up. Distinct from both [`Self::dark`] (nothing live at
+    /// all) and [`Self::live_but_unconverged`] (live, and content stuck) — a
+    /// churning fleet passes both of those checks while nothing a person types
+    /// on a phone is ever answered. Every surface that renders an engine as
+    /// healthy has to ask this too.
+    pub fn churning(&self) -> bool {
+        self.rooms_churning > 0
+    }
+
     /// One line for `comet status` and `comet-board doctor`. Says what is
     /// held, and names what is missing rather than only counting it — "0 of 3"
     /// does not tell an operator which socket to go and look at.
@@ -184,6 +228,35 @@ impl EdgeHealth {
                  offline elsewhere)",
                 presence_down.join(", ")
             ));
+        }
+        // Churn, not sockets (gh#527). Placed FIRST among the qualifiers,
+        // ahead of even the content clauses, because it is the one that
+        // contradicts the number an operator has already read: "10 of 10 live"
+        // followed by "and 10 of those rooms died 34 times in the last hour"
+        // is the sentence that was missing on 2026-08-19.
+        if self.churning() {
+            detail.push_str(&format!(
+                " — {} room(s) CHURNING: {} session(s) joined and died inside 30s in the last \
+                 hour (the sockets keep coming back; the rooms do not stay up, so replies do \
+                 not arrive)",
+                self.rooms_churning, self.sessions_died_young_last_hour
+            ));
+            let named: Vec<String> = self
+                .churning_rooms
+                .iter()
+                .take(3)
+                .map(|room| format!("{}: {} deaths/h", room.room_id, room.died_young_last_hour))
+                .collect();
+            if !named.is_empty() {
+                detail.push_str(&format!(" [{}", named.join("; ")));
+                if self.churning_rooms.len() > named.len() {
+                    detail.push_str(&format!(
+                        "; +{} more",
+                        self.churning_rooms.len() - named.len()
+                    ));
+                }
+                detail.push(']');
+            }
         }
         // Content, not sockets (gh#483). Named after the socket clauses on
         // purpose: an operator reading "12 of 12 live" has to see, in the same
@@ -368,6 +441,53 @@ mod tests {
             summary.contains("[b5b3c796: pending 74]"),
             "the room is NAMED, not only counted: {summary}"
         );
+    }
+
+    /// The gh#527 shape, and the reason this crate learned a THIRD axis: every
+    /// socket is up when asked — `live()` says 5 of 5, `dark()` says no,
+    /// content is converged — and the rooms have died 34 times in the last
+    /// hour. That engine reported itself healthy all evening while nothing a
+    /// person typed on a phone was ever answered.
+    #[test]
+    fn a_live_engine_whose_rooms_keep_dying_says_so() {
+        let health = EdgeHealth {
+            rooms_churning: 4,
+            sessions_died_young_last_hour: 34,
+            churning_rooms: vec![
+                RoomChurn {
+                    room_id: "ws4/org/user".into(),
+                    died_young_last_hour: 12,
+                    sessions_last_hour: 12,
+                },
+                RoomChurn {
+                    room_id: "b5b3c796".into(),
+                    died_young_last_hour: 9,
+                    sessions_last_hour: 10,
+                },
+            ],
+            ..online()
+        };
+        assert!(!health.dark(), "the sockets really do keep coming back");
+        assert!(!health.live_but_unconverged(), "and content is not the fault");
+        assert!(health.churning());
+        let summary = health.summary();
+        assert!(summary.contains("5 of 5 live"), "{summary}");
+        assert!(summary.contains("4 room(s) CHURNING"), "{summary}");
+        assert!(summary.contains("34 session(s)"), "{summary}");
+        assert!(
+            summary.contains("[ws4/org/user: 12 deaths/h; b5b3c796: 9 deaths/h]"),
+            "the rooms are NAMED, not only counted: {summary}"
+        );
+    }
+
+    /// Churn is a RATE. A fleet that thrashed this morning and has been fine
+    /// since must read clean, or the gauge becomes something operators learn
+    /// to ignore.
+    #[test]
+    fn a_healed_fleet_adds_no_churn_clause() {
+        let summary = online().summary();
+        assert!(!summary.contains("CHURNING"), "{summary}");
+        assert!(!online().churning());
     }
 
     #[test]
