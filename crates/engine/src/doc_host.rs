@@ -212,6 +212,17 @@ pub struct ConvergenceCensus {
     pub unconverged: usize,
     pub recovering: usize,
     pub blocked: usize,
+    /// Chats whose unacknowledged content has been unacknowledged past
+    /// `comet_sync::UNACKNOWLEDGED_ALERT` — on a live socket (gh#483 §7).
+    ///
+    /// Kept apart from [`Self::unconverged`] because the two grade differently
+    /// (gh#527 review): a room that is merely pending is a write in flight,
+    /// which is what a healthy fleet looks like most seconds of the day, while
+    /// a room that has been pending for two minutes on a live socket is the
+    /// gh#483 incident in progress. A check that failed on the first would cry
+    /// wolf on every keystroke; one that cannot see the second prints `ok` over
+    /// 262 entries that exist on one device.
+    pub stalled: usize,
     pub unacknowledged_entries: usize,
     /// The chats behind those counts, named — worst first (blocked, then
     /// recovering, then merely pending), so a truncated view still shows the
@@ -748,9 +759,15 @@ impl DocHost {
             census.unacknowledged_entries += state.unacked();
             let severity = match state {
                 comet_sync::ConvergenceState::Converged => continue,
-                comet_sync::ConvergenceState::Pending { .. } => {
+                comet_sync::ConvergenceState::Pending { stalled, .. } => {
                     census.unconverged += 1;
-                    0
+                    if stalled {
+                        census.stalled += 1;
+                    }
+                    // Severity 0 in flight, 2 stalled: a stalled room outranks
+                    // one that is merely RECOVERING, because recovery is the
+                    // machinery working and a stall is the machinery not.
+                    if stalled { 2 } else { 0 }
                 }
                 comet_sync::ConvergenceState::Recovering { .. } => {
                     census.recovering += 1;
@@ -760,7 +777,7 @@ impl DocHost {
                 comet_sync::ConvergenceState::BlockedLocalOnly { .. } => {
                     census.blocked += 1;
                     census.unconverged += 1;
-                    2
+                    3
                 }
             };
             ranked.push((
