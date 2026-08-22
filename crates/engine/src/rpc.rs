@@ -280,6 +280,37 @@ struct CreateWorktreeParams {
     branch: String,
 }
 
+/// [`methods::CREATE_BOARD_WORKTREE`] — the board's exact-branch cut, taken on
+/// the device that holds the space rather than the one hosting the board.
+///
+/// It carries the agent-config half as well, and has to: the login a run spends
+/// and the files that teach it the board are per-device — a slot id is portable,
+/// the `~/.claude` behind it is not — so the board's own device materializing
+/// them would seed the wrong machine. The device about to run the attempt
+/// prepares itself, in the same call, before it answers.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateBoardWorktreeParams {
+    #[serde(alias = "repo")]
+    repo_path: String,
+    /// The exact branch to cut, from `routing.toml`'s `branch_template`.
+    branch: String,
+    /// The route's `base` — resolved against *this* device's clone, and
+    /// fetched from origin before a fresh branch starts on it (gh#67).
+    base: String,
+    /// The harness the attempt will run on, for the config dir to seed.
+    harness: HarnessId,
+    /// The agent-account slot the route named, if any. Absent means the run
+    /// inherits this device's own CLI login, which is what a single-login
+    /// machine has.
+    #[serde(default)]
+    account: Option<String>,
+    /// Whether the route wants the board's conventions in this harness's
+    /// instruction file (gh#272).
+    #[serde(default)]
+    agent_instructions: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DeleteWorktreeParams {
@@ -1939,6 +1970,10 @@ fn forwardable(method: &str) -> bool {
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::CREATE_WORKTREE
+            // …and the board's own cut, which is the whole point of gh#558:
+            // the device that hosts the board is not always the device that
+            // holds the checkout the attempt runs in.
+            | methods::CREATE_BOARD_WORKTREE
             | methods::DELETE_WORKTREE
             // A fork is made where the source chat's transcript, checkout and
             // provider session are — which is its host device, not the laptop
@@ -2750,6 +2785,40 @@ impl RpcService for EngineRpc {
                 let worktree = self
                     .repos
                     .create_worktree(std::path::Path::new(&p.repo_path), &p.branch)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&worktree)
+            }
+            methods::CREATE_BOARD_WORKTREE => {
+                let p: CreateBoardWorktreeParams = parse_params(params)?;
+                // The login first, for the reason the local dispatch path
+                // materializes before it queues anything: an attempt whose
+                // checkout exists but whose login does not is a row somebody
+                // has to clean up, and the caller finds out either way.
+                let config_dir = match p.account.as_deref() {
+                    Some(account) => Some(
+                        self.agent_accounts
+                            .materialize(p.harness, account)
+                            .map_err(|e| RpcError::Failed(e.to_string()))?,
+                    ),
+                    None => self.agent_accounts.default_config_dir(p.harness),
+                };
+                // …and the conventions, never fatally (gh#272): an attempt that
+                // can run is worth more than a file that could not be written,
+                // and the brief carries the essentials regardless.
+                if let Some(dir) = &config_dir
+                    && let Err(err) =
+                        comet_board::conventions::apply(dir, p.harness, p.agent_instructions)
+                {
+                    tracing::warn!(
+                        dir = %dir.display(),
+                        error = %err,
+                        "could not write the board conventions for a dispatch from another device"
+                    );
+                }
+                let worktree = self
+                    .repos
+                    .create_worktree_on(std::path::Path::new(&p.repo_path), &p.branch, &p.base)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&worktree)
