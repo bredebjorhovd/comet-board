@@ -731,9 +731,17 @@ fn main() -> Result<()> {
             let prompt = prompt.unwrap_or_default();
             let chat = std::env::var(ops::CHAT_ID_ENV).ok();
             let contract = comet_board::git_credentials::push_contract_from_env()?;
-            if chat.is_some() && contract.is_none() {
-                bail!("a board-dispatched credential request has no persisted push contract");
-            }
+            // The demand is classified by prompt kind first (gh#549): a
+            // username prompt is answered off a constant and emits no
+            // credential, so a dispatched chat's missing contract cannot
+            // endanger anything by being absent for it. Guarding before the
+            // classification turned every `doctor` run made from inside a
+            // comet chat into a red "no dispatched agent on this box can push".
+            comet_board::git_credentials::ensure_contract_for_prompt(
+                &prompt,
+                chat.as_deref(),
+                contract,
+            )?;
             match comet_board::git_credentials::askpass_with_contract(
                 &paths,
                 &prompt,
@@ -744,7 +752,7 @@ fn main() -> Result<()> {
                     // A username prompt is answered off a constant, so it is
                     // not a mint and must not be recorded as one — an alibi
                     // for a push has to be a credential that was issued.
-                    if !prompt.to_ascii_lowercase().contains("username") {
+                    if !comet_board::git_credentials::prompt_asks_username(&prompt) {
                         comet_board::credential_ledger::minted(
                             &paths,
                             "git-askpass",

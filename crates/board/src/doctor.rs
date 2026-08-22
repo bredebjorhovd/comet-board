@@ -2467,6 +2467,11 @@ fn span_secs(from: &str, to: &str) -> Option<i64> {
 /// with — in a scratch directory, so a `doctor` run by the wrong user cannot
 /// leave a file the engine then cannot rewrite.
 ///
+/// The question runs in an environment built for it rather than inherited from
+/// whoever typed the command (gh#549): every comet chat's shell carries
+/// `COMET_BOARD_CHAT_ID` and no push contract, and a probe that rode those in
+/// answered for the caller's shell instead of for this device.
+///
 /// The ledger is read as well as probed, because a failure that happened during
 /// somebody's real run is a fact the probe cannot reach (gh#233). But *only*
 /// the probe is present tense, which is what gh#515 got wrong: any recorded
@@ -2481,13 +2486,13 @@ fn dispatched_push_check(paths: &Paths, now: chrono::DateTime<chrono::Utc>) -> C
     let live = match (&exe, credential) {
         (None, _) => Live::Broken(format!(
             "no comet-board binary found beside the engine or on PATH — agents push with \
-             this box's own git credentials (set {})",
+             this device's own git credentials (set {})",
             git_credentials::BOARD_EXE_ENV
         )),
         (Some(_), false) => Live::Broken(
-            "no GitHub credential — agents push with this box's own git credentials".to_string(),
+            "no GitHub credential — agents push with this device's own git credentials".to_string(),
         ),
-        (Some(exe), true) => match askpass_answers(exe) {
+        (Some(exe), true) => match askpass_answers(exe, paths) {
             Ok(()) => Live::Working(format!(
                 "the askpass helper answers, and mints per push{}",
                 match &gh {
@@ -2496,8 +2501,8 @@ fn dispatched_push_check(paths: &Paths, now: chrono::DateTime<chrono::Utc>) -> C
                 }
             )),
             Err(err) => Live::Broken(format!(
-                "the credential path does not work — no dispatched agent on this box can \
-                 push with the board's App: {err:#}"
+                "the credential path does not work — no dispatched agent on this device \
+                 can push with the board's App: {err:#}"
             )),
         },
     };
@@ -2573,8 +2578,8 @@ fn push_verdict(
             false,
             format!(
                 "a dispatched run could not use the credential path {when} — {what}. The live \
-                 check cannot reproduce it, so read that run's own log rather than this box's \
-                 config · {live_detail}"
+                 check cannot reproduce it, so read that run's own log rather than this \
+                 device's config · {live_detail}"
             ),
         ),
         // Past the window, and — since `standing_failure` stops at a mint —
@@ -2613,11 +2618,16 @@ fn clip(text: &str, max: usize) -> String {
 
 /// Build the askpass shim in a scratch directory and ask it git's username
 /// prompt. Removed afterwards: this is a diagnostic, not an install.
-fn askpass_answers(board_exe: &Path) -> anyhow::Result<()> {
+///
+/// The helper runs in the environment [`git_credentials::verify_askpass`]
+/// constructs — the board `paths` name, nothing of the shell this was raised
+/// from (gh#549) — so the answer is about this device whatever process ran
+/// `doctor`.
+fn askpass_answers(board_exe: &Path, paths: &Paths) -> anyhow::Result<()> {
     let dir = std::env::temp_dir().join(format!("comet-doctor-askpass-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let result = git_credentials::install_askpass_shim(&dir, board_exe)
-        .and_then(|shim| git_credentials::verify_askpass(&shim));
+        .and_then(|shim| git_credentials::verify_askpass(&shim, paths));
     let _ = std::fs::remove_dir_all(&dir);
     result
 }
@@ -6748,7 +6758,7 @@ mod tests {
     #[test]
     fn a_broken_probe_leads_and_the_ledger_trails_it() {
         let now = chrono::Utc::now();
-        let broken = "the credential path does not work — no dispatched agent on this box can \
+        let broken = "the credential path does not work — no dispatched agent on this device can \
                       push with the board's App: cannot exec";
         let c = push_verdict(
             Live::Broken(broken.into()),

@@ -1959,7 +1959,7 @@ fn askpass_for_clone(paths: &comet_board::config::Paths) -> anyhow::Result<std::
         .ok_or_else(|| anyhow::anyhow!("no comet-board binary found on this device"))?;
     let dir = paths.state_dir.join(crate::push_credentials::SHIM_DIR);
     let shim = comet_board::git_credentials::install_askpass_shim(&dir, &exe)?;
-    comet_board::git_credentials::verify_askpass(&shim)?;
+    comet_board::git_credentials::verify_askpass(&shim, paths)?;
     Ok(shim)
 }
 

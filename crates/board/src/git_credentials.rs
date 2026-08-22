@@ -277,7 +277,7 @@ pub fn askpass_with_contract(
              App installation token and belongs to github.com only"
         );
     }
-    if prompt.to_ascii_lowercase().contains("username") {
+    if prompt_asks_username(prompt) {
         return Ok(APP_USERNAME.to_string());
     }
     let repo = repo
@@ -287,6 +287,30 @@ pub fn askpass_with_contract(
         Some(contract) => token_with_contract(paths, repo, contract),
         None => token(paths, repo),
     }
+}
+
+/// The CLI boundary rule for a `git-askpass` invocation (gh#549): a request
+/// that will emit a credential, made by a board-dispatched chat, must carry
+/// that chat's persisted contract.
+///
+/// Classified by [`prompt_asks_username`] *before* the demand is made, not
+/// after: the guard used to fire on every prompt a dispatched shell's helper
+/// answered, including the username one — which mints nothing, so its missing
+/// contract endangered nothing. That is how `doctor`'s probe, run from inside
+/// any comet chat, was refused before it reached the question it came to ask,
+/// and reported the caller's shell as a broken box.
+pub fn ensure_contract_for_prompt(
+    prompt: &str,
+    chat: Option<&str>,
+    contract: Option<comet_proto::GithubPushContract>,
+) -> Result<()> {
+    if prompt_asks_username(prompt) {
+        return Ok(());
+    }
+    if chat.is_some() && contract.is_none() {
+        anyhow::bail!("a board-dispatched credential request has no persisted push contract");
+    }
+    Ok(())
 }
 
 /// A live credential for `repo`, read off this box's board configuration —
@@ -318,6 +342,20 @@ pub(crate) fn token_with_contract_from(
 ) -> Result<String> {
     rest.push_capabilities(repo)?.require(contract)?;
     token_for_push(rest.auth(), repo)
+}
+
+/// Does this prompt ask for the username rather than for a secret?
+///
+/// git asks for a username when the URL carries none and for a password when it
+/// does; [`push_url`] always carries one, but answering both keeps the helper
+/// correct if somebody points it at a bare URL. The answer to this kind is
+/// [`APP_USERNAME`] — a constant — so the classification decides two things
+/// besides the answer itself: whether a mint is recorded (gh#549's sibling
+/// rule at the CLI), and whether a dispatched chat's persisted contract can be
+/// demanded at all. A prompt of this kind emits no credential, so a missing
+/// contract cannot endanger anything.
+pub fn prompt_asks_username(prompt: &str) -> bool {
+    prompt.to_ascii_lowercase().contains("username")
 }
 
 /// The host inside a git credential prompt — `Password for
@@ -417,6 +455,12 @@ pub fn install_askpass_shim(_dir: &Path, _board_exe: &Path) -> Result<PathBuf> {
 /// the answer arrives on stdout. Every layer of the credential path except the
 /// mint itself, for the price of one `fork`.
 ///
+/// The question runs in the environment [`run_askpass`] constructs, never the
+/// one it inherits (gh#549): a probe that reports on the box must not read the
+/// shell it was raised in. `paths` names the board the helper should attach to
+/// — the same pair a dispatch stamps, so a `--data-dir` run checks the board it
+/// named rather than whatever the ambient environment resolved.
+///
 /// Called the way git calls it: the prompt as the single argument.
 ///
 /// This is also the barrier that makes the `git push` after it safe (gh#301).
@@ -436,8 +480,8 @@ pub fn install_askpass_shim(_dir: &Path, _board_exe: &Path) -> Result<PathBuf> {
 /// failure through. A successful exec proves the inode has no writers, which is
 /// why this being the last thing before a push is what keeps `git`'s own exec of
 /// the same file (which nothing can retry) off the same race.
-pub fn verify_askpass(askpass: &Path) -> Result<()> {
-    let out = run_askpass(askpass, "Username for 'https://github.com': ")
+pub fn verify_askpass(askpass: &Path, paths: &Paths) -> Result<()> {
+    let out = run_askpass(askpass, "Username for 'https://github.com': ", paths)
         .with_context(|| format!("running the askpass helper at {}", askpass.display()))?;
     let answer = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !out.status.success() {
@@ -507,8 +551,31 @@ const EXEC_BUSY_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Run the shim the way git runs it, waiting out `ETXTBSY` (see
 /// [`verify_askpass`] for why that is a wait and not a retry-around-a-defect).
-fn run_askpass(askpass: &Path, prompt: &str) -> std::io::Result<std::process::Output> {
-    exec_waiting_out_busy(std::process::Command::new(askpass).arg(prompt))
+///
+/// The environment is **constructed, not inherited** (gh#549). The probe is a
+/// diagnostic pretending to be a dispatched run, so it gets the environment a
+/// dispatch constructs — here, the pair that says which board the helper
+/// attaches to, from [`agent_env`] — and nothing else. Whatever shell raised
+/// the caller is invisible to the answer: a `comet-board doctor` run from
+/// inside a comet chat used to hand the child its own `COMET_BOARD_CHAT_ID`
+/// (set in every chat) with no contract (never set outside a dispatch), and the
+/// helper refused the username question on exactly those facts — reporting the
+/// caller's shell as "no dispatched agent on this box can push". Nothing else
+/// is stamped deliberately: no repo, because this question names none and a
+/// invented one could one day be minted against; no contract or chat id,
+/// because the secret-bearing half of a dispatch has its own probe in
+/// [`verify_push_credential`], which builds the full [`agent_env_with_contract`].
+fn run_askpass(
+    askpass: &Path,
+    prompt: &str,
+    paths: &Paths,
+) -> std::io::Result<std::process::Output> {
+    let mut command = std::process::Command::new(askpass);
+    command.arg(prompt);
+    command.env_clear();
+    command.env(crate::config::CONFIG_DIR_ENV, &paths.config_dir);
+    command.env(crate::config::STATE_DIR_ENV, &paths.state_dir);
+    exec_waiting_out_busy(&mut command)
 }
 
 /// Run `cmd` to completion, waiting out an `ETXTBSY` that a sibling thread's
@@ -1071,7 +1138,11 @@ mod tests {
             std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
-        verify_askpass(&shim).expect("the credential path answers");
+        let paths = Paths {
+            config_dir: dir.join("config"),
+            state_dir: dir.join("state"),
+        };
+        verify_askpass(&shim, &paths).expect("the credential path answers");
         let out = std::process::Command::new(&shim)
             .arg("Password for 'https://x-access-token@github.com': ")
             .output()
@@ -1088,9 +1159,13 @@ mod tests {
     #[cfg(unix)]
     fn a_credential_path_that_cannot_answer_is_an_error_with_the_reason_in_it() {
         let dir = scratch("askpass-broken");
+        let paths = Paths {
+            config_dir: dir.join("config"),
+            state_dir: dir.join("state"),
+        };
         // Nothing there at all — the gh#233 shape, where git said only
         // "cannot exec".
-        let err = verify_askpass(&dir.join("missing"))
+        let err = verify_askpass(&dir.join("missing"), &paths)
             .expect_err("a missing helper verified")
             .to_string();
         assert!(err.contains("running the askpass helper"), "{err}");
@@ -1103,7 +1178,7 @@ mod tests {
             std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
-        let err = verify_askpass(&shim)
+        let err = verify_askpass(&shim, &paths)
             .expect_err("a helper that exits 2 verified")
             .to_string();
         assert!(err.contains("unknown subcommand"), "{err}");
@@ -1111,7 +1186,7 @@ mod tests {
         // There, running, and answering something git would send as a
         // username.
         std::fs::write(&board, "#!/bin/sh\necho hello\n").unwrap();
-        let err = verify_askpass(&shim)
+        let err = verify_askpass(&shim, &paths)
             .expect_err("a helper answering rubbish verified")
             .to_string();
         assert!(err.contains("\"hello\""), "{err}");
@@ -1136,11 +1211,11 @@ mod tests {
             std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
-        verify_askpass(&shim).expect("the username half answers");
         let paths = Paths {
             config_dir: dir.join("config"),
             state_dir: dir.join("state"),
         };
+        verify_askpass(&shim, &paths).expect("the username half answers");
         let error = verify_push_credential(
             &shim,
             "o/r",
@@ -1154,6 +1229,156 @@ mod tests {
         .to_string();
         assert!(error.contains("returned no credential"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gh#549, the mechanism: the probe's helper runs in an environment that was
+    /// constructed for it, so the shell that raised it cannot be read in the
+    /// answer. A comet chat's shell carries `COMET_BOARD_CHAT_ID` and never
+    /// `COMET_BOARD_PUSH_CONTRACT`; before this fix both facts rode into the
+    /// child and the guard refused the question before it was asked.
+    #[test]
+    #[cfg(unix)]
+    fn the_probe_constructs_its_environment_instead_of_inheriting_it() {
+        let dir = scratch("askpass-cleanroom");
+        // A shim-side stand-in that reports the markers the real helper reads.
+        let board = dir.join("comet-board");
+        std::fs::write(
+            &board,
+            "#!/bin/sh\n\
+             echo \"chat:${COMET_BOARD_CHAT_ID:-none} \
+             contract:${COMET_BOARD_PUSH_CONTRACT:-none} \
+             config:$COMET_BOARD_CONFIG_DIR\"\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let paths = Paths::under(&dir).unwrap();
+
+        // The contamination, exactly as every comet chat's environment has it:
+        // the chat id set, the contract absent.
+        let prior_chat = std::env::var("COMET_BOARD_CHAT_ID").ok();
+        let prior_contract = std::env::var(PUSH_CONTRACT_ENV).ok();
+        unsafe {
+            std::env::set_var("COMET_BOARD_CHAT_ID", "chat-549");
+            std::env::remove_var(PUSH_CONTRACT_ENV);
+        }
+        let out = run_askpass(&board, "Username for 'https://github.com': ", &paths).unwrap();
+        restore_env("COMET_BOARD_CHAT_ID", prior_chat.as_deref());
+        restore_env(PUSH_CONTRACT_ENV, prior_contract.as_deref());
+
+        let seen = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(
+            seen.trim(),
+            format!(
+                "chat:none contract:none config:{}",
+                paths.config_dir.display()
+            ),
+            "the child saw the ambient shell, not the environment a dispatch constructs"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// gh#549, end to end: the same probe, the same minute, one variable
+    /// different. With the chat marker in the ambient environment the probe
+    /// must still answer — the helper under it enforces the real guard, which
+    /// is precisely what used to turn `doctor`'s line red from inside a chat.
+    #[test]
+    #[cfg(unix)]
+    fn the_username_probe_answers_from_a_dispatched_shell() {
+        let dir = scratch("askpass-ambient");
+        // The real helper's shape: refuse a credential request from a chat with
+        // no persisted contract; answer the username off the constant.
+        let board = dir.join("comet-board");
+        std::fs::write(
+            &board,
+            "#!/bin/sh\n\
+             if [ -n \"$COMET_BOARD_CHAT_ID\" ] && [ -z \"$COMET_BOARD_PUSH_CONTRACT\" ]; then\n\
+                 echo 'a board-dispatched credential request has no persisted push \
+             contract' >&2\n\
+                 exit 1\n\
+             fi\n\
+             case \"$2\" in *sername*) echo x-access-token ;; *) exit 3 ;; esac\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shim = install_askpass_shim(&dir.join("bin"), &board).unwrap();
+        let paths = Paths::under(&dir).unwrap();
+
+        let prior_chat = std::env::var("COMET_BOARD_CHAT_ID").ok();
+        let prior_contract = std::env::var(PUSH_CONTRACT_ENV).ok();
+        unsafe {
+            std::env::set_var("COMET_BOARD_CHAT_ID", "chat-549");
+            std::env::remove_var(PUSH_CONTRACT_ENV);
+        }
+        let answered = verify_askpass(&shim, &paths);
+        restore_env("COMET_BOARD_CHAT_ID", prior_chat.as_deref());
+        restore_env(PUSH_CONTRACT_ENV, prior_contract.as_deref());
+
+        answered.expect("the probe answers whatever shell raised it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Set or clear one variable, back to what the test process had. Env vars
+    /// are process-global and libtest threads share them; the save/restore
+    /// keeps the contamination this test needs from outliving it.
+    #[cfg(unix)]
+    fn restore_env(key: &str, prior: Option<&str>) {
+        unsafe {
+            match prior {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    /// The CLI boundary rule (gh#549): classified by prompt kind *before* the
+    /// contract is demanded. A username prompt emits no credential, so a
+    /// dispatched chat without a contract may still ask it.
+    #[test]
+    fn the_contract_guard_belongs_after_the_prompt_is_classified() {
+        let chat = Some("chat-1");
+        let none = None;
+        let full = Some(comet_proto::GithubPushContract {
+            contents_write: true,
+            workflows_write: true,
+        });
+
+        // The username question is answered off a constant either way.
+        assert!(prompt_asks_username("Username for 'https://github.com': "));
+        assert!(!prompt_asks_username(
+            "Password for 'https://x-access-token@github.com': "
+        ));
+        ensure_contract_for_prompt("Username for 'https://github.com': ", chat, none)
+            .expect("a username prompt needs no contract");
+
+        // Anything that would mint still demands the contract of a chat.
+        let err = ensure_contract_for_prompt(
+            "Password for 'https://x-access-token@github.com': ",
+            chat,
+            none,
+        )
+        .expect_err("a contractless password prompt verified")
+        .to_string();
+        assert!(err.contains("no persisted push contract"), "{err}");
+
+        // And nobody else is asked for one.
+        ensure_contract_for_prompt(
+            "Password for 'https://x-access-token@github.com': ",
+            None,
+            none,
+        )
+        .expect("no chat, no contract to demand");
+        ensure_contract_for_prompt(
+            "Password for 'https://x-access-token@github.com': ",
+            chat,
+            full,
+        )
+        .expect("a carried contract satisfies the demand");
     }
 
     /// gh#301, the write side: an installed shim is exec'able *as installed*,
@@ -1227,7 +1452,14 @@ mod tests {
             drop(held);
         });
 
-        verify_askpass(&shim).expect("the check gave up on a handle that was about to close");
+        verify_askpass(
+            &shim,
+            &Paths {
+                config_dir: dir.join("config"),
+                state_dir: dir.join("state"),
+            },
+        )
+        .expect("the check gave up on a handle that was about to close");
         releaser.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1269,9 +1501,15 @@ mod tests {
         let _held = std::fs::OpenOptions::new().write(true).open(&shim).unwrap();
 
         let start = std::time::Instant::now();
-        let err = verify_askpass(&shim)
-            .expect_err("a permanently busy shim verified")
-            .to_string();
+        let err = verify_askpass(
+            &shim,
+            &Paths {
+                config_dir: dir.join("config"),
+                state_dir: dir.join("state"),
+            },
+        )
+        .expect_err("a permanently busy shim verified")
+        .to_string();
         assert!(err.contains("running the askpass helper"), "{err}");
         assert!(
             start.elapsed() < EXEC_BUSY_BUDGET * 10,
