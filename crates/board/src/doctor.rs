@@ -19,7 +19,7 @@ use crate::skill;
 use crate::sources::github::{CapabilityEvidence, PushCapabilities, WriteCapability};
 use anyhow::Result;
 use comet_proto::view::board::RuntimeOption;
-use comet_proto::{AgentAccount, EdgeHealth, HarnessId, Space};
+use comet_proto::{AgentAccount, Device, EdgeHealth, HarnessId, Space};
 use std::path::{Path, PathBuf};
 
 pub struct Check {
@@ -54,6 +54,18 @@ pub struct EngineStatus {
     /// own (gh#195). `None` when the sweep could not be run at all — the engine
     /// was not reachable, so nothing was asked and nothing may be claimed.
     pub peers: Option<Peers>,
+    /// This device's own id, from `LocalDevice`. What makes a space in the
+    /// workspace list *this* device's rather than another's (gh#558): the
+    /// space list doctor is handed is the whole workspace's, because a route
+    /// may legitimately name a space another device hosts, and every check that
+    /// stats a path has to know which of the two it is looking at. `None` when
+    /// the engine could not be asked — in which case there is no space list
+    /// either, and the route checks say "not checked".
+    pub device: Option<String>,
+    /// The workspace's device rows, for turning the `device_id` on a space
+    /// into a name a person recognises ("on Tokenmaxxer9000", not on
+    /// `5fedcd47-…`). Best-effort: an empty list only costs the id.
+    pub devices: Vec<Device>,
 }
 
 /// What a sweep of the other devices found (gh#195).
@@ -93,10 +105,11 @@ pub struct PeerBoard {
 
 /// Check the environment. Plain stdout — the report is the output.
 ///
-/// `spaces` is this device's space list, and `accounts` its saved agent
-/// logins, or `None` when the engine could not be asked. Route checks against
-/// a `None` say "not checked" rather than failing every route over one dead
-/// engine — the engine check itself is the one that fails loudly. `edge` is
+/// `spaces` is the *workspace's* space list — every device's, not only this
+/// one's (gh#558) — and `accounts` this device's saved agent logins, or `None`
+/// when the engine could not be asked. Route checks against a `None` say "not
+/// checked" rather than failing every route over one dead engine — the engine
+/// check itself is the one that fails loudly. `edge` is
 /// the same engine's live edge-connection census (gh#116), and `members` how
 /// many people are in the workspace (gh#161) — the fact that turns "a dispatch
 /// that names no account spends the box's login" from a tautology into a
@@ -247,6 +260,22 @@ pub fn doctor(
             cfg.routes.len(),
         )
     });
+
+    // The spaces on *this* device, out of the workspace's whole list (gh#558).
+    // Every check below that touches the disk — the adopt sweep's `probe`, a
+    // route's repo path, the remote its base is fetched from — is about a path
+    // on this machine, and a space another device hosts has no path here. An
+    // engine that could not name itself leaves this the whole list, which is
+    // what the report meant before a route could name another device's space.
+    let local_spaces: Option<Vec<Space>> = spaces.map(|all| match engine.device.as_deref() {
+        Some(local) => all
+            .iter()
+            .filter(|s| s.device_id == local)
+            .cloned()
+            .collect(),
+        None => all.to_vec(),
+    });
+    let local_spaces = local_spaces.as_deref();
 
     // Routing is where most misconfiguration lives, so it is checked in detail.
     // Parsing is deliberately separated from validation: a single bad runtime
@@ -425,11 +454,22 @@ pub fn doctor(
             checks.push(Check {
                 name: "unadopted repos".into(),
                 ok: true,
-                detail: crate::adopt::doctor_detail(&cfg, spaces),
+                // Local spaces only: the sweep probes each one's folder for a
+                // git remote, and another device's folder is not on this disk.
+                detail: crate::adopt::doctor_detail(&cfg, local_spaces),
             });
 
             for r in &cfg.routes {
                 let name = r.display_name().to_string();
+
+                // Where the space this route names actually is (gh#558). Read
+                // before every check under it, because it decides which of them
+                // are about this disk at all: a route may name a space another
+                // device hosts — that is the whole of one board driving two
+                // machines — and the checkout it points at is then a path over
+                // there, which this box would report as missing while dispatch
+                // works fine.
+                let host = space_host(spaces, engine.device.as_deref(), &engine.devices, r);
 
                 // Read before the space check as well as after it: whether the
                 // checkout is there is half of what repairs a missing space
@@ -437,10 +477,10 @@ pub fn doctor(
                 let repo = r.repo_path();
                 let repo_ok = repo.join(".git").exists();
 
-                checks.push(match spaces {
+                checks.push(match &host {
                     // Route checks must not fail nineteen times over one dead
                     // engine; the engine check above is the loud one.
-                    None => Check {
+                    SpaceHost::Unknown => Check {
                         name: format!("route {name}: space"),
                         ok: true,
                         detail: format!(
@@ -448,54 +488,103 @@ pub fn doctor(
                             r.workspace
                         ),
                     },
-                    Some(spaces) => {
-                        let ws_ok = spaces
-                            .iter()
-                            .any(|s| s.display_name().eq_ignore_ascii_case(&r.workspace));
-                        Check {
-                            name: format!("route {name}: space"),
-                            ok: ws_ok,
-                            detail: if ws_ok {
-                                format!("`{}` exists", r.workspace)
-                            } else {
-                                // The state, then the repair — the way every
-                                // other failing line here reads (gh#342). A
-                                // route with no space is a row nothing can be
-                                // dispatched on, and it used to be reported
-                                // with no hint that one verb fixes it.
-                                format!(
-                                    "no comet space named `{}` ({}) — {}",
-                                    r.workspace,
-                                    have_phrase(spaces),
-                                    crate::onboard::missing_space_repair(
-                                        r,
-                                        repo_ok,
-                                        &crate::config::clone_root(),
-                                        |p| crate::adopt::git_remote(&p.to_string_lossy()),
-                                    )
+                    SpaceHost::Here => Check {
+                        name: format!("route {name}: space"),
+                        ok: true,
+                        detail: format!("`{}` exists", r.workspace),
+                    },
+                    // Not a failure, and the sentence says which one it is
+                    // (gh#558). The old check compared against this device's
+                    // spaces alone, so a route dispatching to the other machine
+                    // — the supported thing, and the point of one board instead
+                    // of two — read as "no comet space named", with a repair
+                    // that would have cloned a second checkout here.
+                    SpaceHost::Elsewhere { device, path } => Check {
+                        name: format!("route {name}: space"),
+                        ok: true,
+                        detail: format!(
+                            "`{}` is on {device}, not here — this board dispatches there \
+                             ({path}). Nothing below this line is checked from this box",
+                            r.workspace
+                        ),
+                    },
+                    SpaceHost::Nowhere => Check {
+                        name: format!("route {name}: space"),
+                        ok: false,
+                        detail: {
+                            // The state, then the repair — the way every
+                            // other failing line here reads (gh#342). A
+                            // route with no space is a row nothing can be
+                            // dispatched on, and it used to be reported
+                            // with no hint that one verb fixes it.
+                            format!(
+                                "no comet space named `{}` ({}) — {}",
+                                r.workspace,
+                                have_phrase(local_spaces.unwrap_or_default()),
+                                crate::onboard::missing_space_repair(
+                                    r,
+                                    repo_ok,
+                                    &crate::config::clone_root(),
+                                    |p| crate::adopt::git_remote(&p.to_string_lossy()),
                                 )
-                            },
-                        }
-                    }
-                });
-
-                checks.push(Check {
-                    name: format!("route {name}: repo"),
-                    ok: repo_ok,
-                    detail: if repo_ok {
-                        repo.display().to_string()
-                    } else {
-                        format!("{} is not a git repo", repo.display())
+                            )
+                        },
                     },
                 });
 
-                // Where this route's dispatches branch from (gh#67). Local
-                // only: doctor asks whether the repo has the remote the base
-                // names, not whether the network is up — a fetch here would
-                // hang the report on every unreachable remote, and dispatch
-                // refuses loudly on its own when the fetch fails.
-                if repo_ok {
-                    checks.push(base_check(&name, cfg.base(r), &repo));
+                // The checkout and its base are facts about the machine that
+                // holds the space. Asked of this one only when the space is
+                // here: for a route pointing at the other device they would be
+                // two more red lines about a path that was never supposed to
+                // exist here, and doctor would be wrong twice over one correct
+                // config. The device that hosts it answers them on its own run.
+                if let SpaceHost::Elsewhere { device, path } = &host {
+                    // `repo =` is what a dispatch actually cuts in — `build_spec`
+                    // reads the route, not the space — so on a remote route it
+                    // has to be a path on *that* device. This box cannot stat it
+                    // to find out, but it can notice that the route and the
+                    // space it names disagree about where the checkout is, which
+                    // is what a route carried over from the board that used to
+                    // run here looks like.
+                    let agrees =
+                        repo.to_string_lossy().trim_end_matches('/') == path.trim_end_matches('/');
+                    checks.push(Check {
+                        name: format!("route {name}: repo"),
+                        ok: true,
+                        detail: if agrees {
+                            format!(
+                                "{} — on {device}, so not checked here; run `comet-board doctor` \
+                                 there for the checkout and its base",
+                                repo.display()
+                            )
+                        } else {
+                            format!(
+                                "{} — but the space is at {path} on {device}, and `repo =` is \
+                                 the path a dispatch cuts in. One of the two is wrong, and \
+                                 neither is on this disk to check",
+                                repo.display()
+                            )
+                        },
+                    });
+                } else {
+                    checks.push(Check {
+                        name: format!("route {name}: repo"),
+                        ok: repo_ok,
+                        detail: if repo_ok {
+                            repo.display().to_string()
+                        } else {
+                            format!("{} is not a git repo", repo.display())
+                        },
+                    });
+
+                    // Where this route's dispatches branch from (gh#67). Local
+                    // only: doctor asks whether the repo has the remote the base
+                    // names, not whether the network is up — a fetch here would
+                    // hang the report on every unreachable remote, and dispatch
+                    // refuses loudly on its own when the fetch fails.
+                    if repo_ok {
+                        checks.push(base_check(&name, cfg.base(r), &repo));
+                    }
                 }
 
                 let harness = harness_for_runtime(&r.runtime).map(harness_name);
@@ -611,6 +700,84 @@ pub fn doctor(
     ));
 
     Ok(checks)
+}
+
+/// Which machine holds the space a route names (gh#558).
+///
+/// A route names a space, and a space is a device+folder pair — so "the space
+/// this route names" has three possible answers, not two, and until gh#558 the
+/// check knew only about the device it was running on. One board driving two
+/// machines is the supported shape (the engine's space lookup does not filter
+/// to the local device, and `DispatchSpec` carries `device_id` through), so a
+/// route pointing at the other machine's space is a correct config that the old
+/// check reported as `no comet space named` — with a repair that would have
+/// cloned a second checkout onto the wrong box.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SpaceHost {
+    /// The engine could not be asked, so no space list exists to look in.
+    Unknown,
+    /// This device hosts it — every disk check below the space line is about a
+    /// real path here.
+    Here,
+    /// Another device hosts it, named as a person would recognise it, with the
+    /// folder path *on that device*.
+    Elsewhere { device: String, path: String },
+    /// No device in the workspace has a space by that name.
+    Nowhere,
+}
+
+/// Resolve [`SpaceHost`] for one route against the workspace's whole space list.
+///
+/// The predicate is the union of the engine's own ([`crate::dispatch::space_matches`],
+/// which is what a dispatch will use) and the case-insensitive display-name
+/// comparison this check has always made — so nothing that reported green goes
+/// red for a spelling doctor used to forgive. A local hit wins over a remote
+/// one: on a name two devices both answer to, a dispatch could go either way,
+/// and the reading that keeps this box's own disk checks meaningful is the
+/// conservative one.
+fn space_host(
+    spaces: Option<&[Space]>,
+    local_device: Option<&str>,
+    devices: &[Device],
+    route: &crate::config::Route,
+) -> SpaceHost {
+    let Some(spaces) = spaces else {
+        return SpaceHost::Unknown;
+    };
+    let named = |s: &Space| {
+        crate::dispatch::space_matches(s.name.as_deref(), &s.path, &route.workspace)
+            || s.display_name().eq_ignore_ascii_case(&route.workspace)
+    };
+    let mut matches = spaces.iter().filter(|s| named(s));
+    let Some(first) = matches.next() else {
+        return SpaceHost::Nowhere;
+    };
+    // A local hit anywhere in the list, not only at the front: the engine's
+    // `.find()` takes doc order, but a space on this device is the one whose
+    // checkout this report can actually speak about.
+    if local_device.is_none_or(|local| first.device_id == local)
+        || std::iter::once(first)
+            .chain(matches)
+            .any(|s| Some(s.device_id.as_str()) == local_device)
+    {
+        return SpaceHost::Here;
+    }
+    SpaceHost::Elsewhere {
+        device: device_name(devices, &first.device_id),
+        path: first.path.clone(),
+    }
+}
+
+/// A device id as a person reads it — its name, or the id when the workspace
+/// has no row for it (or the row is nameless).
+fn device_name(devices: &[Device], id: &str) -> String {
+    devices
+        .iter()
+        .find(|d| d.id == id)
+        .map(|d| d.name.trim())
+        .filter(|n| !n.is_empty())
+        .unwrap_or(id)
+        .to_string()
 }
 
 /// The spaces this device does have, for a route that names one it does not.
@@ -3431,13 +3598,20 @@ mod tests {
             // No sweep, for the same reason: every test that is not about the
             // other devices on the account gets "not checked" (gh#195).
             peers: None,
+            // The id `space()` stamps, so a fixture space is this device's own
+            // unless a test deliberately puts one somewhere else (gh#558).
+            device: Some(LOCAL_DEVICE.into()),
+            devices: Vec::new(),
         }
     }
+
+    /// The device `engine_up` is, and the one `space()` puts its spaces on.
+    const LOCAL_DEVICE: &str = "dev-1";
 
     fn space(name: &str) -> Space {
         Space {
             id: format!("s-{name}"),
-            device_id: "dev-1".into(),
+            device_id: LOCAL_DEVICE.into(),
             path: format!("/code/{name}"),
             name: Some(name.into()),
             git_detected: true,
@@ -3445,6 +3619,19 @@ mod tests {
             checkout_id: None,
             branch: None,
             created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// A workspace device row, for turning a remote space's `device_id` into
+    /// the name the report prints (gh#558).
+    fn device_row(id: &str, name: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            platform: String::new(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
         }
     }
 
@@ -4135,6 +4322,8 @@ mod tests {
             version: None,
             update: None,
             peers: None,
+            device: None,
+            devices: Vec::new(),
         };
         let checks = doctor(&p, &down, None, Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
@@ -4146,6 +4335,171 @@ mod tests {
             .expect("the route is still reported");
         assert!(space.ok, "{}", space.detail);
         assert!(space.detail.contains("not checked"), "{}", space.detail);
+    }
+
+    /// A route naming a space the *other* device hosts (gh#558).
+    ///
+    /// This is the shape one board driving two machines has: the box polls
+    /// `comet-board`, and the route sends every dispatch to the Mac's
+    /// `comet-board-laptop` space, because comet-board has iOS and macOS
+    /// targets that cannot build on Linux. The engine's space lookup does not
+    /// filter to the local device and `DispatchSpec` carries `device_id`
+    /// through, so that route dispatches; doctor compared against this box's
+    /// spaces alone and called it `no comet space named`, with a repair that
+    /// would have cloned a second checkout onto the wrong machine.
+    ///
+    /// The disk checks under the space line go the same way. `repo = ` on such
+    /// a route is a path on the *other* device — `/Users/brede/dev/comet-board`
+    /// read from a Linux box — and both `repo` and `base` used to fail on it,
+    /// so one correct route cost three red lines and none of them was true.
+    #[test]
+    fn a_route_to_another_devices_space_resolves_and_its_disk_is_not_checked_here() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { gh_repo = \"o/comet-board\" }\n\
+             workspace = \"comet-board-laptop\"\n\
+             repo = \"/Users/brede/dev/comet-board\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let mut theirs = space("comet-board-laptop");
+        theirs.device_id = "dev-2".into();
+        theirs.path = "/Users/brede/dev/comet-board".into();
+        let mut engine = engine_up();
+        engine.devices = vec![device_row("dev-2", "McComet")];
+
+        let checks = doctor(
+            &p,
+            &engine,
+            Some(&[space("OIOS-local"), theirs]),
+            Some(&[]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let find = |name: &str| {
+            checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} is reported"))
+        };
+
+        let s = find("route comet-board-laptop: space");
+        assert!(s.ok, "{}", s.detail);
+        assert!(
+            s.detail.contains("McComet"),
+            "named, not an id: {}",
+            s.detail
+        );
+        assert!(
+            !s.detail.contains("no comet space named"),
+            "the old wart: {}",
+            s.detail
+        );
+
+        // …and the path on that device is reported, not stat'd here.
+        let repo = find("route comet-board-laptop: repo");
+        assert!(repo.ok, "{}", repo.detail);
+        assert!(repo.detail.contains("McComet"), "{}", repo.detail);
+        assert!(
+            !repo.detail.contains("is not a git repo"),
+            "{}",
+            repo.detail
+        );
+        assert!(
+            !repo.detail.contains("One of the two is wrong"),
+            "the route and the space name the same path here: {}",
+            repo.detail
+        );
+        // The base is that checkout's `origin`, and this box cannot see it.
+        assert!(
+            !checks
+                .iter()
+                .any(|c| c.name == "route comet-board-laptop: base"),
+            "a base check here could only ask the wrong disk"
+        );
+    }
+
+    /// A remote route whose `repo =` is not the space's own folder — which is
+    /// what a route left behind by the board that used to run here looks like,
+    /// and exactly the Mac's `itsm-agent` route today: it points at
+    /// `/Users/brede/.comet-native/repos/itsm-agent` while the space is at
+    /// `/home/comet/…` on the box. `repo =` is the path a dispatch cuts in
+    /// (`build_spec` reads the route, not the space), so this route dispatches
+    /// into a directory that exists on neither machine. Not a failure — nothing
+    /// here can stat the other device's disk to prove it — but said out loud.
+    #[test]
+    fn a_remote_route_whose_repo_is_not_the_spaces_folder_says_so() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { gh_repo = \"o/itsm-agent\" }\nworkspace = \"itsm-agent\"\n\
+             repo = \"/Users/brede/.comet-native/repos/itsm-agent\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let mut theirs = space("itsm-agent");
+        theirs.device_id = "dev-2".into();
+        theirs.path = "/home/comet/.comet-native/repos/itsm-agent".into();
+        let mut engine = engine_up();
+        engine.devices = vec![device_row("dev-2", "Tokenmaxxer9000")];
+
+        let checks = doctor(&p, &engine, Some(&[theirs]), Some(&[]), None, None, None).unwrap();
+        let repo = checks
+            .iter()
+            .find(|c| c.name == "route itsm-agent: repo")
+            .expect("the route's repo is reported");
+        assert!(repo.ok, "this box cannot prove it wrong: {}", repo.detail);
+        assert!(
+            repo.detail
+                .contains("/home/comet/.comet-native/repos/itsm-agent"),
+            "the space's own path is named, so the disagreement is visible: {}",
+            repo.detail
+        );
+        assert!(
+            repo.detail.contains("One of the two is wrong"),
+            "{}",
+            repo.detail
+        );
+    }
+
+    /// …and a space no device has is still the failure it always was: the
+    /// remote-space case above must not turn a genuine typo green.
+    #[test]
+    fn a_space_no_device_hosts_still_fails_and_lists_this_devices_own() {
+        let (_d, p) = tmp();
+        std::fs::write(
+            p.routing(),
+            "[[route]]\nmatch = { label = \"x\" }\nworkspace = \"typo\"\n\
+             repo = \"/nowhere\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let mut theirs = space("their-space");
+        theirs.device_id = "dev-2".into();
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[space("mine"), theirs]),
+            Some(&[]),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let s = checks
+            .iter()
+            .find(|c| c.name == "route typo: space")
+            .expect("the route is reported");
+        assert!(!s.ok, "{}", s.detail);
+        assert!(s.detail.contains("no comet space named"), "{}", s.detail);
+        // `have:` is this device's own — offering to adopt another machine's
+        // folder is not a repair anybody can run from here.
+        assert!(s.detail.contains("mine"), "{}", s.detail);
+        assert!(
+            !s.detail.contains("their-space"),
+            "the other device's spaces are not repairs for this one: {}",
+            s.detail
+        );
     }
 
     /// A route pointing at a clone with no remote fails its `base` check rather

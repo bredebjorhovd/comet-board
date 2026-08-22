@@ -329,7 +329,10 @@ describe("SessionRoom load guard on real workerd", () => {
         // WASM_POISON_ABORT_AFTER; before gh#554 this room had aborted itself
         // by now and every attached socket would have read 1006.
         expect(refusing.lastAbort).toBeNull();
-        expect(refusing.heapSpared).toBe(0);
+        // Nor did it even reach the tripwire to be declined there (gh#557's
+        // `wasm.faults`): the refusal is an ANSWER, and it is raised where the
+        // stored bytes are, not after a strike was considered.
+        expect((refusing.wasm as { faults: number }).faults).toBe(0);
         // Evicted, so the fleet reseeds instead of replaying the poison.
         expect(refusing.postReset).toBe(true);
         expect(refusing.snapshotBytes).toBe(0);

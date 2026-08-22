@@ -116,6 +116,25 @@ pub mod methods {
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
     pub const CREATE_WORKTREE: &str = "CreateWorktree";
+    /// Cut an attempt's checkout on a device that is not the one hosting the
+    /// board (gh#558). Params `{repoPath, branch, base}` → a `Worktree`.
+    ///
+    /// Distinct from [`CREATE_WORKTREE`], which generates the branch name and
+    /// treats its `branch` param as a *start point*. This one is the board's
+    /// dispatch path: the branch name comes from `routing.toml`'s
+    /// `branch_template` and is exact, and a fresh branch starts at `base`
+    /// **fetched from origin** (gh#67) rather than at whatever the space folder
+    /// was last left on.
+    ///
+    /// It exists because a route names a space, a space is a device+folder
+    /// pair, and one board is supposed to be able to drive both machines: the
+    /// box polls `comet-board` and dispatches into the Mac's checkout, because
+    /// comet-board has iOS and macOS targets that cannot build on Linux. The
+    /// board's chat, brief and command ledger are all workspace-doc writes that
+    /// already land on the space's own device; the checkout was the one step
+    /// still being taken on whichever box happened to host the board, against a
+    /// path that does not exist there.
+    pub const CREATE_BOARD_WORKTREE: &str = "CreateBoardWorktree";
     pub const DELETE_WORKTREE: &str = "DeleteWorktree";
     /// Fork a conversation from one of its messages (gh#425). Params are a
     /// [`comet_proto::ForkRequest`] → [`comet_proto::ForkResult`].

@@ -740,6 +740,7 @@ impl Engine {
         // as `syncd`, fed by the same merged session stream `WatchSessions`
         // serves. Failure to start is a warning, not fatal — the engine's job
         // is chats, and the board is an addition.
+        let mut board_dispatch_runtime: Option<Arc<board_runtime::CometRuntime>> = None;
         if config.board {
             let sessions_watch = core
                 .workspace
@@ -771,6 +772,11 @@ impl Engine {
                     "board directories unreadable — board-dispatched GitHub runs will be refused"
                 ),
             }
+            // Kept past the move into the board below, so the relay built after
+            // it can be handed back (gh#558): a dispatch whose route names a
+            // space on the other device cuts its checkout over that relay, and
+            // the relay does not exist yet at this point in the assembly.
+            board_dispatch_runtime = Some(runtime.clone());
             match board::BoardService::spawn(
                 &config.data_dir,
                 sessions_watch,
@@ -796,6 +802,12 @@ impl Engine {
                 .set_peer_alive_hook(Arc::new(move |device_id: &str| {
                     links_for_presence.reset_cooldown(device_id);
                 }));
+            // The board's dispatch path needs the same cache the RPC layer
+            // forwards over (gh#558) — it is how a route pointing at the other
+            // device's space gets its checkout cut where the run will happen.
+            if let Some(runtime) = &board_dispatch_runtime {
+                runtime.set_links(links.clone());
+            }
             core.set_links(links);
             core.start_host_relay(&edge.url)
         });
