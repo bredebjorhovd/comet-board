@@ -405,6 +405,10 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
         !env.contains_key("GH_TOKEN"),
         "a token was exported into the agent's environment: {env:?}"
     );
+    let git_guard = std::fs::read_to_string(bin_dir.join("git")).unwrap();
+    assert!(git_guard.contains("COMET_BOARD_CHAT_ID='chat-dispatched'"), "{git_guard}");
+    assert!(git_guard.contains("GIT_ASKPASS="), "{git_guard}");
+    assert!(git_guard.contains("credential.helper"), "{git_guard}");
 
     // Whose commits these are (gh#107). The author is the teammate the board
     // resolved at dispatch; the committer is left unset, so git falls back to

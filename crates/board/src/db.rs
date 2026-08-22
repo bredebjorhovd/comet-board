@@ -2043,6 +2043,18 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Whether this exact writeback has ever been queued, including effects
+    /// already delivered or deferred beyond the current retry window.
+    pub fn has_writeback(&self, task_id: &str, kind: &str, idem_key: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM writeback_queue
+             WHERE task_id = ?1 AND kind = ?2 AND idem_key = ?3",
+            params![task_id, kind, idem_key],
+            |row| row.get(0),
+        )?;
+        Ok(count != 0)
+    }
+
     pub fn mark_writeback_done(&self, id: i64) -> Result<()> {
         self.conn.execute(
             "UPDATE writeback_queue SET done = 1, last_error = NULL WHERE id = ?1",
@@ -2681,6 +2693,9 @@ mod tests {
         db.mark_writeback_done(pending[0].id).unwrap();
         assert!(!db.enqueue_writeback(&w).unwrap());
         assert!(db.pending_writebacks(10).unwrap().is_empty());
+        assert!(db
+            .has_writeback("linear:LIN-142", "comment", "k1")
+            .unwrap());
     }
 
     #[test]
@@ -2701,6 +2716,9 @@ mod tests {
         assert!(db.pending_writebacks(10).unwrap().is_empty());
         // ...but it is still pending and will drain when the source returns.
         assert_eq!(db.pending_writeback_count().unwrap(), 1);
+        assert!(db
+            .has_writeback("linear:LIN-142", "comment", "k1")
+            .unwrap());
     }
 
     #[test]

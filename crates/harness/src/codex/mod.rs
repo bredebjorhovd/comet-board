@@ -476,6 +476,11 @@ impl Harness for CodexHarness {
             // paired with the credential projection: ordinary chats retain
             // their configured login-shell behavior.
             cmd.arg("-c").arg("allow_login_shell=false");
+            // Defense in depth for startup hooks. The git shim installed by
+            // the engine is the fail-closed credential boundary; snapshots
+            // are also disabled so a stale shell cannot remove that shim's
+            // directory from PATH before git is resolved.
+            cmd.arg("-c").arg("features.shell_snapshot=false");
         }
         for config in mcp_config_overrides(&controls.mcp_servers) {
             cmd.arg("-c").arg(config);

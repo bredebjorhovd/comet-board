@@ -36,6 +36,66 @@ mod common;
 /// runner (gh#167).
 const RUN_DEADLINE: Duration = Duration::from_secs(10);
 
+#[cfg(unix)]
+fn authenticated_git_http(origin: PathBuf) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("git HTTP listener");
+    let url = format!("http://x-access-token@{}/origin.git", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(8) {
+            let mut stream = stream.expect("git HTTP request");
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).unwrap();
+            let mut length = 0usize;
+            let mut content_type = String::new();
+            let mut authorized = false;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" { break; }
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") { length = v.trim().parse().unwrap(); }
+                if let Some(v) = line.strip_prefix("Content-Type:").or_else(|| line.strip_prefix("content-type:")) { content_type = v.trim().into(); }
+                if let Some(v) = line.strip_prefix("Authorization:").or_else(|| line.strip_prefix("authorization:")) {
+                    let expected = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "x-access-token:board-token");
+                    authorized = v.trim() == format!("Basic {expected}");
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            if !authorized {
+                stream.write_all(b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"GitHub\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                continue;
+            }
+            let target = first.split_whitespace().nth(1).unwrap();
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let root = origin.parent().unwrap();
+            let mut child = std::process::Command::new("git")
+                .arg("http-backend")
+                .env("GIT_PROJECT_ROOT", root)
+                .env("GIT_HTTP_EXPORT_ALL", "1")
+                .env("PATH_INFO", path)
+                .env("QUERY_STRING", query)
+                .env("REQUEST_METHOD", first.split_whitespace().next().unwrap())
+                .env("REMOTE_USER", "x-access-token")
+                .env("CONTENT_TYPE", content_type)
+                .env("CONTENT_LENGTH", length.to_string())
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn().unwrap();
+            child.stdin.take().unwrap().write_all(&body).unwrap();
+            let out = child.wait_with_output().unwrap();
+            let split = out.stdout.windows(2).position(|w| w == b"\n\n").map(|i| i + 2)
+                .or_else(|| out.stdout.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\n").unwrap();
+            stream.write_all(&out.stdout[..split]).unwrap();
+            stream.write_all(&out.stdout[split..]).unwrap();
+            if std::process::Command::new("git").args(["--git-dir", origin.to_str().unwrap(), "show-ref", "--verify", "--quiet", "refs/heads/board-test"]).status().unwrap().success() { break; }
+        }
+    });
+    url
+}
+
 fn fixture_path() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -389,8 +449,8 @@ async fn spawned_codex_forces_push_credentials_through_its_shell_policy() {
         "the gh shim must lead Codex's tool PATH: {policy}"
     );
     assert_eq!(
-        argv.get(2..4),
-        Some(&["-c", "allow_login_shell=false"][..]),
+        argv.get(2..6),
+        Some(&["-c", "allow_login_shell=false", "-c", "features.shell_snapshot=false"][..]),
         "credentialed runs must prohibit profile mutation after policy application: {argv:?}"
     );
     assert_eq!(argv.last(), Some(&"app-server"), "{argv:?}");
@@ -474,9 +534,13 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     // A credential the push could use if the board's empty helper override is
     // filtered out. The server records which password actually reaches it.
     let ambient = dir.path().join("ambient-helper");
+    let ambient_used = dir.path().join("ambient-used");
     std::fs::write(
         &ambient,
-        "#!/bin/sh\n[ \"$1\" = get ] && printf 'username=x-access-token\\npassword=ambient-token\\n'\n",
+        format!(
+            "#!/bin/sh\nprintf used > '{}'\n[ \"$1\" = get ] && printf 'username=x-access-token\\npassword=ambient-token\\n'\n",
+            ambient_used.display()
+        ),
     )
     .expect("ambient helper");
     std::fs::set_permissions(&ambient, std::fs::Permissions::from_mode(0o755))
@@ -499,10 +563,21 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     std::fs::write(&bash_env, &profile).expect("hostile BASH_ENV");
     std::fs::write(home.join(".zshenv"), &profile).expect("hostile .zshenv");
 
-    // Cargo starts this integration test in the crate directory, while the
-    // app server below starts in the temporary account root. That differing
-    // workdir intentionally makes Codex's root shell snapshot inapplicable.
-    let tool_cwd = std::env::current_dir().expect("test crate directory");
+    let tool_cwd = dir.path().join("source");
+    std::fs::create_dir_all(&tool_cwd).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["config", "user.email", "codex@test.invalid"],
+        vec!["config", "user.name", "Codex Test"],
+        vec!["commit", "--allow-empty", "-m", "non-shallow source"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&tool_cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
     let model_listener = TcpListener::bind("127.0.0.1:0").expect("model listener");
     let model_base_url = format!("http://{}/v1", model_listener.local_addr().unwrap());
     let tool_arguments = serde_json::json!({
@@ -510,8 +585,10 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         // inside that real model-tool command so one CI host exercises both
         // noninteractive startup mechanisms with the policy-built env.
         "cmd": format!(
-            "{} -c 'git push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test'",
-            shell.display()
+            "{} -c 'unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT {} {} GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push \"$COMET_TEST_PUSH_URL\" HEAD:refs/heads/board-test'",
+            shell.display(),
+            concat!("COMET_BOARD_", "CONFIG_DIR"),
+            concat!("COMET_BOARD_", "STATE_DIR")
         ),
         "workdir": tool_cwd.clone(),
         "yield_time_ms": 10_000
@@ -549,7 +626,7 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
                 .lock()
                 .unwrap()
                 .push(String::from_utf8_lossy(&body).into_owned());
-            let response = if index == 0 {
+            let response = if index % 2 == 0 {
                 &first_response
             } else {
                 &second_response
@@ -564,38 +641,13 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         }
     });
 
-    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
-    let url = format!(
-        "http://x-access-token@{}/owner/repo.git",
-        listener.local_addr().unwrap()
-    );
-    let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-    let recorded = Arc::clone(&seen);
-    std::thread::spawn(move || {
-        for stream in listener.incoming().take(3) {
-            let mut stream = stream.expect("request");
-            let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
-            let mut authorization = String::new();
-            loop {
-                let mut line = String::new();
-                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
-                    break;
-                }
-                if let Some(value) = line
-                    .strip_prefix("Authorization: ")
-                    .or_else(|| line.strip_prefix("authorization: "))
-                {
-                    authorization = value.trim().to_string();
-                }
-            }
-            recorded.lock().unwrap().push(authorization);
-            stream
-                .write_all(
-                    b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"GitHub\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .expect("challenge");
-        }
-    });
+    let origin = dir.path().join("origin.git");
+    std::process::Command::new("git").args(["init", "--bare", origin.to_str().unwrap()]).output().unwrap();
+    let configured = std::process::Command::new("git")
+        .args(["--git-dir", origin.to_str().unwrap(), "config", "http.receivepack", "true"])
+        .output().unwrap();
+    assert!(configured.status.success());
+    let url = authenticated_git_http(origin.clone());
 
     // Capture the exact overlay the harness will pass, then give it to the
     // real Codex app server over an adversarial lower account policy. This is
@@ -607,13 +659,36 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     controls.chat_id = Some("chat-464".into());
     credential_ledger::handed(&paths, "owner/repo", Some("chat-464"));
     let mut env = git_credentials::push_env(&askpass, "owner/repo");
-    env.push(("COMET_TEST_PUSH_URL".into(), url));
-    controls.push = Some(PushCredentials { env, bin_dir: None });
+    env.push(("COMET_TEST_PUSH_URL".into(), url.clone()));
+    let system_git = git_credentials::resolve_git(None).expect("real git");
+    let git_guard_ran = dir.path().join("git-guard-ran");
+    let recorded_git = dir.path().join("recorded-real-git");
+    std::fs::write(
+        &recorded_git,
+        format!(
+            "#!/bin/sh\nprintf invoked > '{}'\nexec '{}' \"$@\"\n",
+            git_guard_ran.display(),
+            system_git.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&recorded_git, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let guarded_bin = git_credentials::install_git_shim(
+        &dir.path().join("guarded-bin"),
+        &recorded_git,
+        &askpass,
+        "owner/repo",
+        &paths,
+        comet_proto::GithubPushContract { contents_write: true, workflows_write: true },
+        "chat-464",
+    ).expect("git guard");
+    controls.push = Some(PushCredentials { env, bin_dir: Some(guarded_bin.clone()) });
     run_to_end(&harness, request("scenario:happy"), controls).await;
     let argv = std::fs::read_to_string(argv_file).expect("Codex argv");
     let argv: Vec<&str> = argv.lines().collect();
     let policy = argv.get(1).expect("policy overlay");
     assert_eq!(argv.get(3), Some(&"allow_login_shell=false"), "{argv:?}");
+    assert_eq!(argv.get(5), Some(&"features.shell_snapshot=false"), "{argv:?}");
     assert!(policy.contains(r#""BASH_ENV" = """#), "{policy}");
     assert!(policy.contains(r#""ENV" = """#), "{policy}");
     assert!(policy.contains(r#""ZDOTDIR" = "/dev/null""#), "{policy}");
@@ -625,7 +700,7 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         format!(
             "model = \"gpt-5.4\"\nmodel_provider = \"mock\"\n\
              [model_providers.mock]\nname = \"mock\"\nbase_url = \"{model_base_url}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n\
-             [features]\nunified_exec = true\nshell_snapshot = false\n\
+             [features]\nunified_exec = true\nshell_snapshot = true\n\
              [shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n\
              [shell_environment_policy.set]\nBASH_ENV = {}\nENV = {}\nZDOTDIR = {}\n",
             serde_json::to_string(&bash_env.display().to_string()).expect("BASH_ENV encodes"),
@@ -634,123 +709,55 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
         ),
     )
     .expect("restrictive lower config");
-    let mut child = tokio::process::Command::new("codex")
-        .args(["-c", policy, "-c", "allow_login_shell=false", "app-server"])
-        .env("CODEX_HOME", &codex_home)
-        .env("HOME", &home)
-        .current_dir(dir.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .expect("real Codex app server");
-    let mut stdin = child.stdin.take().expect("Codex stdin");
-    let stdout = child.stdout.take().expect("Codex stdout");
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    let mut stdout = tokio::io::BufReader::new(stdout).lines();
-    stdin
-        .write_all(
-            b"{\"id\":1,\"method\":\"initialize\",\"params\":{\"clientInfo\":{\"name\":\"comet-test\",\"version\":\"1\"},\"capabilities\":{\"experimentalApi\":true}}}\n",
-        )
-        .await
-        .expect("initialize");
-    let initialized = stdout
-        .next_line()
-        .await
-        .expect("initialize read")
-        .expect("initialize reply");
-    assert!(initialized.contains("\"id\":1"), "{initialized}");
-    stdin
-        .write_all(b"{\"method\":\"initialized\"}\n")
-        .await
-        .expect("initialized");
-    let start = serde_json::json!({
-        "id": 2,
-        "method": "thread/start",
-        "params": {
-            "cwd": tool_cwd,
-            "ephemeral": true,
-            "sandbox": "danger-full-access",
-            "approvalPolicy": "never"
-        }
+    // Now traverse the production harness itself, not a reconstructed argv.
+    // The wrapper supplies only the isolated account directories; every
+    // policy flag, environment projection, and app-server request comes from
+    // `CodexHarness::run`.
+    let real_codex = std::env::split_paths(&std::env::var_os("PATH").expect("PATH"))
+        .map(|dir| dir.join("codex"))
+        .find(|path| path.is_file())
+        .expect("Codex on PATH");
+    let live = dir.path().join("live-codex");
+    std::fs::write(
+        &live,
+        format!(
+            "#!/bin/sh\nexport CODEX_HOME='{}' HOME='{}'\nexec '{}' \"$@\"\n",
+            codex_home.display(),
+            home.display(),
+            real_codex.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let live_harness = CodexHarness::new().with_executable(live);
+    let (mut live_controls, _, _) = self::controls("Yes");
+    live_controls.chat_id = Some("chat-464".into());
+    let mut live_env = git_credentials::push_env(&askpass, "owner/repo");
+    live_env.push(("COMET_TEST_PUSH_URL".into(), url));
+    live_controls.push = Some(PushCredentials {
+        env: live_env,
+        bin_dir: Some(guarded_bin),
     });
-    // The URL lives in the forced policy, not this test process. The fake
-    // model deliberately references the variable instead of smuggling the URL
-    // into the tool call as an environment override.
-    stdin
-        .write_all(format!("{start}\n").as_bytes())
-        .await
-        .expect("thread/start");
-    let start_reply = loop {
-        let line = stdout
-            .next_line()
-            .await
-            .expect("command read")
-            .expect("command reply");
-        if line.contains("\"id\":2") {
-            break serde_json::from_str::<serde_json::Value>(&line).expect("thread/start JSON");
-        }
-    };
-    let thread_id = start_reply["result"]["thread"]["id"]
-        .as_str()
-        .expect("started thread id");
-    let turn = serde_json::json!({
-        "id": 3,
-        "method": "turn/start",
-        "params": {
-            "threadId": thread_id,
-            "input": [{"type": "text", "text": "push the current branch"}],
-            "approvalPolicy": "never",
-            "sandboxPolicy": { "type": "dangerFullAccess" }
-        }
-    });
-    stdin
-        .write_all(format!("{turn}\n").as_bytes())
-        .await
-        .expect("turn/start");
-    let command_reply = tokio::time::timeout(Duration::from_secs(20), async {
-        let mut transcript = String::new();
-        loop {
-            let line = stdout
-                .next_line()
-                .await
-                .expect("turn read")
-                .expect("turn reply");
-            transcript.push_str(&line);
-            transcript.push('\n');
-            if line.contains("\"method\":\"turn/completed\"") {
-                break transcript;
-            }
-        }
-    })
-    .await
-    .expect("real Codex model-tool turn timed out");
-    child.kill().await.ok();
+    let mut live_request = request("push the current branch");
+    live_request.cwd = tool_cwd.display().to_string();
+    // This test itself runs inside macOS seatbelt; nesting another workspace
+    // seatbelt around a temp checkout is refused before Git starts. Credential
+    // enforcement is the boundary under test, so let the inner Codex run use
+    // the same unsandboxed tool mode the former direct app-server fixture did.
+    live_request.sandbox = SandboxLevel::DangerFullAccess;
+    let before = std::process::Command::new("git")
+        .args(["--git-dir", origin.to_str().unwrap(), "show-ref", "--verify", "--quiet", "refs/heads/board-test"])
+        .status().unwrap();
+    assert!(!before.success(), "production ref existed before the harness push");
+    let events = run_to_end(&live_harness, live_request, live_controls).await;
     assert!(
-        command_reply.contains(&shell.display().to_string()),
-        "Codex did not execute through requested {shell_name} shell {}: {command_reply}",
-        shell.display()
+        !events.iter().any(|event| matches!(event, AgentEvent::Error { .. })),
+        "production harness emitted an error: {events:?}"
     );
 
-    let offered = seen.lock().unwrap().join("\n");
-    let board = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        "x-access-token:board-token",
-    );
-    let ambient = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        "x-access-token:ambient-token",
-    );
-    assert!(
-        offered.contains(&board),
-        "board credential was not offered: {offered}; Codex said: {command_reply}; model requests: {:?}",
-        model_requests.lock().unwrap()
-    );
-    assert!(
-        !offered.contains(&ambient),
-        "ambient credential escaped: {offered}"
-    );
+    let pushed = std::process::Command::new("git").args(["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/board-test"]).output().unwrap();
+    assert!(pushed.status.success(), "origin did not change; events: {events:?}; model requests: {:?}", model_requests.lock().unwrap());
+    assert!(git_guard_ran.exists(), "the model push bypassed the guarded Git boundary");
     assert!(
         !hostile_profile.exists(),
         "Codex sourced the hostile {shell_name} startup hook after constructing the protected environment"
@@ -761,6 +768,14 @@ async fn restrictive_codex_tool_push_case(shell_name: &str, shell: &std::path::P
     assert!(
         !record.unsanctioned(),
         "an attested push settled as alternate"
+    );
+    assert!(
+        comet_board::sync::credential_is_sanctioned_at_settle(&paths, "chat-464"),
+        "the production settlement verdict rejected the model-issued push"
+    );
+    assert!(
+        !ambient_used.exists(),
+        "Git selected the hostile ambient credential helper"
     );
 }
 

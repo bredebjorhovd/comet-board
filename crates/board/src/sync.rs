@@ -159,6 +159,13 @@ enum Told {
 /// has no session row, which is [`AgentStatus::Missing`].
 pub type SessionStatuses = HashMap<String, AgentStatus>;
 
+/// The credential verdict applied when work is present on origin at settle.
+/// Kept as one seam so end-to-end push tests can assert the exact production
+/// decision rather than reimplementing Handed/Minted interpretation.
+pub fn credential_is_sanctioned_at_settle(paths: &Paths, chat: &str) -> bool {
+    !credential_ledger::for_chat(paths, chat).unsanctioned()
+}
+
 pub struct SyncEngine {
     pub db: Db,
     pub cfg: RoutingConfig,
@@ -3593,7 +3600,7 @@ impl SyncEngine {
                 failure.summary()
             ));
         }
-        if !record.unsanctioned() {
+        if credential_is_sanctioned_at_settle(&self.paths, chat) {
             return None;
         }
         // The accusation binds to an origin that *moved* during this attempt
@@ -7194,6 +7201,15 @@ mod tests {
             credential_ledger::minted(paths, "git-askpass", "owner/widget", Some("chat-9"));
         });
 
+        // gh#488: this is also the board-side half of the live-Codex
+        // regression. The harness test executes the model-issued push; here
+        // the same chat's Handed + Minted pair travels through a dispatched
+        // attempt, PR discovery, session reconciliation, and final settle.
+        // Do not replace this with a credential-ledger unit assertion: the
+        // bug was observable only when an origin update and settle met.
+        let record = credential_ledger::for_chat(&e.paths, "chat-9");
+        assert!(record.handed && record.minted, "{record:?}");
+        assert!(!record.unsanctioned(), "{record:?}");
         assert!(credential_writebacks(&e).is_empty());
         assert_eq!(hook.posts.lock().unwrap()[0].1["note"], Value::Null);
     }

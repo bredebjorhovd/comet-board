@@ -8,15 +8,41 @@
 //! blocks on async engine calls, so trait calls run on `spawn_blocking` —
 //! exactly the off-runtime placement the board loop gives them in production.
 
+#[cfg(target_os = "linux")]
+use std::io::{BufRead, BufReader, Read, Write};
+#[cfg(target_os = "linux")]
+use std::net::TcpListener;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use comet_board::config::Paths;
+#[cfg(target_os = "linux")]
+use comet_board::credential_ledger;
+#[cfg(target_os = "linux")]
+use comet_board::db::{Db, UpsertTask};
+#[cfg(target_os = "linux")]
+use comet_board::dispatch::{DispatchOrigin, DispatchOverrides};
+#[cfg(target_os = "linux")]
+use comet_board::model::{BoardState, Outcome, Source, UpstreamState};
 use comet_board::runtime::{DispatchSpec, RunEnd, Runtime};
+#[cfg(target_os = "linux")]
+use comet_board::sources::github::{CapabilityEvidence, PushCapabilities, WriteCapability};
 use comet_doc::{MessageRole, MessageStatus};
+#[cfg(target_os = "linux")]
+use comet_engine::board::BoardService;
 use comet_engine::push_credentials::PushCredentials;
 use comet_engine::{CometRuntime, EngineCore, HarnessRegistry};
+#[cfg(target_os = "linux")]
+use comet_harness::codex::CodexHarness;
 use comet_harness::mock::MockHarness;
 use comet_proto::{AgentEvent, DoneStatus, HarnessId, SessionStatus};
 
@@ -31,6 +57,50 @@ fn git(repo: &std::path::Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+static WORKTREES_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct WorktreesEnvGuard {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    prior: Option<std::ffi::OsString>,
+    prior_codex_home: Option<Option<std::ffi::OsString>>,
+}
+
+impl Drop for WorktreesEnvGuard {
+    fn drop(&mut self) {
+        if let Some(prior) = self.prior.take() {
+            unsafe { std::env::set_var("COMET_WORKTREES_DIR", prior) };
+        } else {
+            unsafe { std::env::remove_var("COMET_WORKTREES_DIR") };
+        }
+        if let Some(prior) = self.prior_codex_home.take() {
+            if let Some(prior) = prior {
+                unsafe { std::env::set_var("CODEX_HOME", prior) };
+            } else {
+                unsafe { std::env::remove_var("CODEX_HOME") };
+            }
+        }
+    }
+}
+
+impl WorktreesEnvGuard {
+    #[cfg(target_os = "linux")]
+    fn set_codex_home(&mut self, path: &std::path::Path) {
+        self.prior_codex_home = Some(std::env::var_os("CODEX_HOME"));
+        unsafe { std::env::set_var("CODEX_HOME", path) };
+    }
+}
+
+async fn isolate_worktrees(path: &std::path::Path) -> WorktreesEnvGuard {
+    let lock = WORKTREES_ENV.lock().await;
+    let prior = std::env::var_os("COMET_WORKTREES_DIR");
+    unsafe { std::env::set_var("COMET_WORKTREES_DIR", path) };
+    WorktreesEnvGuard {
+        _lock: lock,
+        prior,
+        prior_codex_home: None,
+    }
 }
 
 fn mock_script() -> Vec<AgentEvent> {
@@ -55,11 +125,191 @@ fn mock_script() -> Vec<AgentEvent> {
     ]
 }
 
+#[cfg(target_os = "linux")]
+fn has_board_basic_auth(line: &str) -> bool {
+    let Some((name, value)) = line.split_once(':') else {
+        return false;
+    };
+    if !name.trim().eq_ignore_ascii_case("authorization") {
+        return false;
+    }
+    let mut value = value.split_whitespace();
+    value
+        .next()
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("basic"))
+        && value.next() == Some("eC1hY2Nlc3MtdG9rZW46Ym9hcmQtdG9rZW4=")
+        && value.next().is_none()
+}
+
+#[cfg(target_os = "linux")]
+fn authenticated_git_http(origin: PathBuf) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!(
+        "http://x-access-token@{}/repo.git",
+        listener.local_addr().unwrap()
+    );
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&trace);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut content_length = 0usize;
+            let mut content_type = String::new();
+            let mut transfer_encoding = String::new();
+            let mut authenticated = false;
+            let mut request_headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                request_headers.push(line.trim_end().to_string());
+                let lower = line.to_ascii_lowercase();
+                if let Some(value) = lower.strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                if let Some(value) = lower.strip_prefix("content-type:") {
+                    content_type = value.trim().to_string();
+                }
+                if let Some(value) = lower.strip_prefix("transfer-encoding:") {
+                    transfer_encoding = value.trim().to_string();
+                }
+                if has_board_basic_auth(&line) {
+                    authenticated = true;
+                }
+            }
+            let mut body = vec![0; content_length];
+            reader.read_exact(&mut body).unwrap();
+            recorded.lock().unwrap().push(format!(
+                "request={:?} headers={request_headers:?} authenticated={authenticated} content_length={content_length} transfer_encoding={transfer_encoding:?} body_read={}",
+                request.trim_end(),
+                body.len()
+            ));
+            if !authenticated {
+                write!(stream, "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=board\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                continue;
+            }
+            let target = request.split_whitespace().nth(1).unwrap();
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            let path_info = path.strip_prefix("/repo.git").unwrap_or("");
+            let mut child = Command::new("git")
+                .arg("http-backend")
+                .env("GIT_PROJECT_ROOT", origin.parent().unwrap())
+                .env("GIT_HTTP_EXPORT_ALL", "1")
+                .env(
+                    "PATH_INFO",
+                    format!(
+                        "/{}{}",
+                        origin.file_name().unwrap().to_string_lossy(),
+                        path_info
+                    ),
+                )
+                .env("QUERY_STRING", query)
+                .env("REQUEST_METHOD", request.split_whitespace().next().unwrap())
+                .env("CONTENT_TYPE", content_type)
+                .env("CONTENT_LENGTH", content_length.to_string())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.as_mut().unwrap().write_all(&body).unwrap();
+            let output = child.wait_with_output().unwrap();
+            let split = output
+                .stdout
+                .windows(2)
+                .position(|w| w == b"\n\n")
+                .map(|i| i + 2)
+                .or_else(|| {
+                    output
+                        .stdout
+                        .windows(4)
+                        .position(|w| w == b"\r\n\r\n")
+                        .map(|i| i + 4)
+                })
+                .unwrap();
+            let headers = String::from_utf8_lossy(&output.stdout[..split]);
+            let response_body = &output.stdout[split..];
+            recorded.lock().unwrap().push(format!(
+                "backend_status={} backend_stderr={:?} cgi_headers={:?} response_body={}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+                headers,
+                response_body.len()
+            ));
+            write!(stream, "HTTP/1.1 200 OK\r\n").unwrap();
+            for header in headers.lines() {
+                let header = header.trim_end_matches('\r');
+                if !header.is_empty() {
+                    write!(stream, "{header}\r\n").unwrap();
+                }
+            }
+            write!(stream, "Connection: close\r\n\r\n").unwrap();
+            stream.write_all(response_body).unwrap();
+        }
+    });
+    (url, trace)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn smart_http_auth_preserves_case_sensitive_basic_payload() {
+    assert!(has_board_basic_auth(
+        "aUtHoRiZaTiOn: bAsIc eC1hY2Nlc3MtdG9rZW46Ym9hcmQtdG9rZW4=\r\n"
+    ));
+    assert!(!has_board_basic_auth(
+        "Authorization: Basic eC1hY2Nlc3MtdG9rZW46YW1iaWVudC10b2tlbg==\r\n"
+    ));
+}
+
+#[cfg(target_os = "linux")]
+fn serve_push_model(command: String) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let requests = Arc::new(AtomicUsize::new(0));
+    let served = Arc::clone(&requests);
+    std::thread::spawn(move || {
+        for (index, stream) in listener.incoming().take(2).enumerate() {
+            served.fetch_add(1, Ordering::SeqCst);
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line.is_empty() {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).unwrap();
+            let response = if index == 0 {
+                let args = serde_json::json!({"cmd": command, "yield_time_ms": 10000}).to_string();
+                format!(
+                    "event: response.created\ndata: {{\"type\":\"response.created\",\"response\":{{\"id\":\"r1\"}}}}\n\nevent: response.output_item.done\ndata: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"function_call\",\"call_id\":\"push\",\"name\":\"exec_command\",\"arguments\":{}}}}}\n\nevent: response.completed\ndata: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"r1\",\"usage\":{{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}}}}\n\n",
+                    serde_json::to_string(&args).unwrap()
+                )
+            } else {
+                "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r2\"}}\n\nevent: response.output_item.done\ndata: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"id\":\"m1\",\"content\":[{\"type\":\"output_text\",\"text\":\"done\"}]}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"r2\",\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"total_tokens\":0}}}\n\n".into()
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        }
+    });
+    (base, requests)
+}
+
 async fn wait_for<F>(mut predicate: F, what: &str)
 where
     F: FnMut() -> bool,
 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !predicate() {
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -72,10 +322,10 @@ where
 #[tokio::test(flavor = "multi_thread")]
 async fn dispatch_prompt_cancel_against_a_real_engine() {
     let dir = tempfile::tempdir().unwrap();
-    // Keep worktrees inside the tempdir — the default root is global
-    // (`~/.comet-native/worktrees`) and a leftover checkout there would
-    // collide with every later run. Safe to set: this binary has one test.
-    unsafe { std::env::set_var("COMET_WORKTREES_DIR", dir.path().join("worktrees")) };
+    // Keep worktrees inside the tempdir — the default root is global. The
+    // guard serializes both tests in this binary and restores the caller's
+    // process environment when the fixture drops.
+    let _worktrees_env = isolate_worktrees(&dir.path().join("worktrees")).await;
     // A clone with an origin, because that is what a dispatch now needs: the
     // spec's `base` is fetched before the branch is cut (gh#67).
     let origin = dir.path().join("origin");
@@ -499,5 +749,277 @@ async fn dispatch_prompt_cancel_against_a_real_engine() {
         "an archived chat is not alive"
     );
 
+    core.shutdown().await;
+}
+
+/// gh#488's whole production chain: the board releases the task, the real
+/// runtime hands the chat its protected tool PATH, Codex issues the push after
+/// deleting every inherited credential variable, and the board loop settles
+/// only after that same chat has minted through askpass.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !Command::new("codex")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        assert_ne!(
+            std::env::var_os("COMET_REQUIRE_REAL_CODEX"),
+            Some("1".into())
+        );
+        eprintln!("no real Codex CLI; skipping board dispatch regression");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut worktrees_env = isolate_worktrees(&dir.path().join("worktrees")).await;
+    let source = dir.path().join("widget");
+    std::fs::create_dir_all(&source).unwrap();
+    git(&source, &["init", "-b", "main"]);
+    git(&source, &["config", "user.email", "t@t"]);
+    git(&source, &["config", "user.name", "t"]);
+    std::fs::write(source.join("seed"), "seed\n").unwrap();
+    git(&source, &["add", "seed"]);
+    git(&source, &["commit", "-m", "root"]);
+    let checkout_origin = dir.path().join("checkout-origin.git");
+    git(
+        dir.path(),
+        &[
+            "clone",
+            "--bare",
+            source.to_str().unwrap(),
+            checkout_origin.to_str().unwrap(),
+        ],
+    );
+    git(
+        &source,
+        &["remote", "add", "origin", checkout_origin.to_str().unwrap()],
+    );
+
+    let receive = dir.path().join("receive.git");
+    git(dir.path(), &["init", "--bare", receive.to_str().unwrap()]);
+    let output = Command::new("git")
+        .args([
+            "--git-dir",
+            receive.to_str().unwrap(),
+            "config",
+            "http.receivepack",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let (push_url, receiver_trace) = authenticated_git_http(receive.clone());
+    let (model, model_requests) = serve_push_model(format!(
+        "unset GIT_ASKPASS COMET_BOARD_ASKPASS_REPO COMET_BOARD_CHAT_ID COMET_BOARD_PUSH_CONTRACT {} {} GIT_TERMINAL_PROMPT GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; git push '{}' HEAD:refs/heads/board-test",
+        concat!("COMET_BOARD_", "CONFIG_DIR"),
+        concat!("COMET_BOARD_", "STATE_DIR"),
+        push_url
+    ));
+
+    let data = dir.path().join("data");
+    let paths = Paths::under(&data).unwrap();
+    std::fs::create_dir_all(&paths.config_dir).unwrap();
+    std::fs::create_dir_all(&paths.state_dir).unwrap();
+    std::fs::write(paths.config_dir.join(".env"), "GITHUB_TOKEN=configured\n").unwrap();
+    let board = dir.path().join("comet-board");
+    let ledger = credential_ledger::path(&paths);
+    std::fs::write(&board, format!(
+        "#!/bin/sh\n[ \"$1\" = git-askpass ] || exit 2\ncase \"$2\" in *sername*) echo x-access-token ;; *) printf '{{\"at\":\"test\",\"event\":\"minted\",\"tool\":\"git-askpass\",\"repo\":\"owner/widget\",\"chat\":\"%s\"}}\\n' \"$COMET_BOARD_CHAT_ID\" >> '{}'; echo board-token ;; esac\n",
+        ledger.display()
+    )).unwrap();
+    std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let home = dir.path().join("home");
+    let codex_home = dir.path().join("codex-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&codex_home).unwrap();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        serde_json::json!({ "OPENAI_API_KEY": "fixture-key" }).to_string(),
+    )
+    .unwrap();
+    worktrees_env.set_codex_home(&codex_home);
+    let hostile = dir.path().join("ambient-used");
+    let ambient = dir.path().join("ambient-helper");
+    std::fs::write(&ambient, format!("#!/bin/sh\nprintf used > '{}'\n[ \"$1\" = get ] && printf 'username=x-access-token\\npassword=ambient-token\\n'\n", hostile.display())).unwrap();
+    std::fs::set_permissions(&ambient, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(
+        home.join(".gitconfig"),
+        format!("[credential]\n\thelper = {}\n", ambient.display()),
+    )
+    .unwrap();
+    std::fs::write(codex_home.join("config.toml"), format!(
+        "model = \"gpt-5.4\"\nmodel_provider = \"mock\"\n[model_providers.mock]\nname = \"mock\"\nbase_url = \"{}\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nrequest_max_retries = 0\nstream_max_retries = 0\n[features]\nunified_exec = true\nshell_snapshot = true\n[sandbox_workspace_write]\nnetwork_access = true\n[shell_environment_policy]\ninherit = \"none\"\ninclude_only = [\"HOME\"]\n",
+        model
+    )).unwrap();
+    let codex = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|p| p.join("codex"))
+        .find(|p| p.is_file())
+        .unwrap();
+    let live_codex = dir.path().join("live-codex");
+    std::fs::write(
+        &live_codex,
+        format!(
+            "#!/bin/sh\nexport CODEX_HOME='{}' HOME='{}'\nexec '{}' \"$@\"\n",
+            codex_home.display(),
+            home.display(),
+            codex.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&live_codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(CodexHarness::new().with_executable(live_codex)));
+    let core = EngineCore::assemble(&data, Arc::new(registry), HarnessId::Codex, None).unwrap();
+    core.workspace
+        .create_space(
+            "space-widget",
+            &core.device_id,
+            &source.to_string_lossy(),
+            None,
+            true,
+        )
+        .unwrap();
+    let push = Arc::new(PushCredentials::with_board_exe(paths.clone(), Some(board)));
+    core.sessions.set_push_credentials(push.clone());
+    let runtime = Arc::new(CometRuntime::new(
+        core.repos.clone(),
+        core.workspace.clone(),
+        core.doc_host.clone(),
+        core.workspace
+            .merged_sessions_watch(core.sessions.watch_sessions()),
+        core.sessions.journal(),
+        core.agent_accounts.clone(),
+        core.checkout_prep.clone(),
+        tokio::runtime::Handle::current(),
+    ));
+    runtime.set_push_credentials(push);
+    std::fs::write(paths.routing(), format!("[[route]]\nmatch = {{ gh_repo = \"owner/widget\" }}\nworkspace = \"widget\"\nrepo = {:?}\nruntime = \"codex\"\nbase = \"HEAD\"\n", source.to_string_lossy())).unwrap();
+    let db = Db::open(&paths.db()).unwrap();
+    db.upsert_task(&UpsertTask {
+        id: "gh:owner/widget#488".into(),
+        source: Source::Github,
+        source_id: "488".into(),
+        identifier: "gh#488".into(),
+        title: "guard push".into(),
+        body: Some("push it".into()),
+        url: "https://github.com/owner/widget/issues/488".into(),
+        labels: vec![],
+        source_state: None,
+        linear_team: None,
+        linear_project: None,
+        upstream: UpstreamState::Unstarted,
+        updated_at: comet_board::db::now(),
+    })
+    .unwrap();
+    drop(db);
+    let board_service = BoardService::spawn_at_with_capabilities(
+        paths.clone(),
+        core.workspace
+            .merged_sessions_watch(core.sessions.watch_sessions()),
+        runtime.clone(),
+        core.workspace.watch_spaces(),
+        tokio::runtime::Handle::current(),
+        Some(PushCapabilities {
+            contents: WriteCapability::Write,
+            workflows: WriteCapability::Write,
+            evidence: CapabilityEvidence::AppInstallation,
+        }),
+    )
+    .unwrap();
+    let dispatched = board_service
+        .dispatch_task(
+            "gh:owner/widget#488",
+            DispatchOrigin::default(),
+            DispatchOverrides::default(),
+        )
+        .await
+        .unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let pushed = loop {
+        if {
+            Command::new("git")
+                .args([
+                    "--git-dir",
+                    receive.to_str().unwrap(),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/board-test",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        } {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+    assert!(
+        pushed,
+        "model-issued remote ref missing; model requests={}; sessions={:?}; run_end={:?}; ledger={:?}; receiver={:?}",
+        model_requests.load(Ordering::SeqCst),
+        core.sessions.watch_sessions().borrow().clone(),
+        runtime.last_run_end(&dispatched.chat_id),
+        credential_ledger::for_chat(&paths, &dispatched.chat_id),
+        receiver_trace.lock().unwrap(),
+    );
+    wait_for(
+        || {
+            let facts = credential_ledger::for_chat(&paths, &dispatched.chat_id);
+            facts.handed && facts.minted
+        },
+        "matching Handed and Minted",
+    )
+    .await;
+    assert!(!hostile.exists(), "ambient helper bypassed the board guard");
+    let db = Db::open(&paths.db()).unwrap();
+    db.set_pr(
+        "gh:owner/widget#488",
+        Some("https://github.com/owner/widget/pull/1"),
+        Some(1),
+        true,
+    )
+    .unwrap();
+    drop(db);
+    wait_for(
+        || {
+            Db::open(&paths.db())
+                .unwrap()
+                .get_task("gh:owner/widget#488")
+                .unwrap()
+                .is_some_and(|t| t.state == BoardState::Review)
+        },
+        "SyncEngine settlement",
+    )
+    .await;
+    let task = Db::open(&paths.db())
+        .unwrap()
+        .get_task("gh:owner/widget#488")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.attempts.last().and_then(|a| a.outcome),
+        Some(Outcome::Done)
+    );
+    let attempt = task.attempts.last().unwrap();
+    let credential_notice_key = format!("{}:credential:{}", task.id, attempt.id);
+    let credential_notice_exists = Db::open(&paths.db())
+        .unwrap()
+        .has_writeback(&task.id, "credential", &credential_notice_key)
+        .unwrap();
+    assert!(
+        !credential_notice_exists,
+        "settlement classified the model push as an alternate credential"
+    );
+    board_service.shutdown();
     core.shutdown().await;
 }

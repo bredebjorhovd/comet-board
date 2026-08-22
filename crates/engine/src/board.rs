@@ -190,7 +190,13 @@ impl BoardService {
         Self::spawn_at_with_capabilities(paths, sessions, runtime, spaces, handle, None)
     }
 
-    fn spawn_at_with_capabilities(
+    /// As [`BoardService::spawn_at`], for an engine embedding that owns the
+    /// GitHub source probe separately and therefore already has its result
+    /// when it assembles the board. The desktop learns this later through its
+    /// sync loop; headless/test assemblies can inject the same typed result
+    /// here instead of weakening dispatch preflight to infer scopes from a
+    /// configured credential.
+    pub fn spawn_at_with_capabilities(
         paths: Paths,
         mut sessions: watch::Receiver<Vec<Session>>,
         runtime: Arc<dyn Runtime + Send + Sync>,
