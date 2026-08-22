@@ -894,7 +894,6 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
             .merged_sessions_watch(core.sessions.watch_sessions()),
         core.sessions.journal(),
         core.agent_accounts.clone(),
-        core.checkout_prep.clone(),
         tokio::runtime::Handle::current(),
     ));
     runtime.set_push_credentials(push);
@@ -910,8 +909,6 @@ async fn board_dispatch_push_and_settle_share_one_guarded_credential_event() {
         url: "https://github.com/owner/widget/issues/488".into(),
         labels: vec![],
         source_state: None,
-        linear_team: None,
-        linear_project: None,
         upstream: UpstreamState::Unstarted,
         updated_at: comet_board::db::now(),
     })
