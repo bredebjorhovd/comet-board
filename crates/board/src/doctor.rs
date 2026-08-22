@@ -1293,9 +1293,33 @@ fn edge_connections_check(edge: Option<&EdgeHealth>) -> Check {
              stopped",
         );
     }
+    // Local resources, not sockets (gh#552). The box this check exists for
+    // ran its engine at 103 of the kernel's 128 inotify instances with no
+    // reading anywhere, until EAGAIN panicked it every few hours and each
+    // restart dropped every room. Both states below are that state, seen
+    // earlier: at the engine's own bound (refusing watches), or having
+    // survived watcher deaths an older engine would have crashed on.
+    if edge.watchers_saturated() {
+        detail.push_str(
+            ". The engine is refusing filesystem watches, so new checkouts get no live diffs. \
+             Raise COMET_MAX_FS_WATCHERS for the engine, or reclaim worktrees; on Linux also \
+             check `sysctl fs.inotify.max_user_instances`",
+        );
+    }
+    if edge.watchers_degraded() {
+        detail.push_str(
+            ". Watcher event loops have died and been survived — the repair tick keeps diffs \
+             correct, but repeated degradation points at kernel pressure (inotify limits, fd \
+             exhaustion); `journalctl -u <unit> | grep DEGRADED` names when",
+        );
+    }
     Check {
         name: "edge connections".into(),
-        ok: !edge.dark() && !edge.churning() && !edge.content_stuck(),
+        ok: !edge.dark()
+            && !edge.churning()
+            && !edge.content_stuck()
+            && !edge.watchers_saturated()
+            && !edge.watchers_degraded(),
         detail,
     }
 }
@@ -4110,6 +4134,19 @@ mod tests {
             .expect("edge connections is always reported")
     }
 
+    /// A healthy online engine, for tests that overlay one local fault on it.
+    fn online_edge() -> EdgeHealth {
+        EdgeHealth {
+            edge_url: Some("https://edge.example".into()),
+            host_relay: Some(true),
+            workspace_room: Some(true),
+            workspace_presence: Some(true),
+            org_registry: Some(true),
+            org_presence: Some(true),
+            ..EdgeHealth::default()
+        }
+    }
+
     /// gh#116: the state the box was actually in — engine up, IPC answering,
     /// every edge socket dead. Doctor has to fail on it, because nothing else
     /// on this box can tell.
@@ -4173,6 +4210,70 @@ mod tests {
         assert!(check.ok, "{}", check.detail);
         assert!(
             check.detail.contains("workspace room down"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// gh#552: the box this exists for sat at 103 of 128 inotify instances
+    /// with no reading anywhere until the kernel panicked its engine, four
+    /// times in 48h. At the engine's OWN bound — before the kernel is ever
+    /// involved — doctor has to fail and say what to raise.
+    #[test]
+    fn an_engine_at_its_watcher_bound_fails() {
+        let (_d, p) = tmp();
+        let saturated = EdgeHealth {
+            fs_watchers_open: 96,
+            fs_watchers_limit: 96,
+            ..online_edge()
+        };
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            Some(&saturated),
+            None,
+            None,
+        )
+        .unwrap();
+        let check = edge_check_in(&checks);
+        assert!(!check.ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("AT LIMIT (96/96)"),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("COMET_MAX_FS_WATCHERS"),
+            "{}",
+            check.detail
+        );
+    }
+
+    /// And a watcher that died and was survived — gh#552's crash, degraded
+    /// instead — is still a fault worth failing on, not a silent pass.
+    #[test]
+    fn an_engine_with_degraded_watchers_fails() {
+        let (_d, p) = tmp();
+        let degraded = EdgeHealth {
+            fs_watchers_degraded: 3,
+            ..online_edge()
+        };
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            Some(&degraded),
+            None,
+            None,
+        )
+        .unwrap();
+        let check = edge_check_in(&checks);
+        assert!(!check.ok, "{}", check.detail);
+        assert!(
+            check.detail.contains("3 filesystem watcher(s) DEGRADED"),
             "{}",
             check.detail
         );

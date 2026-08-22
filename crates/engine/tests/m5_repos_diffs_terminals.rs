@@ -681,6 +681,108 @@ async fn a_deleted_checkout_is_never_probed_with_git_again() {
     core.shutdown().await;
 }
 
+/// gh#552: reclaiming a worktree releases its checkout entry — watchers,
+/// cached diff and cwd resolutions alike — at the moment the board reclaims
+/// the directory, not at the next reconcile that happens to notice. Every
+/// entry held is one OS watcher instance against a per-user kernel cap; a box
+/// whose worktree population churns filled the kernel's table to 103 of 128
+/// before EAGAIN panicked it. Release must also survive later reconciles:
+/// with the directory gone and the cache cleared, the entry does not
+/// resurrect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reclaimed_worktree_releases_its_watchers_at_once() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("reclaimed-repo");
+    init_repo(&repo_dir).await;
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-reclaim",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    // cwd defaults to the space path — the checkout under test.
+    core.workspace
+        .create_chat("chat-reclaim", "space-reclaim", None, None)
+        .expect("chat row");
+    // The background task reconciles on every workspace publish, so drive to
+    // steady state rather than asserting on any single pass (the same shape
+    // the gh#526 test settles with).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkout entry never formed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Retention sweeps the tree, then the runtime's reclaim verb releases
+    // everything rooted under the reclaimed path — in the production order,
+    // where the directory is ALREADY gone when release runs.
+    std::fs::remove_dir_all(&repo_dir).expect("sweep checkout");
+    let released = core.diff_sync.release_under(&repo_dir);
+    assert_eq!(released, 1, "the reclaimed checkout's watchers go with it");
+    // (A background reconcile may legitimately have re-parked the cwd as
+    // Gone by now — that is the gh#526 gate, not an entry, and holds no
+    // watchers. What must stay zero is tracked_checkout_count, below.)
+    assert_eq!(
+        core.diff_sync.watch_diffs().borrow().len(),
+        0,
+        "the released checkout's published diff is dropped"
+    );
+
+    // …and nothing resurrects: the directory is gone and its resolution is
+    // cleared, so every following reconcile — including any that raced the
+    // release — parks the cwd instead of rebuilding an entry (and spending
+    // watchers).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        assert_eq!(
+            core.diff_sync.tracked_checkout_count(),
+            0,
+            "a released checkout must not come back while its directory is gone"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert_eq!(core.diff_sync.tracked_checkout_count(), 0);
+
+    // A release over an unrelated root leaves live entries alone.
+    init_repo(&repo_dir).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rebuilt checkout entry never formed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    assert_eq!(core.diff_sync.release_under(elsewhere.path()), 0);
+    assert_eq!(
+        core.diff_sync.tracked_checkout_count(),
+        1,
+        "an unrelated release touches nothing"
+    );
+    core.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Terminals
 // ---------------------------------------------------------------------------

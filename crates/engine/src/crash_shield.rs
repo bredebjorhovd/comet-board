@@ -14,6 +14,14 @@
 //! launchd/systemd restarts a clean process. Boot recovery picks the runs back
 //! up from the journal from there.
 //!
+//! One carve-out (gh#552): a panic that belongs to a filesystem watcher —
+//! notify's event-loop thread dying on a poll error, or its follow-up unwraps
+//! once that loop is gone — is logged and counted as a degradation instead.
+//! The blast radius of one dead watcher is "its events stop and the owning
+//! service's repair tick takes over", which is where it should stop; exiting
+//! turned it into every sync room dropped, four times in 48h. See
+//! [`crate::fs_watch`].
+//!
 //! Everything here is bounded, because the drain may well touch whatever just
 //! panicked (a poisoned lock, a wedged executor): a shield that hangs is no
 //! better than no shield. The drain gets [`DRAIN_DEADLINE`]; independently, a
@@ -62,6 +70,30 @@ pub fn install(drain: Drain) {
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
             .unwrap_or_else(|| "<unknown>".into());
         let payload = panic_message(info);
+        // A filesystem watcher's own death is not the engine's death (gh#552).
+        // notify's event loop panics on a poll error — `poll failed: Resource
+        // temporarily unavailable` took this box down four times in 48h,
+        // dropping every sync room each restart. The loop thread dying costs
+        // one watcher: its events stop and the owning service's repair tick
+        // keeps the data correct. Classify before arming the exit; the
+        // watcher's slot is released quietly by `FsWatcher::drop`, which also
+        // swallows notify's follow-up unwrap when the dead watcher is later
+        // closed.
+        let thread_name = std::thread::current().name().map(str::to_string);
+        let location_file = info
+            .location()
+            .map(|l| l.file().to_string())
+            .unwrap_or_default();
+        if crate::fs_watch::is_watcher_panic(thread_name.as_deref(), &location_file) {
+            crate::fs_watch::note_degraded();
+            tracing::error!(
+                location = %location,
+                payload = %payload,
+                "filesystem watcher died — degrading that watcher (repair tick keeps its data \
+                 current); engine stays up"
+            );
+            return;
+        }
         tracing::error!(location = %location, payload = %payload, "PANIC — crash shield engaged");
         // `try_send` on a 1-slot channel: the first panic wins and every
         // later one (including any raised by the drain) is a no-op.

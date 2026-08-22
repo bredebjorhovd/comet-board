@@ -37,6 +37,7 @@ use comet_proto::{Chat, CheckoutDiff, DiffFileSummary};
 
 use crate::EngineError;
 use crate::doc_host::EdgeConfig;
+use crate::fs_watch::{FsWatcher, WatcherSpawnError};
 use crate::repos::{CheckoutIdentity, Repos};
 use crate::workspace_host::WorkspaceHost;
 
@@ -96,8 +97,10 @@ struct CheckoutEntry {
     checksum: Mutex<Option<String>>,
     /// Kick channel into the entry's debounce/sync task.
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Keeps the recursive fs watchers alive; dropped on entry close.
-    _watchers: Vec<notify::RecommendedWatcher>,
+    /// Keeps the recursive fs watchers alive; dropped on entry close. Each is
+    /// one OS watcher instance, counted against the engine's budget
+    /// ([`crate::fs_watch`]).
+    _watchers: Vec<FsWatcher>,
 }
 
 /// What reconcile remembers about a chat's cwd, so a reconcile — which runs on
@@ -184,6 +187,62 @@ impl CheckoutDiffSync {
         for entry in lock(&self.inner.entries).values() {
             let _ = entry.kick_tx.send(());
         }
+    }
+
+    /// Release every entry rooted under `root` — watchers, cached diff and
+    /// cwd resolutions alike (gh#552).
+    ///
+    /// Called by the board runtime the moment it reclaims a worktree, so its
+    /// watcher slots come back with the directory instead of riding until the
+    /// next reconcile notices the path is gone. Entries whose checkout still
+    /// has chats re-form on the next reconcile if the directory returns.
+    /// Returns how many entries were released.
+    ///
+    /// The prefix match is against canonical roots
+    /// ([`Repos::checkout_identity`] canonicalizes), so `root` is
+    /// canonicalized too — on macOS a tempdir path and its `/private` real
+    /// form are otherwise different prefixes.
+    pub fn release_under(&self, root: &Path) -> usize {
+        let root = canonical_root(root);
+        let removed: Vec<String> = {
+            let mut entries = lock(&self.inner.entries);
+            let doomed: Vec<String> = entries
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.identity.root.starts_with(&root)
+                        || entry.identity.git_dir.starts_with(&root)
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
+            for id in &doomed {
+                entries.remove(id); // dropping the entry drops its watchers
+            }
+            doomed
+        };
+        if removed.is_empty() {
+            return 0;
+        }
+        lock(&self.inner.identities).retain(|cwd, _| !Path::new(cwd).starts_with(&root));
+        publish_watch(&self.inner);
+        tracing::info!(
+            root = %root.display(),
+            released = removed.len(),
+            "diff-sync: released watchers for reclaimed worktree(s)"
+        );
+        removed.len()
+    }
+
+    /// Live entries — a test/diagnostics probe in the shape of
+    /// [`crate::repos::Repos::git_spawn_attempts`].
+    #[doc(hidden)]
+    pub fn tracked_checkout_count(&self) -> usize {
+        lock(&self.inner.entries).len()
+    }
+
+    /// Cached cwd resolutions — same probe surface as above.
+    #[doc(hidden)]
+    pub fn cached_cwd_count(&self) -> usize {
+        lock(&self.inner.identities).len()
     }
 }
 
@@ -356,23 +415,32 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
             continue;
         }
         let tx = kick_tx.clone();
-        let watcher =
-            notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
+        // One counted watcher per target (gh#552): the budget refusal and any
+        // other failure degrade this checkout to repair-tick-only diffs — the
+        // snapshot stays correct, just not instant — instead of leaning on
+        // the kernel's inotify cap to surface the population for us.
+        match FsWatcher::spawn(
+            target,
+            notify::RecursiveMode::Recursive,
+            move |event: Result<notify::Event, notify::Error>| {
                 if event.is_ok() {
                     let _ = tx.send(());
                 }
-            });
-        match watcher {
-            Ok(mut watcher) => {
-                use notify::Watcher as _;
-                match watcher.watch(target, notify::RecursiveMode::Recursive) {
-                    Ok(()) => watchers.push(watcher),
-                    Err(err) => {
-                        tracing::debug!(path = %target.display(), error = %err, "diff-sync: watch failed")
-                    }
-                }
+            },
+        ) {
+            Ok(watcher) => watchers.push(watcher),
+            Err(WatcherSpawnError::BudgetExhausted { open, limit }) => {
+                tracing::warn!(
+                    path = %target.display(),
+                    held = open,
+                    limit,
+                    "diff-sync: filesystem-watcher budget exhausted; checkout falls back to the \
+                     repair tick (raise COMET_MAX_FS_WATCHERS if this box should watch more)"
+                );
             }
-            Err(err) => tracing::debug!(error = %err, "diff-sync: watcher create failed"),
+            Err(err) => {
+                tracing::debug!(path = %target.display(), error = %err, "diff-sync: watch failed")
+            }
         }
     }
 
@@ -529,6 +597,24 @@ fn publish_watch_with(inner: &Arc<DiffSyncInner>, updated: Option<CheckoutDiff>)
 
 fn publish_watch(inner: &Arc<DiffSyncInner>) {
     publish_watch_with(inner, None);
+}
+
+/// The canonical form of `path`, surviving its own deletion.
+///
+/// [`Repos::checkout_identity`] canonicalizes, so entry roots are things like
+/// `/private/var/…` on macOS while the board's recorded worktree path may say
+/// `/var/…`. When the directory still exists a plain canonicalize answers;
+/// when it is ALREADY GONE — the usual order here, since release follows the
+/// reclaim's delete — the canonical parent + final component reconstructs
+/// exactly what canonicalize would have said (gh#552).
+fn canonical_root(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    match path.parent().and_then(|parent| std::fs::canonicalize(parent).ok()) {
+        Some(parent) => parent.join(path.file_name().unwrap_or_default()),
+        None => path.to_path_buf(),
+    }
 }
 
 /// Chat-watch follower + repair tick. Holds only weak handles so dropping the
