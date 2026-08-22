@@ -362,6 +362,7 @@ mod tests {
 
     fn chat(id: &str, title: Option<&str>, preview: Option<&str>) -> Chat {
         Chat {
+            creation_state: crate::ChatCreationState::Ready,
             id: id.into(),
             device_id: "box".into(),
             title: title.map(str::to_string),

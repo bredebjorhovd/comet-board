@@ -14,6 +14,7 @@
 
 use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, Window, actions};
 
+use crate::commands::NEW_SESSION;
 use crate::composer;
 
 actions!(
@@ -129,6 +130,7 @@ pub fn app_menus() -> Vec<Menu> {
 
     let mut menus = vec![
         Menu::new("Comet").items(app_items),
+        Menu::new("File").items([NEW_SESSION.menu_item()]),
         // Standard clipboard verbs tied to the composer's existing actions via
         // their native selectors (`OsAction` → cut:/copy:/paste:/selectAll:),
         // so the OS Edit menu routes through the responder chain to the focused
@@ -157,17 +159,8 @@ pub fn app_menus() -> Vec<Menu> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::NewSession;
     use gpui::{Action as _, Keystroke};
-
-    fn action_names(menu: &Menu) -> Vec<&'static str> {
-        menu.items
-            .iter()
-            .filter_map(|item| match item {
-                MenuItem::Action { action, .. } => Some(action.name()),
-                _ => None,
-            })
-            .collect()
-    }
 
     #[test]
     fn app_menu_ends_with_quit() {
@@ -184,7 +177,10 @@ mod tests {
     fn about_is_disabled_placeholder() {
         let menus = app_menus();
         let first = &menus[0].items[0];
-        assert!(first.is_disabled(), "About stays disabled until implemented");
+        assert!(
+            first.is_disabled(),
+            "About stays disabled until implemented"
+        );
     }
 
     #[test]
@@ -242,5 +238,29 @@ mod tests {
         assert_eq!(find(Quit.name()), Some(combo("cmd-q")));
         assert_eq!(find(CloseWindow.name()), Some(combo("cmd-w")));
         assert_eq!(find(Minimize.name()), Some(combo("cmd-m")));
+    }
+
+    #[test]
+    fn file_menu_and_shortcut_share_the_new_session_action() {
+        let menus = app_menus();
+        let file = menus
+            .iter()
+            .find(|menu| menu.name.as_ref() == "File")
+            .unwrap();
+        let Some(MenuItem::Action { name, action, .. }) = file.items.first() else {
+            panic!("New Session must be a native action");
+        };
+        assert_eq!(name.as_ref(), NEW_SESSION.label);
+        assert_eq!(action.name(), NewSession.name());
+        let binding =
+            crate::commands::new_session_binding(&crate::settings::KeymapConfig::default());
+        assert_eq!(binding.action().name(), action.name());
+        assert_eq!(
+            binding.keystrokes()[0].inner(),
+            &Keystroke::parse(&crate::settings::platform_combo(
+                NEW_SESSION.shortcut.default_combo()
+            ))
+            .unwrap()
+        );
     }
 }

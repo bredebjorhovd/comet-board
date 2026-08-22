@@ -558,10 +558,14 @@ impl Shell {
                 .into_any_element()
         });
 
-        // `+` — the new-session canvas "is" the unmaterialized tab, so the
-        // button carries the active wash while the canvas shows.
+        // `+` invokes the same typed command as File → New Session and ⌘T.
         let new_tab = div()
             .id("session-tab-new")
+            .role(gpui::Role::Button)
+            .aria_label(crate::commands::NEW_SESSION.label)
+            .aria_keyshortcuts(crate::settings::display_combo(
+                &crate::commands::NEW_SESSION.effective_combo(&self.settings.keymap),
+            ))
             .size(px(28.0))
             .flex_none()
             .flex()
@@ -577,20 +581,15 @@ impl Shell {
             )
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|_this, _, _, cx| {
                 cx.stop_propagation();
-                // Off a review, `+` is a way out too — and leaving the route
-                // without dropping the card would leave a live review panel
-                // mounted behind the canvas.
-                if matches!(this.route, Route::Review { .. }) {
-                    this.active_chat = String::new();
-                    this.close_review(cx);
-                }
-                this.route = Route::Chat;
-                this.state.update(cx, |s, cx| s.select_chat(None, cx));
-                cx.notify();
+                cx.dispatch_action(&crate::commands::NEW_SESSION.action());
             }))
-            .child(icon(icons::PLUS).size(px(16.0)).text_color(theme.text_muted));
+            .child(
+                icon(icons::PLUS)
+                    .size(px(16.0))
+                    .text_color(theme.text_muted),
+            );
 
         // Overflow: the tab region scrolls horizontally; edge fades appear on
         // whichever side has hidden tabs (offset from the LAST frame — a

@@ -756,6 +756,7 @@ impl WorkspaceHost {
             branch: None,
             checkout_id: None,
             config: None,
+            creation_state: comet_proto::ChatCreationState::Ready,
             last_message_preview: None,
             last_message_at: None,
             created_at: Utc::now(),
@@ -938,8 +939,19 @@ impl WorkspaceHost {
         config: Option<ChatConfig>,
         cwd: Option<String>,
     ) -> Result<(), EngineError> {
-        if self.inner.doc().chat(chat_id)?.is_some() {
-            return Ok(()); // idempotent: optimistic client retries never duplicate
+        let _gate = lock(&self.inner.owner_gate);
+        if let Some(chat) = self.inner.doc().chat(chat_id)? {
+            if chat.space_id.as_deref() != Some(space_id) {
+                return Err(EngineError::Other(format!(
+                    "chat {chat_id} already belongs to another space"
+                )));
+            }
+            // A retry after response loss is the durable acknowledgement: even
+            // if the first save failed or the reply vanished, persist the exact
+            // currently observed document before returning success.
+            let bytes = self.inner.doc().export_snapshot()?;
+            self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
+            return Ok(());
         }
         let Some(space) = self.inner.doc().space(space_id)? else {
             return Err(EngineError::Other(format!("no such space: {space_id}")));
@@ -953,6 +965,7 @@ impl WorkspaceHost {
             branch: None,
             checkout_id: None,
             config,
+            creation_state: comet_proto::ChatCreationState::Draft,
             last_message_preview: None,
             last_message_at: None,
             created_at: Utc::now(),
@@ -962,7 +975,68 @@ impl WorkspaceHost {
             last_seen_at: None,
             forked_from: None,
         })?;
+        let bytes = self.inner.doc().export_snapshot()?;
+        self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
         Ok(())
+    }
+
+    /// Finalize an empty UI-created draft exactly once before its first Run.
+    /// The row update is one workspace-doc write under the owner gate, so the
+    /// doc host can never observe cwd without config (or vice versa).
+    pub fn finalize_chat_draft(
+        &self,
+        chat_id: &str,
+        space_id: &str,
+        cwd: String,
+        branch: Option<String>,
+        config: ChatConfig,
+    ) -> Result<(), EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        let mut chat =
+            self.inner.doc().chat(chat_id)?.ok_or_else(|| {
+                EngineError::Other(format!("draft chat {chat_id} does not exist"))
+            })?;
+        if chat.space_id.as_deref() != Some(space_id) {
+            return Err(EngineError::Other(format!(
+                "draft chat {chat_id} belongs to another space"
+            )));
+        }
+        if chat.creation_state != comet_proto::ChatCreationState::Draft {
+            let already_final = chat.cwd.as_deref() == Some(cwd.as_str())
+                && chat.branch == branch
+                && chat.config.as_ref() == Some(&config);
+            return if already_final {
+                let bytes = self.inner.doc().export_snapshot()?;
+                self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
+                Ok(())
+            } else {
+                Err(EngineError::Other(format!(
+                    "chat {chat_id} is no longer an empty draft"
+                )))
+            };
+        }
+        chat.cwd = Some(cwd);
+        chat.branch = branch;
+        chat.config = Some(config);
+        chat.creation_state = comet_proto::ChatCreationState::Ready;
+        self.inner.doc().upsert_chat(&chat)?;
+        let bytes = self.inner.doc().export_snapshot()?;
+        self.inner.store.save_snapshot(WORKSPACE_DOC_ID, &bytes)?;
+        Ok(())
+    }
+
+    /// Prove under the workspace owner gate that a failed creation UUID never
+    /// committed. The UI may discard its durable recovery intent only after
+    /// this returns successfully.
+    pub fn confirm_chat_absent(&self, chat_id: &str) -> Result<(), EngineError> {
+        let _gate = lock(&self.inner.owner_gate);
+        if self.inner.doc().chat(chat_id)?.is_some() {
+            Err(EngineError::Other(format!(
+                "chat {chat_id} exists and must be reconciled"
+            )))
+        } else {
+            Ok(())
+        }
     }
 
     /// Publish one exact host-owned chat while holding the workspace document
@@ -1577,6 +1651,122 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
 #[cfg(test)]
 mod room_supervision_tests {
     use super::*;
+
+    fn test_config() -> WorkspaceHostConfig {
+        WorkspaceHostConfig {
+            device_id: "host-1".into(),
+            device_name: "Host".into(),
+            platform: "test".into(),
+            org_id: "org".into(),
+            user_id: "user".into(),
+            edge: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_chat_acknowledges_only_after_the_exact_row_is_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(store.clone(), test_config()).unwrap();
+        host.doc()
+            .upsert_space(&Space {
+                id: "space-1".into(),
+                device_id: "host-1".into(),
+                path: "/repo".into(),
+                name: None,
+                git_detected: true,
+                git_checked_at: None,
+                checkout_id: None,
+                branch: Some("main".into()),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        host.confirm_chat_absent("draft").unwrap();
+        host.create_chat("draft", "space-1", None, None).unwrap();
+        assert!(host.confirm_chat_absent("draft").is_err());
+        drop(host);
+
+        let restarted = WorkspaceHost::open(store, test_config()).unwrap();
+        let chat = restarted.doc().chat("draft").unwrap().unwrap();
+        assert_eq!(chat.space_id.as_deref(), Some("space-1"));
+        assert_eq!(chat.cwd.as_deref(), Some("/repo"));
+        assert_eq!(
+            chat.creation_state,
+            comet_proto::ChatCreationState::Draft
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_draft_finalization_atomically_sets_first_run_cwd_branch_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(DocsStore::open(dir.path()).unwrap());
+        let host = WorkspaceHost::open(store.clone(), test_config()).unwrap();
+        let chat: Chat = serde_json::from_value(serde_json::json!({
+            "id": "draft", "deviceId": "host-1", "title": null, "archived": false,
+            "cwd": "/base", "branch": null, "checkoutId": null, "config": null,
+            "creationState": "draft",
+            "lastMessagePreview": null, "lastMessageAt": null,
+            "createdAt": "2026-08-17T00:00:00Z", "harnessSessionId": null,
+            "harnessSessionCwd": null, "spaceId": "space-1", "lastSeenAt": null,
+            "forkedFrom": null
+        }))
+        .unwrap();
+        host.doc().upsert_chat(&chat).unwrap();
+        let config: ChatConfig = serde_json::from_value(serde_json::json!({
+            "harness": "codex", "model": "gpt-5.6", "reasoning": "high",
+            "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+            "pushRepo": null, "pushContract": null, "gitAuthor": null,
+            "turnLimits": {}, "mcpServers": []
+        }))
+        .unwrap();
+        host.finalize_chat_draft(
+            "draft",
+            "space-1",
+            "/worktree".into(),
+            Some("feature".into()),
+            config.clone(),
+        )
+        .unwrap();
+        let finalized = host.doc().chat("draft").unwrap().unwrap();
+        assert_eq!(finalized.cwd.as_deref(), Some("/worktree"));
+        assert_eq!(finalized.branch.as_deref(), Some("feature"));
+        assert_eq!(finalized.config, Some(config));
+        assert_eq!(
+            finalized.creation_state,
+            comet_proto::ChatCreationState::Ready
+        );
+        host.finalize_chat_draft(
+            "draft",
+            "space-1",
+            "/worktree".into(),
+            Some("feature".into()),
+            finalized.config.unwrap(),
+        )
+        .unwrap();
+        assert!(
+            host.finalize_chat_draft(
+                "draft",
+                "space-1",
+                "/other".into(),
+                None,
+                serde_json::from_value(serde_json::json!({
+                    "harness": "codex", "model": null, "reasoning": null,
+                    "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+                    "pushRepo": null, "pushContract": null, "gitAuthor": null,
+                    "turnLimits": {}, "mcpServers": []
+                }))
+                .unwrap(),
+            )
+            .is_err(),
+            "a finalized draft cannot be reconfigured"
+        );
+        drop(host);
+        let restarted = WorkspaceHost::open(store, test_config()).unwrap();
+        let durable = restarted.doc().chat("draft").unwrap().unwrap();
+        assert_eq!(durable.cwd.as_deref(), Some("/worktree"));
+        assert_eq!(durable.branch.as_deref(), Some("feature"));
+        assert!(durable.config.is_some());
+    }
 
     #[test]
     fn a_live_reseed_preserves_the_exact_host_owned_fork_row() {

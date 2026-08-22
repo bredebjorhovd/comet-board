@@ -310,6 +310,47 @@ impl EngineHandle {
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test_service(
+        service: Arc<dyn RpcService>,
+    ) -> (Self, Arc<tokio::runtime::Runtime>) {
+        struct TestEngine {
+            client: RpcClient,
+            _runtime: Arc<tokio::runtime::Runtime>,
+        }
+
+        #[async_trait]
+        impl EngineBackend for TestEngine {
+            fn client(&self) -> &RpcClient {
+                &self.client
+            }
+
+            fn mode(&self) -> EngineMode {
+                EngineMode::InProcess
+            }
+
+            async fn shutdown(&self) {}
+        }
+
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test RPC runtime"),
+        );
+        let client = {
+            let _entered = runtime.enter();
+            comet_rpc::operator_memory_client(service)
+        };
+        let handle = Self {
+            inner: Arc::new(TestEngine {
+                client,
+                _runtime: runtime.clone(),
+            }),
+        };
+        (handle, runtime)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -720,6 +761,15 @@ impl AppState {
         self.chats.iter().find(|c| c.id == id)
     }
 
+    /// Empty user-created sessions retain the draft checkout controls until
+    /// their first run fixes cwd/worktree. Board-created attempts already have
+    /// a Session row and are never drafts.
+    pub fn selected_chat_is_draft(&self) -> bool {
+        self.selected_chat_row().is_some_and(|chat| {
+            chat.creation_state == comet_proto::ChatCreationState::Draft
+        })
+    }
+
     pub fn gate(&self) -> GatePhase {
         gate_phase(&self.connection, self.auth.as_ref())
     }
@@ -809,6 +859,11 @@ impl AppState {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
         }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn attach_test_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
+        self.attach_engine(handle, cx);
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -1376,6 +1431,7 @@ mod tests {
             .unwrap()
             .to_utc();
         Chat {
+            creation_state: comet_proto::ChatCreationState::Ready,
             id: id.into(),
             device_id: "dev".into(),
             title: None,
@@ -1567,6 +1623,30 @@ mod tests {
         sort_tabs(&mut tabs);
         let order: Vec<&str> = tabs.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(order, ["b", "a"]);
+    }
+
+    #[test]
+    fn empty_user_session_keeps_first_turn_checkout_configuration() {
+        let mut state = AppState::new();
+        state.chats = vec![chat("draft", 1, None)];
+        state.selected_chat = Some("draft".into());
+        state.chats[0].creation_state = comet_proto::ChatCreationState::Draft;
+        assert!(state.selected_chat_is_draft());
+        state.chats[0].config = Some(
+            serde_json::from_value(serde_json::json!({
+                "harness": "codex", "model": null, "reasoning": null,
+                "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+                "pushRepo": null, "pushContract": null, "gitAuthor": null,
+                "turnLimits": {}, "mcpServers": []
+            }))
+            .unwrap(),
+        );
+        assert!(
+            state.selected_chat_is_draft(),
+            "provenance, not nullable config, defines a draft"
+        );
+        state.chats[0].creation_state = comet_proto::ChatCreationState::Ready;
+        assert!(!state.selected_chat_is_draft());
     }
 
     #[test]

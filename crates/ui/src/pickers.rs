@@ -477,9 +477,16 @@ impl Pickers {
         &self.config
     }
 
+    /// One source of truth for whether picker changes still belong to the
+    /// first-turn draft rather than an already-finalized chat.
+    fn editing_draft(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state.selected_chat.is_none() || state.selected_chat_is_draft()
+    }
+
     /// Harness is locked once the chat exists (feature-inventory §1.7).
     fn harness_locked(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_chat.is_some()
+        !self.editing_draft(cx)
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -876,7 +883,7 @@ impl Pickers {
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
         // Existing session: the pick SWITCHES the session's checkout (the
         // t3code mid-session `switchRef`) instead of updating the draft.
-        if self.state.read(cx).selected_chat_row().is_some() {
+        if !self.editing_draft(cx) {
             self.switch_session_ref(row, cx);
             return;
         }
@@ -1081,7 +1088,7 @@ impl Pickers {
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
         self.open = None;
-        if self.state.read(cx).selected_chat.is_some() {
+        if !self.editing_draft(cx) {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
             self.update_chat_config(cx, move |config| config.model = Some(model_id));
@@ -1105,7 +1112,7 @@ impl Pickers {
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
         // Always a concrete selection (no toggle-back-to-default).
-        if self.state.read(cx).selected_chat.is_some() {
+        if !self.editing_draft(cx) {
             self.update_chat_config(cx, move |config| config.reasoning = Some(level));
         } else {
             self.config.reasoning = Some(level);
@@ -1122,7 +1129,7 @@ impl Pickers {
         default: bool,
         cx: &mut Context<Self>,
     ) {
-        if self.state.read(cx).selected_chat.is_some() {
+        if !self.editing_draft(cx) {
             self.update_chat_config(cx, move |config| {
                 if default {
                     config.model_options.remove(&option_id);
@@ -1626,7 +1633,7 @@ impl Pickers {
                 .and_then(|_| state.selected_chat_row().cloned());
             (space, session)
         };
-        let new_chat = session.is_none();
+        let new_chat = self.editing_draft(cx);
 
         // Refs feed both modes (draft labels, mid-session switch list) —
         // eager + idempotent. Self-guarding on `git_detected`, so the non-git
@@ -1694,7 +1701,9 @@ impl Pickers {
         let ref_side =
             attach_overlay_end(ref_chip, &mut overlay, PickerKind::Branch, "branch-popover");
 
-        if let Some(chat) = &session {
+        if let Some(chat) = &session
+            && !new_chat
+        {
             // The checkout KIND is fixed at creation (harness resume is
             // cwd-scoped — the session never moves folders): label only.
             let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);

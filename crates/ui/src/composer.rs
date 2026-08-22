@@ -30,7 +30,7 @@ use comet_doc::{
 use comet_proto::view::context as view_context;
 use comet_proto::view::skills as view_skills;
 use comet_proto::{
-    ContextMatch, ContextRef, ContextRefKind, ContextSearch, RunRequest, SandboxLevel,
+    ChatConfig, ContextMatch, ContextRef, ContextRefKind, ContextSearch, RunRequest, SandboxLevel,
     SkillDescriptor, UserInputAnswer, UserInputQuestion,
 };
 use comet_rpc::methods;
@@ -49,6 +49,27 @@ use crate::theme::{Bed, ListRow as _, Theme};
 /// Expanded-mode textarea vertical padding: `pt-4 pb-1` (comet composer.tsx
 /// line 578) = 16 + 4.
 pub const TEXTAREA_PAD_V: f32 = 20.0;
+
+fn draft_mutate_params(
+    materialized: bool,
+    chat_id: &str,
+    space_id: &str,
+    cwd: &str,
+    branch: Option<&str>,
+    config: &ChatConfig,
+) -> serde_json::Value {
+    let mut params = serde_json::json!({
+        "op": if materialized { "finalizeChatDraft" } else { "createChat" },
+        "chatId": chat_id,
+        "spaceId": space_id,
+        "cwd": cwd,
+        "config": config,
+    });
+    if let (Some(branch), Some(object)) = (branch, params.as_object_mut()) {
+        object.insert("branch".into(), serde_json::Value::String(branch.into()));
+    }
+    params
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ContextSelection {
@@ -2182,6 +2203,15 @@ impl Composer {
         composer
     }
 
+    #[cfg(test)]
+    pub(crate) fn send_for_interaction_test(
+        &mut self,
+        text: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.send(text.into(), false, cx);
+    }
+
     /// Capture-knob passthrough (`COMET_OPEN_DIALOG=model`): open the
     /// combined harness/model menu.
     pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3403,8 +3433,11 @@ impl Composer {
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let draft_key = self.current_key.clone();
-        let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
-            Some(id) => (id, false),
+        let configurable = self.state.read(cx).selected_chat_is_draft();
+        let selected_chat = self.state.read(cx).selected_chat.clone();
+        let materialized_draft = selected_chat.is_some() && configurable;
+        let (chat_id, is_new) = match selected_chat {
+            Some(id) => (id, configurable),
             None => (uuid::Uuid::new_v4().to_string(), true),
         };
         // Where the new session runs (Current checkout / reuse an existing
@@ -3584,32 +3617,31 @@ impl Composer {
                 // the doc host would materialize the chat on first command
                 // anyway, so failures are non-fatal).
                 if is_new && let Some(space_id) = &space_id {
-                    let mut mutate = serde_json::json!({
-                        "op": "createChat",
-                        "chatId": chat_id,
-                        "spaceId": space_id,
-                    });
-                    if let Some(object) = mutate.as_object_mut() {
-                        if let Some(worktree_cwd) = &worktree_cwd {
-                            object.insert(
-                                "cwd".into(),
-                                serde_json::Value::String(worktree_cwd.clone()),
-                            );
-                        }
-                        if let Some(branch) = &chat_branch {
-                            object.insert(
-                                "branch".into(),
-                                serde_json::Value::String(branch.clone()),
-                            );
-                        }
-                        if let Some(config) = resolved.chat_config()
-                            && let Ok(config) = serde_json::to_value(&config)
-                        {
-                            object.insert("config".into(), config);
-                        }
-                    }
+                    let config = resolved.chat_config().ok_or_else(|| {
+                        "Send failed: choose an available harness before starting the session."
+                            .to_string()
+                    })?;
+                    let mutate = draft_mutate_params(
+                        materialized_draft,
+                        &chat_id,
+                        space_id,
+                        &cwd,
+                        chat_branch.as_deref(),
+                        &config,
+                    );
                     if let Err(err) = engine.client().call(methods::MUTATE, mutate).await {
-                        tracing::debug!(error = %err, "CreateChat mutate unavailable; doc host will materialize the chat");
+                        // A freshly cut worktree belongs to this transaction.
+                        // Roll it back only after a definitive engine refusal;
+                        // transport loss is ambiguous and may have committed.
+                        if !matches!(err, comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_))
+                            && matches!(plan, crate::pickers::CheckoutPlan::NewWorktree { .. })
+                            && let (Some(repo_path), Some(path)) = (&space_path, &worktree_cwd)
+                        {
+                            let _ = engine.client().call(methods::DELETE_WORKTREE, serde_json::json!({
+                                "repoPath": repo_path, "worktreePath": path,
+                            })).await;
+                        }
+                        return Err(format!("Send failed while finalizing the session: {err}"));
                     }
                 }
 
@@ -5136,6 +5168,33 @@ mod tests {
         );
     }
 
+    fn test_chat_config() -> ChatConfig {
+        serde_json::from_value(serde_json::json!({
+            "harness": "codex", "model": null, "reasoning": null,
+            "modelOptions": {}, "sandbox": "workspace-write", "account": null,
+            "pushRepo": null, "pushContract": null, "gitAuthor": null,
+            "turnLimits": {}, "mcpServers": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn first_turn_checkout_plans_always_carry_an_exact_cwd() {
+        let config = test_chat_config();
+        let cases = [
+            ("/repo", None),
+            ("/existing-worktree", Some("existing")),
+            ("/fresh-worktree", Some("feature")),
+        ];
+        for (cwd, branch) in cases {
+            let params = draft_mutate_params(true, "chat", "space", cwd, branch, &config);
+            assert_eq!(params["op"], "finalizeChatDraft");
+            assert_eq!(params["cwd"], cwd);
+            assert_eq!(params["branch"].as_str(), branch);
+            assert_eq!(params["config"]["harness"], "codex");
+        }
+    }
+
     fn question(id: &str, options: &[&str], multi: bool) -> UserInputQuestion {
         UserInputQuestion {
             id: id.into(),
@@ -5859,6 +5918,7 @@ mod tests {
             branch: None,
             checkout_id: None,
             config: None,
+            creation_state: comet_proto::ChatCreationState::Ready,
             last_message_preview: None,
             last_message_at: None,
             created_at: chrono::Utc::now(),

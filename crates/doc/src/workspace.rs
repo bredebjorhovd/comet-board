@@ -264,6 +264,13 @@ impl WorkspaceDoc {
             }
             None => row.delete("config")?,
         }
+        row.insert(
+            "creationState",
+            match chat.creation_state {
+                comet_proto::ChatCreationState::Ready => "ready",
+                comet_proto::ChatCreationState::Draft => "draft",
+            },
+        )?;
         set_opt_str(
             &row,
             "lastMessagePreview",
@@ -901,6 +908,8 @@ struct RawChat {
     #[serde(default)]
     config: Option<ChatConfig>,
     #[serde(default)]
+    creation_state: comet_proto::ChatCreationState,
+    #[serde(default)]
     board_push: Option<GithubPushState>,
     #[serde(default)]
     last_message_preview: Option<String>,
@@ -941,6 +950,7 @@ impl From<RawChat> for Chat {
             branch: raw.branch,
             checkout_id: raw.checkout_id,
             config,
+            creation_state: raw.creation_state,
             last_message_preview: raw.last_message_preview,
             last_message_at: raw.last_message_at.map(dt),
             created_at: dt(raw.created_at),
@@ -999,6 +1009,7 @@ mod tests {
 
     fn chat(id: &str, device_id: &str) -> Chat {
         Chat {
+            creation_state: comet_proto::ChatCreationState::Ready,
             id: id.into(),
             device_id: device_id.into(),
             title: Some("First chat".into()),
@@ -1301,13 +1312,15 @@ mod tests {
     fn rows_round_trip() {
         let ws = WorkspaceDoc::new();
         ws.upsert_device(&device("dev-a", "laptop")).unwrap();
-        ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
+        let mut expected_chat = chat("chat-1", "dev-a");
+        expected_chat.creation_state = comet_proto::ChatCreationState::Draft;
+        ws.upsert_chat(&expected_chat).unwrap();
         ws.upsert_session(&session("chat-1", "dev-a", SessionStatus::Working))
             .unwrap();
 
         let state = ws.read_all().unwrap();
         assert_eq!(state.devices, vec![device("dev-a", "laptop")]);
-        assert_eq!(state.chats, vec![chat("chat-1", "dev-a")]);
+        assert_eq!(state.chats, vec![expected_chat]);
         assert_eq!(
             state.sessions,
             vec![session("chat-1", "dev-a", SessionStatus::Working)]

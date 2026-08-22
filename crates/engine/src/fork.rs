@@ -842,6 +842,7 @@ async fn assemble_fork(
         branch: input.branch.clone(),
         checkout_id: Some(checkout_id.clone()),
         config: Some(config.clone()),
+        creation_state: comet_proto::ChatCreationState::Ready,
         last_message_preview: None,
         last_message_at: None,
         // Workspace chat rows store millisecond timestamps. Canonicalize
