@@ -529,19 +529,45 @@ pub struct OomJournalEntry {
     pub line: String,
 }
 
+/// The phrases that mean somebody was actually killed by memory here (gh#544).
+///
+/// Each wording is its own marker because each writer words it differently,
+/// and a report that missed one would be quiet on the night it is needed:
+///
+/// - the service manager announcing the death, old wording and new — "A
+///   process of this unit has been killed by the OOM killer", "The kernel OOM
+///   killer killed …";
+/// - its verdict on what the death did to the unit — "Failed with result
+///   'oom-kill'";
+/// - systemd-oomd's kills — "Killed … due to memory pressure";
+/// - the kernel's own report — "Out of memory: Killed process 12345 (cargo)",
+///   whose older siblings said "Kill" and whose cgroup-v1 cousins prefix
+///   "Memory cgroup".
+///
+/// What is *not* here is a bare `oom`, which was gh#544: every `room
+/// reconnected` INFO line the engine logs contains "room", which contains
+/// "oom", and thirteen thousand rooms read as thirteen thousand kills. The
+/// kernel needle keeps its colon-and-word tail for the same reason turned
+/// inside out — the engine's own retelling of a kill ("run killed: the box ran
+/// out of memory: …", `sessions.rs`) reaches this very journal through
+/// tracing, and describes a death the unit's lines already counted.
+const OOM_KILL_MARKERS: &[&str] = &[
+    "killed by the oom killer",
+    "the kernel oom killer",
+    "failed with result 'oom-kill'",
+    "due to memory pressure",
+    "out of memory: kill",
+];
+
 /// Pick the oom-kill lines out of `journalctl -o short-iso` output.
 ///
-/// Matched on the word rather than on one systemd version's exact sentence:
-/// "A process of this unit has been killed by the OOM killer" (the service
-/// manager), "Killed … due to memory pressure" (systemd-oomd) and the kernel's
-/// own "Out of memory: Killed process" all say `oom` or `out of memory`
-/// somewhere, and a report that missed one because a distribution reworded it
-/// would be quiet on the night it is needed.
+/// A line counts when it carries one of [`OOM_KILL_MARKERS`] — never merely
+/// because the word appears in it.
 pub fn parse_oom_journal(text: &str) -> Vec<OomJournalEntry> {
     text.lines()
         .filter(|line| {
             let lower = line.to_ascii_lowercase();
-            lower.contains("oom") || lower.contains("out of memory")
+            OOM_KILL_MARKERS.iter().any(|marker| lower.contains(marker))
         })
         .map(|line| {
             // `2026-08-19T23:41:02+0200 host systemd[1]: unit: message`
@@ -859,6 +885,57 @@ SwapFree:              0 kB
     fn a_quiet_journal_yields_nothing() {
         assert!(
             parse_oom_journal("2026-08-20T09:00:00+0200 h systemd[1]: x: Started.\n").is_empty()
+        );
+    }
+
+    /// The box that reported gh#544, as its journal has it: the night of
+    /// 2026-08-19 interleaved with the room chatter that made the old matcher
+    /// count the incident a thousandfold. The count is pinned to the real
+    /// kills, and the quoted line is the newest *match*, not the newest line.
+    #[test]
+    fn room_chatter_is_not_an_oom_kill_and_the_newest_match_is_what_gets_quoted() {
+        let journal = concat!(
+            "2026-08-19T03:14:05+0000 mylder kernel: Out of memory: Killed process 8117 ",
+            "(node) total-vm:12480000kB, anon-rss:9800004kB, shmem-rss:0kB\n",
+            "2026-08-19T03:14:06+0000 mylder systemd[1401]: comet-native.service: ",
+            "The kernel OOM killer killed process 8117 (node).\n",
+            "2026-08-19T03:14:06+0000 mylder systemd[1401]: comet-native.service: ",
+            "Failed with result 'oom-kill'.\n",
+            "2026-08-19T22:41:02+0000 mylder comet-native[824]: INFO ",
+            "comet_engine::workspace_host: room reconnected room=cd16185d\n",
+            "2026-08-20T20:16:18+00:00 mylder comet-native[824]: INFO ",
+            "comet_engine::workspace_host: room reconnected room=ab12ef90\n",
+        );
+        let found = parse_oom_journal(journal);
+        // Three genuine markers out of five lines; "room reconnected" is not
+        // one of them, though every line it produces contains "oom".
+        assert_eq!(found.len(), 3, "{found:?}");
+        for entry in &found {
+            assert!(!entry.line.contains("room "), "{entry:?}");
+        }
+        // Two days younger than the kill it used to bury as "latest": the last
+        // line in the window is reconnect chatter, and must not be the quote.
+        let latest = found.last().unwrap();
+        assert_eq!(latest.at, "2026-08-19T03:14:06+0000", "{latest:?}");
+        assert!(
+            latest.line.ends_with("Failed with result 'oom-kill'."),
+            "{latest:?}"
+        );
+    }
+
+    /// The engine retells each kill it attributes ("run killed: the box ran out
+    /// of memory: …") into this very journal through tracing. That sentence
+    /// describes a death the unit's own lines already counted; counting it too
+    /// doubles every incident.
+    #[test]
+    fn the_engines_own_retelling_of_a_kill_is_not_a_second_kill() {
+        let echo = "2026-08-19T03:14:07+0000 mylder comet-native[824]: WARN run killed: \
+                    the box ran out of memory: the kernel OOM-killed 1 process inside the \
+                    engine's own cgroup while this run was going\n";
+        assert!(
+            parse_oom_journal(echo).is_empty(),
+            "{:?}",
+            parse_oom_journal(echo)
         );
     }
 

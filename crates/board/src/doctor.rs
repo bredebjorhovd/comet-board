@@ -233,6 +233,7 @@ pub fn doctor(
     checks.push(oom_kills_check(
         crate::pressure::read_oom_journal(comet_update::service::UNIT, OOM_JOURNAL_DAYS).as_deref(),
         host.oom,
+        chrono::Utc::now(),
     ));
     checks.push(unit_governance_check(
         comet_update::service::effective_governance().as_ref(),
@@ -2167,6 +2168,13 @@ fn runs_check(db: Option<&Db>, now: chrono::DateTime<chrono::Utc>) -> Check {
 /// and the first thing anybody does to a box that keeps dying is restart it.
 const OOM_JOURNAL_DAYS: u32 = 7;
 
+/// How fresh a journal-recorded kill must be to read as news rather than
+/// history (gh#544), in seconds — one day, the same window [`push_verdict`]
+/// gives a credential failure (gh#515). The night of 2026-08-19 was still
+/// printing as a red FAIL two days later, and the line gave no way to tell
+/// that nothing had been killed since.
+const OOM_FRESH_SECS: i64 = 86_400;
+
 /// Sustained load per core past which the box is oversubscribed enough to say
 /// so. Two: a build box at 1.5× cores on the fifteen-minute average is working,
 /// and one at 2× has a queue that is not draining.
@@ -2257,7 +2265,7 @@ fn swap_check(snap: &crate::pressure::Snapshot) -> Check {
     }
 }
 
-/// Has the kernel been killing things here (gh#533)?
+/// Has the kernel been killing things here *lately* (gh#533, aged by gh#544)?
 ///
 /// The one red line of the four, because it is the only one that reports
 /// something that has *already happened*. Everything else here is a shape the
@@ -2270,9 +2278,17 @@ fn swap_check(snap: &crate::pressure::Snapshot) -> Check {
 /// cannot act on, and the live counter is named separately because it means
 /// something different — kills since this unit last started, which is usually
 /// "since the last time somebody restarted it to make the problem go away".
+///
+/// And the verdict ages, by gh#515's rule for a credential failure (gh#544):
+/// the night of 2026-08-19 was still failing this check two days later, red on
+/// an incident that was already history. A kill inside [`OOM_FRESH_SECS`] is
+/// news and fails the report; when every kill in the window is older, the line
+/// says so and goes green — an operator reading it learns "it happened, and it
+/// has stopped", which is the sentence that lets them move on.
 fn oom_kills_check(
     journal: Option<&[crate::pressure::OomJournalEntry]>,
     counters: Option<crate::pressure::OomCounters>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Check {
     let live = counters.map(|c| c.cgroup).unwrap_or(0);
     let Some(journal) = journal else {
@@ -2299,16 +2315,45 @@ fn oom_kills_check(
             detail: format!("none in the last {OOM_JOURNAL_DAYS} days"),
         };
     }
+    // The quote is the newest *matching* line — which, with the parser now
+    // counting real kills only, is the newest kill rather than whatever room
+    // happened to reconnect last (gh#544).
     let latest = journal.last();
     let mut detail = format!(
         "{} oom-kill event(s) in the engine's unit journal in the last {OOM_JOURNAL_DAYS} days",
         journal.len()
     );
+    let age = latest.and_then(|entry| journal_age_secs(&entry.at, now));
     if let Some(entry) = latest {
-        detail.push_str(&format!(" — latest {}: {}", entry.at, entry.line));
+        detail.push_str(&match age {
+            Some(secs) => {
+                format!(
+                    " — latest {} ({}): {}",
+                    human_age(secs),
+                    entry.at,
+                    entry.line
+                )
+            }
+            None => format!(" — latest {}: {}", entry.at, entry.line),
+        });
     }
     if live > 0 {
         detail.push_str(&format!(" · {live} of them since the unit last started"));
+    }
+    let history = matches!(age, Some(secs) if secs >= OOM_FRESH_SECS);
+    if history {
+        // Every kill in the window predates the day: past tense, and green. An
+        // unparsable timestamp reads as *not* history on purpose — a kill this
+        // cannot date must not be waved off as old.
+        detail.push_str(
+            ". Nothing has been killed in the last day — history rather than news; if it \
+             comes back, the host memory and swap lines above name what to change",
+        );
+        return Check {
+            name: "oom kills".into(),
+            ok: true,
+            detail,
+        };
     }
     detail.push_str(
         ". The box is running out of memory under its own agents: give it swap, lower \
@@ -2319,6 +2364,45 @@ fn oom_kills_check(
         name: "oom kills".into(),
         ok: false,
         detail,
+    }
+}
+
+/// How long ago a `journalctl -o short-iso` stamp was, in seconds. Two formats,
+/// because journalctl has printed both `+0000` and `+00:00`; `None` when the
+/// stamp will not parse at all, and the caller treats that as fresh.
+fn journal_age_secs(at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    let t = chrono::DateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S%.f%z")
+        .or_else(|_| chrono::DateTime::parse_from_str(at, "%Y-%m-%dT%H:%M:%S%.f%:z"))
+        .ok()?;
+    Some((now - t.with_timezone(&chrono::Utc)).num_seconds().max(0))
+}
+
+#[cfg(test)]
+mod journal_age_tests {
+    use super::*;
+
+    #[test]
+    fn journal_stamps_date_whatever_way_the_offset_was_printed() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-20T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            journal_age_secs("2026-08-20T10:00:00+0000", now),
+            Some(7_200)
+        );
+        // The spelling on the box that reported gh#544.
+        assert_eq!(
+            journal_age_secs("2026-08-20T10:00:00+00:00", now),
+            Some(7_200)
+        );
+        assert_eq!(
+            journal_age_secs("2026-08-20T14:00:00+04:00", now),
+            Some(7_200)
+        );
+        // A stamp in the future reads as zero, not negative: clock skew is
+        // news until proven otherwise.
+        assert_eq!(journal_age_secs("2026-08-20T13:00:00+00:00", now), Some(0));
+        assert_eq!(journal_age_secs("not-a-stamp", now), None);
     }
 }
 
@@ -4244,10 +4328,21 @@ mod tests {
             }],
             ..EdgeHealth::default()
         };
-        let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), Some(&stuck), None, None)
-            .unwrap();
+        let checks = doctor(
+            &p,
+            &engine_up(),
+            Some(&[]),
+            Some(&[]),
+            Some(&stuck),
+            None,
+            None,
+        )
+        .unwrap();
         let check = edge_check_in(&checks);
-        assert!(!stuck.dark() && !stuck.churning(), "sockets and rooms are fine");
+        assert!(
+            !stuck.dark() && !stuck.churning(),
+            "sockets and rooms are fine"
+        );
         assert!(!check.ok, "{}", check.detail);
         assert!(check.detail.contains("18 of 18 live"), "{}", check.detail);
         assert!(check.detail.contains("STALLED"), "{}", check.detail);
@@ -6515,8 +6610,8 @@ mod tests {
         assert!(!busy.detail.contains("warn"), "{}", busy.detail);
     }
 
-    /// The one red line: work that has already been destroyed, with the dates
-    /// that make it actionable.
+    /// The one red line: work destroyed *today*, with the timestamps that make
+    /// it actionable.
     #[test]
     fn oom_kills_fail_the_report_with_their_timestamps() {
         let journal = crate::pressure::parse_oom_journal(
@@ -6525,15 +6620,25 @@ mod tests {
              2026-08-20T00:12:44+0200 mylder systemd[1401]: comet-native.service: A process of \
              this unit has been killed by the OOM killer.\n",
         );
+        // Seven hours past the newest kill: still news.
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-20T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
         let c = oom_kills_check(
             Some(&journal),
             Some(crate::pressure::OomCounters {
                 cgroup: 1,
                 boxwide: 1,
             }),
+            now,
         );
         assert!(!c.ok, "an OOM kill is worth an exit code");
         assert!(c.detail.contains("2 oom-kill event(s)"), "{}", c.detail);
+        assert!(
+            c.detail.contains("latest 7h ago"),
+            "the verdict should carry an age: {}",
+            c.detail
+        );
         assert!(
             c.detail.contains("2026-08-20T00:12:44+0200"),
             "{}",
@@ -6548,9 +6653,103 @@ mod tests {
         assert!(c.detail.contains("min_memory_headroom"), "{}", c.detail);
     }
 
+    /// gh#544's actual complaint: the night of 2026-08-18/19 kept failing the
+    /// check two days on, reading as a box dying right now. Older-only kills
+    /// are history — past tense, green, and saying what makes it green.
+    #[test]
+    fn a_two_day_old_kill_is_history_not_a_fail() {
+        let journal = crate::pressure::parse_oom_journal(
+            "2026-08-19T03:14:05+0000 mylder kernel: Out of memory: Killed process 8117 (node).\n\
+             2026-08-19T03:14:06+0000 mylder systemd[1401]: comet-native.service: Failed with \
+             result 'oom-kill'.\n",
+        );
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-21T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let c = oom_kills_check(Some(&journal), None, now);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("2 oom-kill event(s)"), "{}", c.detail);
+        assert!(c.detail.contains("latest 2d ago"), "{}", c.detail);
+        assert!(
+            c.detail.contains("Nothing has been killed in the last day"),
+            "{}",
+            c.detail
+        );
+        // The evidence is still shown — history, not redaction.
+        assert!(c.detail.contains("Failed with result"), "{}", c.detail);
+        assert!(
+            !c.detail.contains("running out of memory"),
+            "the present-tense sentence has no place on a history line: {}",
+            c.detail
+        );
+    }
+
+    /// The edge of [`OOM_FRESH_SECS`]: twenty-four hours minus one second is
+    /// news; the day-old kill itself is history.
+    #[test]
+    fn the_verdict_turns_over_at_one_day() {
+        let journal = crate::pressure::parse_oom_journal(
+            "2026-08-20T12:00:00+0000 mylder systemd[1401]: comet-native.service: Failed with \
+             result 'oom-kill'.\n",
+        );
+        let at = |age_secs: i64| {
+            chrono::DateTime::parse_from_rfc3339("2026-08-20T12:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+                + chrono::Duration::seconds(age_secs)
+        };
+        assert!(!oom_kills_check(Some(&journal), None, at(86_399)).ok);
+        assert!(oom_kills_check(Some(&journal), None, at(86_400)).ok);
+    }
+
+    /// A stamp this cannot date reads as *fresh*, never as old: a kill nobody
+    /// can put a time on must not be waved off as history.
+    #[test]
+    fn an_undateable_kill_keeps_the_line_red() {
+        let undated = vec![crate::pressure::OomJournalEntry {
+            at: "not-a-stamp".into(),
+            line: "comet-native.service: Failed with result 'oom-kill'.".into(),
+        }];
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-22T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let c = oom_kills_check(Some(&undated), None, now);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("not-a-stamp"), "{}", c.detail);
+    }
+
+    /// The box that reported gh#544: thousands of `room reconnected` lines and
+    /// no kills. Room chatter contains "oom" ("r**oom**"); the parser must see
+    /// through it to a quiet week, not thirteen thousand kills.
+    #[test]
+    fn room_chatter_alone_leaves_the_check_green() {
+        let journal = crate::pressure::parse_oom_journal(concat!(
+            "2026-08-20T09:41:02+00:00 mylder comet-native[824]: INFO ",
+            "comet_engine::workspace_host: room reconnected room=cd16185d\n",
+            "2026-08-20T14:02:51+00:00 mylder comet-native[824]: INFO ",
+            "comet_engine::workspace_host: room joined room=ab12ef90\n",
+            "2026-08-20T20:16:18+00:00 mylder comet-native[824]: INFO ",
+            "comet_engine::workspace_host: room reconnected room=cd16185d\n",
+        ));
+        assert!(
+            journal.is_empty(),
+            "room chatter parsed as oom events: {journal:?}"
+        );
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-22T06:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let c = oom_kills_check(Some(&journal), None, now);
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("none in the last"), "{}", c.detail);
+    }
+
     #[test]
     fn a_quiet_week_is_green() {
-        let c = oom_kills_check(Some(&[]), Some(crate::pressure::OomCounters::default()));
+        let c = oom_kills_check(
+            Some(&[]),
+            Some(crate::pressure::OomCounters::default()),
+            chrono::Utc::now(),
+        );
         assert!(c.ok);
         assert!(c.detail.contains("none in the last"), "{}", c.detail);
     }
@@ -6560,7 +6759,7 @@ mod tests {
     /// journal's silence.
     #[test]
     fn an_unreadable_journal_does_not_hide_the_counter() {
-        let quiet = oom_kills_check(None, None);
+        let quiet = oom_kills_check(None, None, chrono::Utc::now());
         assert!(quiet.ok);
         assert!(quiet.detail.contains("not checked"), "{}", quiet.detail);
 
@@ -6570,6 +6769,7 @@ mod tests {
                 cgroup: 3,
                 boxwide: 3,
             }),
+            chrono::Utc::now(),
         );
         assert!(!counted.ok);
         assert!(
