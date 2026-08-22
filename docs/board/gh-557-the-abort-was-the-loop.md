@@ -10,7 +10,7 @@ survivable, gh#554 proposed catching the corruption and evicting.
 lastAbort: "wasm heap poisoned after 3 strikes: RangeError: Invalid array buffer length"
 ```
 
-## The hypothesis, and what happened to it
+### The hypothesis, and what happened to it
 
 The reading going in was that fragment reassembly was the corrupter. The
 workspace doc is ~1.7MB against a 200_000-byte payload budget, so a full-doc
@@ -33,7 +33,7 @@ refuses. And the room's own numbers say the corrupt bytes never existed:
 `importPenalty` empty. Nothing was being rejected, because nothing was wrong
 with what devices sent.
 
-## What was actually happening
+### What was actually happening
 
 `RangeError("Invalid array buffer length")` means one of two things, and they
 want opposite cures:
@@ -52,7 +52,7 @@ loop**, and it closes it whether or not the heap was ever unwell.
 
 Three things made that reachable, and each is fixed here.
 
-### 1. The tripwire now asks the heap
+#### 1. The tripwire now asks the heap
 
 `wasmHeapUsable()` builds a small `LoroDoc`, commits, exports and re-imports it.
 Under the exhaustion the tripwire exists for, that cannot succeed — wasm memory
@@ -63,7 +63,7 @@ wrapper says nothing about the heap, and nothing in the instance recovers it).
 
 The probe costs nothing on the healthy path — only a failure asks.
 
-### 2. `foldLog` had no catch
+#### 2. `foldLog` had no catch
 
 The log fold — snapshot re-export, then clear the update log — was the one wasm
 export in this room with no guard of its own. The history trim above it has
@@ -93,7 +93,7 @@ Now the fold catches, records, and backs off on the alarm chain's ladder (a
 minute, doubling, capped at an hour). The room keeps serving: reads, writes,
 joins and relays never touched the fold. It simply cannot compact, and says so.
 
-### 3. An unimportable push was never answered
+#### 3. An unimportable push was never answered
 
 `applyUpdates` rethrew any wasm-shaped failure from `doc.import` of
 client-supplied bytes, so the sender got no ack at all — it redialled and re-sent
@@ -101,7 +101,7 @@ the same payload. That is the reseed half of the loop, driven by the room. A
 `RangeError` over a working heap is now a statement about the push: salvage the
 rest of the batch, strike the device, answer `InvalidUpdate`.
 
-## What an operator can now read
+### What an operator can now read
 
 `/stats` gained two objects, because the old surface let this hide:
 
@@ -114,7 +114,7 @@ rest of the batch, strike the device, answer `InvalidUpdate`.
   to say which of the room's half-dozen export paths produced it. Every
   `escalateWasmPoisoning` caller now passes a site name.
 
-## Reassembly, hardened anyway
+### Reassembly, hardened anyway
 
 The reading turned up real gaps, just not this bug's. `edge/src/session-room.ts`
 was the only one of the three reassemblers in the tree without an index bounds
@@ -132,9 +132,49 @@ fragments correctly. Now the batch stays open until the fragment that is
 actually missing arrives, and a batch whose header and fragments genuinely
 disagree is refused at the seam without a wasm call.
 
-## What this does not claim
+### What this does not claim
 
 Which wasm call threw on 2026-08-22 is not settled from here: that needs the
 room's `wasm.lastFault.site`, which did not exist until this change. What is
 settled is that the room could not tell a sick heap from a call it could not
 serve, and that reading it wrong is what made every reset temporary.
+
+### How this was verified
+
+`node` and `npm` are **not on a dispatched agent's PATH** on the box, and
+`edge/node_modules` does not survive between sessions. Both suites run fine
+once that is supplied — this is a PATH fact, not a "the workerd tier cannot run
+here" fact, and the difference matters because the second reading would make
+this change CI-verified rather than author-verified:
+
+```
+cd edge
+PATH=/opt/homebrew/bin:$PATH npm ci
+PATH=/opt/homebrew/bin:$PATH npm run typecheck   # clean
+PATH=/opt/homebrew/bin:$PATH npm test            # 101 unit + 35 workerd, all green
+```
+
+Red-before-green was run three ways, because the claims are separable and a
+single crude revert proves none of them.
+
+**Do not revert `session-room.ts` wholesale to check this.** The test file
+imports `FRAGMENT_BYTES`, which this change is what exports — so a whole-file
+swap makes all nine tests fail on a missing binding, which looks like a
+behavioural red and is not one. Revert the specific behaviour instead:
+
+1. **Reassembly only** (restore the arrival count and the `new Uint8Array()`
+   placeholder, keep everything else): the two happy-path tests **pass**, the
+   three guard tests fail. This is the exoneration — the required shapes import
+   byte-identically through the *unfixed* reassembler.
+2. **The tripwire's discriminator only** (`wasmHeapUsable()` → `false`, i.e. the
+   pre-gh#557 rule, with the fold catch, the backoff, `/stats` and the
+   reassembly guards all left in place): the room aborts anyway —
+   `wasm heap poisoned (3 strikes); aborting isolate`, `durableObjectReset:
+   true`. The backoff test still passes. **That is the load-bearing result**:
+   guarding the fold lowers the rate, but the abort policy is what closes the
+   loop, and only the discriminator opens it.
+3. **Both files against the pre-fix source**: all nine fail, and the two files
+   take each other down — the abort-loop tests' `ctx.abort()` kills the isolate
+   the fragment tests are using. That is this bug's blast radius reproduced by
+   accident, and it is the same mechanism behind the chat rooms churning
+   alongside the workspace room.
