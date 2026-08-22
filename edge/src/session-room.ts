@@ -208,6 +208,22 @@ export const MAX_DOC_LOAD_BYTES = 32 * 1024 * 1024;
  * server lacks on its next join. Bounded so a refusal that heals on its own
  * (a corrupt blob replaced by a fold) never costs the room its history. */
 export const LOAD_REFUSAL_LIMIT = 3;
+/** Alarm attempts that may be answered by a load REFUSAL without spending the
+ * give-up budget (gh#554).
+ *
+ * `ALARM_FAILURE_LIMIT` is sized against an OUTAGE — a day of impossible writes
+ * that heals when the platform does (gh#373's six hours). A doc that will not
+ * load is the opposite kind of failure: it does not heal by waiting, and the
+ * room already owns the escalation that fixes it (`LOAD_REFUSAL_LIMIT` → evict
+ * and reseed). The 2026-08-19 room sat at 21 of 24 consecutive failures against
+ * exactly that — three attempts from giving up on its trim, snapshot and backup
+ * permanently, for a doc the guard could have reseeded in three minutes. So a
+ * refusal reschedules at the base delay and leaves the budget alone.
+ *
+ * Bounded at twice the guard's own limit so this cannot become an unbounded
+ * once-a-minute chain: past it the ordinary ladder resumes. Cleared by any
+ * completed alarm. */
+export const ALARM_REFUSAL_BUDGET = LOAD_REFUSAL_LIMIT * 2;
 
 /** The room refuses to materialize its doc — too large to import, or stored
  * bytes that will not decode. Carried out to the join as a `JoinError` rather
@@ -240,6 +256,11 @@ const isLive = (obj: unknown): boolean =>
  * so the tripwire must count these too. */
 const isWasmUseAfterFree = (e: unknown): boolean =>
   e instanceof Error && /null pointer passed to rust|detached ArrayBuffer/i.test(e.message);
+/** The error shapes that come off the loro-wasm boundary rather than out of our
+ * own code — the set `escalateWasmPoisoning` and `handleDocUpdate` each spell
+ * inline, named here because `ensureDoc` now asks the same question (gh#554). */
+const isWasmShaped = (e: unknown): boolean =>
+  e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e);
 /** Does loro-wasm still work? Asked of the heap, not of the document (gh#557).
  *
  * `RangeError("Invalid array buffer length")` means one of two things and they
@@ -678,7 +699,12 @@ export class SessionRoom implements DurableObject {
             consecutiveFailures: Number(this.getMeta("alarmFailures") ?? "0"),
             gaveUp: Boolean(this.getMeta("alarmGaveUpAt")),
             gaveUpAt: Number(this.getMeta("alarmGaveUpAt") || "0") || null,
-            limit: ALARM_FAILURE_LIMIT
+            limit: ALARM_FAILURE_LIMIT,
+            // Alarms answered by the load guard rather than by a failure
+            // (gh#554) — these do NOT spend the budget above, because the guard
+            // is reseeding the room the alarm would otherwise give up on.
+            refusals: Number(this.getMeta("alarmRefusals") ?? "0"),
+            refusalBudget: ALARM_REFUSAL_BUDGET
           },
           // Non-zero while a cold replay is in flight or has been dying — the
           // wedge signature ensureDoc's automated reset watches for.
@@ -1756,14 +1782,25 @@ export class SessionRoom implements DurableObject {
     const started = Date.now();
     const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
+    let snapshotLoaded = false;
     if (snapshot && snapshot.length > 0) {
       try {
         doc.import(snapshot);
+        snapshotLoaded = true;
       } catch (e) {
         // Heap poisoning is a different fault with its own escalation — never
         // let it be mistaken for a corrupt blob, or a pressed isolate would
         // talk healthy rooms into evicting their history.
-        if (e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e)) {
+        //
+        // gh#554: ask the heap, the way gh#557 taught `escalateWasmPoisoning`
+        // and `handleDocUpdate` to. These bytes came off THIS room's storage,
+        // and a wasm-shaped throw over a working heap is a statement about the
+        // stored snapshot, not about the isolate. Rethrowing it on shape alone
+        // is why the guard below never fired on the incident it was written
+        // for: the refusal path existed and the corruption never reached it.
+        // A use-after-free stays exempt — it says nothing about the bytes.
+        const blameTheBytes = e instanceof RangeError && wasmHeapUsable();
+        if (isWasmShaped(e) && !blameTheBytes) {
           doc.free();
           throw e;
         }
@@ -1777,13 +1814,53 @@ export class SessionRoom implements DurableObject {
       }
     }
     let rows = 0;
+    let rowsFailed = 0;
+    let lastRowError: unknown;
     for (const update of readUpdateRows(this.ctx.storage.sql)) {
       rows++;
       try {
         doc.import(update);
-      } catch {
-        // A poisoned update cannot be applied; skip it rather than brick the room.
+      } catch (e) {
+        // A poisoned update cannot be applied; skip it rather than brick the
+        // room — one bad row among many heals on the next fold. But COUNT it
+        // (gh#554): this loop swallowed every row in turn, so a log that would
+        // not replay AT ALL produced a hollow doc, silently, on every wake
+        // forever. That is the same wedge a refusal names, minus the evidence
+        // and minus the reseed.
+        rowsFailed++;
+        lastRowError = e;
       }
+    }
+    if (rowsFailed > 0 && rowsFailed === rows && !snapshotLoaded) {
+      // The replay produced NOTHING: no snapshot, and not one row of the log
+      // would import. That is not a poisoned row, it is stored state this
+      // instance cannot materialize — and it is the gh#554 shape exactly, where
+      // the corruption is small enough to sail past the size guard (the
+      // 2026-08-19 room was 1.67MB with `snapshotBytes: 0`, 5% of the
+      // threshold, and recorded zero refusals all evening).
+      //
+      // Deliberately narrow. A log that fails BEHIND a snapshot that loaded
+      // keeps the skip above: the doc still holds the room's history, the next
+      // fold rewrites the log out of it, and evicting there would spend a good
+      // snapshot on a bad tail.
+      doc.free();
+      const blameTheBytes = lastRowError instanceof RangeError && wasmHeapUsable();
+      if (isWasmShaped(lastRowError) && !blameTheBytes) throw lastRowError;
+      this.refuseLoad(
+        `stored log will not import (${rows} rows): ${String(lastRowError)}`,
+        storedBytes
+      );
+    }
+    if (rowsFailed > 0) {
+      // Skipped rows are silent data loss — say so. A room whose tail never
+      // replays reads to its users as "my last messages vanished", and read to
+      // this code, until now, as a perfectly ordinary cold start.
+      console.error(
+        "stored update rows would not import; replaying without them",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `failed=${rowsFailed}/${rows}`,
+        String(lastRowError)
+      );
     }
     for (const update of this.pending) {
       try {
@@ -2282,6 +2359,25 @@ export class SessionRoom implements DurableObject {
     try {
       await this.runScheduledWork();
     } catch (e) {
+      const refusals = Number(this.getMeta("alarmRefusals") ?? "0");
+      if (e instanceof DocLoadRefused && refusals < ALARM_REFUSAL_BUDGET) {
+        // gh#554: a refusal is not an alarm failure. The guard has already
+        // counted it and will evict and reseed within LOAD_REFUSAL_LIMIT
+        // attempts — the alarm's job is to keep ARRIVING until it does, not to
+        // count down to a permanent give-up on a room that is about to heal.
+        // Restore the pre-spent failure and come back on the base delay, so the
+        // strikes land in minutes rather than across the ladder's hours.
+        this.setMeta("alarmFailures", String(failures));
+        this.setMeta("alarmRefusals", String(refusals + 1));
+        console.warn(
+          "alarm refused by the load guard; retrying while it reseeds",
+          `room=${this.getMeta("chatId") ?? "?"}`,
+          `alarmRefusals=${refusals + 1}/${ALARM_REFUSAL_BUDGET}`,
+          e.message
+        );
+        await this.ctx.storage.setAlarm(Date.now() + ALARM_RETRY_BASE_MS);
+        return;
+      }
       console.error(
         "alarm failed",
         `room=${this.getMeta("chatId") ?? "?"}`,
@@ -2308,6 +2404,7 @@ export class SessionRoom implements DurableObject {
     // Completed — the chain is clean. One failure followed by a success costs
     // nothing but the retry that healed it.
     this.setMeta("alarmFailures", "0");
+    if (this.getMeta("alarmRefusals")) this.setMeta("alarmRefusals", "0");
     if (this.getMeta("alarmGaveUpAt")) this.setMeta("alarmGaveUpAt", "");
   }
 
@@ -2340,6 +2437,7 @@ export class SessionRoom implements DurableObject {
     await this.armDailyAlarm();
     this.setMeta("alarmGaveUpAt", "");
     this.setMeta("alarmFailures", "0");
+    this.setMeta("alarmRefusals", "0");
     console.log("alarm re-armed after give-up", `room=${this.getMeta("chatId") ?? "?"}`);
     return true;
   }
