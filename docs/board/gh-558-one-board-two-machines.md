@@ -1,4 +1,4 @@
-# One board, two machines — **the code, done; the cutover, gated** (gh#558)
+# One board, two machines — **the code, done; the cutover, a human's** (gh#558)
 
 Two boards on one account, partitioned only by which repos each polls. The Mac
 (`McComet`) polls `bredebjorhovd/comet-board` and `bredebjorhovd/itsm-agent`;
@@ -140,7 +140,8 @@ root — which is the bug, in the one place it is visible.
 ### The cutover — not done, and deliberately
 
 The config half of the ticket is **not** in this change, and the ordering is the
-dangerous part of it:
+dangerous part of it. Run it from the box (`comet-board routes --device …`
+reaches the host that owns each `routing.toml`, gh#75):
 
 1. **Remove `comet-board` and `itsm-agent` from the Mac's `[github] repos` and
    its routes first.** If both boards poll one repo even briefly they derive the
@@ -159,11 +160,30 @@ dangerous part of it:
    every route must resolve — including, on the box, the comet-board route
    reading as "on McComet".
 
-**Gated on gh#557.** The box learns about the Mac's spaces through the workspace
-doc, over the same room that is currently poisoning its wasm heap and resetting.
-A board that cannot see the Mac's spaces refuses every comet dispatch with `no
-comet space named` — the correct refusal, for a reason that has nothing to do
-with this. Land the code, leave the config until the room is stable.
+**The gh#557 gate is open.** The box learns about the Mac's spaces through the
+workspace doc, and while that room was poisoning its wasm heap and resetting, a
+board that could not see the Mac's spaces would have refused every comet
+dispatch with `no comet space named` — the correct refusal, for a reason with
+nothing to do with this. That was the reason to land the code and leave the
+config alone.
+
+gh#557 landed in #559 (`the abort was the loop, not the reseed`) and is
+deployed; the workspace room has since held across a deploy, and `doctor`
+reports the edge fully live. One *chat* room is carrying unacknowledged entries
+— a different room, below the alert threshold, and not the one space visibility
+rides on. It does not gate this.
+
+So what is left is not technical. **The cutover is a human's keypress**, and
+step 1 is the one that cannot be got wrong: while both boards poll one repo they
+derive the same issue as ready and either can dispatch it. Nothing in this
+change performs any of it, and nothing should perform it unattended.
+
+One practical note for whoever runs it: `doctor`'s new remote-space answers ship
+in the *next* release. The `comet-board` on a box's PATH is the copy its engine
+shipped with, so until both machines are on a build past this one, the box will
+still print `no comet space named` for the Mac-routed comet-board route — the
+old wart, from an old binary, about a route that is working. Check the version
+line before reading the space lines.
 
 ### What is still device-blind
 
