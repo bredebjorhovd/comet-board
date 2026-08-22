@@ -91,8 +91,10 @@ const RETAIN_MS = RETAIN_DAYS * DAY_MS;
 /** Consecutive cold-replay deaths (CPU-limit kills mid-`ensureDoc`) before the
  * room concludes it is wedged and drops its own log — see `ensureDoc`. */
 const REPLAY_CRASH_LIMIT = 3;
-/** Payload bytes per outbound fragment (leaves room for the envelope). */
-const FRAGMENT_BYTES = 200_000;
+/** Payload bytes per outbound fragment (leaves room for the envelope).
+ * Mirrored by every client that fragments into this room — `FRAGMENT_BYTES` in
+ * crates/sync/src/room.rs and `fragmentBytes` in apps/ios. */
+export const FRAGMENT_BYTES = 200_000;
 /** Maximum Loro operations exported by one ordinary join event.
  *
  * `sendUpdates` bounds WebSocket FRAME size, but it runs after Loro has
@@ -238,6 +240,51 @@ const isLive = (obj: unknown): boolean =>
  * so the tripwire must count these too. */
 const isWasmUseAfterFree = (e: unknown): boolean =>
   e instanceof Error && /null pointer passed to rust|detached ArrayBuffer/i.test(e.message);
+/** Does loro-wasm still work? Asked of the heap, not of the document (gh#557).
+ *
+ * `RangeError("Invalid array buffer length")` means one of two things and they
+ * want OPPOSITE cures: an exhausted linear memory, which only an isolate
+ * recycle clears, or one call the runtime would not serve, which a recycle
+ * does nothing for. The tripwire below could not tell them apart, so it read
+ * every one as the first — and on 2026-08-22 the `ws4` workspace room aborted
+ * its isolate over and over on that reading, severing every co-located room's
+ * sockets each time, while the reseed that followed walked it straight back
+ * (gh#527/#378/#553/#554 all chased a symptom of that loop).
+ *
+ * A fresh round trip through the allocator settles it. Under the exhaustion
+ * this tripwire exists for, wasm memory only ever grows and the poisoned state
+ * is permanent until the isolate dies — so even these few hundred bytes cannot
+ * be allocated, committed, exported and re-imported. If they can, the heap is
+ * not the patient. Costs nothing on the healthy path: only a failure asks. */
+const wasmHeapUsable = (): boolean => {
+  let probe: LoroDoc | undefined;
+  let echo: LoroDoc | undefined;
+  try {
+    probe = new LoroDoc();
+    probe.getMap("probe").set("k", "v");
+    probe.commit();
+    // Export is the call that fails first on a pressed heap (2026-08-04: every
+    // byte-EXPORTING call threw while imports kept working), so the probe has
+    // to cross the boundary in both directions to mean anything.
+    const bytes = probe.export({ mode: "snapshot" });
+    echo = new LoroDoc();
+    echo.import(bytes);
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try {
+      probe?.free();
+    } catch {
+      /* poisoned beyond freeing — the return value already said so */
+    }
+    try {
+      echo?.free();
+    } catch {
+      /* same */
+    }
+  }
+};
 
 interface SocketState {
   userId: string;
@@ -429,7 +476,9 @@ export const chatRoomAccess = (
 };
 
 interface FragmentBatch {
-  parts: Uint8Array[];
+  /** One slot per `fragmentCount`; `undefined` until that index arrives. */
+  parts: (Uint8Array | undefined)[];
+  /** Distinct indices seen — a repeat does not advance it (see `handleFragment`). */
   received: number;
   totalSize: number;
   header: DocUpdateFragmentHeader;
@@ -652,6 +701,25 @@ export class SessionRoom implements DurableObject {
             limit: LOAD_REFUSAL_LIMIT,
             lastRefusal: this.readJsonMeta("lastLoadRefusal")
           },
+          // Whether this room can still COMPACT (gh#557). `snapshotBytes: 0`
+          // on a megabyte room was the only trace a fold had never landed, and
+          // it reads identically to "nothing to fold yet" — so a room whose
+          // snapshot export kept failing looked healthy on every surface while
+          // it aborted its isolate over it. Say it outright.
+          fold: {
+            consecutiveFailures: Number(this.getMeta("foldFailures") ?? "0"),
+            retryAt: Number(this.getMeta("foldRetryAt") ?? "0") || null,
+            lastFailure: this.readJsonMeta("lastFoldFailure")
+          },
+          // Every wasm-shaped failure, struck or not, and WHICH call made it.
+          // `lastAbort` carried the exception and no call site, which is how
+          // three tickets read the same RangeError without being able to say
+          // where it came from.
+          wasm: {
+            faults: Number(this.getMeta("wasmFaults") ?? "0"),
+            lastFault: this.readJsonMeta("lastWasmFault"),
+            abortAfterStrikes: WASM_POISON_ABORT_AFTER
+          },
           // The last time THIS room aborted its own instance, and why — the
           // half of a 1006 storm that is our doing rather than the platform's.
           lastAbort: this.readJsonMeta("lastAbort")
@@ -660,7 +728,7 @@ export class SessionRoom implements DurableObject {
         // The one observability surface must never die as a bare 1101/500 —
         // /stats is how an operator sees a room mid-incident (see /tail).
         console.error("stats failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-        this.escalateWasmPoisoning(e);
+        this.escalateWasmPoisoning(e, "stats");
         return json({ error: "stats_failed", message: String(e) }, 500);
       }
     }
@@ -682,7 +750,7 @@ export class SessionRoom implements DurableObject {
         // 2026-08-05 incident an hour of blind guessing (Workers Logs can't
         // be queried without an observability-scoped token).
         console.error("tail materialization failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-        this.escalateWasmPoisoning(e);
+        this.escalateWasmPoisoning(e, "tail");
         return json({ error: "tail_failed", message: String(e) }, 500);
       }
     }
@@ -713,7 +781,7 @@ export class SessionRoom implements DurableObject {
       } catch (e) {
         // The repair-read must never fail as a bare 1101 — see /tail above.
         console.error("snapshot export failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-        this.escalateWasmPoisoning(e);
+        this.escalateWasmPoisoning(e, "snapshot-export");
         return json({ error: "snapshot_failed", message: String(e) }, 500);
       }
     }
@@ -909,7 +977,7 @@ export class SessionRoom implements DurableObject {
           message: "internal error"
         });
       }
-      this.escalateWasmPoisoning(e);
+      this.escalateWasmPoisoning(e, "ws-message");
     }
   }
 
@@ -938,7 +1006,7 @@ export class SessionRoom implements DurableObject {
       // Flush can fold the log (a wasm snapshot export); an uncaught throw
       // here is invisible in a close handler. Same discipline as above.
       console.error("flush on socket close failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-      this.escalateWasmPoisoning(e);
+      this.escalateWasmPoisoning(e, "flush-on-close");
     }
   }
 
@@ -950,7 +1018,7 @@ export class SessionRoom implements DurableObject {
       await this.flush();
     } catch (e) {
       console.error("flush on socket error failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-      this.escalateWasmPoisoning(e);
+      this.escalateWasmPoisoning(e, "flush-on-error");
     }
   }
 
@@ -1054,11 +1122,36 @@ export class SessionRoom implements DurableObject {
    * signature of an exhausted loro-wasm heap (see `wasmPoisonStrikes`).
    * Strike out and `ctx.abort()` so clients redial into a fresh isolate
    * within seconds instead of hot-looping against a deaf room until
-   * Cloudflare's memory-limit reset finally fires. */
-  private escalateWasmPoisoning(e: unknown): void {
+   * Cloudflare's memory-limit reset finally fires.
+   *
+   * `site` names the wasm call that threw, and it is not decoration (gh#557):
+   * `lastAbort` recorded the exception and nothing else, so three tickets read
+   * `RangeError: Invalid array buffer length` without being able to say which
+   * of the room's half-dozen export paths produced it. Every caller passes one.
+   *
+   * A wasm-shaped throw off a heap that [`wasmHeapUsable`] proves still works
+   * is NOT a strike. Aborting on it recycles an isolate that was never sick,
+   * sheds every socket in it, and invites the reseed that reproduces the
+   * fault — the loop this ticket is about. It is still recorded. */
+  private escalateWasmPoisoning(e: unknown, site: string): void {
     if (!(e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e))) {
       return;
     }
+    // Use-after-free is exempt from the probe on purpose: a dangling wrapper
+    // says nothing about the heap (a probe would always pass) and nothing in
+    // the instance recovers the flows still holding it — see `isLive`.
+    if (!isWasmUseAfterFree(e) && wasmHeapUsable()) {
+      this.noteWasmFault(site, e, false);
+      console.error(
+        "wasm-shaped failure on a WORKING heap; not a poison strike",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `site=${site}`,
+        `storedBytes=${this.storedDocBytes()}`,
+        String(e)
+      );
+      return;
+    }
+    this.noteWasmFault(site, e, true);
     wasmPoisonStrikes++;
     if (wasmPoisonStrikes < WASM_POISON_ABORT_AFTER) return;
     console.error(`wasm heap poisoned (${wasmPoisonStrikes} strikes); aborting isolate for a fresh heap`);
@@ -1077,7 +1170,28 @@ export class SessionRoom implements DurableObject {
     // reconcile say "we did this, and here is why" instead of leaving
     // `vanished` sockets to be blamed on the duration cap. `sync()` is what
     // makes it survive: an abort discards uncommitted writes.
-    this.recordAbort(`wasm heap poisoned after ${wasmPoisonStrikes} strikes: ${String(e)}`);
+    this.recordAbort(
+      `wasm heap poisoned after ${wasmPoisonStrikes} strikes at ${site}: ${String(e)}`
+    );
+  }
+
+  /** Leave every wasm-shaped failure behind, struck or not (gh#557).
+   *
+   * The non-striking ones are the point: a room that keeps failing one export
+   * on a healthy heap now says so on /stats instead of being silently absorbed,
+   * which is the reading `snapshotBytes: 0` was quietly making all along.
+   * Never throws — this is diagnostics on an already-bad path. */
+  private noteWasmFault(site: string, e: unknown, struck: boolean): void {
+    try {
+      const faults = Number(this.getMeta("wasmFaults") ?? "0") + 1;
+      this.setMeta("wasmFaults", String(faults));
+      this.setMeta(
+        "lastWasmFault",
+        JSON.stringify({ at: Date.now(), site, struck, error: String(e) }).slice(0, 512)
+      );
+    } catch {
+      /* storage refused the marker; the classification above still stands */
+    }
   }
 
   /** Persist why this instance is about to die, then die (gh#527).
@@ -1331,9 +1445,18 @@ export class SessionRoom implements DurableObject {
         // Wasm-heap poison is terminal for this instance — no salvage
         // retries against a dying heap; the outer handler's tripwire counts
         // it and recycles the isolate.
-        if (e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e)) {
-          throw e;
-        }
+        //
+        // But only if the heap is the patient (gh#557). These bytes came off
+        // the wire, and a wasm-shaped throw over a working heap is a statement
+        // about the PUSH, not the isolate — rethrowing it left the sender with
+        // no ack at all, so it redialled and re-sent the same payload, which is
+        // the reseed half of the loop. Salvage below answers it instead.
+        const wasmShaped =
+          e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e);
+        // Only the RangeError arm is ambiguous enough to be worth asking about
+        // — a RuntimeError or a dangling wrapper says nothing about the bytes.
+        const blameTheBytes = e instanceof RangeError && wasmHeapUsable();
+        if (wasmShaped && !blameTheBytes) throw e;
         // Includes imports concurrent to a shallow-snapshot start (§3.1 stale
         // peer) — the client resyncs fresh and re-submits at the app layer.
         // Salvage the rest of the batch individually first: one unimportable
@@ -1468,7 +1591,13 @@ export class SessionRoom implements DurableObject {
       this.fragments.set(ws, batches);
     }
     batches.set(message.batchId, {
-      parts: Array.from({ length: message.fragmentCount }, () => new Uint8Array()),
+      // `undefined`, not an empty Uint8Array (gh#557): the placeholder has to
+      // be distinguishable from a fragment that legitimately arrived, or a
+      // part that never came reassembles as a zero-length one and every later
+      // part lands 200_000 bytes early. Both clients that fragment into this
+      // room hold the same discipline — `Option` in crates/sync/src/room.rs,
+      // `nil` in apps/ios — and this was the one reassembler without it.
+      parts: Array.from({ length: message.fragmentCount }, () => undefined),
       received: 0,
       totalSize: message.totalSizeBytes,
       header: message
@@ -1493,17 +1622,76 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.FragmentTimeout, message.batchId);
       return;
     }
+    // An index past the header's `fragmentCount` would extend the parts array
+    // with holes, so the batch could never complete and its buffer would leak
+    // until the socket died. The batch is internally inconsistent; drop it.
+    if (message.index >= batch.parts.length) {
+      this.refuseBatch(
+        ws,
+        state,
+        message,
+        `fragment index ${message.index} past fragmentCount ${batch.parts.length}`
+      );
+      return;
+    }
+    // Count DISTINCT indices. Counting arrivals let a repeated fragment
+    // complete a batch that was still missing one — and the buffer that
+    // assembles from is not the update the sender sent: short by a fragment,
+    // zero-padded at the tail, everything after the hole shifted left.
+    if (batch.parts[message.index] === undefined) batch.received++;
     batch.parts[message.index] = message.fragment;
-    batch.received++;
     if (batch.received < batch.parts.length) return;
     this.fragments.get(ws)?.delete(message.batchId);
     const total = new Uint8Array(batch.totalSize);
     let off = 0;
     for (const part of batch.parts) {
+      if (part === undefined || off + part.length > total.length) {
+        // Unreachable via the two guards above unless the sender's own header
+        // disagrees with its fragments. Refuse rather than import bytes that
+        // are not what any device holds — a Loro update whose interior lengths
+        // have shifted is exactly the shape that makes the runtime try to
+        // allocate an absurd buffer.
+        this.refuseBatch(ws, state, message, "fragments do not fill totalSizeBytes");
+        return;
+      }
       total.set(part, off);
       off += part.length;
     }
+    if (off !== total.length) {
+      this.refuseBatch(
+        ws,
+        state,
+        message,
+        `assembled ${off}B against a header claiming ${total.length}B`
+      );
+      return;
+    }
     await this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, [total]);
+  }
+
+  /** A fragment batch that cannot be assembled as its own header describes it.
+   *
+   * Answered `InvalidUpdate` rather than `FragmentTimeout`: a timeout asks for
+   * the same batch again, and a sender whose header and fragments disagree
+   * would send the same one forever. `InvalidUpdate` is bounded on both ends
+   * (the client's rejoin cap, this room's penalty box) and true — nothing was
+   * imported. Nothing is charged to the wasm heap: no wasm call was made. */
+  private refuseBatch(
+    ws: WebSocket,
+    state: SocketState,
+    message: { crdt: CrdtType; roomId: string; batchId: `0x${string}` },
+    why: string
+  ): void {
+    this.fragments.get(ws)?.delete(message.batchId);
+    console.warn(
+      "refusing an unassemblable fragment batch",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `device=${state.deviceId ?? "unattributed"}`,
+      `batch=${message.batchId}`,
+      why
+    );
+    this.notePush(state.deviceId, false, Date.now());
+    this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
   }
 
   // ── doc/ephemeral materialization ────────────────────────────────────────
@@ -1747,6 +1935,13 @@ export class SessionRoom implements DurableObject {
     this.setMeta("updateBytes", "0");
     this.setMeta("checkpoints", "[]");
     this.setMeta("lastTrimAt", "");
+    // An emptied log has nothing to fold, so the fold backoff must not outlive
+    // it: the reseed that follows is exactly when the room needs to be able to
+    // compact again, and carrying an hour-long ladder across the drop would
+    // hold it open through the whole re-upload (gh#557).
+    this.setMeta("foldFailures", "0");
+    this.setMeta("foldRetryAt", "0");
+    this.setMeta("lastFoldFailure", "");
     this.pending = [];
     this.pendingBytes = 0;
     // Until an engine re-uploads real state, anything materialized from here
@@ -1837,7 +2032,7 @@ export class SessionRoom implements DurableObject {
       // socket-close flush.
       this.flush().catch((e) => {
         console.error("debounced flush failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-        this.escalateWasmPoisoning(e);
+        this.escalateWasmPoisoning(e, "flush-debounced");
       });
     }, DO_FLUSH_MS);
   }
@@ -1860,6 +2055,13 @@ export class SessionRoom implements DurableObject {
     this.setMeta("updateBytes", String(logBytes));
     this.pending = [];
     this.pendingBytes = 0;
+    // A fold that just failed is not retried on the next write (gh#557). The
+    // fold trigger is a THRESHOLD, and a failed fold clears nothing — so a room
+    // whose snapshot export will not complete crosses it again on every single
+    // flush, burning a wasm export and (before this ticket) a poison strike
+    // each time. Back off instead; see `noteFoldFailure`. Rows are already
+    // appended above: this defers compaction, never durability.
+    if (now < Number(this.getMeta("foldRetryAt") ?? "0")) return;
     // Fold on EITHER budget: bytes bounds one huge update, rows bounds many
     // tiny ones — a cold `ensureDoc` replay pays per-import overhead per row,
     // so a high row count is as expensive as a high byte count (see
@@ -1879,17 +2081,83 @@ export class SessionRoom implements DurableObject {
    * colo (2026-08-04 wasm exhaustion) kept thrash-cycling for up to a day
    * after the retention fix deployed; a high-churn room folds every ~400
    * rows, so trimming here converges in minutes instead. Falls back to the
-   * lossless full snapshot when no trim is due (or the trim export fails). */
+   * lossless full snapshot when no trim is due (or the trim export fails).
+   *
+   * Never throws (gh#557). The trim above has always caught its own export —
+   * "best-effort, leave the room to the caller's lossless fold" — but the fold
+   * IS that caller, and it had no catch of its own, so the fallback's fallback
+   * was whatever the flush's caller did with the exception: on the debounced
+   * timer, on socket close, on socket error and in the alarm, all four hand it
+   * to `escalateWasmPoisoning`. One room that could not export its snapshot
+   * therefore aborted the isolate — severing every co-located room's sockets —
+   * and did it again on the next write, because a failed fold leaves the log
+   * exactly as large as the threshold that triggered it. */
   private async foldLog(): Promise<void> {
     const doc = await this.ensureDoc();
-    if (await this.trimHistoryIfDue(doc, Date.now())) return;
+    if (await this.trimHistoryIfDue(doc, Date.now())) {
+      this.noteFoldSuccess();
+      return;
+    }
     // Re-resolve after the await above: a concurrent trim may have replaced
     // and FREED the wrapper captured in `doc` (guarded ensureDoc returns the
     // live cached doc, or cheaply rematerializes).
     const live = await this.ensureDoc();
-    this.blobs.put("snapshot", live.export({ mode: "snapshot" }));
+    try {
+      // Export AND put together: a put that dies partway leaves chunk rows
+      // that do not add up to a snapshot, and the log below is the only other
+      // copy of that state. Dropping the partial blob keeps the log
+      // authoritative instead of handing the next cold start a snapshot that
+      // will not import.
+      this.blobs.put("snapshot", live.export({ mode: "snapshot" }));
+    } catch (e) {
+      try {
+        this.blobs.delete("snapshot");
+      } catch {
+        /* nothing to undo, or storage is refusing everything */
+      }
+      this.noteFoldFailure(e);
+      return;
+    }
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.setMeta("updateBytes", "0");
+    this.noteFoldSuccess();
+  }
+
+  /** The log folded: clear the backoff ladder and the failure it recorded. */
+  private noteFoldSuccess(): void {
+    if (this.getMeta("foldFailures")) {
+      this.setMeta("foldFailures", "0");
+      this.setMeta("foldRetryAt", "0");
+      this.setMeta("lastFoldFailure", "");
+    }
+  }
+
+  /** The log did NOT fold: back off, say so durably, and classify the fault.
+   *
+   * The room keeps working — reads, writes, joins and relays never touched the
+   * fold — it simply cannot compact, so its log goes on growing until either a
+   * later attempt succeeds or a checkpoint ages into trim eligibility (a
+   * `ws4` room reset yesterday becomes trimmable a day later, `dropLog` having
+   * cleared its checkpoints). `MAX_DOC_LOAD_BYTES` is the backstop under all
+   * of that. What must NOT happen is the room taking the isolate down over it,
+   * which is what `escalateWasmPoisoning` is now able to decline. */
+  private noteFoldFailure(e: unknown): void {
+    const failures = Number(this.getMeta("foldFailures") ?? "0") + 1;
+    this.setMeta("foldFailures", String(failures));
+    // Same ladder the alarm chain uses: a minute, doubling, capped at an hour.
+    this.setMeta("foldRetryAt", String(Date.now() + alarmRetryDelay(failures)));
+    this.setMeta(
+      "lastFoldFailure",
+      JSON.stringify({ at: Date.now(), failures, error: String(e) }).slice(0, 512)
+    );
+    console.error(
+      "log fold failed; backing off (the room still serves, it just cannot compact)",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `consecutiveFailures=${failures}`,
+      `updateBytes=${this.getMeta("updateBytes") ?? "0"}`,
+      String(e)
+    );
+    this.escalateWasmPoisoning(e, "fold-export");
   }
 
   /** HISTORY TRIM (§3.1): shallow snapshot at the newest recorded frontier
@@ -2034,7 +2302,7 @@ export class SessionRoom implements DurableObject {
       // Escalate LAST: a wasm-poisoning strike-out calls ctx.abort(), which
       // tears this instance down where it stands — anything after it may never
       // run, and the ladder is what must survive.
-      this.escalateWasmPoisoning(e);
+      this.escalateWasmPoisoning(e, "alarm");
       return;
     }
     // Completed — the chain is clean. One failure followed by a success costs
