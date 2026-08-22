@@ -749,23 +749,80 @@ export class SessionRoom implements DurableObject {
       // holds the full workspace doc locally and re-uploads it on the next join
       // (CRDT merge), exactly like the `ws3` fresh-namespace recovery. Presence
       // is ephemeral and simply re-published. Owner/chatId meta are preserved.
+      //
+      // EVERY STEP BUT THE DROP IS CLEANUP, and is written to fail without
+      // taking the drop with it (gh#553). The room this lands on is by
+      // definition sick: on 2026-08-22 the workspace room had just aborted on
+      // `wasm heap poisoned after 3 strikes`, and the unguarded `this.doc.free()`
+      // below threw out of the handler as a bare 1101 — twice — so the one tool
+      // that exists for a wedged room appeared not to work on the exact room it
+      // exists for. An operator who did not blindly retry would have escalated
+      // to a generation bump instead.
       if (access !== "owner") return refuse();
-      const before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
-        | number
-        | undefined;
-      this.dropLog();
-      this.doc?.free(); // release the wasm memory, don't wait on GC finalizers
+      const room = this.getMeta("chatId") ?? "?";
+      const problems: string[] = [];
+      /** Cleanup step: log it, remember it, never let it reach the caller. */
+      const cleanup = (what: string, run: () => void): void => {
+        try {
+          run();
+        } catch (e) {
+          problems.push(`${what}: ${String(e)}`);
+          console.error(
+            "reset-log cleanup step failed (continuing)",
+            `room=${room}`,
+            what,
+            String(e)
+          );
+        }
+      };
+      let before: number | undefined;
+      cleanup("count updates", () => {
+        before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
+          | number
+          | undefined;
+      });
+      try {
+        this.dropLog();
+      } catch (e) {
+        // The drop IS the request. If it cannot happen, say which step died
+        // rather than dying as an anonymous 1101 (same reasoning as /snapshot).
+        console.error("reset-log could not drop the log", `room=${room}`, String(e));
+        return json({ error: "reset_failed", message: String(e) }, 500);
+      }
+      // Commit the drop BEFORE touching wasm: a free on a poisoned heap can take
+      // the whole invocation down rather than merely throw, and a killed
+      // invocation rolls back this event's uncommitted storage writes — the
+      // wedge break would be undone by its own cleanup (same hazard, same fix,
+      // as the trim's sync in `maybeTrim`).
+      await this.ctx.storage.sync();
+      cleanup("free doc", () => {
+        // Release the wasm memory rather than wait on GC finalizers — but only
+        // if the wrapper is still live. A room that just aborted on a poisoned
+        // heap is precisely a room whose cached `this.doc` is a dangling
+        // wrapper, and calling into a freed one throws (see `isLive`). The
+        // catch covers the rest: memory that is already gone is not an error
+        // worth propagating.
+        if (this.doc && isLive(this.doc)) this.doc.free();
+      });
       this.doc = undefined; // force a fresh (empty) materialization next join
       // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
       // sessions bail and reconnect into the now-empty doc.
-      for (const sock of this.ctx.getWebSockets()) {
-        try {
-          sock.close(4410, "room reset");
-        } catch {
-          /* already gone */
+      cleanup("boot sockets", () => {
+        for (const sock of this.ctx.getWebSockets()) {
+          try {
+            sock.close(4410, "room reset");
+          } catch {
+            /* already gone */
+          }
         }
-      }
-      return json({ ok: true, clearedUpdateRows: before ?? 0 });
+      });
+      return json({
+        ok: true,
+        clearedUpdateRows: before ?? 0,
+        // Present only when a cleanup step failed: the log is dropped either
+        // way, and the operator should still see what limped.
+        ...(problems.length > 0 ? { problems } : {})
+      });
     }
     return new Response("not found", { status: 404 });
   }
@@ -1673,7 +1730,11 @@ export class SessionRoom implements DurableObject {
       );
       return;
     }
-    this.doc.free();
+    // Same liveness rule as everywhere else (see `isLive`): the cached wrapper
+    // can already have been freed by a flow that did not clear the field, and
+    // `free()` on a zeroed pointer is a double free, not a no-op. This one fires
+    // from a bare timer, where the throw has no caller to answer to.
+    if (isLive(this.doc)) this.doc.free();
     this.doc = undefined;
   }
 

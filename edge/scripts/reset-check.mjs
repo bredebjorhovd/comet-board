@@ -37,6 +37,9 @@ const res = await fetch(`${base}/workspace/${orgId}/reset-log`, {
 });
 const body = await res.json();
 check("reset-log ok", res.status === 200 && body.ok === true, JSON.stringify(body));
+// gh#553: cleanup steps (freeing the cached doc, booting sockets) are allowed to
+// fail without failing the drop — but a healthy room should report none.
+check("reset-log had no limping cleanup", !body.problems, JSON.stringify(body.problems ?? []));
 await sleep(300);
 const s1 = await stats();
 check("log cleared after reset", s1.updateRows === 0, `updateRows=${s1.updateRows}, snapshotBytes=${s1.snapshotBytes}`);
