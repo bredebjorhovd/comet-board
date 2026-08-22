@@ -69,6 +69,12 @@ document locally, and `dropLog`'s `postReset` keeps the R2 disaster copy from
 being overwritten by the emptied doc meanwhile. Same shape, and the same
 reasoning, as `REPLAY_CRASH_LIMIT`.
 
+**This predicate shipped too narrow and never fired on the incident above** —
+the room was 1.67 MB against the 32 MB line, and its corruption was routed to
+the poisoning tripwire instead. Fixed in gh#554; see
+[gh-554-size-is-not-the-predicate.md](gh-554-size-is-not-the-predicate.md) for
+where the line between the two escalations actually goes.
+
 `edge/test/workerd/session-load-guard.workerd.test.ts` runs it in real workerd:
 a corrupt snapshot is answered three times, then evicted, then the room joins
 clean; an oversized room refuses and **keeps answering** — an abort there would
