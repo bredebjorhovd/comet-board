@@ -51,6 +51,11 @@ pub struct CometRuntime {
     /// The exact resolver also wired into `Sessions`, so dispatch preflights
     /// the handoff later runs will receive rather than only GitHub metadata.
     push: OnceLock<Arc<crate::push_credentials::PushCredentials>>,
+    /// The peer link cache, for a dispatch whose space is on another device
+    /// (gh#558). Set after construction because the relay is built after the
+    /// board — a board that never gets one can still dispatch every route
+    /// pointing at a space here, and refuses the cross-device ones by name.
+    links: OnceLock<Arc<comet_rpc::LinkCache>>,
     handle: Handle,
 }
 
@@ -73,12 +78,88 @@ impl CometRuntime {
             journal,
             accounts,
             push: OnceLock::new(),
+            links: OnceLock::new(),
             handle,
         }
     }
 
     pub fn set_push_credentials(&self, push: Arc<crate::push_credentials::PushCredentials>) {
         let _ = self.push.set(push);
+    }
+
+    /// Attach the peer link cache — what lets a dispatch reach the device that
+    /// holds its route's space (gh#558).
+    pub fn set_links(&self, links: Arc<comet_rpc::LinkCache>) {
+        let _ = self.links.set(links);
+    }
+
+    /// Cut the attempt's checkout on the device that holds the space.
+    ///
+    /// The mirror of the local `create_worktree_on` call, over the relay
+    /// ([`comet_rpc::methods::CREATE_BOARD_WORKTREE`]) — and refusing the same
+    /// way, as a [`RefusedBeforeCut`]: nothing has been branched and no chat
+    /// made, so the board deletes the attempt row rather than burning an
+    /// attempt on a machine that was asleep.
+    fn create_worktree_on_device(
+        &self,
+        device_id: &str,
+        spec: &DispatchSpec,
+    ) -> Result<String, RefusedBeforeCut> {
+        let Some(links) = self.links.get().cloned() else {
+            return Err(RefusedBeforeCut(format!(
+                "this route's space is on device {device_id}, and this engine has no relay to \
+                 reach it — a board can only dispatch to another device once it is signed in \
+                 and its edge connection is up"
+            )));
+        };
+        // The login and the instruction file travel with the cut: both are
+        // per-device state on the machine that will run the attempt, and doing
+        // them here would seed this box for a run that happens on that one.
+        let params = serde_json::json!({
+            "targetDeviceId": device_id,
+            "repoPath": spec.repo_path,
+            "branch": spec.branch,
+            "base": spec.base,
+            "harness": spec.harness,
+            "account": spec.account,
+            "agentInstructions": spec.agent_instructions,
+        });
+        let reply = self
+            .handle
+            .block_on(async {
+                let client = links.client(device_id).await?;
+                client
+                    .call(comet_rpc::methods::CREATE_BOARD_WORKTREE, params)
+                    .await
+                    .inspect_err(|e| {
+                        // Same rule the RPC layer's own forward follows: a dead
+                        // transport must not be cached, or every retry of this
+                        // dispatch dials the same corpse.
+                        if matches!(
+                            e,
+                            comet_rpc::RpcError::Closed | comet_rpc::RpcError::Transport(_)
+                        ) {
+                            links.invalidate(device_id);
+                        }
+                    })
+            })
+            .map_err(|e| {
+                RefusedBeforeCut(format!(
+                    "cutting {} on device {device_id}: {e}",
+                    spec.branch
+                ))
+            })?;
+        reply
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                RefusedBeforeCut(format!(
+                    "device {device_id} cut {} but named no path for it — the engine there is \
+                     older than gh#558 and does not know the verb",
+                    spec.branch
+                ))
+            })
     }
 
     fn chat_config(&self, chat_id: &str) -> Option<ChatConfig> {
@@ -120,23 +201,42 @@ impl Runtime for CometRuntime {
                 "board-dispatched GitHub work has an inconsistent repository/contract tuple"
             ),
         }
+        // Which machine this attempt actually runs on (gh#558). A route names a
+        // space, and a space is a device+folder pair — usually this device's,
+        // but not necessarily: one board hosted on the always-on box dispatches
+        // comet's own iOS and macOS work into the Mac's checkout, because that
+        // work cannot build on Linux. Everything below that is a workspace-doc
+        // write already lands on the space's device (`create_chat` stamps the
+        // chat with `space.device_id`, and the command ledger is the chat's).
+        // The checkout was the one step still taken here, against a path that
+        // exists over there.
+        let local = self.workspace.device_id();
+        let elsewhere = (!spec.device_id.is_empty() && spec.device_id != local)
+            .then_some(spec.device_id.as_str());
+
         // The checkout first: a failure here leaves nothing behind to clean up.
         // That includes an unreachable origin — `create_worktree_on` fetches
         // `spec.base` before cutting and refuses rather than branching from a
         // stale local HEAD (gh#67). Typed as `RefusedBeforeCut` (gh#410): no
         // branch was cut and no chat made, so the board deletes the attempt
         // row it opened instead of burning an attempt on a pre-flight refusal.
-        let cwd = if spec.worktree {
-            self.handle
-                .block_on(self.repos.create_worktree_on(
-                    Path::new(&spec.repo_path),
-                    &spec.branch,
-                    &spec.base,
-                ))
-                .map_err(|e| anyhow::Error::new(RefusedBeforeCut(e.to_string())))?
-                .path
-        } else {
-            spec.repo_path.clone()
+        let cwd = match (spec.worktree, elsewhere) {
+            (true, None) => {
+                self.handle
+                    .block_on(self.repos.create_worktree_on(
+                        Path::new(&spec.repo_path),
+                        &spec.branch,
+                        &spec.base,
+                    ))
+                    .map_err(|e| anyhow::Error::new(RefusedBeforeCut(e.to_string())))?
+                    .path
+            }
+            (true, Some(device)) => self
+                .create_worktree_on_device(device, spec)
+                .map_err(anyhow::Error::new)?,
+            // A route with `worktree = false` runs in the space folder itself,
+            // which is a path on its own device either way.
+            (false, _) => spec.repo_path.clone(),
         };
 
         // Fail the dispatch here if the account does not resolve, rather than
@@ -144,8 +244,17 @@ impl Runtime for CometRuntime {
         // not is a row somebody has to clean up, and the operator finds out
         // either way. Materializing now also means the dir is seeded before
         // the brief is queued, so the run never races the seeding.
-        let config_dir = match spec.account.as_deref() {
-            Some(account) => Some(
+        //
+        // Only for a run on this device. An agent login is a per-device CLI
+        // login — the slot ids are portable, the `~/.claude` behind them is
+        // not — so for a dispatch to the other machine this would materialize
+        // the wrong box's credentials and then fail the dispatch over a slot
+        // that is perfectly present where the run will happen. The device that
+        // runs it resolves its own login off the chat's `account`, which is
+        // where that decision has always been recorded.
+        let config_dir = match (elsewhere, spec.account.as_deref()) {
+            (Some(_), _) => None,
+            (None, Some(account)) => Some(
                 self.accounts
                     .materialize(spec.harness, account)
                     .map_err(|e| anyhow::anyhow!("{e}"))?,
@@ -154,7 +263,7 @@ impl Runtime for CometRuntime {
             // which on a single-login box is every dispatch there is. That dir
             // is the box user's `~/.claude` / `~/.codex`, so the write into it
             // has to be the marker-managed kind — and it is (gh#272).
-            None => self.accounts.default_config_dir(spec.harness),
+            (None, None) => self.accounts.default_config_dir(spec.harness),
         };
 
         // The board's conventions in the file this runtime reads without being

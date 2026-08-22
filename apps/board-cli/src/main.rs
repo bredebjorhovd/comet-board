@@ -1174,8 +1174,12 @@ fn main() -> Result<()> {
                             peers: runtime
                                 .block_on(sweep_boards(port, &info.device, info.edge.as_ref()))
                                 .ok(),
+                            // Which of the spaces below are this box's own
+                            // (gh#558), and who the rest belong to.
+                            device: Some(info.device.clone()),
+                            devices: info.devices,
                         },
-                        Some(info.spaces),
+                        Some(info.all_spaces),
                         Some(info.accounts),
                         info.edge,
                         info.members,
@@ -1191,8 +1195,11 @@ fn main() -> Result<()> {
                             version: None,
                             update: None,
                             // Nothing was asked, so nothing may be claimed
-                            // about the other devices either (gh#195).
+                            // about the other devices either (gh#195) — nor
+                            // about which device this one is (gh#558).
                             peers: None,
+                            device: None,
+                            devices: Vec::new(),
                         },
                         None,
                         None,
@@ -1919,7 +1926,17 @@ struct EngineInfo {
     /// The engine binary's own version (gh#156). `None` from an engine older
     /// than the field — doctor then falls back to what is on disk.
     version: Option<String>,
+    /// The spaces *this* device owns — what `init` and `adopt` want, because
+    /// both of them probe folders on this disk.
     spaces: Vec<Space>,
+    /// The workspace's whole space list, every device's (gh#558). Doctor wants
+    /// this one: a route may name a space another device hosts, and reporting
+    /// that as missing was the wart consolidating onto one board had to clear.
+    all_spaces: Vec<Space>,
+    /// The workspace's device rows, so a `device_id` on a remote space can be
+    /// reported as the name a person knows it by. Best-effort — an engine that
+    /// cannot answer costs the name, not the check.
+    devices: Vec<comet_proto::Device>,
     accounts: Vec<comet_proto::AgentAccount>,
     edge: Option<comet_proto::EdgeHealth>,
     /// How many people are in this workspace (gh#161). `None` when the engine
@@ -1936,11 +1953,13 @@ struct EngineInfo {
     update: Option<comet_update::UpdateStatus>,
 }
 
-/// This device's spaces, from the engine: `LocalDevice` for the device id (and
-/// the engine's version), the first `WatchSpaces` snapshot for the rows,
-/// filtered to spaces this device owns — a route's `repo =` is a local path, and
-/// another device's folders are not on this disk. Plus the engine's live
-/// edge-connection census (gh#116), which is the one fact this loopback
+/// The spaces, from the engine: `LocalDevice` for the device id (and the
+/// engine's version), the first `WatchSpaces` snapshot for the rows — kept
+/// whole *and* filtered to this device (gh#558). `init` and `adopt` want the
+/// filtered list, because both probe folders on this disk; doctor wants the
+/// whole one, because a route may name a space another device hosts and one
+/// board dispatching to two machines is the supported shape. Plus the engine's
+/// live edge-connection census (gh#116), which is the one fact this loopback
 /// conversation cannot otherwise reveal.
 async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
     let fetch = async {
@@ -1968,9 +1987,24 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             .ok_or_else(|| anyhow::anyhow!("WatchSpaces stream ended before a snapshot"))?;
         let spaces: Vec<Space> = serde_json::from_value(snapshot)?;
         let mine: Vec<Space> = spaces
-            .into_iter()
+            .iter()
             .filter(|s| s.device_id == device)
+            .cloned()
             .collect();
+        // Who the other device_ids on those spaces *are* (gh#558) — best-effort
+        // like the calls below it: an engine that cannot answer leaves a remote
+        // space reported by its id, which is a worse sentence, not a wrong one.
+        let devices: Vec<comet_proto::Device> = match client
+            .subscribe(methods::WATCH_DEVICES, serde_json::json!({}))
+            .await
+        {
+            Ok(mut stream) => stream
+                .recv()
+                .await
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
         // The saved agent logins, for the route `account` check. Offline list
         // (no `forceUsage`): doctor wants the ids and who they belong to, not
         // a round of rate-limit probes.
@@ -2029,6 +2063,8 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             device,
             version,
             spaces: mine,
+            all_spaces: spaces,
+            devices,
             accounts,
             edge,
             members,
