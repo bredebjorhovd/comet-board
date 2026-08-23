@@ -282,6 +282,22 @@ pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div 
         .child(label.into())
 }
 
+/// The blocked status pill — [`badge_active`]'s shape wearing the danger ramp:
+/// the Accounts "Stale" freshness badge (gh#599), and any other verdict a
+/// provider has refused. Painted from the theme like every severity widget
+/// here, so it inverts for light with the rest.
+pub fn badge_stale(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .flex_none()
+        .px(px(BADGE_PAD_X))
+        .py(px(BADGE_PAD_Y))
+        .rounded(px(Theme::RADIUS_CHIP))
+        .bg(theme.danger.opacity(0.14))
+        .text_size(px(Theme::TEXT_CAPTION))
+        .text_color(theme.danger_text())
+        .child(label.into())
+}
+
 const BADGE_PAD_X: f32 = 8.0;
 const BADGE_PAD_Y: f32 = 1.0;
 

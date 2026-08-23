@@ -3321,7 +3321,9 @@ fn account_check(
                     false,
                     format!(
                         "`{account}` — {} ({}) — but the login is STALE, {}. \
-                          Run `comet-board relogin {}` before dispatching here",
+                          Re-sign it before dispatching here: Settings → Agents in \
+                          the Comet app has a Re-sign action for the slot, or \
+                          `comet-board relogin {}` from a shell",
                         found.email.as_deref().unwrap_or("unknown"),
                         harness_name(harness),
                         h.detail,
@@ -3415,8 +3417,9 @@ fn agent_account_health_checks(
                     name,
                     ok: false,
                     detail: format!(
-                        "{who} ({}){active} — STALE, {} · re-sign it with \
-                         `comet-board relogin {}`",
+                        "{who} ({}){active} — STALE, {}. Re-sign it under \
+                         Settings → Agents in the Comet app, or with \
+                         `comet-board relogin {}` from a shell",
                         harness_name(a.harness),
                         h.detail,
                         relogin_arg(a, accounts)
@@ -5259,6 +5262,46 @@ mod tests {
                 .iter()
                 .all(|c| c.ok)
         );
+    }
+
+    /// gh#599: the stale-slot hint points at the app surface too — the
+    /// Accounts page's Re-sign action — while keeping the CLI verb for the
+    /// SSH-only moments. Both per-login lines and route lines carry it.
+    #[test]
+    fn a_stale_hint_names_the_app_surface_beside_the_shell_verb() {
+        let (_d, p) = tmp();
+        routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
+        let saved = [account(
+            "8f2c1d0a7b6e4539",
+            "sam@example.com",
+            HarnessId::ClaudeCode,
+        )];
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![health(
+            "8f2c1d0a7b6e4539",
+            HarnessId::ClaudeCode,
+            comet_proto::AgentAccountState::Stale,
+        )]);
+        for check in doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap() {
+            let stale_hint =
+                check.name.starts_with("agent account ") || check.name == "route x: account";
+            if !stale_hint {
+                continue;
+            }
+            assert!(!check.ok, "{}", check.detail);
+            assert!(
+                check.detail.contains("Settings → Agents"),
+                "{} should point at the app surface: {}",
+                check.name,
+                check.detail
+            );
+            assert!(
+                check.detail.contains("comet-board relogin"),
+                "{} keeps the shell verb: {}",
+                check.name,
+                check.detail
+            );
+        }
     }
 
     /// An unverifiable login is "not verified", never invented into either

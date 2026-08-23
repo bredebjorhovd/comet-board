@@ -719,7 +719,8 @@ impl SessionsEngine {
             let Ok(handle) = self.doc_handle(chat_id) else {
                 return Ok(false);
             };
-            let stamped = handle.mark_abandoned_streams("Turn stopped — its run no longer exists")?;
+            let stamped =
+                handle.mark_abandoned_streams("Turn stopped — its run no longer exists")?;
             if stamped.is_empty() {
                 return Ok(false);
             }
@@ -1666,7 +1667,8 @@ fn say_stale_login(
     Some(format!(
         "This run spent the agent account {email} (slot {account_id}, {harness}), whose \
          access token ran out at {when} — it died authenticating, not working. Re-sign \
-         that login (`comet-board relogin {account_id}`) and retry. ({message})",
+         that login (Settings → Agents in the app has a Re-sign action for the slot; \
+         `comet-board relogin {account_id}` does it from a shell) and retry. ({message})",
         email = expired.email,
         harness = harness.as_str(),
         when = crate::agent_accounts::stamp(expired.expired_at),
@@ -2607,6 +2609,9 @@ mod tests {
         .expect("an expired slot is named");
         assert!(said.contains("sam@example.com"), "{said}");
         assert!(said.contains(&format!("relogin {id}")), "{said}");
+        // gh#599: the hint renders inside the app, so it points at the app's
+        // own re-sign surface first and keeps the shell verb beside it.
+        assert!(said.contains("Settings → Agents"), "{said}");
         assert!(
             said.contains(original),
             "the harness's own error survives behind the attribution: {said}"
