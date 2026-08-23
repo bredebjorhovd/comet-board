@@ -5,7 +5,7 @@ Every removal below is backed by a reference check (symbol counted across every
 and clippy output, or repository history. Nothing was removed for looking
 unused; where an item is part of a cross-language contract it stayed.
 
-## Dead production code
+### Dead production code
 
 - **`toggle_switch`** (`crates/ui/src/pickers.rs`) — a `#[allow(dead_code)]`
   port of comet's branch-picker `Toggle` with no caller anywhere. The allow
@@ -42,7 +42,7 @@ unused; where an item is part of a cross-language contract it stayed.
   **`dot::AWAITING` / `dot::ERRORED`** (`crates/proto/src/view.rs`) — all
   definition-only.
 
-## Drifted mirrors and orphaned dependencies
+### Drifted mirrors and orphaned dependencies
 
 - **`RETAIN_DAYS` / `COMPACT_LOG_BYTES` / `SOFT_CEILING_BYTES` /
   `DO_FLUSH_MS`** (`crates/doc/src/constants.rs`) deleted. These are Session DO
@@ -58,7 +58,7 @@ unused; where an item is part of a cross-language contract it stayed.
 - **`serde_json` dev-dependency** (`crates/sync/Cargo.toml`) — literal
   duplicate of the same entry already under `[dependencies]`.
 
-## Orphaned assets
+### Orphaned assets
 
 - **`scripts/frame_png.py`** deleted. It renders `frame_dump.json` files — a
   format produced only by `crates/tui/tests/frame_dump.rs`, which gh#416
@@ -66,7 +66,7 @@ unused; where an item is part of a cross-language contract it stayed.
   the TUI. The script survived the cull with no input producer and no
   reference from any file, script, or workflow.
 
-## What was checked and deliberately kept
+### What was checked and deliberately kept
 
 - Every icon in `crates/ui/assets/icons` is registered in the `icon_assets!`
   macro; fonts, sounds, `dist/` packaging assets and the embedded board skill
@@ -84,7 +84,7 @@ unused; where an item is part of a cross-language contract it stayed.
 - Tests that assert constants against each other (`shell.rs` review-column
   bounds) read as vacuous to clippy but pin design boundaries; kept.
 
-## Found but not fixed here
+### Found but not fixed here
 
 - `jitter::tests::consecutive_draws_differ` fails on this Mac while passing in
   CI, and the test is the messenger for a real finding: `spread()`
