@@ -457,6 +457,16 @@ struct ListAgentAccountsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct VerifyAgentAccountsParams {
+    /// One slot only, when named — the re-login verb verifying the account it
+    /// just walked through. `None` asks every login on this device, which is
+    /// what doctor's per-slot lines are made of.
+    #[serde(default)]
+    account_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct AgentAccountParams {
     harness: HarnessId,
     account_id: String,
@@ -474,6 +484,14 @@ struct StartAgentLoginParams {
     /// callback to its own loopback, which that browser can never reach.
     #[serde(default)]
     target_device_id: Option<String>,
+    /// The same fact said out loud, for a caller that knows better than the
+    /// transport shows (gh#576): `comet-board relogin` over SSH dials the
+    /// loopback like any local client, but there is no browser on the box to
+    /// land a callback in. `true` forces the flows that need no browser on
+    /// this device (paste-code, device code); `false` forces the local ones.
+    /// Unset keeps the tells above.
+    #[serde(default)]
+    remote: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2022,6 +2040,10 @@ fn forwardable(method: &str) -> bool {
             | methods::COMPLETE_AGENT_LOGIN
             | methods::POLL_AGENT_LOGIN
             | methods::CANCEL_AGENT_LOGIN
+            // Freshness is a fact about the named device's stored logins, and
+            // `comet-board relogin --device` walks the whole flow from a
+            // laptop — start, code, poll, verify (gh#576).
+            | methods::VERIFY_AGENT_ACCOUNTS
             // Uploads/attachments target the chat's host device (the agent reads
             // the committed file from that device's disk).
             | methods::UPLOAD_CHUNK
@@ -2962,8 +2984,13 @@ impl RpcService for EngineRpc {
                 // Two independent tells that nobody is sitting at this device:
                 // the caller named it by id (the switcher only does that for a
                 // device that is not its own), or the call came in over the
-                // relay instead of this device's IPC. Either is enough.
-                let remote = p.target_device_id.is_some() || caller.is_verified();
+                // relay instead of this device's IPC. Either is enough — and
+                // either can be overridden by a caller that knows better
+                // (gh#576): an SSH shell dials the loopback with no browser
+                // behind it, so `comet-board relogin` says `remote` out loud.
+                let remote = p
+                    .remote
+                    .unwrap_or(p.target_device_id.is_some() || caller.is_verified());
                 let start = self
                     .agent_accounts
                     .start_login(p.harness, remote)
@@ -2993,6 +3020,11 @@ impl RpcService for EngineRpc {
                 let p: LoginIdParams = parse_params(params)?;
                 self.agent_accounts.cancel_login(&p.login_id);
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::VERIFY_AGENT_ACCOUNTS => {
+                let p: VerifyAgentAccountsParams = parse_params(params)?;
+                let health = self.agent_accounts.health(p.account_id.as_deref()).await;
+                RpcReply::value(&health)
             }
             methods::UPLOAD_CHUNK => {
                 let p: UploadChunkParams = parse_params(params)?;

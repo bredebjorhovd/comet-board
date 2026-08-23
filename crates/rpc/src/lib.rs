@@ -170,6 +170,12 @@ pub mod methods {
     pub const COMPLETE_AGENT_LOGIN: &str = "CompleteAgentLogin";
     pub const POLL_AGENT_LOGIN: &str = "PollAgentLogin";
     pub const CANCEL_AGENT_LOGIN: &str = "CancelAgentLogin";
+    /// Per-slot credential freshness, verified against the provider where a
+    /// timestamp cannot answer (gh#576). Params: `{accountId?}` →
+    /// `Vec<comet_proto::AgentAccountHealth>`; omit `accountId` for every
+    /// account on the device. What `comet-board doctor`'s per-login lines and
+    /// `comet-board relogin`'s final verdict are made of.
+    pub const VERIFY_AGENT_ACCOUNTS: &str = "VerifyAgentAccounts";
     // Uploads / attachments (ControlRpc, relay-forwardable — target the chat's host device).
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";

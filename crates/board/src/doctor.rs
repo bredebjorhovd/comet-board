@@ -66,6 +66,13 @@ pub struct EngineStatus {
     /// into a name a person recognises ("on Tokenmaxxer9000", not on
     /// `5fedcd47-…`). Best-effort: an empty list only costs the id.
     pub devices: Vec<Device>,
+    /// Per-login credential freshness, as the engine just verified it
+    /// against each provider (gh#576). What the per-slot `agent account`
+    /// lines are made of, and what turns a route naming a dead login into a
+    /// failing check instead of a dispatch that dies mid-run. `None` when
+    /// the engine could not be asked — those lines then say "not checked"
+    /// rather than inventing verdicts.
+    pub account_health: Option<Vec<comet_proto::AgentAccountHealth>>,
 }
 
 /// What a sweep of the other devices found (gh#195).
@@ -211,6 +218,17 @@ pub fn doctor(
     // every harness on every device and a dispatch to a missing CLI failed
     // after the worktree was cut.
     checks.push(harnesses_check(runtimes));
+
+    // Per-login freshness (gh#576). Outside the routing match on purpose —
+    // a broken routing.toml must not hide that a login died, any more than a
+    // dead login should hide behind a healthy config. One line per account:
+    // the whole point is naming WHICH slot went stale, because a red
+    // "somewhere on this box a login died" sent the operator reading
+    // credential files by hand.
+    checks.extend(agent_account_health_checks(
+        accounts,
+        engine.account_health.as_deref(),
+    ));
 
     // …and whether the box has the memory to run any of them (gh#533). Beside
     // the harness census because it is the same question about the same box
@@ -659,7 +677,13 @@ pub fn doctor(
                 // laptop has no accounts to check and should not be told about
                 // a feature it is not using (gh#59).
                 if let Some(account) = r.account.as_deref().filter(|a| !a.is_empty()) {
-                    checks.push(account_check(&name, account, r, accounts));
+                    checks.push(account_check(
+                        &name,
+                        account,
+                        r,
+                        accounts,
+                        engine.account_health.as_deref(),
+                    ));
                 }
             }
         }
@@ -3108,6 +3132,7 @@ fn account_check(
     account: &str,
     route: &crate::config::Route,
     accounts: Option<&[AgentAccount]>,
+    health: Option<&[comet_proto::AgentAccountHealth]>,
 ) -> Check {
     let check = |ok: bool, detail: String| Check {
         name: format!("route {name}: account"),
@@ -3136,7 +3161,8 @@ fn account_check(
             false,
             if known.is_empty() {
                 format!(
-                    "`{account}` is not a saved login — this device has none; sign one                      in under Agent accounts first"
+                    "`{account}` is not a saved login — this device has none; sign one \
+                     in under Agent accounts first"
                 )
             } else {
                 format!(
@@ -3149,23 +3175,123 @@ fn account_check(
     match harness_for_runtime(&route.runtime) {
         // A bad runtime is already its own failing check; not repeating it here.
         None => check(true, format!("`{account}` — runtime unresolved")),
-        Some(harness) if harness == found.harness => check(
-            true,
-            format!(
-                "`{account}` — {} ({})",
-                found.email.as_deref().unwrap_or("unknown"),
-                harness_name(harness)
-            ),
-        ),
+        Some(harness) if harness == found.harness => {
+            // The login resolving is not the same as the login working
+            // (gh#576): a slot the provider just refused fails this route,
+            // naming the repair, because every dispatch on it would die
+            // authenticating. Only a *verified* stale verdict fails — an
+            // unverifiable one (engine down, network down) is "not checked",
+            // not a red line about something nobody measured.
+            let stale = health.and_then(|all| all.iter().find(|h| h.id == found.id));
+            match stale {
+                Some(h) if h.state == comet_proto::AgentAccountState::Stale => check(
+                    false,
+                    format!(
+                        "`{account}` — {} ({}) — but the login is STALE, {}. \
+                         Run `comet-board relogin {}` before dispatching here",
+                        found.email.as_deref().unwrap_or("unknown"),
+                        harness_name(harness),
+                        h.detail,
+                        found.id
+                    ),
+                ),
+                _ => check(
+                    true,
+                    format!(
+                        "`{account}` — {} ({})",
+                        found.email.as_deref().unwrap_or("unknown"),
+                        harness_name(harness)
+                    ),
+                ),
+            }
+        }
         Some(harness) => check(
             false,
             format!(
-                "`{account}` is a {} login, but this route dispatches to {} — an                  account cannot be lent across CLIs",
+                "`{account}` is a {} login, but this route dispatches to {} — an \
+                 account cannot be lent across CLIs",
                 harness_name(found.harness),
                 harness_name(harness)
             ),
         ),
     }
+}
+
+/// Per-login credential freshness (gh#576): one line per agent account this
+/// device holds, saying whether a run under it would work right now.
+///
+/// Silent when the box holds no accounts at all — the gh#59 rule again: a
+/// laptop that never uses the feature is not told about it. When the engine
+/// could not be asked (down, or too old for the verb), the line exists and
+/// says "not checked", because "the engine is dead" and "every login is
+/// fine" are different facts a summary must not merge.
+fn agent_account_health_checks(
+    accounts: Option<&[AgentAccount]>,
+    health: Option<&[comet_proto::AgentAccountHealth]>,
+) -> Vec<Check> {
+    let Some(accounts) = accounts else {
+        return Vec::new();
+    };
+    if accounts.is_empty() {
+        return Vec::new();
+    }
+    let Some(health) = health else {
+        return vec![Check {
+            name: "agent accounts".into(),
+            ok: true,
+            detail: "not checked — the engine did not answer the freshness probe".into(),
+        }];
+    };
+    accounts
+        .iter()
+        .map(|a| {
+            let name = format!(
+                "agent account {} ({})",
+                a.email.as_deref().unwrap_or(a.id.as_str()),
+                harness_name(a.harness)
+            );
+            let who = a.email.as_deref().unwrap_or(a.id.as_str()).to_string();
+            let active = if a.active {
+                " · this box's live login"
+            } else {
+                ""
+            };
+            let Some(h) = health.iter().find(|h| h.id == a.id) else {
+                return Check {
+                    name,
+                    ok: true,
+                    detail: format!("{who} — not checked"),
+                };
+            };
+            match h.state {
+                comet_proto::AgentAccountState::Ok => Check {
+                    name,
+                    ok: true,
+                    detail: format!("{who} ({}){active} — {}", harness_name(a.harness), h.detail),
+                },
+                comet_proto::AgentAccountState::Unknown => Check {
+                    name,
+                    ok: true,
+                    detail: format!(
+                        "{who} ({}){active} — not verified ({})",
+                        harness_name(a.harness),
+                        h.detail
+                    ),
+                },
+                comet_proto::AgentAccountState::Stale => Check {
+                    name,
+                    ok: false,
+                    detail: format!(
+                        "{who} ({}){active} — STALE, {} · re-sign it with \
+                         `comet-board relogin {}`",
+                        harness_name(a.harness),
+                        h.detail,
+                        a.id
+                    ),
+                },
+            }
+        })
+        .collect()
 }
 
 /// Which agent hears that a settle or a block happened.
@@ -3720,6 +3846,9 @@ mod tests {
             // unless a test deliberately puts one somewhere else (gh#558).
             device: Some(LOCAL_DEVICE.into()),
             devices: Vec::new(),
+            // No freshness verdicts, so the per-login lines say "not checked"
+            // in every test that is not about them (gh#576).
+            account_health: None,
         }
     }
 
@@ -4530,6 +4659,7 @@ mod tests {
             peers: None,
             device: None,
             devices: Vec::new(),
+            account_health: None,
         };
         let checks = doctor(&p, &down, None, Some(&[]), None, None, None).unwrap();
         assert!(checks.iter().any(|c| c.name == "engine" && !c.ok));
@@ -4854,6 +4984,166 @@ mod tests {
         let c = account_check_in(&checks);
         assert!(c.ok, "{}", c.detail);
         assert!(c.detail.contains("not checked"), "{}", c.detail);
+    }
+
+    // --- per-login freshness (gh#576) ---------------------------------------
+
+    fn health(
+        id: &str,
+        harness: comet_proto::HarnessId,
+        state: comet_proto::AgentAccountState,
+    ) -> comet_proto::AgentAccountHealth {
+        comet_proto::AgentAccountHealth {
+            id: id.into(),
+            harness,
+            email: None,
+            state,
+            detail: "the probe's own sentence".into(),
+        }
+    }
+
+    /// The whole point of the gh#576 report: WHICH login went stale is
+    /// named, with the repair on the same line — not a vague red somewhere.
+    #[test]
+    fn each_login_gets_a_freshness_line_and_a_stale_one_fails() {
+        let (_d, p) = tmp();
+        let saved = [
+            account("aaaaaaaaaaaaaaaa", "sam@example.com", HarnessId::ClaudeCode),
+            account("bbbbbbbbbbbbbbbb", "kim@example.com", HarnessId::Codex),
+        ];
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![
+            health(
+                "aaaaaaaaaaaaaaaa",
+                HarnessId::ClaudeCode,
+                comet_proto::AgentAccountState::Ok,
+            ),
+            health(
+                "bbbbbbbbbbbbbbbb",
+                HarnessId::Codex,
+                comet_proto::AgentAccountState::Stale,
+            ),
+        ]);
+        let checks = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None)
+            .unwrap()
+            .into_iter()
+            .filter(|c| c.name.starts_with("agent account "))
+            .collect::<Vec<_>>();
+
+        let sam = checks.iter().find(|c| c.name.contains("sam@")).unwrap();
+        assert!(sam.ok, "{}", sam.detail);
+        assert!(sam.detail.contains("claude-code"), "{}", sam.detail);
+
+        let kim = checks
+            .iter()
+            .find(|c| c.name.contains("kim@"))
+            .expect("one line per login");
+        assert!(!kim.ok, "{}", kim.detail);
+        assert!(
+            kim.detail.contains("relogin bbbbbbbbbbbbbbbb"),
+            "{}",
+            kim.detail
+        );
+        // And the stale one does not silently pass the report.
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![
+            health(
+                "aaaaaaaaaaaaaaaa",
+                HarnessId::ClaudeCode,
+                comet_proto::AgentAccountState::Ok,
+            ),
+            health(
+                "bbbbbbbbbbbbbbbb",
+                HarnessId::Codex,
+                comet_proto::AgentAccountState::Stale,
+            ),
+        ]);
+        assert!(
+            !doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None)
+                .unwrap()
+                .iter()
+                .all(|c| c.ok)
+        );
+    }
+
+    /// An unverifiable login is "not verified", never invented into either
+    /// verdict — and an engine that could not be asked at all leaves one
+    /// quiet "not checked" line rather than none or many.
+    #[test]
+    fn unknown_freshness_reads_as_not_checked_not_ok_or_dead() {
+        let (_d, p) = tmp();
+        let saved = [account(
+            "cccccccccccccccc",
+            "lee@example.com",
+            HarnessId::Codex,
+        )];
+        let verdicts = [health(
+            "cccccccccccccccc",
+            HarnessId::Codex,
+            comet_proto::AgentAccountState::Unknown,
+        )];
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![verdicts[0].clone()]);
+        let checks = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "agent account lee@example.com (codex)")
+            .expect("a held login is reported");
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("not verified"), "{}", c.detail);
+
+        let mut engine = engine_up();
+        engine.account_health = None;
+        let checks = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
+        let c = checks
+            .iter()
+            .find(|c| c.name == "agent accounts")
+            .expect("the line exists so silence cannot read as all-clear");
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("not checked"), "{}", c.detail);
+    }
+
+    /// A route whose configured slot the provider just refused fails its own
+    /// line — the dispatch it would release dies authenticating, and that is
+    /// now knowable before the worktree is cut.
+    #[test]
+    fn a_route_on_a_stale_slot_is_refused_by_name() {
+        let (_d, p) = tmp();
+        routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
+        let saved = [account(
+            "8f2c1d0a7b6e4539",
+            "sam@example.com",
+            HarnessId::ClaudeCode,
+        )];
+
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![health(
+            "8f2c1d0a7b6e4539",
+            HarnessId::ClaudeCode,
+            comet_proto::AgentAccountState::Stale,
+        )]);
+        let bad = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
+        let c = account_check_in(&bad);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("comet-board relogin 8f2c1d0a7b6e4539"),
+            "{}",
+            c.detail
+        );
+
+        // A fresh verdict leaves the route green again — same config, new token.
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![health(
+            "8f2c1d0a7b6e4539",
+            HarnessId::ClaudeCode,
+            comet_proto::AgentAccountState::Ok,
+        )]);
+        let good = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
+        assert!(
+            account_check_in(&good).ok,
+            "{}",
+            account_check_in(&good).detail
+        );
     }
 
     #[test]

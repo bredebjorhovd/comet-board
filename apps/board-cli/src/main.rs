@@ -401,6 +401,20 @@ enum Command {
     /// Check the environment: keys, engine, routes, repos. Exits non-zero on
     /// any failing check.
     Doctor,
+    /// Re-sign one agent-account login on this device: the guided OAuth flow
+    /// for its harness, verified against the provider before success is
+    /// declared (gh#576).
+    ///
+    /// For the box you are SSHed into: it uses the flows that need no browser
+    /// on the device — paste-code for Claude Code (open the URL anywhere,
+    /// bring the code back by hand), a one-time device code for Codex — and
+    /// it does not say "done" until the fresh credential has actually been
+    /// accepted. `comet-board doctor` names the stale slots; this fixes one.
+    Relogin {
+        /// Which login: its slot id or the email on it (`comet-board doctor`
+        /// lists both). Omit when this device holds exactly one.
+        target: Option<String>,
+    },
     /// Generate a starter routing.toml from the spaces on this device.
     Init {
         /// Overwrite an existing routing.toml.
@@ -1162,7 +1176,7 @@ fn main() -> Result<()> {
         }
         Command::Doctor => {
             let (engine, spaces, accounts, edge, members, runtimes) =
-                match runtime.block_on(fetch_spaces(port)) {
+                match runtime.block_on(fetch_spaces(port, true)) {
                     Ok(info) => (
                         EngineStatus {
                             reachable: true,
@@ -1186,6 +1200,7 @@ fn main() -> Result<()> {
                             // (gh#558), and who the rest belong to.
                             device: Some(info.device.clone()),
                             devices: info.devices,
+                            account_health: info.account_health,
                         },
                         Some(info.all_spaces),
                         Some(info.accounts),
@@ -1208,6 +1223,7 @@ fn main() -> Result<()> {
                             peers: None,
                             device: None,
                             devices: Vec::new(),
+                            account_health: None,
                         },
                         None,
                         None,
@@ -1230,13 +1246,19 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Relogin { target } => runtime.block_on(async {
+            let board = ops::attach(port, device).await?;
+            ops::relogin(&board, target.as_deref()).await
+        }),
         Command::Init { force } => {
-            let info = runtime.block_on(fetch_spaces(port)).with_context(|| {
-                format!(
-                    "listing spaces from the engine on 127.0.0.1:{port} — \
+            let info = runtime
+                .block_on(fetch_spaces(port, false))
+                .with_context(|| {
+                    format!(
+                        "listing spaces from the engine on 127.0.0.1:{port} — \
                      start `comet` or `comet headless` first"
-                )
-            })?;
+                    )
+                })?;
             comet_board::init::init(&paths, &info.spaces, adopt::probe, force)
         }
         Command::Routes { command } => runtime.block_on(async {
@@ -1306,7 +1328,7 @@ fn main() -> Result<()> {
             }
 
             let spaces = runtime
-                .block_on(fetch_spaces(port))
+                .block_on(fetch_spaces(port, false))
                 .with_context(|| {
                     format!(
                         "listing spaces from the engine on 127.0.0.1:{port} — \
@@ -1956,6 +1978,10 @@ struct EngineInfo {
     /// engine too old to answer, which doctor reports as "not checked" rather
     /// than as a box that can run nothing.
     runtimes: Vec<comet_proto::view::board::RuntimeOption>,
+    /// Per-login credential freshness as the engine verified it (gh#576).
+    /// `None` when not asked for (only `doctor` asks — it costs one provider
+    /// probe per expired login) or when the engine could not answer.
+    account_health: Option<Vec<comet_proto::AgentAccountHealth>>,
     /// What the engine's release checker last saw at the edge (gh#197). `None`
     /// from an engine that has no updater attached or predates the verb.
     update: Option<comet_update::UpdateStatus>,
@@ -1969,7 +1995,7 @@ struct EngineInfo {
 /// board dispatching to two machines is the supported shape. Plus the engine's
 /// live edge-connection census (gh#116), which is the one fact this loopback
 /// conversation cannot otherwise reveal.
-async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
+async fn fetch_spaces(port: u16, with_health: bool) -> Result<EngineInfo> {
     let fetch = async {
         let client: RpcClient = connect_ws(&format!("ws://127.0.0.1:{port}")).await?;
         let local = client
@@ -2051,6 +2077,18 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             .ok()
             .and_then(|v| serde_json::from_value(v).ok())
             .unwrap_or_default();
+        // Per-login freshness (gh#576), only where the report will use it:
+        // every expired slot costs a provider round trip to verify, which
+        // `init` and `adopt` have no line to put it in.
+        let account_health: Option<Vec<comet_proto::AgentAccountHealth>> = if with_health {
+            client
+                .call(methods::VERIFY_AGENT_ACCOUNTS, serde_json::json!({}))
+                .await
+                .ok()
+                .and_then(|v| serde_json::from_value(v).ok())
+        } else {
+            None
+        };
         // What the edge is handing out (gh#197), taken from the engine's own
         // release checker rather than fetched here: it is the process that
         // performs updates, and a second opinion could only disagree with it.
@@ -2077,6 +2115,7 @@ async fn fetch_spaces(port: u16) -> Result<EngineInfo> {
             edge,
             members,
             runtimes,
+            account_health,
             update,
         })
     };

@@ -637,6 +637,38 @@ pub enum AgentLoginStatus {
     Error,
 }
 
+/// One saved login's answer to "would a run under this work right now?"
+/// (gh#576) — what `VerifyAgentAccounts` reports per slot and `comet-board
+/// doctor` renders per line. The verdict is minted, not guessed: where the
+/// stored token's freshness cannot be read off a timestamp, the provider is
+/// asked to accept it before `Ok` is claimed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentAccountHealth {
+    pub id: String,
+    pub harness: HarnessId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    pub state: AgentAccountState,
+    /// One human sentence: what was asked of which provider, and what came
+    /// back — the thing a doctor line and a re-login transcript both quote.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentAccountState {
+    /// The provider accepted the credential just now, or it carries no
+    /// expiring token (an API key).
+    Ok,
+    /// The provider refused the credential: the next run under this login
+    /// dies at its first request. Re-sign it.
+    Stale,
+    /// No verdict — the probe could not run (network down, credentials
+    /// unreadable). Reported as such rather than guessed in either direction.
+    Unknown,
+}
+
 /// CLI plan rate-limit window (accounts settings meters) — NOT app token accounting.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
