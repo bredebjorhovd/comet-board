@@ -3119,6 +3119,24 @@ fn base_check(name: &str, base: &str, repo: &std::path::Path) -> Check {
     }
 }
 
+/// The relogin target a person would actually type for this slot (gh#585):
+/// the harness — `codex`, not a slot id nobody keeps on hand — whenever that
+/// word alone names exactly one login on this device, and the slot id only
+/// when the same harness holds several. Whatever this prints,
+/// `comet-board relogin <it>` must resolve; the CLI's picker accepts both
+/// spellings.
+pub fn relogin_arg(slot: &AgentAccount, accounts: &[AgentAccount]) -> String {
+    let siblings = accounts
+        .iter()
+        .filter(|a| a.harness == slot.harness)
+        .count();
+    if siblings <= 1 {
+        harness_name(slot.harness)
+    } else {
+        slot.id.clone()
+    }
+}
+
 /// Does a route's `account` name a login this device has saved, for the
 /// harness the route dispatches to?
 ///
@@ -3188,11 +3206,11 @@ fn account_check(
                     false,
                     format!(
                         "`{account}` — {} ({}) — but the login is STALE, {}. \
-                         Run `comet-board relogin {}` before dispatching here",
+                          Run `comet-board relogin {}` before dispatching here",
                         found.email.as_deref().unwrap_or("unknown"),
                         harness_name(harness),
                         h.detail,
-                        found.id
+                        relogin_arg(found, accounts)
                     ),
                 ),
                 _ => check(
@@ -3286,7 +3304,7 @@ fn agent_account_health_checks(
                          `comet-board relogin {}`",
                         harness_name(a.harness),
                         h.detail,
-                        a.id
+                        relogin_arg(a, accounts)
                     ),
                 },
             }
@@ -5039,9 +5057,12 @@ mod tests {
             .find(|c| c.name.contains("kim@"))
             .expect("one line per login");
         assert!(!kim.ok, "{}", kim.detail);
+        // gh#585: the hint is the command a person would type — the harness,
+        // because kim's is this device's only codex login.
+        assert!(kim.detail.contains("relogin codex"), "{}", kim.detail);
         assert!(
-            kim.detail.contains("relogin bbbbbbbbbbbbbbbb"),
-            "{}",
+            !kim.detail.contains("bbbbbbbbbbbbbbbb"),
+            "the slot id is not something the operator keeps on hand: {}",
             kim.detail
         );
         // And the stale one does not silently pass the report.
@@ -5103,6 +5124,70 @@ mod tests {
         assert!(c.detail.contains("not checked"), "{}", c.detail);
     }
 
+    /// gh#585's fallback half: the harness word is only the right hint while
+    /// it names exactly one login. The moment the same harness holds a second
+    /// slot, `relogin codex` would print a menu instead of fixing anything —
+    /// and then the id is the honest thing to print.
+    #[test]
+    fn a_hint_says_codex_until_a_second_codex_slot_forces_the_id() {
+        // The rule on its face, as a function over the roster.
+        let only = [account(
+            "bbbbbbbbbbbbbbbb",
+            "kim@example.com",
+            HarnessId::Codex,
+        )];
+        assert_eq!(relogin_arg(&only[0], &only), "codex");
+
+        // And rendered into the line an operator actually reads.
+        let (_d, p) = tmp();
+        let saved = [
+            account("aaaaaaaaaaaaaaaa", "sam@example.com", HarnessId::ClaudeCode),
+            account("bbbbbbbbbbbbbbbb", "kim@example.com", HarnessId::Codex),
+            account("dddddddddddddddd", "kim+alt@example.com", HarnessId::Codex),
+        ];
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![
+            health(
+                "bbbbbbbbbbbbbbbb",
+                HarnessId::Codex,
+                comet_proto::AgentAccountState::Stale,
+            ),
+            health(
+                "dddddddddddddddd",
+                HarnessId::Codex,
+                comet_proto::AgentAccountState::Ok,
+            ),
+        ]);
+        let checks = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
+        let kim = checks
+            .iter()
+            .find(|c| !c.ok && c.detail.contains("kim@example.com"))
+            .expect("the stale line");
+        assert!(
+            kim.detail.contains("relogin bbbbbbbbbbbbbbbb"),
+            "{}",
+            kim.detail
+        );
+    }
+
+    /// The hint must match reality (gh#585): what it prints is what the
+    /// operator types, so the harness word whenever it alone names the login
+    /// on this roster, the slot id only once that stops being true.
+    #[test]
+    fn every_stale_hint_prints_the_word_a_person_would_type() {
+        let saved = [
+            account("aaaaaaaaaaaaaaaa", "sam@example.com", HarnessId::ClaudeCode),
+            account("bbbbbbbbbbbbbbbb", "kim@example.com", HarnessId::Codex),
+            account("dddddddddddddddd", "kim+alt@example.com", HarnessId::Codex),
+        ];
+        // sam's claude-code login is her kind's only one; kim's codex slot has
+        // a sibling, so only the id names it.
+        let sam = saved.iter().find(|a| a.id == "aaaaaaaaaaaaaaaa").unwrap();
+        assert_eq!(relogin_arg(sam, &saved), "claude-code");
+        let kim = saved.iter().find(|a| a.id == "bbbbbbbbbbbbbbbb").unwrap();
+        assert_eq!(relogin_arg(kim, &saved), "bbbbbbbbbbbbbbbb");
+    }
+
     /// A route whose configured slot the provider just refused fails its own
     /// line — the dispatch it would release dies authenticating, and that is
     /// now knowable before the worktree is cut.
@@ -5125,8 +5210,10 @@ mod tests {
         let bad = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
         let c = account_check_in(&bad);
         assert!(!c.ok, "{}", c.detail);
+        // gh#585: sam's is this device's only claude-code login, so the
+        // command names the harness a person would type, not the slot id.
         assert!(
-            c.detail.contains("comet-board relogin 8f2c1d0a7b6e4539"),
+            c.detail.contains("comet-board relogin claude-code"),
             "{}",
             c.detail
         );
@@ -5143,6 +5230,33 @@ mod tests {
             account_check_in(&good).ok,
             "{}",
             account_check_in(&good).detail
+        );
+    }
+
+    /// The same refusal when the harness word would not name the login: two
+    /// claude-code slots on the device means `relogin claude-code` prints a
+    /// menu, so the hint falls back to the one always-unique handle.
+    #[test]
+    fn a_route_stale_hint_falls_back_to_the_slot_id_when_the_harness_is_ambiguous() {
+        let (_d, p) = tmp();
+        routing_with_account(&p, "claude-code", "8f2c1d0a7b6e4539");
+        let saved = [
+            account("8f2c1d0a7b6e4539", "sam@example.com", HarnessId::ClaudeCode),
+            account("9999999999999999", "pat@example.com", HarnessId::ClaudeCode),
+        ];
+        let mut engine = engine_up();
+        engine.account_health = Some(vec![health(
+            "8f2c1d0a7b6e4539",
+            HarnessId::ClaudeCode,
+            comet_proto::AgentAccountState::Stale,
+        )]);
+        let bad = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
+        let c = account_check_in(&bad);
+        assert!(!c.ok, "{}", c.detail);
+        assert!(
+            c.detail.contains("comet-board relogin 8f2c1d0a7b6e4539"),
+            "{}",
+            c.detail
         );
     }
 

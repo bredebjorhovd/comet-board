@@ -1852,7 +1852,10 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// (open the URL anywhere, bring the code back by hand) and `--device-auth`
 /// for Codex. The loopback flow is nicer when a browser is right there, but
 /// a verb whose caller is usually on another machine cannot assume one.
-pub async fn relogin(board: &Board, target: Option<&str>) -> Result<()> {
+///
+/// Targets are harness-first (gh#585): `relogin claude` / `relogin codex`
+/// is the invocation a person types, not a slot id nobody keeps on hand.
+pub async fn relogin(board: &Board, target: Option<&str>, detail: Option<&str>) -> Result<()> {
     let Some(accounts) = agent_accounts(board).await else {
         bail!(
             "could not read this device's agent accounts — start `comet` or \
@@ -1865,7 +1868,7 @@ pub async fn relogin(board: &Board, target: Option<&str>) -> Result<()> {
              Agent accounts in the app first"
         );
     }
-    let account = pick_account(&accounts, target)?;
+    let account = pick_account(&accounts, target, detail)?;
     match account.harness {
         comet_proto::HarnessId::ClaudeCode | comet_proto::HarnessId::Codex => {}
         other => bail!(
@@ -2058,24 +2061,109 @@ async fn verify_and_report(board: &Board, wanted: &str, before_max_saved: i64) -
     }
 }
 
-/// Which login to re-sign: exact id, exact email, or a unique email prefix.
+/// One line in an account menu: id, harness, email.
+fn account_line(a: &comet_proto::AgentAccount) -> String {
+    format!(
+        "{} · {} · {}",
+        a.id,
+        runtime_name(a.harness),
+        a.email.as_deref().unwrap_or("unnamed login")
+    )
+}
+
+/// The menu shown when one harness holds several logins is numbered (gh#585):
+/// "the second codex one" has no email worth keeping on hand either, so the
+/// line number is a target too — `relogin codex 2`.
+fn numbered_menu(slots: &[&comet_proto::AgentAccount]) -> String {
+    slots
+        .iter()
+        .enumerate()
+        .map(|(i, a)| format!("  {} · {}", i + 1, account_line(a)))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Narrow one harness's logins by menu number, slot id, or email (exact or
+/// unique prefix). Refuses with the same numbered menu rather than guessing.
+fn pick_within(
+    name: &str,
+    slots: &[&comet_proto::AgentAccount],
+    want: &str,
+) -> Result<comet_proto::AgentAccount> {
+    let menu = || numbered_menu(slots);
+    if let Ok(n) = want.parse::<usize>() {
+        return match n.checked_sub(1).and_then(|ix| slots.get(ix)) {
+            Some(one) => Ok((*one).clone()),
+            None => bail!(
+                "no {name} login numbered {n} — pick 1..={}\n{}",
+                slots.len(),
+                menu()
+            ),
+        };
+    }
+    let exact: Vec<usize> = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            a.id.eq_ignore_ascii_case(want)
+                || a.email
+                    .as_deref()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(want))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if let [one] = exact.as_slice() {
+        return Ok(slots[*one].clone());
+    }
+    if exact.len() > 1 {
+        bail!(
+            "`{want}` names more than one {name} login on this device — use its \
+             slot id:\n{}",
+            menu()
+        );
+    }
+    // Half-typed addresses are what people have; ids are for machines.
+    let prefixes: Vec<usize> = slots
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| {
+            a.email
+                .as_deref()
+                .is_some_and(|e| e.to_lowercase().starts_with(&want.to_lowercase()))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    match prefixes.as_slice() {
+        [one] => Ok(slots[*one].clone()),
+        [] => bail!("no saved {name} login matches `{want}`:\n{}", menu()),
+        _ => bail!(
+            "`{want}` is a prefix of several {name} emails — be more specific:\n{}",
+            menu()
+        ),
+    }
+}
+
+/// Which login to re-sign. The harness is the primary key (gh#585): it is
+/// what a person actually knows about their login — "my codex one" — and the
+/// only word that stays unambiguous when two services share an email. So a
+/// target that reads as a harness (`claude`, `claude-code`, `codex`,
+/// `openai-codex`, any case) resolves across slots by harness before any
+/// id-or-email reading does: exactly one login for that harness starts
+/// straight away; several print a numbered menu a second word narrows by
+/// email, slot id, or menu number. Slot ids and emails keep working as the
+/// target, exactly as before — including the unique email prefix.
+///
 /// Ambiguity refuses with the menu rather than guessing — a wrong guess here
 /// overwrites somebody's live login.
 fn pick_account(
     accounts: &[comet_proto::AgentAccount],
     target: Option<&str>,
+    detail: Option<&str>,
 ) -> Result<comet_proto::AgentAccount> {
     let menu = || {
         accounts
             .iter()
-            .map(|a| {
-                format!(
-                    "  {} · {} · {}",
-                    a.id,
-                    runtime_name(a.harness),
-                    a.email.as_deref().unwrap_or("unnamed login")
-                )
-            })
+            .map(|a| format!("  {}", account_line(a)))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -2084,11 +2172,36 @@ fn pick_account(
             return Ok(only.clone());
         }
         bail!(
-            "several agent logins exist on this device — name one:\n{}\n\
-             e.g. `comet-board relogin <id-or-email>`",
+            "several agent logins exist on this device — name the harness:\n{}\n\
+             e.g. `comet-board relogin codex`",
             menu()
         );
     };
+
+    // Harness first. Before ids and emails, so the natural invocation cannot
+    // be hijacked by a coincidental email prefix (`claudia@…` does not beat
+    // `claude` meaning the harness).
+    if let Some(harness) = harness_for_runtime(&target.to_lowercase()) {
+        let name = runtime_name(harness);
+        let slots: Vec<&comet_proto::AgentAccount> =
+            accounts.iter().filter(|a| a.harness == harness).collect();
+        if slots.is_empty() {
+            bail!(
+                "no saved {name} login on this device — this device holds:\n{}",
+                menu()
+            );
+        }
+        return match detail.map(str::trim).filter(|d| !d.is_empty()) {
+            None if slots.len() == 1 => Ok(slots[0].clone()),
+            None => bail!(
+                "several {name} logins on this device — pick one:\n{}\n\
+                 e.g. `comet-board relogin {name} <email-or-id-or-number>`",
+                numbered_menu(&slots)
+            ),
+            Some(want) => pick_within(name, &slots, want),
+        };
+    }
+
     let matches: Vec<&comet_proto::AgentAccount> = accounts
         .iter()
         .filter(|a| {
@@ -2101,11 +2214,15 @@ fn pick_account(
     if let [one] = matches.as_slice() {
         return Ok((*one).clone());
     }
-    if matches.len() > 1 {
-        bail!(
-            "`{target}` matches more than one login — use its slot id:\n{}",
-            menu()
-        );
+    if !matches.is_empty() {
+        // The same address signed into two services (gh#585): the slot id
+        // would work, but the word the operator actually has is the harness.
+        let ways = matches
+            .iter()
+            .map(|a| format!("`relogin {} {target}`", runtime_name(a.harness)))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        bail!("`{target}` matches more than one login — say which service: {ways}");
     }
     // No exact hit: a unique email prefix is still worth accepting — ids are
     // for machines, and half-typed addresses are what people have.
@@ -2120,7 +2237,8 @@ fn pick_account(
     match prefixes.as_slice() {
         [one] => Ok((*one).clone()),
         [] => bail!(
-            "no saved login matches `{target}` — this device holds:\n{}",
+            "no saved login matches `{target}` — this device holds:\n{}\n\
+             Tip: `relogin claude` / `relogin codex` picks by harness",
             menu()
         ),
         _ => bail!(
@@ -3026,5 +3144,264 @@ mod tests {
             text.find("full access").unwrap() < text.find("EFFECTS").unwrap(),
             "the caveat comes before what it qualifies: {text}"
         );
+    }
+
+    // --- relogin targets (gh#585) -------------------------------------------
+
+    fn acct(id: &str, email: &str, harness: comet_proto::HarnessId) -> comet_proto::AgentAccount {
+        comet_proto::AgentAccount {
+            id: id.into(),
+            harness,
+            email: Some(email.into()),
+            plan_label: None,
+            active: false,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        }
+    }
+
+    /// The natural invocation: name the harness, and if it holds exactly one
+    /// login, that is the slot — no id to look up, no menu to walk.
+    #[test]
+    fn a_single_slot_for_a_harness_goes_straight_through() {
+        let accounts = [
+            acct(
+                "aaaaaaaaaaaaaaaa",
+                "sam@work.com",
+                comet_proto::HarnessId::ClaudeCode,
+            ),
+            acct(
+                "bbbbbbbbbbbbbbbb",
+                "kim@work.com",
+                comet_proto::HarnessId::Codex,
+            ),
+        ];
+        for spelling in ["codex", "Codex", "openai-codex"] {
+            assert_eq!(
+                pick_account(&accounts, Some(spelling), None).unwrap().id,
+                "bbbbbbbbbbbbbbbb",
+                "{spelling}"
+            );
+        }
+        for spelling in ["claude", "claude-code", "CLAUDE-CODE"] {
+            assert_eq!(
+                pick_account(&accounts, Some(spelling), None).unwrap().id,
+                "aaaaaaaaaaaaaaaa",
+                "{spelling}"
+            );
+        }
+    }
+
+    /// The report behind gh#585: one address signed into both services. The
+    /// bare email refuses rather than guessing — but names the harness word
+    /// as the way through, and `relogin <harness> <email>` lands exactly.
+    #[test]
+    fn one_email_on_two_services_resolves_through_the_harness() {
+        let accounts = [
+            acct(
+                "aaaaaaaaaaaaaaaa",
+                "me@work.com",
+                comet_proto::HarnessId::ClaudeCode,
+            ),
+            acct(
+                "bbbbbbbbbbbbbbbb",
+                "me@work.com",
+                comet_proto::HarnessId::Codex,
+            ),
+        ];
+        let err = pick_account(&accounts, Some("me@work.com"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("say which service"), "{err}");
+        assert!(err.contains("`relogin claude-code me@work.com`"), "{err}");
+        assert!(err.contains("`relogin codex me@work.com`"), "{err}");
+
+        assert_eq!(
+            pick_account(&accounts, Some("claude"), Some("me@work.com"))
+                .unwrap()
+                .id,
+            "aaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            pick_account(&accounts, Some("codex"), Some("me@work.com"))
+                .unwrap()
+                .id,
+            "bbbbbbbbbbbbbbbb"
+        );
+        // Each harness alone is already unambiguous — no second word needed.
+        assert_eq!(
+            pick_account(&accounts, Some("claude"), None).unwrap().id,
+            "aaaaaaaaaaaaaaaa"
+        );
+    }
+
+    /// Several logins under one harness: the menu filters to that harness and
+    /// is numbered, so the second word can be a line number, an email, or the
+    /// id — and never shows slots it does not concern.
+    #[test]
+    fn several_logins_for_a_harness_print_a_numbered_menu_the_second_word_answers() {
+        let accounts = [
+            acct(
+                "cccccccccccccccc",
+                "kim+1@work.com",
+                comet_proto::HarnessId::Codex,
+            ),
+            acct(
+                "dddddddddddddddd",
+                "kim+2@work.com",
+                comet_proto::HarnessId::Codex,
+            ),
+            acct(
+                "aaaaaaaaaaaaaaaa",
+                "sam@work.com",
+                comet_proto::HarnessId::ClaudeCode,
+            ),
+        ];
+        let err = pick_account(&accounts, Some("codex"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("several codex logins"), "{err}");
+        assert!(err.contains("1 · cccc"), "{err}");
+        assert!(err.contains("2 · dddd"), "{err}");
+        assert!(!err.contains("sam@work.com"), "filtered to codex: {err}");
+
+        assert_eq!(
+            pick_account(&accounts, Some("codex"), Some("2"))
+                .unwrap()
+                .id,
+            "dddddddddddddddd"
+        );
+        assert_eq!(
+            pick_account(&accounts, Some("codex"), Some("kim+1"))
+                .unwrap()
+                .id,
+            "cccccccccccccccc"
+        );
+        assert_eq!(
+            pick_account(&accounts, Some("codex"), Some("dddddddddddddddd"))
+                .unwrap()
+                .id,
+            "dddddddddddddddd"
+        );
+        assert!(
+            pick_account(&accounts, Some("codex"), Some("9")).is_err(),
+            "no login numbered 9"
+        );
+        assert!(
+            pick_account(&accounts, Some("codex"), Some("nobody@work.com")).is_err(),
+            "an email from the other harness is not a codex login"
+        );
+    }
+
+    /// A harness word is read as a harness before any email-prefix reading:
+    /// two addresses starting `claud…` must not make `relogin claude` refuse.
+    #[test]
+    fn a_harness_word_is_never_read_as_an_email_prefix() {
+        let accounts = [
+            acct(
+                "aaaaaaaaaaaaaaaa",
+                "claudia@work.com",
+                comet_proto::HarnessId::ClaudeCode,
+            ),
+            acct(
+                "bbbbbbbbbbbbbbbb",
+                "claudia@home.com",
+                comet_proto::HarnessId::Codex,
+            ),
+        ];
+        assert_eq!(
+            pick_account(&accounts, Some("claude"), None).unwrap().id,
+            "aaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            pick_account(&accounts, Some("codex"), None).unwrap().id,
+            "bbbbbbbbbbbbbbbb"
+        );
+    }
+
+    /// Ids and emails keep working as targets — the harness word is added at
+    /// the front of the language, not swapped for it. And a device with a
+    /// single login still needs no target at all.
+    #[test]
+    fn ids_emails_and_prefixes_keep_working() {
+        let accounts = [
+            acct(
+                "aaaaaaaaaaaaaaaa",
+                "sam@work.com",
+                comet_proto::HarnessId::ClaudeCode,
+            ),
+            acct(
+                "bbbbbbbbbbbbbbbb",
+                "kim@work.com",
+                comet_proto::HarnessId::Codex,
+            ),
+        ];
+        assert_eq!(
+            pick_account(&accounts, Some("aaaaaaaaaaaaaaaa"), None)
+                .unwrap()
+                .id,
+            "aaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            pick_account(&accounts, Some("kim@work.com"), None)
+                .unwrap()
+                .id,
+            "bbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            pick_account(&accounts, Some("sa"), None).unwrap().id,
+            "aaaaaaaaaaaaaaaa"
+        );
+        let err = pick_account(&accounts, None, None).unwrap_err().to_string();
+        assert!(err.contains("name the harness"), "{err}");
+
+        let single = [acct(
+            "aaaaaaaaaaaaaaaa",
+            "sam@work.com",
+            comet_proto::HarnessId::ClaudeCode,
+        )];
+        assert_eq!(pick_account(&single, None, None).unwrap().id, single[0].id);
+    }
+
+    /// doctor prints `comet-board relogin <arg>` on every stale slot; whatever
+    /// argument it prints has to come back through this picker and land on the
+    /// slot it was printed for — that is the whole contract (gh#585).
+    #[test]
+    fn every_hint_doctor_prints_resolves_through_this_picker() {
+        use comet_board::doctor::relogin_arg;
+
+        let accounts = [
+            acct(
+                "aaaaaaaaaaaaaaaa",
+                "sam@example.com",
+                comet_proto::HarnessId::ClaudeCode,
+            ),
+            acct(
+                "bbbbbbbbbbbbbbbb",
+                "kim@example.com",
+                comet_proto::HarnessId::Codex,
+            ),
+            acct(
+                "dddddddddddddddd",
+                "pat@example.com",
+                comet_proto::HarnessId::Codex,
+            ),
+        ];
+        // The hint's shape follows the roster: sam's harness word names her
+        // slot alone; kim shares codex and gets her id.
+        assert_eq!(relogin_arg(&accounts[0], &accounts), "claude-code");
+        assert_eq!(relogin_arg(&accounts[1], &accounts), "bbbbbbbbbbbbbbbb");
+        assert_eq!(relogin_arg(&accounts[2], &accounts), "dddddddddddddddd");
+
+        for a in &accounts {
+            let arg = relogin_arg(a, &accounts);
+            let picked = pick_account(&accounts, Some(&arg), None)
+                .unwrap_or_else(|e| panic!("`relogin {arg}` refused: {e}"));
+            assert_eq!(picked.id, a.id, "`{arg}` must land on {}", a.id);
+        }
     }
 }

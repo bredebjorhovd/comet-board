@@ -403,7 +403,8 @@ enum Command {
     Doctor,
     /// Re-sign one agent-account login on this device: the guided OAuth flow
     /// for its harness, verified against the provider before success is
-    /// declared (gh#576).
+    /// declared (gh#576). Harness-first targets (gh#585): `relogin claude` /
+    /// `relogin codex`; a second word picks within a harness.
     ///
     /// For the box you are SSHed into: it uses the flows that need no browser
     /// on the device — paste-code for Claude Code (open the URL anywhere,
@@ -411,9 +412,14 @@ enum Command {
     /// it does not say "done" until the fresh credential has actually been
     /// accepted. `comet-board doctor` names the stale slots; this fixes one.
     Relogin {
-        /// Which login: its slot id or the email on it (`comet-board doctor`
-        /// lists both). Omit when this device holds exactly one.
+        /// Which login: a harness (`claude` / `codex` — `comet-board doctor`
+        /// names it on every stale slot), a slot id, or the email on it. A
+        /// harness holding several logins takes a second word to pick within:
+        /// `relogin codex me@work.com`, a slot id, or the menu number.
         target: Option<String>,
+        /// With a harness as the first word: which login within it — email,
+        /// slot id, or the number the menu printed.
+        detail: Option<String>,
     },
     /// Generate a starter routing.toml from the spaces on this device.
     Init {
@@ -1246,9 +1252,9 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Relogin { target } => runtime.block_on(async {
+        Command::Relogin { target, detail } => runtime.block_on(async {
             let board = ops::attach(port, device).await?;
-            ops::relogin(&board, target.as_deref()).await
+            ops::relogin(&board, target.as_deref(), detail.as_deref()).await
         }),
         Command::Init { force } => {
             let info = runtime
