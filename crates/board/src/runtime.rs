@@ -298,10 +298,20 @@ impl DispatchSpec {
     /// actually cut. The one variable resolution cannot fill in advance: the
     /// engine picks the path while executing the spec, so the executor calls
     /// this with the real cwd just before sending the brief.
+    ///
+    /// The checkout existing is also what makes the environment note possible
+    /// (gh#561): whether the worktree's packages have their dependencies
+    /// installed is a fact about the directory, knowable only now. A fresh
+    /// worktree gets one paragraph telling the agent to install before it
+    /// verifies — see [`crate::dispatch::env_note_line`].
     pub fn prompt_at(&self, cwd: &str) -> String {
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("worktree", cwd.to_string());
-        crate::config::interpolate(&self.prompt, &vars)
+        let mut prompt = crate::config::interpolate(&self.prompt, &vars);
+        if let Some(note) = crate::dispatch::env_note_line(std::path::Path::new(cwd)) {
+            prompt.push_str(&note);
+        }
+        prompt
     }
 
     /// What the chat is called in the sidebar: `gh#25 · D1 Prototype v1`.

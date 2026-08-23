@@ -58,6 +58,7 @@ fn finding_kind(kind: FindingKind) -> &'static str {
         FindingKind::UnsupportedClaims => "unsupported_claims",
         FindingKind::NeverPassed => "never_passed",
         FindingKind::Unchecked => "unchecked",
+        FindingKind::TestsNeverRun => "tests_never_run",
         FindingKind::NeverClaimed => "never_claimed",
         FindingKind::MalformedClaims => "malformed_claims",
         FindingKind::NoDiff => "no_diff",

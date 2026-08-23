@@ -499,6 +499,9 @@ impl Harness for CodexHarness {
             environment.apply(&mut cmd);
         } else {
             crate::prepend_dirs_to_path(&mut cmd, &controls.bin_dirs);
+            // Same tail the other adapters use: toolchain gap-fillers behind
+            // everything, so they never shadow a resolved entry (gh#561).
+            crate::append_missing_to_path(&mut cmd, &controls.tool_dirs);
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
@@ -626,6 +629,13 @@ impl CodexPushEnvironment {
         }
         if let Some(path) = std::env::var_os("PATH") {
             paths.extend(std::env::split_paths(&path));
+        }
+        // Toolchain gap-fillers last (gh#561): behind the inherited PATH, and
+        // only where it lacks them — the same tail the non-push path gets.
+        for dir in &controls.tool_dirs {
+            if !paths.contains(dir) {
+                paths.push(dir.clone());
+            }
         }
         let path = std::env::join_paths(paths).map_err(|error| {
             HarnessError::Protocol(format!(
@@ -789,6 +799,7 @@ async fn run_session(session: Session) {
         push: _,
         bin_dirs: _,
         mcp_servers: _,
+        tool_dirs: _,
     } = controls;
     let request_input = Arc::new(request_input);
 
@@ -1848,6 +1859,7 @@ mod tests {
                 bin_dir: Some(PathBuf::from("/board/bin")),
             }),
             bin_dirs: vec![PathBuf::from("/engine/bin")],
+            tool_dirs: vec![PathBuf::from("/opt/node/bin")],
             mcp_servers: Vec::new(),
         };
 
@@ -1887,6 +1899,17 @@ mod tests {
             path.is_some(),
             "the gh wrapper must lead the forced PATH: {config}"
         );
+        // gh#561: and the toolchain dirs close the forced PATH out — behind
+        // everything inherited, filling rather than shadowing.
+        let path_value = &config[path.expect("checked above")..];
+        let end = path_value[r#""PATH" = ""#.len()..]
+            .find('"')
+            .expect("a closed JSON string");
+        let path_value = &path_value[..r#""PATH" = ""#.len() + end];
+        assert!(
+            path_value.ends_with(":/opt/node/bin"),
+            "toolchain dirs must trail the forced PATH: {path_value}"
+        );
 
         let mut ordinary = controls;
         ordinary.push = None;
@@ -1916,6 +1939,7 @@ mod tests {
                 bin_dir: Some(PathBuf::from("/board:bin")),
             }),
             bin_dirs: Vec::new(),
+            tool_dirs: Vec::new(),
             mcp_servers: Vec::new(),
         };
 
@@ -1951,6 +1975,7 @@ mod tests {
                 ))),
             }),
             bin_dirs: Vec::new(),
+            tool_dirs: Vec::new(),
             mcp_servers: Vec::new(),
         };
 

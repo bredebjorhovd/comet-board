@@ -226,6 +226,40 @@ fn pr_base_line(base: &str) -> String {
     )
 }
 
+/// The environment note [`crate::runtime::DispatchSpec::prompt_at`] appends
+/// when the checkout it was just handed declares packages whose dependencies
+/// are not installed (gh#561).
+///
+/// A fresh worktree has no `node_modules` — worktrees share git objects, not
+/// untracked build trees — so the first `npm test` in one fails with
+/// missing-module errors that look like a broken change and are not. Twice in
+/// a row (gh#553, gh#557) that cost an attempt its verification; the agents
+/// that diagnosed it each paid for the discovery. The brief is the one channel
+/// the board is guaranteed to reach the agent through, and this is the one
+/// moment the checkout's state is known — so say it there, before the first
+/// command runs.
+///
+/// `None` is every quiet case: an empty or unreadable path, no manifests, or
+/// every manifest already holding its `node_modules` (a route running in the
+/// space folder itself, or a re-dispatch into a warmed worktree).
+pub fn env_note_line(cwd: &std::path::Path) -> Option<String> {
+    let missing = crate::toolchain::missing_js_packages(cwd);
+    if missing.is_empty() {
+        return None;
+    }
+    let list = missing
+        .iter()
+        .map(|p| format!("{} (`{}`)", p.label(), p.install_command()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "\n\nEnvironment note — this fresh worktree has no installed dependencies: {list}. \
+         Node and npm are on your PATH. Run each package's install command before running \
+         its tests or typecheck: without it they fail with missing-module errors that are \
+         about the empty worktree, not your change."
+    ))
+}
+
 /// The credential preflight every GitHub-backed dispatch receives (gh#440).
 ///
 /// A workflow file is not ordinary repository content to GitHub. A credential
@@ -2407,6 +2441,49 @@ mod tests {
             "{sent}"
         );
         assert!(!sent.contains('{'), "unresolved placeholder: {sent}");
+    }
+
+    /// gh#561: a fresh worktree whose packages have no `node_modules` gets one
+    /// actionable paragraph — install before you verify — and a checkout with
+    /// nothing to install stays exactly as the route wrote it.
+    #[test]
+    fn prompt_at_names_the_dependencies_a_fresh_worktree_is_missing() {
+        let dir = std::env::temp_dir().join(format!("comet-env-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("edge")).unwrap();
+        std::fs::write(dir.join("edge/package.json"), "{}").unwrap();
+        std::fs::write(dir.join("edge/package-lock.json"), "{}").unwrap();
+
+        let mut r = route();
+        r.prompt = Some("Work on {title}.".into());
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &r,
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        let sent = spec.prompt_at(dir.to_str().unwrap());
+        assert!(
+            sent.contains("Environment note"),
+            "no environment note: {sent}"
+        );
+        assert!(
+            sent.contains("edge/ (`npm ci`)"),
+            "note must name the package and its command: {sent}"
+        );
+
+        // Installed: quiet.
+        std::fs::create_dir_all(dir.join("edge/node_modules")).unwrap();
+        let sent = spec.prompt_at(dir.to_str().unwrap());
+        assert!(!sent.contains("Environment note"), "{sent}");
+
+        // No checkout at all: quiet, not an error.
+        let sent = spec.prompt_at("/definitely/not/a/checkout");
+        assert!(!sent.contains("Environment note"), "{sent}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- stacking: a dispatch cut from a sibling (gh#285) ------------------

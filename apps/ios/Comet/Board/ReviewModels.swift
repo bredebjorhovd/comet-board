@@ -549,6 +549,8 @@ enum ReviewFindingKind: String, Equatable {
     case unsupportedClaims = "unsupported_claims"
     case neverPassed = "never_passed"
     case unchecked
+    /// The branch adds tests the attempt never ran (gh#561).
+    case testsNeverRun = "tests_never_run"
     case neverClaimed = "never_claimed"
     case malformedClaims = "malformed_claims"
     case noDiff = "no_diff"
@@ -557,7 +559,7 @@ enum ReviewFindingKind: String, Equatable {
     var tone: ReviewTone {
         switch self {
         case .unclaimed, .uncommitted, .unsupportedClaims, .neverPassed,
-             .malformedClaims, .unchecked:
+             .malformedClaims, .unchecked, .testsNeverRun:
             return .alarm
         case .neverClaimed, .noDiff:
             return .unknown

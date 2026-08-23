@@ -302,6 +302,9 @@ impl Harness for ClaudeHarness {
         if let Some(push) = &controls.push {
             push.apply(&mut cmd);
         }
+        // Last, and at the end of PATH: the toolchain gap-fillers (gh#561)
+        // must never shadow anything the layers above resolved.
+        crate::append_missing_to_path(&mut cmd, &controls.tool_dirs);
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 HarnessError::NotInstalled(exe.display().to_string())
@@ -533,6 +536,7 @@ async fn run_session(session: Session) {
         push: _,
         bin_dirs: _,
         mcp_servers: _,
+        tool_dirs: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

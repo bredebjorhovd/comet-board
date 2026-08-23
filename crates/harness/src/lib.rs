@@ -149,6 +149,19 @@ pub struct RunControls {
     /// Applied *before* [`PushCredentials`], whose `gh` shim has to stay in
     /// front of everything.
     pub bin_dirs: Vec<std::path::PathBuf>,
+    /// Toolchain directories appended *after* the child's inherited PATH
+    /// (gh#561) — the gap-fillers from `comet_board::toolchain::agent_tool_dirs`.
+    ///
+    /// A dispatched agent inherits the engine's process PATH, which for a GUI
+    /// or systemd launch is `/usr/bin:/bin` and nothing shaped by any shell —
+    /// so `node`, `npm` and `cargo`, which every human in the checkout has,
+    /// resolve nowhere, and the agent ships work it never verified. These dirs
+    /// (Homebrew, `~/.local/bin`, `~/.cargo/bin`, the Node version managers)
+    /// go behind rather than in front on purpose: they fill what the inherited
+    /// PATH lacks without ever shadowing something it already resolved, and
+    /// [`append_missing_to_path`] drops entries already present so nothing
+    /// appears twice.
+    pub tool_dirs: Vec<std::path::PathBuf>,
     /// Process-local MCP stdio servers for this chat (gh#273). Harness
     /// adapters translate this one shared description into their native
     /// launch configuration; account config dirs remain untouched.
@@ -294,6 +307,41 @@ pub(crate) fn prepend_dirs_to_path(cmd: &mut tokio::process::Command, dirs: &[st
         paths.extend(std::env::split_paths(&path));
     }
     if let Ok(joined) = std::env::join_paths(paths) {
+        cmd.env("PATH", joined);
+    }
+}
+
+/// Append `dirs` to the end of the PATH the child will be spawned with,
+/// skipping any entry already on it.
+///
+/// The tail half of [`prepend_dirs_to_path`]: same read-back-first rule for
+/// finding the PATH in play, opposite end. Everything here is a gap-filler
+/// (gh#561) — Homebrew and version-manager install locations a GUI launch's
+/// inherited PATH lacks — so existing entries must keep their precedence and
+/// only what is missing is added. An empty list still leaves PATH untouched.
+pub(crate) fn append_missing_to_path(
+    cmd: &mut tokio::process::Command,
+    dirs: &[std::path::PathBuf],
+) {
+    if dirs.is_empty() {
+        return;
+    }
+    let current = cmd
+        .as_std()
+        .get_envs()
+        .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+        .and_then(|(_, v)| v.map(|v| v.to_os_string()))
+        .or_else(|| std::env::var_os("PATH"));
+    let mut paths: Vec<std::path::PathBuf> = current
+        .as_ref()
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    for dir in dirs {
+        if !paths.contains(dir) {
+            paths.push(dir.clone());
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(&paths) {
         cmd.env("PATH", joined);
     }
 }
@@ -545,6 +593,69 @@ mod tests {
         prepend_exe_dir_to_path(&mut cmd, std::path::Path::new("/opt/node/bin/claude"));
         let before: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
         prepend_dirs_to_path(&mut cmd, &[]);
+        let after: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        assert_eq!(after.get("PATH"), before.get("PATH"));
+    }
+
+    /// gh#561: the toolchain dirs land *behind* everything — they exist to
+    /// fill what a GUI launch's inherited PATH lacks, never to shadow what it
+    /// already resolved.
+    #[test]
+    fn tool_dirs_are_appended_behind_the_path_the_adapter_built() {
+        let base = std::env::temp_dir().join(format!("comet-harness-path-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("brew")).unwrap();
+        std::fs::create_dir_all(base.join("cargo")).unwrap();
+        let brew = base.join("brew");
+        let cargo = base.join("cargo");
+
+        let mut cmd = tokio::process::Command::new("claude");
+        // A stand-in inherited PATH, so the test does not depend on the
+        // machine running it.
+        cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin");
+        prepend_exe_dir_to_path(&mut cmd, std::path::Path::new("/opt/node/bin/claude"));
+        append_missing_to_path(&mut cmd, &[brew.clone(), cargo.clone()]);
+
+        let env: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        let path = env.get("PATH").expect("PATH").clone();
+        let dirs: Vec<String> = path.split(':').map(String::from).collect();
+        // Front stays as the adapters built it…
+        assert_eq!(dirs[0], "/opt/node/bin");
+        assert_eq!(dirs[1], "/usr/local/bin");
+        assert_eq!(dirs[2], "/usr/bin");
+        assert_eq!(dirs[3], "/bin");
+        // …and the gap-fillers close it out, in the order given.
+        assert_eq!(dirs[4], brew.to_string_lossy());
+        assert_eq!(dirs[5], cargo.to_string_lossy());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A dir already on PATH must not appear twice — appending would grow
+    /// PATH on every run of a long-lived engine otherwise.
+    #[test]
+    fn an_inherited_dir_is_not_appended_twice() {
+        let mut cmd = tokio::process::Command::new("claude");
+        cmd.env("PATH", "/usr/bin:/opt/homebrew/bin");
+        append_missing_to_path(&mut cmd, &[std::path::PathBuf::from("/opt/homebrew/bin")]);
+        let env: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        let path = env.get("PATH").expect("PATH").clone();
+        assert_eq!(
+            path.split(':')
+                .filter(|d| *d == "/opt/homebrew/bin")
+                .count(),
+            1,
+            "{path}"
+        );
+    }
+
+    /// No toolchain dirs (a test engine, or nothing to fill) leaves PATH as
+    /// the adapter built it.
+    #[test]
+    fn no_tool_dirs_means_no_path_change() {
+        let mut cmd = tokio::process::Command::new("claude");
+        prepend_exe_dir_to_path(&mut cmd, std::path::Path::new("/opt/node/bin/claude"));
+        let before: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
+        append_missing_to_path(&mut cmd, &[]);
         let after: std::collections::BTreeMap<_, _> = envs(&cmd).into_iter().collect();
         assert_eq!(after.get("PATH"), before.get("PATH"));
     }
