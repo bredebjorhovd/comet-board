@@ -26,6 +26,15 @@
 //!   every `permission.asked` is auto-allowed.
 //! - `COMET_BOARD_CHAT_ID` rides the child env (the board-provenance
 //!   convention; see [`crate::RunControls::chat_id`]).
+//! - **Auth is isolated from the other harnesses' logins (gh#577).** opencode
+//!   bridges Anthropic auth to Claude Code's own login — it reads
+//!   `.credentials.json` out of `$CLAUDE_CONFIG_DIR` (defaulting to
+//!   `~/.claude`) when it has no provider credential of its own — so a box
+//!   whose claude login has lapsed refuses every opencode run with a
+//!   complaint about an account the run was never spending. The adapter pins
+//!   that variable at an empty directory of its own, which both overrides
+//!   whatever the engine's environment carried and cuts the `~/.claude`
+//!   fallback; see [`isolate_foreign_credentials`].
 //! - Context fullness ([`comet_proto::ContextUsage`], gh#271) is **not
 //!   reported here**, deliberately. The SSE stream volunteers no window: an
 //!   assistant `message.updated` carries the message's `tokens`, and the
@@ -328,6 +337,64 @@ fn split_model(model: &Option<String>) -> Option<(String, String)> {
 // Server lifecycle
 // ---------------------------------------------------------------------------
 
+/// Where an opencode server is told Claude Code's config dir is: a directory
+/// of its own that holds nothing (gh#577).
+///
+/// Per engine process rather than per spawn, so repeated runs share one empty
+/// dir instead of littering temp; created best-effort because a path that does
+/// not exist reads as "no credentials" too, which is the entire payload this
+/// directory ever has. It must never hold any — it exists so a foreign CLI's
+/// login cannot reach opencode, and it would defeat itself if it did.
+fn isolated_claude_config_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "comet-opencode-claude-isolation-{}",
+        std::process::id()
+    ));
+    if std::fs::create_dir_all(&dir).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    dir
+}
+
+/// Cut every cross-harness bridge between an opencode server and another CLI's
+/// login (gh#577).
+///
+/// The failure this closes: `opencode serve` inherits its parent's whole
+/// environment, and it bridges Anthropic auth to **Claude Code's** login —
+/// reading `.credentials.json` out of `$CLAUDE_CONFIG_DIR`, or out of
+/// `~/.claude` when the variable is unset, whenever it has no provider
+/// credential of its own. So a box whose claude login had simply *lapsed*
+/// refused every opencode run with an error about the claude account — and
+/// worse, an ambient `CLAUDE_CONFIG_DIR` exported for claude's own sake rode
+/// into the child and handed the bridge that credential dir directly. An
+/// unrelated harness's stale token decided whether opencode worked.
+///
+/// Two stamps make the environments independent:
+///
+/// - `CLAUDE_CONFIG_DIR` is pointed at [`isolated_claude_config_dir`] rather
+///   than removed on purpose: unset is what makes opencode fall back to the
+///   real `~/.claude`, which is the leak's default path. Set-but-empty means
+///   the bridge finds no credentials anywhere and opencode authenticates only
+///   through its own store (`auth.json`) and provider API keys.
+/// - `CLAUDE_CODE_OAUTH_TOKEN` is dropped outright: a Claude Code login token
+///   in the engine's environment is exactly the credential a foreign harness
+///   must not inherit, and there is no legitimate reading of it that is not
+///   this bridge.
+///
+/// The reverse direction needs nothing: neither `claude` nor `codex` reads any
+/// variable pointing at the *other* CLI's store (`CODEX_HOME`, `OPENCODE_*`),
+/// so their adapters cannot leak the way this one could. Provider API keys
+/// (`ANTHROPIC_API_KEY` and friends) are left alone deliberately — they are
+/// not one CLI's login but keys any tool may be given.
+fn isolate_foreign_credentials(cmd: &mut Command) {
+    cmd.env("CLAUDE_CONFIG_DIR", isolated_claude_config_dir());
+    cmd.env_remove("CLAUDE_CODE_OAUTH_TOKEN");
+}
+
 /// Spawn `opencode serve --port 0` (ephemeral port, printed on stdout) and
 /// wait for it to report the port and pass a health check. The port-reader
 /// task keeps draining stdout forever so the child never blocks on a full pipe.
@@ -351,6 +418,7 @@ async fn spawn_server(
     )? {
         cmd.env("OPENCODE_CONFIG_CONTENT", config);
     }
+    isolate_foreign_credentials(&mut cmd);
     // The server is what runs the agent's tools, so the credentials — and the
     // directories the tools themselves live in — belong on it; opencode's own
     // process never pushes anything and never types `comet-board`.
@@ -1184,5 +1252,67 @@ mod tests {
             })
         );
         assert!(opencode_inline_config(None, &[]).unwrap().is_none());
+    }
+
+    /// The env a command would spawn with, as `(name, value)` pairs — the
+    /// same shape the lib tests read back.
+    fn envs(cmd: &Command) -> std::collections::BTreeMap<String, String> {
+        cmd.as_std()
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    /// gh#577, unit form: whatever claude-shaped credential pointers the
+    /// engine's environment carried, an opencode child is launched without a
+    /// single one it could bridge onto. `CLAUDE_CONFIG_DIR` is *replaced*
+    /// rather than dropped — unset is precisely what sends opencode's bridge
+    /// to the real `~/.claude` — and the replacement holds no credentials.
+    #[test]
+    fn an_opencode_child_is_launched_without_a_claude_login_to_bridge_to() {
+        let stale = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            stale.path().join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"expired","expiresAt":1}}"#,
+        )
+        .unwrap();
+
+        let mut cmd = Command::new("opencode");
+        cmd.env("CLAUDE_CONFIG_DIR", stale.path());
+        cmd.env("CLAUDE_CODE_OAUTH_TOKEN", "stale-token");
+
+        isolate_foreign_credentials(&mut cmd);
+        let env = envs(&cmd);
+
+        let handed = env.get("CLAUDE_CONFIG_DIR").expect("still set");
+        assert_ne!(
+            PathBuf::from(handed),
+            stale.path(),
+            "the inherited claude dir reached the child"
+        );
+        assert!(
+            !std::path::Path::new(handed)
+                .join(".credentials.json")
+                .exists(),
+            "the isolation dir must hold no credentials: {handed}"
+        );
+        assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
+    }
+
+    /// And with nothing foreign in the environment at all — the common box —
+    /// the stamp still happens: leaving the variable unset would restore the
+    /// `~/.claude` fallback inside opencode, which is the leak's default path.
+    #[test]
+    fn the_isolation_stamps_even_when_the_environment_had_nothing_to_override() {
+        let mut cmd = Command::new("opencode");
+        isolate_foreign_credentials(&mut cmd);
+        let env = envs(&cmd);
+        assert!(env.contains_key("CLAUDE_CONFIG_DIR"));
+        assert!(!env.contains_key("CLAUDE_CODE_OAUTH_TOKEN"));
     }
 }

@@ -72,7 +72,9 @@ async fn main() -> std::io::Result<()> {
     );
     // What the process that runs the agent's tools was actually handed. The
     // server is the parent of every `git push` an opencode agent makes, so
-    // this file is the environment those pushes inherit.
+    // this file is the environment those pushes inherit. The claude-shaped
+    // variables ride along since gh#577: whether a foreign CLI's login reached
+    // this child is answered by reading what it got, not by reasoning about it.
     let _ = std::fs::write(
         cwd.join("fake-opencode.env"),
         std::env::vars()
@@ -80,6 +82,8 @@ async fn main() -> std::io::Result<()> {
                 k.starts_with("GIT_")
                     || k.starts_with("COMET_BOARD_")
                     || k == "OPENCODE_CONFIG_CONTENT"
+                    || k == "CLAUDE_CONFIG_DIR"
+                    || k == "CLAUDE_CODE_OAUTH_TOKEN"
             })
             .map(|(k, v)| format!("{k}={v}\n"))
             .collect::<String>(),

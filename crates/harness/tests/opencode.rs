@@ -358,6 +358,108 @@ async fn the_serve_child_gets_the_credential_environment_byte_for_byte() {
     );
 }
 
+/// Process-env mutation is not thread-safe, so the stale-claude test holds this
+/// while its variables are swapped in and restores whatever was there after
+/// (the same pattern the engine e2e uses for `COMET_WORKTREES_DIR`).
+static CLAUDE_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct StaleClaudeEnv {
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+    prior_dir: Option<std::ffi::OsString>,
+    prior_token: Option<std::ffi::OsString>,
+}
+
+impl Drop for StaleClaudeEnv {
+    fn drop(&mut self) {
+        match self.prior_dir.take() {
+            Some(prior) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", prior) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        match self.prior_token.take() {
+            Some(prior) => unsafe { std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", prior) },
+            None => unsafe { std::env::remove_var("CLAUDE_CODE_OAUTH_TOKEN") },
+        }
+    }
+}
+
+/// Regression for gh#577: a stale/expired claude login must not affect an
+/// opencode run.
+///
+/// opencode bridges Anthropic auth to Claude Code's login — `.credentials.json`
+/// out of `$CLAUDE_CONFIG_DIR`, falling back to `~/.claude` when unset — so a
+/// box whose claude login had lapsed refused every opencode run with an error
+/// about the *claude* account, and any `CLAUDE_CONFIG_DIR` exported for
+/// claude's own sake rode into the child verbatim. This plants a lapsed login,
+/// exports it the way an engine's environment would carry it, runs a turn, and
+/// then reads what the server process actually received (the gh#233 trick):
+/// the claude dir handed down is an isolated empty one — never the stale dir,
+/// never unset-and-fallback — and no Claude Code token rides along. The run
+/// itself completes.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stale_claude_login_cannot_reach_or_refuse_an_opencode_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // The lapsed login: the exact file shape opencode's bridge reads, with an
+    // expiry long past.
+    let stale_claude = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        stale_claude.path().join(".credentials.json"),
+        r#"{"claudeAiOauth":{"accessToken":"expired-access","refreshToken":"dead-refresh","expiresAt":1700000000000}}"#,
+    )
+    .unwrap();
+
+    let _env = {
+        let lock = CLAUDE_ENV.lock().await;
+        let prior_dir = std::env::var_os("CLAUDE_CONFIG_DIR");
+        let prior_token = std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN");
+        unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", stale_claude.path()) };
+        unsafe { std::env::set_var("CLAUDE_CODE_OAUTH_TOKEN", "stale-oauth-token") };
+        StaleClaudeEnv {
+            _lock: lock,
+            prior_dir,
+            prior_token,
+        }
+    };
+
+    let (controls, steer, _token) = fake_controls();
+    drop(steer); // settle after the turn
+    let events = run_to_end(&harness(), fake_request("scenario:happy", &dir), controls).await;
+    assert_eq!(
+        events.last(),
+        Some(&AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("ses_fake".into()),
+        }),
+        "the run itself works despite the lapsed claude login: {events:?}"
+    );
+
+    let seen: std::collections::BTreeMap<String, String> =
+        std::fs::read_to_string(dir.path().join("fake-opencode.env"))
+            .expect("the fake serve wrote its environment")
+            .lines()
+            .filter_map(|l| l.split_once('=').map(|(k, v)| (k.into(), v.into())))
+            .collect();
+
+    let handed = seen
+        .get("CLAUDE_CONFIG_DIR")
+        .expect("the isolation stamps the variable rather than unsetting it");
+    assert_ne!(
+        Path::new(handed),
+        stale_claude.path(),
+        "the engine's stale claude dir reached the opencode child"
+    );
+    assert!(
+        !Path::new(handed).join(".credentials.json").exists(),
+        "the dir the bridge reads holds no credentials: {handed}"
+    );
+    assert!(
+        !seen.contains_key("CLAUDE_CODE_OAUTH_TOKEN"),
+        "a Claude Code token rode into the opencode child"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn spawned_opencode_receives_the_route_mcp_config() {
