@@ -662,10 +662,6 @@ impl AppState {
         self.spaces.iter().find(|s| s.id == space_id)
     }
 
-    pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
-        self.space_row(chat.space_id.as_deref()?)
-    }
-
     /// Non-archived chats of a space in tab (creation) order. Chats with a
     /// dangling/missing `space_id` are invisible by construction.
     pub fn chats_in_space(&self, space_id: &str) -> Vec<&Chat> {

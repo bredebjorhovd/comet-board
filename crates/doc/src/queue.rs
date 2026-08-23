@@ -22,9 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use comet_proto::ContextRef;
 
-use crate::commands::{
-    QueueOp, SessionCommandEntry, SessionCommandKind, SessionCommandPayload, SessionCommandStatus,
-};
+use crate::commands::{QueueOp, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
 
 /// One row of the visible plan.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -190,15 +188,6 @@ fn move_row(rows: &mut Vec<QueueRow>, target: &str, after: Option<&str>) {
         },
     };
     rows.insert(to, row);
-}
-
-/// Does this entry belong to the queue plane at all? (The drain uses it to
-/// decide whether a pending entry needs the projection computed.)
-pub fn is_queue_entry(entry: &SessionCommandEntry) -> bool {
-    matches!(
-        entry.kind(),
-        SessionCommandKind::Queue | SessionCommandKind::QueueControl
-    )
 }
 
 #[cfg(test)]

@@ -27,15 +27,6 @@ impl Logger {
         }
     }
 
-    /// A logger that only writes to stderr, for one-shot foreground commands.
-    pub fn stderr_only() -> Logger {
-        Logger {
-            path: PathBuf::new(),
-            file: Mutex::new(None),
-            echo: true,
-        }
-    }
-
     pub fn write(&self, level: &str, msg: &str) {
         let line = format!(
             "{} {:<5} {}\n",

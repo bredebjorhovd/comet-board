@@ -1644,64 +1644,6 @@ impl Db {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Record the screen this pane is showing, and that it is showing it *now*.
-    ///
-    /// Only called when the screen has changed, which is what makes `screen_at`
-    /// mean "first seen": a screen resampled every few seconds has to keep
-    /// ageing, or it never reaches `screen::STALL_SECS` and a frozen pane is
-    /// watched forever (gh#32).
-    pub fn set_screen_sample(&self, attempt_id: i64, fingerprint: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE attempts SET screen_print = ?2, screen_at = ?3 WHERE id = ?1",
-            params![attempt_id, fingerprint, now()],
-        )?;
-        Ok(())
-    }
-
-    /// Forget the screen recorded for this attempt.
-    ///
-    /// Called when an attempt is closed. The screen it was last seen showing was
-    /// recorded while its agent was still working, so it is no baseline for the
-    /// question the closed-attempt watch asks — *has this pane moved since we
-    /// called it finished* — and comparing against it would answer yes on the
-    /// very first look (gh#34).
-    pub fn clear_screen_sample(&self, attempt_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE attempts SET screen_print = NULL, screen_at = NULL WHERE id = ?1",
-            params![attempt_id],
-        )?;
-        Ok(())
-    }
-
-    /// Count a nudge sent into this attempt's pane, and stamp when (gh#40).
-    ///
-    /// Counted whatever the delivery reported, because the cap is what bounds
-    /// this: a `herdr agent prompt` that keeps failing is a thing to try a few
-    /// times and then stop, exactly like one that keeps being ignored, and a
-    /// refusal that did not count would leave the board retrying it every cycle
-    /// forever. Which it was is in the log line beside it.
-    pub fn set_nudged(&self, attempt_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE attempts SET nudges = nudges + 1, nudged_at = ?2 WHERE id = ?1",
-            params![attempt_id, now()],
-        )?;
-        Ok(())
-    }
-
-    /// Give an attempt its full allowance of nudges back, because its pane came
-    /// back to life.
-    ///
-    /// Not called on the first sign of movement: a nudge lands as text and gets
-    /// echoed, so the screen moves once for a nudge that achieved nothing. See
-    /// [`crate::nudge::recovered`] for what is waited for instead.
-    pub fn clear_nudges(&self, attempt_id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE attempts SET nudges = 0, nudged_at = NULL WHERE id = ?1",
-            params![attempt_id],
-        )?;
-        Ok(())
-    }
-
     /// Stamp that this attempt has been warned about its wall-clock cap, and
     /// start the grace clock (gh#70).
     ///

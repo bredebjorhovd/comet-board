@@ -21,8 +21,6 @@ pub const NEW_SESSION: CommandDescriptor = CommandDescriptor {
     shortcut: crate::settings::ShortcutId::NewSession,
 };
 
-pub const COMMANDS: &[CommandDescriptor] = &[NEW_SESSION];
-
 impl CommandDescriptor {
     pub fn effective_combo(self, keymap: &crate::settings::KeymapConfig) -> String {
         let configured = crate::settings::platform_combo(keymap.get(self.shortcut));

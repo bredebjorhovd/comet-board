@@ -2506,35 +2506,6 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
     }
 }
 
-/// Display-only toggle switch (comet branch-picker.tsx `Toggle`): an 18×32
-/// pill whose knob slides right and track flips white when on. State is owned
-/// by the parent row.
-#[allow(dead_code)]
-fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
-    div()
-        .flex_none()
-        .w(px(32.0))
-        .h(px(18.0))
-        // round-ok: a switch track is a drawn control, not a box
-        .rounded_full()
-        .bg(if on {
-            theme.text
-        } else {
-            theme.white_alpha(0.15)
-        })
-        .relative()
-        .child(
-            div()
-                .absolute()
-                .top(px(2.0))
-                .left(px(if on { 16.0 } else { 2.0 }))
-                .size(px(14.0))
-                // round-ok: the switch knob
-                .rounded_full()
-                .bg(if on { theme.bg } else { theme.white_alpha(0.7) }),
-        )
-}
-
 /// `COMET_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
 /// production launches never set it, so the mock never surfaces there.
 fn mock_harness_enabled() -> bool {

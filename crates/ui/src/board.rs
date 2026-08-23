@@ -687,11 +687,6 @@ impl BoardModel {
         out
     }
 
-    /// How many task rows the filter lets through, for the header count.
-    pub fn shown_tasks(&self) -> usize {
-        self.sections().iter().map(|(_, rows)| rows.len()).sum()
-    }
-
     pub fn task(&self, id: &str) -> Option<&TaskRow> {
         self.rows.iter().find(|row| row.id == id)
     }
@@ -835,18 +830,6 @@ impl BoardModel {
             _ => self.filter = Filter::Text(ch.to_string()),
         }
         self.typing = true;
-        self.clamp_selection();
-    }
-
-    pub fn find_backspace(&mut self) {
-        if let Filter::Text(q) = &mut self.filter
-            && q.pop().is_none()
-        {
-            // Backspacing past the start closes the field. An empty field
-            // filtering nothing is not a state worth being stuck in.
-            self.clear_filter();
-            return;
-        }
         self.clamp_selection();
     }
 

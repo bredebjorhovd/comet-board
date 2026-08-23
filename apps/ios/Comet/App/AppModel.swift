@@ -336,7 +336,7 @@ final class AppModel {
         (demo?.chats ?? workspace?.chats)?.first { $0.id == id }
     }
 
-    /// state.rs `space_for_chat` — nil for a dangling/missing space_id.
+    /// The chat's space by id — nil for a dangling/missing space_id.
     func space(for chat: Chat) -> Space? {
         guard let spaceId = chat.spaceId else { return nil }
         return spaces.first { $0.id == spaceId }
