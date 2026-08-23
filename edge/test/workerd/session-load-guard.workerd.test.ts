@@ -256,6 +256,57 @@ describe("SessionRoom load guard on real workerd", () => {
     });
   });
 
+  it("refuses a partial log failure with no snapshot — the shape that looped for five days", async () => {
+    const stub = env.TEST_SESSION.get(env.TEST_SESSION.idFromName("partial-log-no-snapshot"));
+
+    await runInDurableObject(stub, async (instance, state) => {
+      const room = instance as unknown as SessionRoom;
+      // The live ws4 workspace room, 2026-08-24: no snapshot, 71 rows, 5 of
+      // them undecodable — `failed=5/71`. The refusal used to demand
+      // `rowsFailed === rows`, so this sailed straight past it, served a doc
+      // missing the ops those rows carried, and every client update after it
+      // threw `Invalid array buffer length` out of the message handler. The
+      // room had been doing that since 2026-08-19.
+      const doc = new LoroDoc();
+      let good: Uint8Array;
+      try {
+        doc.getMap("session").set("title", "a row that replays fine");
+        doc.commit();
+        good = doc.export({ mode: "snapshot" });
+      } finally {
+        doc.free();
+      }
+      insertUpdateRow(state, good);
+      insertUpdateRow(state, corruptBytes(0x7f));
+      insertUpdateRow(state, good);
+      setMeta(state, "updateBytes", String(INCIDENT_STORED_BYTES));
+
+      // A doc that begins empty and loses a row has a hole no later row fills,
+      // so this must refuse rather than serve it — however many rows survived.
+      for (let attempt = 1; attempt <= LOAD_REFUSAL_LIMIT; attempt++) {
+        const frames = await join(room);
+        expect(frames).toHaveLength(1);
+        const error = frames[0]!;
+        expect(error.type).toBe(MessageType.JoinError);
+        if (error.type === MessageType.JoinError) {
+          expect(error.code).toBe(JoinErrorCode.AppError);
+          expect(error.message).toContain("stored log will not import");
+        }
+      }
+
+      // Evicted, so the fleet reseeds from the replicas every engine holds.
+      const refusing = await stats(room);
+      expect(refusing.postReset).toBe(true);
+      expect(refusing.lastAbort).toBeNull();
+      const remaining = [...state.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n;
+      expect(Number(remaining)).toBe(0);
+
+      const healed = await join(room);
+      expect(healed.some((frame) => frame.type === MessageType.JoinResponseOk)).toBe(true);
+      expect(healed.some((frame) => frame.type === MessageType.JoinError)).toBe(false);
+    });
+  });
+
   it("keeps skipping a bad row behind a snapshot that loaded", async () => {
     const stub = env.TEST_SESSION.get(env.TEST_SESSION.idFromName("bad-row-good-snapshot"));
 
