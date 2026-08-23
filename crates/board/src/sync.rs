@@ -303,6 +303,14 @@ fn changed_sections(before: &RoutingConfig, after: &RoutingConfig) -> String {
     out.join("+")
 }
 
+/// What re-opening a merged branch produced, when it did (gh#563).
+struct Reopened {
+    url: String,
+    /// The clause the settle notice carries — what happened, how much was
+    /// stranded, and where the work lives now.
+    clause: String,
+}
+
 impl SyncEngine {
     /// Build a live engine from the board's directories: open `board.db`, load
     /// `routing.toml`, read credentials, construct whichever source clients the
@@ -3433,7 +3441,27 @@ impl SyncEngine {
         });
         match verdict {
             Verdict::Finished(evidence) => {
-                self.settle(runtime, task, attempt, evidence, pr_url.as_deref())?;
+                // gh#563, the orphaned answer: this arm with no open pull
+                // request is where a review's answer lands after its pull
+                // request merged — pushed to a branch whose door closed under
+                // it. On the event path the board can still act instead of
+                // narrating: open the pull request the work now needs.
+                let reopened = match evidence {
+                    Evidence::Commits if ask_github => self.reopen_after_merge(task, attempt),
+                    _ => None,
+                };
+                let (new_url, clause) = match reopened {
+                    Some(r) => (Some(r.url), Some(r.clause)),
+                    None => (None, None),
+                };
+                self.settle(
+                    runtime,
+                    task,
+                    attempt,
+                    evidence,
+                    new_url.as_deref().or(pr_url.as_deref()),
+                    clause,
+                )?;
                 Ok(true)
             }
             // The one StayLive worth a line: a row that stays `working`
@@ -3522,6 +3550,11 @@ impl SyncEngine {
     /// operator's out-of-band channel. The §settle-logic half of what
     /// herdr-board's `settle` did, now including its AGE-25 dispatcher wake
     /// (gh#71).
+    ///
+    /// `note` carries a clause the evidence alone does not describe — the
+    /// re-opened answer of gh#563. It rides the settle signal's own note slot,
+    /// beside whatever [`SyncEngine::note_credential_path`] adds, so every
+    /// channel tells one story about one close.
     fn settle(
         &self,
         runtime: Option<&dyn Runtime>,
@@ -3529,6 +3562,7 @@ impl SyncEngine {
         attempt: &Attempt,
         evidence: Evidence,
         pr_url: Option<&str>,
+        note: Option<String>,
     ) -> Result<()> {
         // The last honest moment to look at the checkout and the journal
         // (§gh#183). The event path settles the instant a run ends, so it can
@@ -3552,6 +3586,15 @@ impl SyncEngine {
         // request, or commits the branch check found on the remote — so this
         // is the moment to ask what pushed it (gh#233).
         let credential = self.note_credential_path(task, attempt);
+        let note = match (note, credential) {
+            (None, None) => None,
+            (Some(one), None) => Some(one),
+            (None, Some(two)) => Some(two),
+            // Both clauses survive a combination: one says where the answer
+            // went, the other who pushed it, and dropping either to keep the
+            // sentence short would drop exactly what somebody was waiting on.
+            (Some(one), Some(two)) => Some(format!("{one}; {two}")),
+        };
         self.announce(
             runtime,
             task,
@@ -3560,10 +3603,166 @@ impl SyncEngine {
                 outcome: Outcome::Done,
                 evidence: Some(evidence),
                 pr_url: pr_url.map(str::to_string),
-                note: credential,
+                note,
             },
         );
         Ok(())
+    }
+
+    /// An attempt answered its review after the pull request merged; give the
+    /// answer its pull request back (gh#563).
+    ///
+    /// The shape of the bug: review delivery queues a verdict into a live chat
+    /// — by design — the agent acts on it and pushes, and by then the dispatcher
+    /// has merged. The push lands on a branch whose pull request is closed, so
+    /// nothing opens, the settle prints "no pull request was opened" exactly as
+    /// if nobody had answered anything, and the work sits on a dead branch until
+    /// somebody diffs it against main by hand. Three of those in one session
+    /// (gh#527's review finding among them) is what this closes.
+    ///
+    /// The asymmetry is real — the board cannot know whether a verdict will
+    /// produce a push, and holding merges is not a workflow — but the *detection*
+    /// was never missing: this is the settle-on-commits path, reached only when
+    /// the run genuinely ended on pushed work with no open pull request to show.
+    /// What was missing was the action, so this takes the ones a first settle
+    /// would have:
+    ///
+    /// - **a pull request**, from the branch at the base its merged one used,
+    ///   recorded immediately (`set_pr`) so the row derives straight to review;
+    /// - **the merge undone** as an operator decision — `finish_on_merge` set
+    ///   `local_done` as a consequence of merging, and fresh reviewable work is
+    ///   the fact that outranks it; cleared only here, only because
+    ///   `task.pr_merged` says the done came from a merge rather than a
+    ///   deliberate mark;
+    /// - **the issue reopened**, through the writeback queue like the close was,
+    ///   since a closed upstream otherwise derives `done` over any open PR.
+    ///
+    /// Guarded to the reported shape, so nothing else changes meaning:
+    /// `ask_github` (event path only — no poll pays for this), a recorded
+    /// *merged* PR on this attempt's own branch, and a branch GitHub says still
+    /// carries commits the base does not (`compare_ahead`; zero means the merge
+    /// already took everything — a push that raced the merge — and there is
+    /// nothing to reopen). Every failure reads as "no reopen": the plain
+    /// commits settle runs as before, which is today's behaviour plus the log
+    /// line saying why nothing could be done.
+    fn reopen_after_merge(&self, task: &Task, attempt: &Attempt) -> Option<Reopened> {
+        let gh = self.github.as_ref()?;
+        let branch = attempt.branch.as_deref()?;
+        // The recorded pull request must be this attempt's own, closed, and
+        // known to have merged — a deliberate `mark done` on a task whose PR is
+        // merely closed leaves `local_done` alone (see above), and another
+        // branch's PR is not this branch's door.
+        if task.pr_number.is_none() || task.pr_open || !task.pr_merged {
+            return None;
+        }
+        // Another branch's PR is not this branch's door.
+        if task
+            .pr_head_ref
+            .as_deref()
+            .is_some_and(|head| head != branch)
+        {
+            return None;
+        }
+        let repo = split_gh_task_id(&task.id)
+            .map(|(r, _)| r)
+            .or_else(|| crate::model::pr_repo(task.pr_url.as_deref()?))?;
+        // Checked non-none above.
+        let old = format!("{repo}#{}", task.pr_number?);
+        let base = task.pr_base_ref.clone()?; // set when the PR was linked
+
+        // What the merge left behind, asked of GitHub because the local
+        // checkout has not seen the merge commit (no fetch on this path).
+        let stranded = match gh.compare_ahead(&repo, &base, branch) {
+            Some(ahead) => ahead,
+            None => {
+                self.log.warn(format!(
+                    "{}: {branch} moved past its base after {old} merged, but the compare \
+                     could not be read — leaving the commits where they are",
+                    task.identifier
+                ));
+                return None;
+            }
+        };
+        if stranded == 0 {
+            // The push raced the merge and lost: everything it made is already
+            // in the base. Nothing orphaned, nothing to open.
+            self.log.info(format!(
+                "{}: {branch} holds nothing that {old}'s merge does not — \
+                 nothing to reopen",
+                task.identifier
+            ));
+            return None;
+        }
+
+        let title = task.title.trim();
+        let body = format!(
+            "comet-board opened this pull request: attempt {} answered its review after \
+             [{old}](https://github.com/{repo}/pull/{num}) had already merged, which left \
+             {stranded} commit(s) on `{branch}` in nothing else.\n\n\
+             The branch was cut from `{base}`; these commits were pushed after the merge and \
+             are reviewed here as they stand.",
+            task.attempt_count().max(1),
+            num = task.pr_number.unwrap_or_default(),
+        );
+        let (number, url) = match gh.create_pull_request(&repo, title, branch, &base, &body) {
+            Ok(opened) => opened,
+            Err(e) => {
+                // "No commits between" is GitHub answering the race question
+                // itself, more recently than our compare did — treat it as the
+                // zero-ahead case above rather than as a failure.
+                if e.to_string().contains("No commits between") {
+                    self.log.info(format!(
+                        "{}: {branch} holds nothing that {old}'s merge does not — \
+                         nothing to reopen",
+                        task.identifier
+                    ));
+                } else {
+                    self.log.warn(format!(
+                        "{}: could not open a pull request for the answer on {branch}: {e:#}",
+                        task.identifier
+                    ));
+                }
+                return None;
+            }
+        };
+
+        // Record before announcing, so every reader — the row derivation, the
+        // notice, the outcome comment — sees the same new door.
+        let _ = self.db.set_pr(&task.id, Some(&url), Some(number), true);
+        let _ = self
+            .db
+            .set_pr_topology(&task.id, Some(&base), Some(branch), None);
+        // The merge decided this row was over; the answer un-decides it. Only
+        // reachable under `pr_merged`, so an operator's own mark stands.
+        let _ = self.db.set_local_done(&task.id, false);
+        // And upstream: finish_on_merge queued a close, and a closed issue
+        // derives `done` over any open pull request. Same queue, same retry
+        // guarantees; keyed per attempt, so each reopened answer reopens once.
+        let queued = self.db.enqueue_writeback(&NewWriteback {
+            task_id: task.id.clone(),
+            kind: "reopen".into(),
+            payload: json!({ "reason": "answered its review after the merge" }).to_string(),
+            idem_key: format!("{}:reopen:{}", task.id, attempt.id),
+        });
+        if let Err(e) = queued {
+            self.log.error(format!(
+                "{}: queueing the issue reopen: {e}",
+                task.identifier
+            ));
+        }
+
+        self.log.warn(format!(
+            "{}: the answer to its review arrived after {old} had merged — {stranded} \
+             commit(s) were on {branch} and in nothing else; opened {url} to carry them, \
+             and the row is back in review",
+            task.identifier
+        ));
+        Some(Reopened {
+            clause: format!(
+                "pushed {stranded} commit(s) after {old} had merged — reopened as {repo}#{number}"
+            ),
+            url,
+        })
     }
 
     /// Did the board's own credential push this? (gh#233.)
@@ -4658,6 +4857,9 @@ impl SyncEngine {
                     }
                     // Close on done, so "mark done" reaches the issue too.
                     "close" => gh.close_issue(&repo, number)?,
+                    // The inverse close (gh#563): an answer that arrived after
+                    // its merge re-opened the work, and the issue follows.
+                    "reopen" => gh.reopen_issue(&repo, number)?,
                     other => self.log.warn(format!("unknown writeback kind {other}")),
                 }
             }
@@ -4717,9 +4919,27 @@ impl SyncEngine {
         self.db.set_pr_merged(&task.id, true)?;
         self.finish_on_merge(task, &repo, number)?;
         self.rederive_all()?;
+        // The other half of gh#563: a review delivered into the agent's chat
+        // minutes ago is the one whose answer can land on this now-merged
+        // branch. The board reopens such an answer as its own pull request —
+        // but the keypress is the moment somebody is still watching, so say it
+        // here too rather than leaving the sentence to a settle notice that may
+        // be hours away.
+        let mut answer = format!("{repo}#{number} merged");
+        if let Some(ago) = crate::review::recent_delivery(&self.db, &task.id) {
+            self.log.warn(format!(
+                "{}: {repo}#{number} merged {} after a review reached the agent's chat — \
+                 if it answers with commits, the board will reopen them as a new pull request",
+                task.identifier, ago
+            ));
+            answer.push_str(
+                " — a review reached the agent's chat just before this merge; \
+                 if it answers with commits, the board will reopen them as a new pull request",
+            );
+        }
         // A sentence, like every other outcome: the caller shows this to the
         // person who pressed the key, whichever surface that was (gh#408).
-        Ok(format!("{repo}#{number} merged"))
+        Ok(answer)
     }
 
     /// What a merged pull request means for the task that owns it.
@@ -6485,6 +6705,248 @@ mod tests {
         e.reconcile_sessions(&statuses(&[("chat-9", AgentStatus::Unknown)]))
             .unwrap();
         assert!(live(&e).outcome.is_none());
+    }
+
+    // ---- the answer that arrived after its merge closed the branch (gh#563)
+
+    /// A gh task's attempt with a chat and a dispatcher to hear the settle,
+    /// standing on a named branch. `settle` tests above reuse the Linear
+    /// fixtures; these need a task id that names a repo.
+    fn gh_attempt(e: &SyncEngine, task: &str, chat: &str, parent: &str, branch: &str) -> i64 {
+        let a =
+            e.db.insert_attempt(&crate::db::NewAttempt {
+                automation: None,
+                automation_owner: None,
+                stacked_on: None,
+                task_id: task.into(),
+                pane_id: None,
+                workspace: "offhand".into(),
+                runtime: "claude-code".into(),
+                worktree: None,
+                branch: Some(branch.into()),
+                dispatched_by: None,
+                dispatched_by_pane: Some(parent.into()),
+                base_sha: None,
+                account: None,
+                repo_path: None,
+                dispatched_by_device: None,
+                dispatched_by_user: None,
+                dispatched_by_verified: false,
+                billed_to: None,
+            })
+            .unwrap();
+        e.db.set_attempt_pane(a, chat).unwrap();
+        a
+    }
+
+    /// The reported shape (gh#563): review delivery woke a settled agent, the
+    /// dispatcher merged while it worked, and its answer landed as commits on
+    /// a branch whose pull request had closed. The settle used to print "no
+    /// pull request was opened" and strand the work; now it opens the door
+    /// again — recorded, derived back into review, upstream reopened, and said
+    /// out loud to whoever was waiting.
+    #[test]
+    fn an_answer_pushed_after_its_pr_merged_reopens_as_a_new_pull_request() {
+        let (_root, work) = repo_ahead_of_its_remote();
+        let wt = work.to_string_lossy().into_owned();
+        let base = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        git_in(&work, &["checkout", "-b", "board/gh-87"]);
+        std::fs::write(work.join("answer"), "the review's ask").unwrap();
+        git_in(&work, &["add", "."]);
+        git_in(&work, &["commit", "-m", "answer the review"]);
+        git_in(&work, &["push", "origin", "board/gh-87"]);
+
+        // The PR recheck finds nothing open (it merged); the compare says two
+        // commits of answer are stranded; the create succeeds.
+        let rest = std::rc::Rc::new(FixtureRest::new(vec![
+            ("/repos/o/r/pulls?".to_string(), json!([])),
+            (
+                "/repos/o/r/compare/main...board/gh-87".to_string(),
+                json!({ "ahead_by": 2 }),
+            ),
+            (
+                "POST /repos/o/r/pulls".to_string(),
+                json!({ "number": 99, "html_url": "https://github.com/o/r/pull/99" }),
+            ),
+        ]));
+        let e = engine_with(Some(Github::new(Box::new(SharedRest(rest)))));
+        seed_gh_in(&e, "gh:o/r#87");
+        let a = gh_attempt(&e, "gh:o/r#87", "chat-9", "chat-parent", "board/gh-87");
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        e.db.set_attempt_base_sha(a, &base).unwrap();
+        // The merge happened while the agent worked: PR closed, merged, done.
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/50"),
+            Some(50),
+            false,
+        )
+        .unwrap();
+        e.db.set_pr_topology("gh:o/r#87", Some("main"), Some("board/gh-87"), None)
+            .unwrap();
+        e.db.set_pr_merged("gh:o/r#87", true).unwrap();
+        e.db.set_local_done("gh:o/r#87", true).unwrap();
+
+        let rt = JournalFact::ending(Some(RunEnd::Completed));
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        let attempt = e.db.attempts_for("gh:o/r#87").unwrap().remove(0);
+        assert_eq!(attempt.outcome, Some(Outcome::Done));
+        let t = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        assert_eq!(t.pr_number, Some(99), "the new door is recorded");
+        assert_eq!(t.pr_url.as_deref(), Some("https://github.com/o/r/pull/99"));
+        assert!(t.pr_open);
+        assert!(
+            !t.local_done,
+            "the merge's `done` does not stand over fresh reviewable work"
+        );
+        e.rederive_all().unwrap();
+        let t = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        assert_eq!(
+            t.state,
+            BoardState::Review,
+            "the answer is reviewable, exactly like a first settle"
+        );
+        assert!(
+            e.db.pending_writebacks(20)
+                .unwrap()
+                .iter()
+                .any(|w| w.kind == "reopen"),
+            "the issue follows the work back open"
+        );
+        assert!(
+            rt.prompts().iter().any(|(_, m)| {
+                m.contains("pushed 2 commit(s) after o/r#50 had merged")
+                    && m.contains("reopened as o/r#99")
+                    && m.contains("pull request: https://github.com/o/r/pull/99")
+            }),
+            "the dispatcher hears what happened and where the work went: {:?}",
+            rt.prompts()
+        );
+    }
+
+    /// A push that raced the merge and lost is not stranded work: GitHub says
+    /// the base already holds everything the branch carries, so no pull
+    /// request is opened and the merge's `done` stands.
+    #[test]
+    fn a_branch_the_merge_already_took_is_not_reopened() {
+        let (_root, work) = repo_ahead_of_its_remote();
+        let wt = work.to_string_lossy().into_owned();
+        let base = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        git_in(&work, &["checkout", "-b", "board/gh-87"]);
+        std::fs::write(work.join("answer"), "raced the merge").unwrap();
+        git_in(&work, &["add", "."]);
+        git_in(&work, &["commit", "-m", "answer the review"]);
+        git_in(&work, &["push", "origin", "board/gh-87"]);
+
+        let rest = std::rc::Rc::new(FixtureRest::new(vec![
+            ("/repos/o/r/pulls?".to_string(), json!([])),
+            (
+                "/repos/o/r/compare/main...board/gh-87".to_string(),
+                json!({ "ahead_by": 0 }),
+            ),
+        ]));
+        let e = engine_with(Some(Github::new(Box::new(SharedRest(rest.clone())))));
+        seed_gh_in(&e, "gh:o/r#87");
+        let a = gh_attempt(&e, "gh:o/r#87", "chat-9", "chat-parent", "board/gh-87");
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        e.db.set_attempt_base_sha(a, &base).unwrap();
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/50"),
+            Some(50),
+            false,
+        )
+        .unwrap();
+        e.db.set_pr_merged("gh:o/r#87", true).unwrap();
+        e.db.set_local_done("gh:o/r#87", true).unwrap();
+
+        let rt = JournalFact::ending(Some(RunEnd::Completed));
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(
+            e.db.attempts_for("gh:o/r#87").unwrap()[0].outcome,
+            Some(Outcome::Done)
+        );
+        let t = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        assert_eq!(t.pr_number, Some(50), "nothing new was opened");
+        assert!(!t.pr_open);
+        assert!(t.local_done);
+        assert!(
+            rest.wrote.borrow().is_empty(),
+            "GitHub was asked, never written"
+        );
+        assert!(
+            rt.prompts()
+                .iter()
+                .any(|(_, m)| m.contains("no pull request was opened")),
+        );
+    }
+
+    /// GitHub refusing the create must not fail the settle: today's behaviour
+    /// — settle on the commits, say there was no PR — is the fallback, with
+    /// the refusal in the log.
+    #[test]
+    fn a_refused_create_falls_back_to_the_plain_commits_settle() {
+        let (_root, work) = repo_ahead_of_its_remote();
+        let wt = work.to_string_lossy().into_owned();
+        let base = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        git_in(&work, &["checkout", "-b", "board/gh-87"]);
+        std::fs::write(work.join("answer"), "work").unwrap();
+        git_in(&work, &["add", "."]);
+        git_in(&work, &["commit", "-m", "answer the review"]);
+        git_in(&work, &["push", "origin", "board/gh-87"]);
+
+        // No `POST /repos/o/r/pulls` route: the fixture answers Null, which
+        // reads as a create without a number in it.
+        let rest = std::rc::Rc::new(FixtureRest::new(vec![
+            ("/repos/o/r/pulls?".to_string(), json!([])),
+            (
+                "/repos/o/r/compare/main...board/gh-87".to_string(),
+                json!({ "ahead_by": 3 }),
+            ),
+        ]));
+        let e = engine_with(Some(Github::new(Box::new(SharedRest(rest)))));
+        seed_gh_in(&e, "gh:o/r#87");
+        let a = gh_attempt(&e, "gh:o/r#87", "chat-9", "chat-parent", "board/gh-87");
+        e.db.set_attempt_worktree(a, &wt).unwrap();
+        e.db.set_attempt_base_sha(a, &base).unwrap();
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/50"),
+            Some(50),
+            false,
+        )
+        .unwrap();
+        e.db.set_pr_merged("gh:o/r#87", true).unwrap();
+        e.db.set_local_done("gh:o/r#87", true).unwrap();
+
+        let rt = JournalFact::ending(Some(RunEnd::Completed));
+        e.refresh_statuses_with(&statuses(&[("chat-9", AgentStatus::Idle)]), Some(&rt))
+            .unwrap();
+
+        assert_eq!(
+            e.db.attempts_for("gh:o/r#87").unwrap()[0].outcome,
+            Some(Outcome::Done)
+        );
+        let t = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        assert_eq!(
+            t.pr_number,
+            Some(50),
+            "the merged PR stays the recorded one"
+        );
+        assert!(t.local_done, "nothing reopened, so nothing un-done");
+        assert!(
+            !e.db
+                .pending_writebacks(20)
+                .unwrap()
+                .iter()
+                .any(|w| w.kind == "reopen")
+        );
     }
 
     // ---- notification (gh#71) --------------------------------------------
@@ -9904,6 +10366,68 @@ max_duration = "{max_duration}"
                 .any(|w| w.kind == "close"),
             "merging finished the work; the ticket is what is left"
         );
+    }
+
+    /// gh#563's other half: a review delivered into the agent's chat minutes
+    /// before the keypress is exactly the one whose answer can land on a branch
+    /// this merge has just closed. Whoever pressed the key hears it now, not in
+    /// a settle notice that may be hours away — and hears that the board will
+    /// reopen such an answer rather than strand it.
+    #[test]
+    fn a_merge_right_after_a_delivered_review_warns_that_an_answer_may_follow() {
+        let e = engine_with(Some(gh_client()));
+        seed_gh(&e);
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/87"),
+            Some(87),
+            true,
+        )
+        .unwrap();
+        let fresh = crate::review::Delivered {
+            last_delivery: Some(crate::db::now()),
+            ..Default::default()
+        };
+        e.db.meta_set(
+            &meta::reviews_for("gh:o/r#87"),
+            &serde_json::to_string(&fresh).unwrap(),
+        )
+        .unwrap();
+
+        let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        let said = e.merge_pull_request(&task).unwrap();
+        assert!(
+            said.contains("a review reached the agent's chat just before this merge")
+                && said.contains("reopen them as a new pull request"),
+            "{said}"
+        );
+    }
+
+    /// And the warning is for the window, not for history: a delivery from an
+    /// hour ago names no answer still coming, and the reply stays one sentence.
+    #[test]
+    fn a_merge_long_after_a_delivery_warns_about_nothing() {
+        let e = engine_with(Some(gh_client()));
+        seed_gh(&e);
+        e.db.set_pr(
+            "gh:o/r#87",
+            Some("https://github.com/o/r/pull/87"),
+            Some(87),
+            true,
+        )
+        .unwrap();
+        let stale = crate::review::Delivered {
+            last_delivery: Some((chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339()),
+            ..Default::default()
+        };
+        e.db.meta_set(
+            &meta::reviews_for("gh:o/r#87"),
+            &serde_json::to_string(&stale).unwrap(),
+        )
+        .unwrap();
+
+        let task = e.db.get_task("gh:o/r#87").unwrap().unwrap();
+        assert_eq!(e.merge_pull_request(&task).unwrap(), "o/r#87 merged");
     }
 
     /// The merge queue accepted the stack; nothing has landed yet. A row marked

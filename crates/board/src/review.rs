@@ -179,6 +179,39 @@ pub struct Delivered {
     /// what has been delivered.
     #[serde(default)]
     pub submissions: Vec<crate::verdict::Submission>,
+    /// When a review last actually reached this task's chat (gh#563) — an
+    /// inbound batch queued into the authoring chat, or an outbound verdict
+    /// delivered into it. `None` is "never", and state written before this
+    /// field existed reads the same way.
+    ///
+    /// The one timestamp in this record, because it answers a question the
+    /// watermarks cannot: did anything just interrupt the agent? The merge
+    /// command asks it, for the window where an answer to that very review can
+    /// land on a branch the merge has already closed.
+    #[serde(default)]
+    pub last_delivery: Option<String>,
+}
+
+/// How long after a delivery a merge still warns that the agent may answer it
+/// (gh#563).
+///
+/// A verdict lands; the agent wakes, works, pushes minutes later; the merge has
+/// by then closed the branch. Ten minutes is the stretch where that answer is
+/// most likely — long enough to cover a small fix, short enough that a warning
+/// about it stays current rather than archaeological.
+pub(crate) const ANSWER_WINDOW_SECS: i64 = 600;
+
+/// How long ago a review last reached this task's chat, when that is inside
+/// [`ANSWER_WINDOW_SECS`] — humanized, ready for a sentence. `None` is "not
+/// recently", which includes never and every unreadable stamp: a warning that
+/// cannot prove it is current does not fire.
+pub(crate) fn recent_delivery(db: &Db, task_id: &str) -> Option<String> {
+    let stamp = load(db, task_id).last_delivery?;
+    let then = chrono::DateTime::parse_from_rfc3339(&stamp).ok()?;
+    let ago = (chrono::Utc::now() - then.with_timezone(&chrono::Utc)).num_seconds();
+    (0..=ANSWER_WINDOW_SECS)
+        .contains(&ago)
+        .then(|| format!("{}s ago", crate::overrun::human_secs(ago)))
 }
 
 impl Delivered {
@@ -783,6 +816,10 @@ impl SyncEngine {
                     items.len(),
                     pr.url
                 ));
+                // The merge side asks this later (gh#563): a verdict that went
+                // into the chat minutes ago is the one whose answer can land
+                // after its pull request closed.
+                state.last_delivery = Some(crate::db::now());
             } else {
                 // Consumed unspoken: there is no chat to hand these to, and
                 // holding them back would hold the verdict back with them. The

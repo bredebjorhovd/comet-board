@@ -786,6 +786,10 @@ impl SyncEngine {
                     {
                         entry.delivered = true;
                     }
+                    // The merge side asks this later (gh#563): this stamp is
+                    // what tells it the agent was handed work minutes before
+                    // its pull request closed.
+                    state.last_delivery = Some(crate::db::now());
                     crate::review::store(&self.db, &task.id, &state)?;
                     self.log.info(format!(
                         "{}: delivered the verdict on {repo}#{number} into chat {chat_id}",
