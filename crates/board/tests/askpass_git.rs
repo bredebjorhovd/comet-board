@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use comet_board::config::Paths;
 use comet_board::git_credentials::{install_askpass_shim, push_env, verify_askpass};
 
 /// The token the fake helper prints — what a real installation token would be.
@@ -214,7 +215,11 @@ fn a_push_authenticates_through_the_boards_askpass_helper() {
     let dir = scratch("works");
     let board = fake_board(&dir);
     let shim = install_askpass_shim(&dir.join("bin"), &board).expect("shim");
-    verify_askpass(&shim).expect("the path answers before git is asked to use it");
+    let paths = Paths {
+        config_dir: dir.join("config"),
+        state_dir: dir.join("state"),
+    };
+    verify_askpass(&shim, &paths).expect("the path answers before git is asked to use it");
 
     let server = Unauthorized::start();
     let stderr = ls_remote(&server.url(), &push_env(&shim, "o/r"), &dir);
@@ -282,9 +287,15 @@ fn a_broken_helper_authenticates_with_nothing_at_all() {
     // Installed, executable, and pointed at a binary that is not there — the
     // shape of a box where the payload shipped the engine alone.
     let shim = install_askpass_shim(&dir.join("bin"), &dir.join("comet-board")).expect("shim");
-    let err = verify_askpass(&shim)
-        .expect_err("a helper reaching nothing verified")
-        .to_string();
+    let err = verify_askpass(
+        &shim,
+        &Paths {
+            config_dir: dir.join("config"),
+            state_dir: dir.join("state"),
+        },
+    )
+    .expect_err("a helper reaching nothing verified")
+    .to_string();
     assert!(err.contains("askpass helper"), "{err}");
 
     let server = Unauthorized::start();

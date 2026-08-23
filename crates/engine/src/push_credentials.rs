@@ -244,7 +244,7 @@ impl PushCredentials {
     ) -> anyhow::Result<PathBuf> {
         let dir = self.paths.state_dir.join(SHIM_DIR);
         let shim = git_credentials::install_askpass_shim(&dir, board_exe)?;
-        git_credentials::verify_askpass(&shim)?;
+        git_credentials::verify_askpass(&shim, &self.paths)?;
         git_credentials::verify_push_credential(&shim, repo, &self.paths, contract)?;
         Ok(shim)
     }
