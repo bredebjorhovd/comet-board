@@ -1113,6 +1113,85 @@ impl<T: Rest> Github<T> {
             .map(str::to_string)
     }
 
+    /// How many commits `head` carries that `base` does not (gh#563).
+    ///
+    /// Asked at the one moment a branch's relation to its base cannot be read
+    /// off the local checkout: the pull request merged while the agent kept
+    /// working, so the merge commit exists only on GitHub and this box's
+    /// `origin/base` predates it. The compare endpoint is the only reader of
+    /// that relation which does not start with a fetch.
+    ///
+    /// `None` covers every failure — either ref missing, GitHub unreachable,
+    /// a body shaped unlike the answer — and the caller reads unproven the way
+    /// [`Github::branch_head`]'s callers do: as "do not act", never as
+    /// "nothing there".
+    pub fn compare_ahead(&self, repo: &str, base: &str, head: &str) -> Option<i64> {
+        // The branch is a path segment and GitHub takes slashes in it verbatim;
+        // the `{base}...{head}` dot-dot-dot form is the two-dot comparison the
+        // caller means — what does head have that base lacks.
+        self.rest
+            .get(&format!("/repos/{repo}/compare/{base}...{head}"))
+            .ok()?
+            .get("ahead_by")?
+            .as_i64()
+    }
+
+    /// Open a pull request (gh#563).
+    ///
+    /// The board does not open pull requests for dispatched agents — the
+    /// dispatch brief tells them to — but an attempt that answers its review
+    /// after the pull request merged has no agent left to ask: its run ended,
+    /// its chat is idle, and the only party watching the branch move is the
+    /// board. This is the re-open-as-new half of the orphan fix; who it is for
+    /// and when it fires is [`SyncEngine::reopen_after_merge`]'s story.
+    ///
+    /// Answers `(number, html_url)`, both read off the create response — the
+    /// caller records them immediately, so a poll is not what links the new
+    /// pull request.
+    pub fn create_pull_request(
+        &self,
+        repo: &str,
+        title: &str,
+        head: &str,
+        base: &str,
+        body: &str,
+    ) -> Result<(i64, String)> {
+        let r = self
+            .rest
+            .post(
+                &format!("/repos/{repo}/pulls"),
+                &serde_json::json!({
+                    "title": title,
+                    "head": head,
+                    "base": base,
+                    "body": body,
+                }),
+            )
+            .with_context(|| format!("opening a pull request from {head} in {repo}"))?;
+        let number = r
+            .get("number")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("github pullRequestCreate returned no number"))?;
+        let url = r
+            .get("html_url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        Ok((number, url))
+    }
+
+    /// Reopen a closed issue (gh#563) — the upstream half of re-opening work
+    /// whose answer arrived after its merge closed it. Delivered through the
+    /// writeback queue like every other upstream effect, so a GitHub outage
+    /// costs a retry rather than the fact.
+    pub fn reopen_issue(&self, repo: &str, number: i64) -> Result<()> {
+        self.rest.patch(
+            &format!("/repos/{repo}/issues/{number}"),
+            &serde_json::json!({ "state": "open" }),
+        )?;
+        Ok(())
+    }
+
     /// Make a stack out of pull requests that are already chained by their base
     /// refs (gh#387).
     ///
@@ -2277,6 +2356,63 @@ mod tests {
         assert_eq!(issues[0].number, 87);
         assert_eq!(issues[0].task_id(), "gh:o/r#87");
         assert_eq!(issues[0].identifier(), "gh#87");
+    }
+
+    /// gh#563: how far a branch runs past its base after the base moved under
+    /// it. The dotted path must survive verbatim — branch names carry slashes.
+    #[test]
+    fn compare_ahead_counts_what_the_base_lacks() {
+        let g = Github::new(FixtureRest::new(vec![(
+            "/repos/o/r/compare/main...board/gh-87".into(),
+            json!({ "ahead_by": 2, "behind_by": 41 }),
+        )]));
+        assert_eq!(
+            g.compare_ahead("o/r", "main", "board/gh-87"),
+            Some(2),
+            "behind_by says nothing about what the merge took"
+        );
+        // A ref GitHub does not know reads as unproven, never as zero.
+        assert_eq!(g.compare_ahead("o/r", "main", "no/such/branch"), None);
+    }
+
+    #[test]
+    fn a_created_pull_request_answers_with_its_number_and_address() {
+        /// The fixture, still readable once the client has boxed it.
+        struct Shared(std::rc::Rc<FixtureRest>);
+        impl Rest for Shared {
+            fn get(&self, path: &str) -> Result<Value> {
+                self.0.get(path)
+            }
+            fn post(&self, path: &str, body: &Value) -> Result<Value> {
+                self.0.post(path, body)
+            }
+            fn patch(&self, path: &str, body: &Value) -> Result<Value> {
+                self.0.patch(path, body)
+            }
+            fn put(&self, path: &str, body: &Value) -> Result<Value> {
+                self.0.put(path, body)
+            }
+        }
+        let rest = std::rc::Rc::new(FixtureRest::new(vec![(
+            "POST /repos/o/r/pulls".into(),
+            json!({ "number": 99, "html_url": "https://github.com/o/r/pull/99" }),
+        )]));
+        let g = Github::new(Shared(rest.clone()));
+        let (number, url) = g
+            .create_pull_request("o/r", "the title", "board/gh-87", "main", "why this exists")
+            .unwrap();
+        assert_eq!(number, 99);
+        assert_eq!(url, "https://github.com/o/r/pull/99");
+        let (_, _, body) = rest.wrote.borrow().last().unwrap().clone();
+        assert_eq!(
+            body,
+            json!({
+                "title": "the title",
+                "head": "board/gh-87",
+                "base": "main",
+                "body": "why this exists",
+            })
+        );
     }
 
     /// The diff of a pushed branch is GitHub's, so a review needs no checkout
