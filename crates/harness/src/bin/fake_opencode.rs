@@ -59,6 +59,18 @@ enum Scenario {
     /// total request deadline. Must still complete (gh#46: the stream is
     /// exempt from the total timeout).
     SlowTurn,
+    /// The gh#600 cutoff shape, captured live against 1.18.21: a mid-loop
+    /// step whose message settles `time.completed` + `finish:"tool-calls"`
+    /// after real tool traffic, then the session goes idle WITHOUT the
+    /// follow-up message that acts on the tool results (a provider death in
+    /// the window between steps). A settled message + idle used to read as a
+    /// clean Completed; it must surface Errored.
+    CutoffAfterTools,
+    /// The same gh#600 shape arriving through the EOF path instead of an
+    /// idle: the feed itself stops right after the mid-loop settle, serve
+    /// still alive. Also Errored — and distinct from StreamEnd, where the
+    /// settled message is a genuine turn end (`finish:"stop"`, nothing after).
+    StreamStopAfterTools,
 }
 
 #[tokio::main]
@@ -147,6 +159,10 @@ async fn handle(
                 Scenario::IdleMidTurn
             } else if body.contains("scenario:slow-turn") {
                 Scenario::SlowTurn
+            } else if body.contains("scenario:cutoff-after-tools") {
+                Scenario::CutoffAfterTools
+            } else if body.contains("scenario:stream-stop-after-tools") {
+                Scenario::StreamStopAfterTools
             } else {
                 Scenario::Happy
             };
@@ -218,8 +234,14 @@ async fn serve_events(mut stream: TcpStream, mut scenario: watch::Receiver<Optio
     )
     .await;
     // A mid-turn stall works real tools before going idle (the fjaerpenn#1
-    // journal shape: deltas + tool calls + idle, no settled message).
-    if sc == Scenario::IdleMidTurn {
+    // journal shape: deltas + tool calls + idle, no settled message); the
+    // gh#600 cutoff shapes work real tools and then SETTLE their mid-loop
+    // message — `finish:"tool-calls"`, exactly what 1.18.21 emits between
+    // steps — before ending without a follow-up step.
+    if matches!(
+        sc,
+        Scenario::IdleMidTurn | Scenario::CutoffAfterTools | Scenario::StreamStopAfterTools
+    ) {
         sse(
             &mut stream,
             "message.part.updated",
@@ -235,12 +257,22 @@ async fn serve_events(mut stream: TcpStream, mut scenario: watch::Receiver<Optio
     }
     match sc {
         // A settled turn's assistant message completes before the turn ends; a
-        // mid-turn stall (IdleMidTurn) never does.
+        // mid-turn stall (IdleMidTurn) never does. The finish reason rides
+        // along since gh#600: "stop" for a genuine end, "tool-calls" for the
+        // mid-loop settles whose turn never continued.
         Scenario::StreamEnd | Scenario::Happy | Scenario::SlowTurn => {
             sse(
                 &mut stream,
                 "message.updated",
-                "{\"info\":{\"id\":\"msg_fake1\",\"role\":\"assistant\",\"time\":{\"created\":1,\"completed\":2}},\"sessionID\":\"ses_fake\"}",
+                "{\"info\":{\"id\":\"msg_fake1\",\"role\":\"assistant\",\"finish\":\"stop\",\"time\":{\"created\":1,\"completed\":2}},\"sessionID\":\"ses_fake\"}",
+            )
+            .await;
+        }
+        Scenario::CutoffAfterTools | Scenario::StreamStopAfterTools => {
+            sse(
+                &mut stream,
+                "message.updated",
+                "{\"info\":{\"id\":\"msg_fake1\",\"role\":\"assistant\",\"finish\":\"tool-calls\",\"time\":{\"created\":1,\"completed\":2}},\"sessionID\":\"ses_fake\"}",
             )
             .await;
         }
@@ -256,12 +288,18 @@ async fn serve_events(mut stream: TcpStream, mut scenario: watch::Receiver<Optio
             sse(&mut stream, "session.idle", "{\"sessionID\":\"ses_fake\"}").await;
             std::process::exit(1);
         }
-        Scenario::Happy | Scenario::IdleMidTurn | Scenario::SlowTurn => {
+        Scenario::Happy
+        | Scenario::IdleMidTurn
+        | Scenario::SlowTurn
+        | Scenario::CutoffAfterTools => {
             sse(&mut stream, "session.idle", "{\"sessionID\":\"ses_fake\"}").await;
             loop {
                 tokio::time::sleep(Duration::from_secs(3600)).await;
             }
         }
+        // The feed itself stops after the mid-loop settle (serve alive) — the
+        // EOF witness of the same cutoff.
+        Scenario::StreamStopAfterTools => {}
     }
 }
 

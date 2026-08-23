@@ -685,6 +685,116 @@ async fn sse_stream_survives_past_the_total_request_deadline() {
     assert_serve_reaped(&dir).await;
 }
 
+/// Regression for gh#600: the cutoff-after-tool-calls shape captured live
+/// against opencode 1.18.21. A mid-loop step's message SETTLES —
+/// `time.completed` + `finish:"tool-calls"` (what the server emits between
+/// steps, verified against a live serve) — after real tool traffic, and then
+/// the session goes idle without the follow-up step that acts on the tool
+/// results (a provider death in the between-steps window; the server log
+/// shows `Upstream request failed` / `finish_reason: network_error`). The
+/// settled message used to read as a clean Completed — the run stopped
+/// looking finished while its work was mid-flight. It must surface Errored,
+/// with a transcript sentence that says where the stream stopped and why.
+#[cfg(unix)]
+#[tokio::test]
+async fn idle_on_a_settled_mid_loop_message_after_tools_reports_errored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, steer, _token) = fake_controls();
+    drop(steer); // close the mailbox so the run settles after its turn
+    let events = run_to_end(
+        &harness(),
+        fake_request("scenario:cutoff-after-tools", &dir),
+        controls,
+    )
+    .await;
+
+    // The turn did real work first: text, then a tool call that settled.
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "hello".into()
+        }),
+        "turn streamed before the cutoff: {events:?}"
+    );
+    assert!(
+        events.contains(&AgentEvent::ToolCall {
+            id: "prt_tool1".into(),
+            call: ToolCall::Exec {
+                command: "ls".into()
+            },
+        }),
+        "tools executed before the cutoff: {events:?}"
+    );
+    assert!(
+        events.contains(&AgentEvent::ToolResult {
+            id: "prt_tool1".into(),
+            is_error: false
+        }),
+        "tool results were delivered before the cutoff: {events:?}"
+    );
+    // …and then the turn ended on the mid-loop settle: Errored, never a
+    // clean-looking Completed.
+    match events.last() {
+        Some(AgentEvent::Done {
+            status,
+            error: Some(error),
+            ..
+        }) => {
+            assert_eq!(*status, DoneStatus::Errored, "{events:?}");
+            assert!(
+                error.contains("after executing tools"),
+                "the message must say the turn stopped right after tools, before the \
+                 follow-up step: {error}"
+            );
+        }
+        other => panic!("expected Errored Done for the after-tools cutoff, got {other:?}"),
+    }
+    assert_serve_reaped(&dir).await;
+}
+
+/// The same gh#600 cutoff arriving through the EOF path: the feed itself
+/// stops right after the mid-loop settle (`finish:"tool-calls"`, no follow-up
+/// model output), serve still alive. This is the exact shape gh#23's contract
+/// was written from — "settled message + closed feed + serve alive = clean" —
+/// except there the settled message ENDED its turn; here it asks for tools.
+/// The stream stopping must be said out loud (Errored), not folded into a
+/// clean-looking Completed.
+#[cfg(unix)]
+#[tokio::test]
+async fn stream_stopping_after_a_mid_loop_settle_reports_errored() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (controls, steer, _token) = fake_controls();
+    drop(steer); // close the mailbox so the run settles after its turn
+    let events = run_to_end(
+        &harness(),
+        fake_request("scenario:stream-stop-after-tools", &dir),
+        controls,
+    )
+    .await;
+
+    assert!(
+        events.contains(&AgentEvent::ToolResult {
+            id: "prt_tool1".into(),
+            is_error: false
+        }),
+        "tool traffic preceded the stream stop: {events:?}"
+    );
+    match events.last() {
+        Some(AgentEvent::Done {
+            status,
+            error: Some(error),
+            ..
+        }) => {
+            assert_eq!(*status, DoneStatus::Errored, "{events:?}");
+            assert!(
+                error.contains("event stream stopped"),
+                "the message must name the stream as the thing that stopped: {error}"
+            );
+        }
+        other => panic!("expected Errored Done for the mid-stream stop, got {other:?}"),
+    }
+    assert_serve_reaped(&dir).await;
+}
+
 fn real_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
