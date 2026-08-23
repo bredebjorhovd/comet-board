@@ -191,7 +191,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 
 | verb | flags | what it is for |
 | --- | --- | --- |
-| `list` | `--state`, `--source`, `--json` | List what is on the board. `--json` for orchestrating agents |
+| `list` | `--state`, `--source`, `--label`, `--json` | List what is on the board. `--json` for orchestrating agents |
 | `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--decompose`, `--onto`, `--base` | Release a task into a coding-agent chat |
 | `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--decompose`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
