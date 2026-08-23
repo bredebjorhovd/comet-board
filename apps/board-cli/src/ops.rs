@@ -34,6 +34,8 @@ use comet_proto::view::board as view;
 use comet_proto::view::stats::AggregateBoardStats;
 use comet_rpc::{RpcClient, connect_ws, methods};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::time::Duration;
 
 /// The engine answers a `WatchBoard` subscription with the current rows
@@ -278,6 +280,27 @@ pub fn validate_filters(state: Option<&str>, source: Option<&str>) -> Result<()>
     Ok(())
 }
 
+/// The `--label` names, from repeated flags or comma-separated lists. Matching
+/// is case-insensitive and a row must carry every name given (gh#540); unlike
+/// `--state` there is nothing to validate the names against — the board cannot
+/// know which labels exist until it looks — so a misspelling answers an empty
+/// list rather than a refusal.
+pub fn parse_label_filter(raw: &[String]) -> Result<Vec<String>> {
+    let mut wanted = Vec::new();
+    for group in raw {
+        for name in group.split(',') {
+            let name = name.trim();
+            if name.is_empty() {
+                bail!("empty label in --label — name the labels to keep, e.g. --label bug");
+            }
+            if !wanted.iter().any(|w: &String| w.eq_ignore_ascii_case(name)) {
+                wanted.push(name.to_string());
+            }
+        }
+    }
+    Ok(wanted)
+}
+
 fn state_names() -> Vec<&'static str> {
     BoardState::SECTION_ORDER
         .iter()
@@ -285,11 +308,181 @@ fn state_names() -> Vec<&'static str> {
         .collect()
 }
 
-pub fn filter_rows(rows: Vec<TaskRow>, state: Option<&str>, source: Option<&str>) -> Vec<TaskRow> {
+pub fn filter_rows(
+    rows: Vec<TaskRow>,
+    state: Option<&str>,
+    source: Option<&str>,
+    labels: &[String],
+) -> Vec<TaskRow> {
     rows.into_iter()
         .filter(|r| state.is_none_or(|want| r.state == want))
         .filter(|r| source.is_none_or(|want| r.source == want))
+        // Every name given, not any of them: "what bugs are waiting" narrows,
+        // and an OR would quietly widen back to the unfiltered list.
+        .filter(|r| {
+            labels
+                .iter()
+                .all(|want| r.labels.iter().any(|l| l.eq_ignore_ascii_case(want)))
+        })
         .collect()
+}
+
+// ---- the printed list ----------------------------------------------------
+
+/// Width the tag block may take before lower-priority labels are dropped for
+/// `+N` — sized so a tagged row costs about what an untagged one spends on
+/// title.
+const TAG_BUDGET_CHARS: usize = 20;
+
+/// The title never renders below this, however loud the tags are: a row whose
+/// labels ate its subject is a row that says nothing at all.
+const TITLE_MIN_CHARS: usize = 28;
+const TITLE_MAX_CHARS: usize = 48;
+
+/// Labels every printed row carries say nothing *in that view*: with `--state
+/// ready` over one repo's queue, `no-robot` on all of them is furniture, and
+/// hiding it buys back the width the interesting labels need (gh#540). Only
+/// rows that carry labels count — a bare row does not make a shared label
+/// universal — and a lone labeled row hides nothing, because with one row
+/// every fact about it is distinguishing.
+pub fn universal_labels(rows: &[TaskRow]) -> HashSet<String> {
+    let mut shared: Option<HashSet<String>> = None;
+    let mut carriers = 0usize;
+    for r in rows {
+        if r.labels.is_empty() {
+            continue;
+        }
+        carriers += 1;
+        let own: HashSet<String> = r.labels.iter().map(|l| l.to_ascii_lowercase()).collect();
+        shared = Some(match shared {
+            None => own,
+            Some(prev) => prev.intersection(&own).cloned().collect(),
+        });
+    }
+    if carriers < 2 {
+        return HashSet::new();
+    }
+    shared.unwrap_or_default()
+}
+
+/// Which labels lead when space runs short. Sizes first — one or two
+/// characters saying how much work this is — then the kind of work, then
+/// everything else in board order (gh#540).
+fn label_rank(label: &str) -> u8 {
+    match label.to_ascii_lowercase().as_str() {
+        "xs" | "s" | "m" | "l" | "xl" => 0,
+        "bug" | "bughunt" | "enhancement" | "feature" | "design" | "docs" | "build" | "fix"
+        | "chore" | "refactor" | "performance" | "security" | "ux" => 1,
+        _ => 2,
+    }
+}
+
+/// One row's visible labels as `[name]` tokens: highest-signal first, dropped
+/// once the budget is gone, with `+N` owning up to what did not fit. The first
+/// token always shows even past the budget — a long label rendered whole beats
+/// a block of nothing.
+fn tag_block(labels: &[&str]) -> String {
+    let mut ordered: Vec<&&str> = labels.iter().collect();
+    ordered.sort_by_key(|l| label_rank(l));
+
+    let mut out = String::new();
+    let mut dropped = 0usize;
+    for l in ordered {
+        let token = format!("[{l}]");
+        let next = out.chars().count() + usize::from(!out.is_empty()) + token.chars().count();
+        if !out.is_empty() && next > TAG_BUDGET_CHARS {
+            dropped += 1;
+        } else {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(&token);
+        }
+    }
+    if dropped > 0 {
+        out.push_str(&format!(" +{dropped}"));
+    }
+    out
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// One printed line, tags ahead of the title exactly where hand-typed
+/// `[TAG]` prefixes sat before the list learned to render them (gh#540).
+///
+/// Colour is paint: the dim wrap adds bytes but no columns, and only when
+/// stdout can show it.
+fn render_row(r: &TaskRow, hidden: &HashSet<String>, colour: bool) -> String {
+    let extra = match (&r.pr_url, r.dispatchable) {
+        // Two different reasons a row cannot be dispatched, and calling the
+        // second one "no route" would send you to routing.toml for nothing.
+        _ if r.gone => "  (gone upstream)".to_string(),
+        (Some(pr), _) => format!("  {pr}"),
+        (None, false) => "  (no route)".to_string(),
+        _ => String::new(),
+    };
+    // How full the live agent's window is, in the same words the two
+    // viewports use (gh#271) — and only once there is something to say.
+    let extra = match comet_proto::view::board::context_note(r.context) {
+        Some(note) => format!("{extra}  ({note})"),
+        None => extra,
+    };
+    // Which layer of a stack this is, and what merging it would really do
+    // (gh#283). Only for stacked rows: for a standalone pull request
+    // `mergeable_state` says what it appears to say, and the printed list
+    // has never carried it. For a layer it does not — `clean` there is
+    // clean against the layer below — so the row that would mislead is
+    // exactly the row that speaks up. `--json` carries `landing` for all.
+    let extra = match (
+        comet_proto::view::board::stack_note(r),
+        comet_proto::view::board::landing_note(r),
+    ) {
+        (Some(stack), Some(landing)) => format!("{extra}  ({stack}, {landing})"),
+        (Some(stack), None) => format!("{extra}  ({stack})"),
+        (None, _) => extra,
+    };
+
+    let visible: Vec<&str> = r
+        .labels
+        .iter()
+        .filter(|l| !hidden.contains(&l.to_ascii_lowercase()))
+        .map(String::as_str)
+        .collect();
+    let tags = tag_block(&visible);
+    // The tags pay for themselves out of the title's width, down to the floor
+    // where the subject still gets said.
+    let title_budget = TITLE_MAX_CHARS
+        .saturating_sub(tags.chars().count())
+        .max(TITLE_MIN_CHARS);
+    let title_field = truncate(&r.title, title_budget);
+    let tag_field = if tags.is_empty() {
+        String::new()
+    } else if colour {
+        format!("\x1b[2m{tags}\x1b[0m ")
+    } else {
+        format!("{tags} ")
+    };
+    format!(
+        "{:<8} {:<24} {:<10} {}{}{}",
+        r.state,
+        r.id,
+        r.workspace.as_deref().unwrap_or("-"),
+        tag_field,
+        title_field,
+        extra
+    )
+}
+
+/// Whether stdout will honour ANSI dimming: a terminal that has not been told
+/// to keep its colour to itself (`NO_COLOR`, empty meaning unset by convention).
+fn stdout_colours() -> bool {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
 }
 
 pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
@@ -301,53 +494,12 @@ pub fn print_tasks(rows: &[TaskRow], json: bool) -> Result<()> {
         println!("nothing on the board");
         return Ok(());
     }
+    let hidden = universal_labels(rows);
+    let colour = stdout_colours();
     for r in rows {
-        let extra = match (&r.pr_url, r.dispatchable) {
-            // Two different reasons a row cannot be dispatched, and calling the
-            // second one "no route" would send you to routing.toml for nothing.
-            _ if r.gone => "  (gone upstream)".to_string(),
-            (Some(pr), _) => format!("  {pr}"),
-            (None, false) => "  (no route)".to_string(),
-            _ => String::new(),
-        };
-        // How full the live agent's window is, in the same words the two
-        // viewports use (gh#271) — and only once there is something to say.
-        let extra = match comet_proto::view::board::context_note(r.context) {
-            Some(note) => format!("{extra}  ({note})"),
-            None => extra,
-        };
-        // Which layer of a stack this is, and what merging it would really do
-        // (gh#283). Only for stacked rows: for a standalone pull request
-        // `mergeable_state` says what it appears to say, and the printed list
-        // has never carried it. For a layer it does not — `clean` there is
-        // clean against the layer below — so the row that would mislead is
-        // exactly the row that speaks up. `--json` carries `landing` for all.
-        let extra = match (
-            comet_proto::view::board::stack_note(r),
-            comet_proto::view::board::landing_note(r),
-        ) {
-            (Some(stack), Some(landing)) => format!("{extra}  ({stack}, {landing})"),
-            (Some(stack), None) => format!("{extra}  ({stack})"),
-            (None, _) => extra,
-        };
-        println!(
-            "{:<8} {:<24} {:<10} {}{}",
-            r.state,
-            r.id,
-            r.workspace.as_deref().unwrap_or("-"),
-            truncate(&r.title, 48),
-            extra
-        );
+        println!("{}", render_row(r, &hidden, colour));
     }
     Ok(())
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        return s.to_string();
-    }
-    let cut: String = s.chars().take(max.saturating_sub(1)).collect();
-    format!("{cut}…")
 }
 
 // ---- the review contract (§gh#183) --------------------------------------
@@ -2406,17 +2558,51 @@ mod tests {
             linear_row,
         ];
 
-        let ready = filter_rows(rows.clone(), Some("ready"), None);
+        let ready = filter_rows(rows.clone(), Some("ready"), None, &[]);
         assert_eq!(
             ready.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["gh:o/r#1"]
         );
 
-        let linear = filter_rows(rows, None, Some("linear"));
+        let linear = filter_rows(rows, None, Some("linear"), &[]);
         assert_eq!(
             linear.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
             ["linear:AGE-1"]
         );
+    }
+
+    #[test]
+    fn label_filter_requires_every_name_and_ignores_case() {
+        let mut bug = row("gh:o/r#1", "ready");
+        bug.labels = vec!["Bug".into(), "M".into()];
+        let mut other = row("gh:o/r#2", "ready");
+        other.labels = vec!["design".into()];
+        let rows = vec![bug, other];
+
+        let bugs = filter_rows(rows.clone(), None, None, &["bug".into()]);
+        assert_eq!(
+            bugs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["gh:o/r#1"],
+            "matching ignores case"
+        );
+
+        // Every name given, not any of them — an OR would widen back.
+        let both = filter_rows(rows.clone(), None, None, &["BUG".into(), "m".into()]);
+        assert_eq!(
+            both.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["gh:o/r#1"]
+        );
+        let none = filter_rows(rows, None, None, &["bug".into(), "design".into()]);
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn label_names_are_parsed_from_repeats_and_comma_lists() {
+        let parsed = parse_label_filter(&["bug,M".into(), " Design ".into(), "m".into()]).unwrap();
+        assert_eq!(parsed, ["bug", "M", "Design"]);
+        assert!(parse_label_filter(&[]).unwrap().is_empty());
+        let err = parse_label_filter(&["bug,".into()]).unwrap_err();
+        assert!(err.to_string().contains("empty label"));
     }
 
     #[test]
@@ -2747,6 +2933,117 @@ mod tests {
     fn truncate_is_char_safe() {
         assert_eq!(truncate("short", 48), "short");
         assert_eq!(truncate("ålesund", 4), "åle…");
+    }
+
+    // ---- labels on the printed list (gh#540) -----------------------------
+
+    fn render_all(rows: &[TaskRow]) -> Vec<String> {
+        let hidden = universal_labels(rows);
+        rows.iter().map(|r| render_row(r, &hidden, false)).collect()
+    }
+
+    #[test]
+    fn labels_render_ahead_of_the_title_where_hand_typed_tags_used_to_sit() {
+        let mut tagged = row("gh:o/r#1", "ready");
+        tagged.workspace = Some("tally".into());
+        tagged.title = "Fakturahistorikk og kreditering per byrå".into();
+        tagged.labels = vec!["enhancement".into(), "M".into()];
+        let line = render_row(&tagged, &HashSet::new(), false);
+
+        let tags_at = line.find("[M] [enhancement]").expect("size label leads");
+        let title_at = line.find("Fakturahistorikk").unwrap();
+        assert!(
+            tags_at < title_at,
+            "tags sit where people typed them: {line}"
+        );
+    }
+
+    #[test]
+    fn size_and_kind_labels_lead_and_the_rest_become_plus_n() {
+        // Board order is arrival order; sizes lead, kinds follow in board
+        // order, and everything else waits behind `+N`.
+        let labels = ["no-robot", "fms-data", "design", "L", "karsto-rfc", "bug"];
+        assert_eq!(tag_block(&labels), "[L] [design] [bug] +3");
+    }
+
+    #[test]
+    fn a_long_label_shows_whole_rather_than_not_at_all() {
+        assert_eq!(tag_block(&["sprint-robotics"]), "[sprint-robotics]");
+        // And it costs the title, down to the floor.
+        let mut tagged = row("gh:o/r#1", "ready");
+        tagged.title = "x".repeat(60);
+        tagged.labels = vec!["sprint-robotics".into(), "no-robot".into()];
+        let line = render_row(&tagged, &HashSet::new(), false);
+        let title_chars = line.chars().filter(|c| *c == 'x').count();
+        // The ellipsis takes one of the budgeted columns.
+        assert_eq!(title_chars, TITLE_MIN_CHARS - 1);
+    }
+
+    #[test]
+    fn tags_pay_for_themselves_out_of_the_title_width() {
+        // `q` keeps the count out of the state column's way.
+        let mut tagged = row("gh:o/r#1", "ready");
+        tagged.title = "q".repeat(60);
+        tagged.labels = vec!["M".into(), "bug".into()];
+        let line = render_row(&tagged, &HashSet::new(), false);
+        let budget = TITLE_MAX_CHARS - "[M] [bug]".len();
+        assert_eq!(
+            line.chars().filter(|c| *c == 'q').count(),
+            budget - 1,
+            "the ellipsis takes one of the budgeted columns"
+        );
+
+        // Untagged rows keep the full width.
+        let mut plain = row("gh:o/r#2", "ready");
+        plain.title = "z".repeat(60);
+        let line = render_row(&plain, &HashSet::new(), false);
+        assert_eq!(
+            line.chars().filter(|c| *c == 'z').count(),
+            TITLE_MAX_CHARS - 1
+        );
+    }
+
+    #[test]
+    fn labels_shared_by_every_labeled_row_are_hidden_from_that_view() {
+        let mut a = row("gh:o/r#1", "ready");
+        a.labels = vec!["no-robot".into(), "fms-data".into(), "L".into()];
+        let mut b = row("gh:o/r#2", "ready");
+        b.labels = vec!["NO-ROBOT".into(), "fms-data".into()];
+        let rows = vec![a.clone(), b.clone()];
+
+        let shared = universal_labels(&rows);
+        assert_eq!(
+            shared,
+            HashSet::from(["no-robot".into(), "fms-data".into()])
+        );
+
+        let lines = render_all(&rows);
+        assert!(
+            !lines[0].contains("no-robot"),
+            "constant across view: {lines:?}"
+        );
+        assert!(lines[0].contains("[L]"), "the distinguishing one stays");
+
+        // One labeled row hides nothing — every fact about it distinguishes.
+        assert!(universal_labels(&[a.clone()]).is_empty());
+        // A bare row does not make the others' labels universal.
+        let bare = row("gh:o/r#3", "ready");
+        assert!(universal_labels(&[a.clone(), bare]).is_empty());
+    }
+
+    #[test]
+    fn colour_wraps_the_tags_without_changing_the_columns() {
+        let mut tagged = row("gh:o/r#1", "ready");
+        tagged.labels = vec!["bug".into()];
+        tagged.title = "Fix the flake".into();
+        let dimmed = render_row(&tagged, &HashSet::new(), true);
+        let plain = render_row(&tagged, &HashSet::new(), false);
+        assert!(dimmed.contains("\x1b[2m[bug]\x1b[0m Fix the flake"));
+        assert_eq!(
+            dimmed.replace("\x1b[2m", "").replace("\x1b[0m", ""),
+            plain,
+            "paint only — never layout"
+        );
     }
 
     // ---- the review, as a reader sees it (§gh#183) ----------------------

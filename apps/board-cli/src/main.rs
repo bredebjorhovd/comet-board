@@ -103,6 +103,12 @@ enum Command {
         /// Only this source: github, or linear for legacy rows.
         #[arg(long)]
         source: Option<String>,
+        /// Only rows carrying every one of these labels — repeat the flag or
+        /// separate names with commas (`--label bug --label M`). Case does not
+        /// matter; a misspelled name answers an empty list, since the board
+        /// cannot know which labels exist until it looks (gh#540).
+        #[arg(long)]
+        label: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -849,15 +855,17 @@ fn main() -> Result<()> {
         Command::List {
             state,
             source,
+            label,
             json,
         } => {
             ops::validate_filters(state.as_deref(), source.as_deref())?;
+            let labels = ops::parse_label_filter(&label)?;
             let rows = runtime.block_on(async {
                 let board = ops::attach(port, device).await?;
                 ops::board_rows(&board).await
             })?;
             ops::print_tasks(
-                &ops::filter_rows(rows, state.as_deref(), source.as_deref()),
+                &ops::filter_rows(rows, state.as_deref(), source.as_deref(), &labels),
                 json,
             )
         }
