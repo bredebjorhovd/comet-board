@@ -203,7 +203,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `new <title>` | `--body`, `--label`, `--source`, `--repo`, `--dispatch` | Write a ticket. Cheaper than not writing one |
 | `stats` | `--since-days`, `--all-boards`, `--json` | What the board knows about its own throughput |
 | `doctor` | — | Check the environment: keys, engine, routes, repos. Exits non-zero on any failing check |
-| `relogin [target]` | — | Re-sign one agent-account login on this device: the guided OAuth flow for its harness, verified against the provider before success is declared (gh#576) |
+| `relogin [target] [detail]` | — | Re-sign one agent-account login on this device: the guided OAuth flow for its harness, verified against the provider before success is declared (gh#576). Harness-first targets (gh#585): `relogin claude` / `relogin codex`; a second word picks within a harness |
 | `init` | `--force` | Generate a starter routing.toml from the spaces on this device |
 | `routes` | — | Read and change the board's `routing.toml` — over the RPC, so `--device` reaches the box that hosts the board (gh#75) |
 | `routes list` | `--json` | The routes in force, what is wrong with the config, and what is not routed yet |
