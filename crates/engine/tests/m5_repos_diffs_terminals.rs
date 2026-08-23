@@ -783,6 +783,204 @@ async fn a_reclaimed_worktree_releases_its_watchers_at_once() {
     core.shutdown().await;
 }
 
+/// gh#571: watcher eligibility excludes archived chats. The bounded FsWatcher
+/// (gh#552) made slots scarce — 96 by default — so a chat that is dead but
+/// still names a checkout must not keep holding one. Archiving the last
+/// eligible chat of a checkout closes its entry (the watchers go back with
+/// it), archiving costs zero git probes from then on, and unarchiving
+/// reclaims eligibility: the entry re-forms on the next pass, which for the
+/// repair-tick shape (`reconcile_now`, refresh=true) is exactly how a missed
+/// change event gets picked up too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_chat_never_holds_a_watcher_slot_and_unarchive_reclaims_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("archived-repo");
+    init_repo(&repo_dir).await;
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-archive",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    // cwd defaults to the space path — the checkout under test.
+    core.workspace
+        .create_chat("chat-archive", "space-archive", None, None)
+        .expect("chat row");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkout entry never formed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // Archive: the same doc-commit → chat-watch path that drives every
+    // reconcile carries it, and the entry's slot must come straight back.
+    core.workspace
+        .set_chat_archived("chat-archive", true)
+        .expect("archive");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "archived chat still holds its checkout entry (and its watcher slot)"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(
+        core.diff_sync.watch_diffs().borrow().len(),
+        0,
+        "the archived checkout's published diff is dropped with its entry"
+    );
+
+    // Dead means dead: repeated repair passes over an all-archived roster
+    // must not probe the checkout at all. `resolve_identity` is what runs
+    // for an eligible chat's cwd — the stat gate and the git spawn alike —
+    // and it never runs for an archived chat, so nothing repopulates the
+    // cwd cache the release prune emptied. That cache count is the
+    // deterministic observable here: counting Repos' git spawns races the
+    // spaces-sync debounced recheck over the same still-existing tree (the
+    // gh#526 sweep makes its background spawns fail; this checkout is
+    // alive, so they land whenever a loaded runner gets around to them).
+    for _ in 0..3 {
+        core.diff_sync.reconcile_now().await;
+        assert_eq!(
+            core.diff_sync.cached_cwd_count(),
+            0,
+            "an archived chat's cwd was resolved — statted or probed with git — on a \
+             reconcile pass"
+        );
+    }
+
+    // Unarchive reclaims eligibility — the entry re-forms, watchers included.
+    core.workspace
+        .set_chat_archived("chat-archive", false)
+        .expect("unarchive");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unarchived chat never regained its checkout entry"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    // …and reclaim goes through the same resolution path: the prune left the
+    // cache empty, so a formed entry means the cwd was asked about again.
+    assert_eq!(
+        core.diff_sync.cached_cwd_count(),
+        1,
+        "the unarchived chat's cwd was not resolved again"
+    );
+    core.shutdown().await;
+}
+
+/// gh#571: the slot belongs to the CHECKOUT while any eligible chat needs it.
+// Two chats sharing one checkout release it only when the LAST eligible one
+// archives; a single archive among live siblings must not flap the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shared_checkout_releases_only_when_its_last_eligible_chat_archives() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("shared-repo");
+    init_repo(&repo_dir).await;
+
+    let core = assemble(&tmp.path().join("data"));
+    core.workspace
+        .create_space(
+            "space-shared",
+            &core.device_id,
+            &repo_dir.to_string_lossy(),
+            None,
+            true,
+        )
+        .expect("space row");
+    // Both chats default to the space path — one checkout between them.
+    core.workspace
+        .create_chat("chat-shared-a", "space-shared", None, None)
+        .expect("chat row");
+    core.workspace
+        .create_chat("chat-shared-b", "space-shared", None, None)
+        .expect("chat row");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "shared checkout entry never formed"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // One archive among live siblings: the entry stays.
+    core.workspace
+        .set_chat_archived("chat-shared-a", true)
+        .expect("archive first");
+    for _ in 0..3 {
+        core.diff_sync.reconcile_now().await;
+        assert_eq!(
+            core.diff_sync.tracked_checkout_count(),
+            1,
+            "a sibling's archive must not drop a still-eligible checkout"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // Last eligible chat archives: the entry (and its slot) goes.
+    core.workspace
+        .set_chat_archived("chat-shared-b", true)
+        .expect("archive last");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 0 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "checkout entry survived its last eligible chat's archive"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // …and unarchiving either sibling rebuilds it.
+    core.workspace
+        .set_chat_archived("chat-shared-a", false)
+        .expect("unarchive first");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        core.diff_sync.reconcile_now().await;
+        if core.diff_sync.tracked_checkout_count() == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "unarchived sibling never reclaimed eligibility"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    core.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Terminals
 // ---------------------------------------------------------------------------

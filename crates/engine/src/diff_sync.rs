@@ -2,7 +2,8 @@
 //! §3.5; port of comet's `checkout-diff-sync.ts` + `git-metadata-sync.ts`).
 //!
 //! Chats do not own working-tree state: a concrete Git checkout does. This service
-//! groups this device's chats by their canonical checkout identity (`chat.cwd` →
+//! groups this device's *eligible* chats (non-archived — gh#571) by their
+//! canonical checkout identity (`chat.cwd` →
 //! [`Repos::checkout_identity`]), computes one bounded atomic snapshot per checkout,
 //! and publishes it three ways:
 //!
@@ -127,7 +128,7 @@ struct DiffSyncInner {
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
     /// chat cwd → its last resolution (see [`CachedCwd`]). Pruned each
-    /// reconcile to the cwds chats still name.
+    /// reconcile to the cwds *eligible* chats still name.
     identities: Mutex<HashMap<String, CachedCwd>>,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
 }
@@ -291,11 +292,18 @@ async fn resolve_identity(
 /// repair tick (and `reconcile_now`), false on the per-chat-change reconciles
 /// the cache exists to keep cheap.
 async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, refresh: bool) {
-    // Group this device's cwd-bearing chats by canonical checkout identity.
+    // Group this device's eligible chats by canonical checkout identity.
+    // Eligibility is recomputed from the live rows on every pass (gh#571): an
+    // archived chat claims nothing — no watcher slot, no sidecar publish, no
+    // branch/checkoutId upkeep — so archiving a checkout's last eligible chat
+    // closes its entry here and drops its watchers back into the budget, and
+    // unarchiving re-forms it on this or the repair-tick pass. The archive
+    // itself needs no new plumbing: it is an ordinary workspace doc commit,
+    // so the same chat-watch change that drives every reconcile carries it.
     let mut groups: HashMap<String, (CheckoutIdentity, Vec<Chat>)> = HashMap::new();
     let mut named_cwds: HashSet<String> = HashSet::new();
     for chat in chats {
-        if chat.device_id != inner.device_id {
+        if chat.device_id != inner.device_id || chat.archived {
             continue;
         }
         let Some(cwd) = chat.cwd.clone() else {
@@ -317,7 +325,8 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>, refresh: bool) 
             .1
             .push(chat);
     }
-    // Cwds no chat names anymore have nothing left to cache for.
+    // Cwds no eligible chat names anymore have nothing left to cache for —
+    // an archived chat's resolution goes with it and is re-asked on unarchive.
     lock(&inner.identities).retain(|cwd, _| named_cwds.contains(cwd));
 
     // Close entries whose checkout no longer has chats; drop their published diff.
