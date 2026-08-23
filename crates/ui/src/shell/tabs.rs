@@ -581,9 +581,12 @@ impl Shell {
             )
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .on_click(cx.listener(|_this, _, _, cx| {
+            .on_click(cx.listener(|_this, _, window, cx| {
                 cx.stop_propagation();
-                cx.dispatch_action(&crate::commands::NEW_SESSION.action());
+                // Deferred: dispatching through `App` here would re-enter the
+                // window update this click is already running inside, which
+                // fails silently and drops the action (gh#575).
+                window.dispatch_action(Box::new(crate::commands::NewSession), cx);
             }))
             .child(
                 icon(icons::PLUS)
