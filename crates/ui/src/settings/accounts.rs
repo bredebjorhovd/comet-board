@@ -37,8 +37,8 @@ use comet_board::config::{AccountConfig, RoutingConfig};
 use comet_proto::view::board;
 use comet_proto::view::rates::human_usd;
 use comet_proto::{
-    AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentAccount, AgentAccountHealth, AgentAccountState, AgentAccountsSnapshot, AgentLoginMode,
+    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, HarnessId,
 };
 use comet_rpc::methods;
 use serde::Deserialize;
@@ -220,11 +220,7 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 /// rolling five-hour allowance "Session"; the supplied Settings design names
 /// the duration instead.
 pub fn usage_window_label(label: &str) -> &str {
-    if label == "Session" {
-        "5 hours"
-    } else {
-        label
-    }
+    if label == "Session" { "5 hours" } else { label }
 }
 
 /// The provider cards, in display order: (harness, name, CLI command — named
@@ -259,6 +255,225 @@ pub fn provider_accounts(
 }
 
 // ---------------------------------------------------------------------------
+// Pure: per-slot freshness (gh#599)
+//
+// The engine mints the verdict (`VerifyAgentAccounts`, gh#576 — the same RPC
+// `comet-board doctor` renders per line); this page only translates it into a
+// badge and a repair. Every rule below is a pure function of the wire shapes.
+// ---------------------------------------------------------------------------
+
+/// What a slot's saved login is worth right now, as [`AgentAccountState`]
+/// maps onto this page's badges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Freshness {
+    /// The provider accepted the stored credential just now, or it carries no
+    /// expiring token.
+    Verified,
+    /// The provider refused it: the next run under this login dies. Re-sign.
+    Stale,
+    /// No verdict — the probe could not run. Reported as such, never guessed.
+    Unverified,
+}
+
+impl Freshness {
+    /// The badge's word. Three words for three states, matching doctor's
+    /// ok / STALE / not verified vocabulary rather than inventing a GUI one.
+    pub fn label(self) -> &'static str {
+        match self {
+            Freshness::Verified => "Verified",
+            Freshness::Stale => "Stale",
+            Freshness::Unverified => "Not verified",
+        }
+    }
+}
+
+/// The badge a verdict renders as. Verified wears the settled hue — the same
+/// ramp as the Active pill it sits beside; Stale the blocked one; and a
+/// non-verdict stays the plain hairline badge, because "not checked" is not a
+/// colour on this page (gh#178's rule, applied to gh#576's verdicts).
+fn freshness_badge(freshness: Freshness, theme: &Theme) -> AnyElement {
+    use crate::settings::widgets;
+    let label = freshness.label();
+    match freshness {
+        Freshness::Verified => widgets::badge_active(theme, label).into_any_element(),
+        Freshness::Stale => widgets::badge_stale(theme, label).into_any_element(),
+        Freshness::Unverified => widgets::badge(theme, label).into_any_element(),
+    }
+}
+
+/// One row's badge state: the slot's verdict when the page holds one.
+///
+/// `None` — the probe has not answered yet, or the slot was not in the reply —
+/// is no badge at all. Absence reads as nothing here; it must never read as
+/// fine, which is why the badge appears only when the engine has said
+/// something.
+pub fn freshness(health: Option<&AgentAccountHealth>) -> Option<Freshness> {
+    Some(match health?.state {
+        AgentAccountState::Ok => Freshness::Verified,
+        AgentAccountState::Stale => Freshness::Stale,
+        AgentAccountState::Unknown => Freshness::Unverified,
+    })
+}
+
+/// Which slot a finished login actually landed in (gh#599): the asked-for one
+/// when its snapshot moved past the watermark, else whichever other slot did.
+///
+/// A login flow writes the account that was signed into, not the row it was
+/// asked for — so an operator who signs into the wrong account gets told which
+/// slot they DID just refreshed, exactly what `comet-board relogin` reports.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Landing {
+    /// The named slot is the one that moved.
+    Requested(AgentAccount),
+    /// A different slot moved — name it out loud.
+    Elsewhere(AgentAccount),
+    /// Nothing on this device changed.
+    Nowhere,
+}
+
+/// Resolve [`Landing`] against the pre-login watermark (`before_max_saved`):
+/// the largest `saved_at` across the accounts list before the flow started.
+/// Pure given the inputs, so the wrong-account rule is pinned by test rather
+/// than by hope.
+pub fn landing(accounts: &[AgentAccount], wanted: &str, before_max_saved: i64) -> Landing {
+    let moved = |a: &AgentAccount| a.saved_at.is_some_and(|at| at > before_max_saved);
+    let wanted_moved = accounts
+        .iter()
+        .find(|a| a.id == wanted && moved(a))
+        .cloned();
+    if let Some(account) = wanted_moved {
+        return Landing::Requested(account);
+    }
+    match accounts.iter().find(|a| moved(a)) {
+        Some(account) => Landing::Elsewhere(account.clone()),
+        None => Landing::Nowhere,
+    }
+}
+
+/// How a re-sign ended, after the engine said what actually happened. The
+/// verify-before-done guarantee from the CLI verb, rendered instead of printed:
+/// success exists only in the shape where the provider accepted the fresh
+/// login AND it is the slot that was asked about.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReSignOutcome {
+    /// Provider accepted the fresh credential, and it is the requested slot.
+    Verified { who: String, detail: String },
+    /// A login completed and even verified — but it is NOT the slot that was
+    /// asked about. The headline names the slot that actually moved.
+    WrongSlot {
+        who: String,
+        wanted: String,
+        verified: bool,
+    },
+    /// The requested slot moved, but verification did not pass.
+    Stale { who: String, detail: String },
+    /// Something moved but the engine could not be asked to verify it.
+    Unverified { who: String },
+    /// The flow completed without any slot changing on this device.
+    NoChange,
+    /// The post-flight reload itself failed — nothing is claimed either way.
+    Failed(String),
+}
+
+impl ReSignOutcome {
+    /// Only a verified, right-slot landing is a success. Everything else says
+    /// what happened instead.
+    pub fn ok(&self) -> bool {
+        matches!(self, ReSignOutcome::Verified { .. })
+    }
+
+    /// The one sentence the dialog leads with — who moved, and what that is
+    /// worth. Pure; tested like the rest.
+    pub fn headline(&self) -> String {
+        match self {
+            ReSignOutcome::Verified { who, .. } => {
+                format!("Signed in as {who} — this slot is verified working.")
+            }
+            ReSignOutcome::WrongSlot {
+                who,
+                wanted,
+                verified: _,
+            } => format!(
+                "Signed in as {who} — but that is NOT slot {wanted}. You signed into a \
+                 different account; the asked-for slot still holds its old login."
+            ),
+            ReSignOutcome::Stale { who, .. } => {
+                format!("Signed in as {who}, but the fresh login did not pass verification.")
+            }
+            ReSignOutcome::Unverified { who } => format!(
+                "Signed in as {who}, but the engine could not verify it just now — \
+                 reopen this page to check the slot."
+            ),
+            ReSignOutcome::NoChange => {
+                "The sign-in finished, but no slot changed on this device.".to_string()
+            }
+            ReSignOutcome::Failed(err) => format!("Could not check what happened: {err}"),
+        }
+    }
+
+    /// The evidence line under the headline, where there is one — the same
+    /// provider sentence a doctor line would quote.
+    pub fn detail(&self) -> Option<String> {
+        match self {
+            ReSignOutcome::Verified { detail, .. } | ReSignOutcome::Stale { detail, .. } => {
+                Some(detail.clone())
+            }
+            // The wrong-account landing still says whether IT verified, so a
+            // reader knows the stray login is healthy and merely misplaced.
+            ReSignOutcome::WrongSlot { verified: true, .. } => Some(
+                "That new login itself verified fine — it is just not the one you meant."
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+}
+
+/// Compose the outcome from the landing and the slot's health verdict.
+///
+/// `None` health means the verify probe never answered; that keeps every
+/// non-`Ok` verdict honest without inventing one (gh#576's rule, carried to
+/// the dialog).
+pub fn resign_outcome(
+    wanted: &str,
+    land: Landing,
+    health: Option<AgentAccountHealth>,
+) -> ReSignOutcome {
+    let who = |a: &AgentAccount| {
+        a.email
+            .clone()
+            .or_else(|| a.display_name.clone())
+            .unwrap_or_else(|| a.id.clone())
+    };
+    let moved = match land {
+        Landing::Nowhere => return ReSignOutcome::NoChange,
+        Landing::Requested(account) | Landing::Elsewhere(account) => account,
+    };
+    if moved.id != wanted {
+        // The landing names another slot than the one asked about — the
+        // Elsewhere case [`landing`] produces, plus a defensive repeat for any
+        // hand-built Requested that does not match. It reads as the stray
+        // login it is: named out loud, never rendered as a fix.
+        return ReSignOutcome::WrongSlot {
+            who: who(&moved),
+            wanted: wanted.to_string(),
+            verified: health.is_some_and(|h| h.state == AgentAccountState::Ok),
+        };
+    }
+    match health {
+        Some(h) if h.state == AgentAccountState::Ok => ReSignOutcome::Verified {
+            who: who(&moved),
+            detail: h.detail,
+        },
+        Some(h) => ReSignOutcome::Stale {
+            who: who(&moved),
+            detail: h.detail,
+        },
+        None => ReSignOutcome::Unverified { who: who(&moved) },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
 
@@ -289,21 +504,63 @@ enum LoginFlow {
         message: Option<SharedString>,
         error: Option<SharedString>,
     },
+    /// Re-sign (gh#599): the transport finished; the verify-before-done pass —
+    /// reload, find which slot moved, put its credential to the provider — is
+    /// running. The dialog holds until it answers.
+    Verifying { resign: Box<Resign> },
+    /// Re-sign (gh#599): verified, and here is what actually happened — the
+    /// same verdict `comet-board relogin` prints, rendered where the flow ran.
+    Settled {
+        outcome: ReSignOutcome,
+        resign: Box<Resign>,
+    },
+}
+
+/// What re-signing one slot tracks that adding an account does not (gh#599).
+#[derive(Debug, Clone)]
+struct Resign {
+    /// The slot asked to re-sign — not necessarily the one the login writes.
+    wanted: String,
+    /// How the row names it, for the dialog title.
+    label: String,
+    /// The largest `saved_at` across the device's slots before the flow
+    /// started: whichever snapshot moves past this is the one this login
+    /// landed in ([`landing`]).
+    before_max_saved: i64,
 }
 
 impl LoginFlow {
-    /// Dialog title (comet: "Add Claude account" / "Add Codex account").
-    fn title(&self) -> &'static str {
-        let harness = match self {
+    /// Dialog title (comet: "Add Claude account" / "Add Codex account"); a
+    /// re-sign names the slot instead of the act of adding.
+    fn title(&self) -> String {
+        match self {
+            LoginFlow::Verifying { resign } | LoginFlow::Settled { resign, .. } => {
+                format!("Re-sign {}", resign.label)
+            }
             LoginFlow::Starting { harness }
             | LoginFlow::PasteCode { harness, .. }
             | LoginFlow::Browser { harness, .. }
-            | LoginFlow::DeviceCode { harness, .. } => *harness,
-        };
-        match harness {
-            HarnessId::Codex => "Add Codex account",
-            HarnessId::Opencode => "OpenCode sign-in",
-            _ => "Add Claude account",
+            | LoginFlow::DeviceCode { harness, .. } => {
+                let harness = *harness;
+                match harness {
+                    HarnessId::Codex => "Add Codex account".to_string(),
+                    HarnessId::Opencode => "OpenCode sign-in".to_string(),
+                    _ => "Add Claude account".to_string(),
+                }
+            }
+        }
+    }
+
+    /// The login id a Cancel has to name at the engine — absent once the
+    /// transport is over (`Verifying`/`Settled` have nothing left to cancel).
+    fn login_id(&self) -> Option<&str> {
+        match self {
+            LoginFlow::PasteCode { start, .. }
+            | LoginFlow::Browser { start, .. }
+            | LoginFlow::DeviceCode { start, .. } => Some(start.login_id.as_str()),
+            LoginFlow::Starting { .. }
+            | LoginFlow::Verifying { .. }
+            | LoginFlow::Settled { .. } => None,
         }
     }
 }
@@ -367,9 +624,18 @@ pub struct AccountsPage {
     /// follows the same mouse-down from instantly reopening the menu.
     device_menu_dismissed_at: Option<std::time::Instant>,
     snapshot: Loadable<AgentAccountsSnapshot>,
+    /// Per-slot freshness verdicts (gh#599), keyed by slot id, from
+    /// `VerifyAgentAccounts` — the same RPC doctor's per-login lines quote.
+    /// Cleared when a fetch fails: an absent badge is no verdict, never a
+    /// stale "fine" left behind by a dead engine.
+    health: BTreeMap<String, AgentAccountHealth>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
+    /// Set while this page's login flow re-signs an existing slot rather than
+    /// adding a new account (gh#599). Read at completion to switch from
+    /// close-and-refresh to verify-and-report; rendered beside the flow copy.
+    resign: Option<Resign>,
     /// What each login's subscription costs (gh#178) — read from, and written
     /// to, the board's `routing.toml`.
     plans: Plans,
@@ -377,6 +643,7 @@ pub struct AccountsPage {
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
+    health_task: Option<Task<()>>,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     /// The board-config read/write runs on its own slot: dropping a gpui `Task`
@@ -410,13 +677,16 @@ impl AccountsPage {
             device_menu_open: false,
             device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
+            health: BTreeMap::new(),
             busy_account: None,
             login: None,
+            resign: None,
             plans: Plans::default(),
             plan_dialog: None,
             error: None,
             code_input,
             load_task: None,
+            health_task: None,
             action_task: None,
             poll_task: None,
             plan_task: None,
@@ -596,10 +866,13 @@ impl AccountsPage {
         }
         self.target_device = target;
         // A different device = a different accounts world: drop in-flight
-        // login/action state and reload with a forced usage probe (the new
-        // device's cache is cold).
+        // login/action state (and the other device's freshness verdicts with
+        // it) and reload with a forced usage probe (the new device's cache is
+        // cold).
         self.login = None;
+        self.resign = None;
         self.busy_account = None;
+        self.health.clear();
         self.error = None;
         self.load(force_usage_for(LoadTrigger::Mount), cx);
     }
@@ -794,7 +1067,44 @@ impl AccountsPage {
             })
             .ok();
         }));
+        self.load_health(cx);
         cx.notify();
+    }
+
+    /// Ask the engine to mint a freshness verdict per slot (gh#599) —
+    /// `VerifyAgentAccounts` with no id, exactly what doctor's per-login lines
+    /// are made of. Read-only by design (no refresh grant is exercised), so it
+    /// is safe beside a live run.
+    ///
+    /// Runs on its own task next to the list load, and clears whatever it held
+    /// when it fails: an absent badge is "not checked", which is the truth,
+    /// while a kept badge would be a verdict the engine no longer stands
+    /// behind.
+    fn load_health(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let params = self.params(serde_json::json!({}));
+        self.health_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::VERIFY_AGENT_ACCOUNTS, params)
+                .await;
+            this.update(cx, |page, cx| {
+                page.health = match result
+                    .ok()
+                    .and_then(|value| serde_json::from_value::<Vec<AgentAccountHealth>>(value).ok())
+                {
+                    Some(verdicts) => verdicts
+                        .into_iter()
+                        .map(|h| (h.id.clone(), h))
+                        .collect::<BTreeMap<_, _>>(),
+                    None => BTreeMap::new(),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Switch / Forget an account.
@@ -832,10 +1142,42 @@ impl AccountsPage {
 
     // ---- add-account flows ----
 
-    fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+    /// Re-sign one saved slot (gh#599): the same START_AGENT_LOGIN walk as
+    /// adding an account, but tracked so the ending can say what actually
+    /// happened — which slot moved, and whether its fresh login works.
+    fn start_resign(&mut self, account: &AgentAccount, cx: &mut Context<Self>) {
+        let before_max_saved = self
+            .snapshot
+            .ready()
+            .map(|s| {
+                s.accounts
+                    .iter()
+                    .filter_map(|a| a.saved_at)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        let label = account
+            .email
+            .clone()
+            .or_else(|| account.display_name.clone())
+            .unwrap_or_else(|| account.id.clone());
+        self.resign = Some(Resign {
+            wanted: account.id.to_string(),
+            label,
+            before_max_saved,
+        });
+        let resign = self.resign.take();
+        self.start_login(account.harness, resign, cx);
+    }
+
+    fn start_login(&mut self, harness: HarnessId, re_sign: Option<Resign>, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        // The flow's identity is decided here, once: a failed start leaves
+        // nothing behind for the next dialog to inherit.
+        self.resign = re_sign;
         self.login = Some(LoginFlow::Starting { harness });
         self.error = None;
         let params = self.params(serde_json::json!({ "harness": harness }));
@@ -922,8 +1264,14 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 match result {
                     Ok(_) => {
-                        page.login = None;
-                        page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                        // A re-sign does not close on transport success: the
+                        // verify-before-done pass runs first (gh#599).
+                        if let Some(resign) = page.resign.take() {
+                            page.finish_resign(resign, cx);
+                        } else {
+                            page.login = None;
+                            page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                        }
                     }
                     Err(err) => {
                         if let Some(LoginFlow::PasteCode {
@@ -940,6 +1288,102 @@ impl AccountsPage {
             .ok();
         }));
         cx.notify();
+    }
+
+    /// The verify-before-done pass (gh#599), run once a re-sign's transport
+    /// has finished: reload the accounts, find which slot actually moved past
+    /// the pre-login watermark, put that slot's stored credential to its
+    /// provider, and only then render what happened — including the
+    /// wrong-account verdict, which names the slot that DID move.
+    ///
+    /// The dialog stays up throughout ([`LoginFlow::Verifying`]) and lands in
+    /// [`LoginFlow::Settled`] with the outcome; the list and freshness badges
+    /// refresh underneath either way.
+    fn finish_resign(&mut self, resign: Resign, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.login = Some(LoginFlow::Verifying {
+            resign: Box::new(resign.clone()),
+        });
+        cx.notify();
+        // Both calls follow the switcher's passthrough, so a re-sign of
+        // another device's slot verifies over there too.
+        let target = self.target_device.clone();
+        let mut list_params = serde_json::json!({});
+        if let (Some(host), Some(object)) = (target.as_deref(), list_params.as_object_mut()) {
+            object.insert("targetDeviceId".into(), serde_json::json!(host));
+        }
+        cx.spawn(async move |this, cx| {
+            // 1. Which slot moved?
+            let accounts: Option<Vec<AgentAccount>> = engine
+                .client()
+                .call(methods::LIST_AGENT_ACCOUNTS, list_params)
+                .await
+                .ok()
+                .and_then(|value| {
+                    serde_json::from_value::<AgentAccountsSnapshot>(value)
+                        .ok()
+                        .map(|snapshot| snapshot.accounts)
+                });
+            let land = accounts
+                .as_deref()
+                .map(|accounts| landing(accounts, &resign.wanted, resign.before_max_saved));
+            // 2. Put whichever slot moved to its provider. Nothing moved (or
+            // the list would not reload) — nothing to verify.
+            let verify_id = match &land {
+                Some(Landing::Requested(account)) | Some(Landing::Elsewhere(account)) => {
+                    Some(account.id.clone())
+                }
+                _ => None,
+            };
+            let health: Option<AgentAccountHealth> = match verify_id {
+                None => None,
+                Some(id) => {
+                    let mut params = serde_json::json!({ "accountId": id });
+                    if let (Some(host), Some(object)) = (target.as_deref(), params.as_object_mut())
+                    {
+                        object.insert("targetDeviceId".into(), serde_json::json!(host));
+                    }
+                    engine
+                        .client()
+                        .call(methods::VERIFY_AGENT_ACCOUNTS, params)
+                        .await
+                        .ok()
+                        .and_then(|value| {
+                            serde_json::from_value::<Vec<AgentAccountHealth>>(value)
+                                .ok()
+                                .and_then(|all| all.into_iter().find(|h| h.id == id))
+                        })
+                }
+            };
+            // 3. Compose the verdict. A failed reload is `Failed`, not
+            // `NoChange` — "could not ask" and "nothing happened" are
+            // different facts.
+            let outcome = match land {
+                None => ReSignOutcome::Failed("the account list would not reload".to_string()),
+                Some(land) => resign_outcome(&resign.wanted, land, health),
+            };
+            this.update(cx, |page, cx| {
+                // The dialog may have been closed while verifying ran; only a
+                // still-open Verifying for THIS slot becomes its verdict.
+                let still_open = matches!(
+                    &page.login,
+                    Some(LoginFlow::Verifying { resign: pending })
+                        if pending.wanted == resign.wanted
+                );
+                if still_open {
+                    page.login = Some(LoginFlow::Settled {
+                        outcome,
+                        resign: Box::new(resign),
+                    });
+                }
+                page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The wait loop shared by both poll-shaped flows (browser callback and
@@ -975,9 +1419,16 @@ impl AccountsPage {
                     }) {
                         Some(poll) => match poll.status {
                             AgentLoginStatus::Done => {
-                                page.login = None;
-                                page.load(force_usage_for(LoadTrigger::PostLogin), cx);
-                                cx.notify();
+                                // A re-sign does not close on transport
+                                // success: verify before declaring anything
+                                // (gh#599).
+                                if let Some(resign) = page.resign.take() {
+                                    page.finish_resign(resign, cx);
+                                } else {
+                                    page.login = None;
+                                    page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                                    cx.notify();
+                                }
                                 true
                             }
                             AgentLoginStatus::Error => {
@@ -1017,12 +1468,14 @@ impl AccountsPage {
     }
 
     fn cancel_login(&mut self, cx: &mut Context<Self>) {
-        let login_id = match &self.login {
-            Some(LoginFlow::PasteCode { start, .. })
-            | Some(LoginFlow::Browser { start, .. })
-            | Some(LoginFlow::DeviceCode { start, .. }) => Some(start.login_id.clone()),
-            _ => None,
-        };
+        // A re-sign abandoned mid-flow is just an add-account dialog closed:
+        // nothing landed yet, so nothing is verified or reported.
+        let login_id = self
+            .login
+            .as_ref()
+            .and_then(LoginFlow::login_id)
+            .map(str::to_string);
+        self.resign = None;
         self.login = None;
         self.poll_task = None;
         if let (Some(login_id), Some(engine)) = (login_id, self.state.read(cx).engine().cloned()) {
@@ -1067,7 +1520,9 @@ impl AccountsPage {
                     .w(px(METER_LABEL_WIDTH))
                     .flex_none()
                     .truncate()
-                    .child(SharedString::from(usage_window_label(&window.label).to_string())),
+                    .child(SharedString::from(
+                        usage_window_label(&window.label).to_string(),
+                    )),
             )
             .child(
                 div()
@@ -1148,6 +1603,7 @@ impl AccountsPage {
             .into();
         let switch_account = account.clone();
         let forget_account = account.clone();
+        let resign_account = account.clone();
         let has_usage = !account.usage_windows.is_empty();
 
         let badges = div()
@@ -1160,6 +1616,33 @@ impl AccountsPage {
             })
             .when_some(account.plan_label.clone(), |el, plan| {
                 el.child(widgets::badge(theme, plan))
+            })
+            // Per-slot freshness (gh#599): the engine's verdict, minted by
+            // `VerifyAgentAccounts` — the same one doctor's lines quote. No
+            // badge until it has answered: absence is "not checked", never a
+            // claim of health.
+            .when_some(
+                freshness(self.health.get(account.id.as_str())),
+                |el, fresh| el.child(freshness_badge(fresh, theme)),
+            );
+
+        // The verdict's own sentence, where there is one worth reading under a
+        // badge that is not quietly fine — what was asked of which provider,
+        // and what came back. A refusal speaks in the blocked tone; a
+        // non-verdict is a notice, not a failure.
+        let health_note = self
+            .health
+            .get(account.id.as_str())
+            .filter(|h| h.state != AgentAccountState::Ok)
+            .map(|h| {
+                (
+                    h.detail.clone(),
+                    if h.state == AgentAccountState::Stale {
+                        theme.danger_text()
+                    } else {
+                        theme.text_subtle
+                    },
+                )
             });
 
         // What this subscription costs (gh#178), under the meters that spend
@@ -1190,67 +1673,90 @@ impl AccountsPage {
                 .into_any_element()
         });
 
-        // Actions only on INACTIVE accounts (comet `{!account.active && …}`):
-        // an icon-only Forget (trash, hover → foreground) then Switch, which
-        // reads "Switching…" while the activate round-trips.
-        let actions: Option<gpui::Div> = (!account.active).then(|| {
+        // Actions: Forget and Switch only on INACTIVE accounts (comet
+        // `{!account.active && …}`) — an icon-only Forget (trash, hover →
+        // foreground) then Switch, which reads "Switching…" while the activate
+        // round-trips. Re-sign (gh#599) sits on EVERY login this page can
+        // drive, active included — a slot going stale is exactly what the
+        // badge above names, and an active row otherwise has no affordance at
+        // all.
+        let mut actions =
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
-                .child(
-                    // Forget is icon-only in a square slot the size of the
-                    // button beside it (F10), not a glyph with padding round it.
-                    div()
-                        .id(("account-forget", ix))
-                        .flex_none()
-                        .size(px(widgets::ACTION_HEIGHT))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(px(Theme::RADIUS_CHIP))
-                        .text_color(theme.text_subtle)
-                        .cursor_pointer()
-                        .when(is_busy, |el| el.opacity(0.5))
-                        .hover(|s| s.bg(theme.chip).text_color(theme.text))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(methods::FORGET_AGENT_ACCOUNT, &forget_account, cx);
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
-                                .size(px(14.0))
-                                .text_color(theme.text_subtle),
-                        ),
-                )
-                .when(account.switchable, |el| {
+                .when(!account.active, |el| {
                     el.child(
-                        // The page's one filled button (F11): 26px tall, 0×10,
-                        // `--text` bed, `--card` copy at 12px/500.
-                        crate::popover::btn_primary(
-                            theme,
-                            if is_busy { "Switching…" } else { "Switch" },
-                        )
-                        .id(("account-switch", ix))
-                        .flex_none()
-                        .h(px(widgets::ACTION_HEIGHT))
-                        .flex()
-                        .items_center()
-                        .px(px(10.0))
-                        .py(px(0.0))
-                        .rounded(px(Theme::RADIUS_CHIP))
-                        .text_size(px(Theme::TEXT_DENSE))
-                        .when(is_busy, |el| el.opacity(0.5))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.account_action(
-                                methods::ACTIVATE_AGENT_ACCOUNT,
-                                &switch_account,
-                                cx,
-                            );
-                        })),
+                        // Forget is icon-only in a square slot the size of the
+                        // button beside it (F10), not a glyph with padding round it.
+                        div()
+                            .id(("account-forget", ix))
+                            .flex_none()
+                            .size(px(widgets::ACTION_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(Theme::RADIUS_CHIP))
+                            .text_color(theme.text_subtle)
+                            .cursor_pointer()
+                            .when(is_busy, |el| el.opacity(0.5))
+                            .hover(|s| s.bg(theme.chip).text_color(theme.text))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.account_action(
+                                    methods::FORGET_AGENT_ACCOUNT,
+                                    &forget_account,
+                                    cx,
+                                );
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_subtle),
+                            ),
                     )
-                })
-        });
+                    .when(account.switchable, |el| {
+                        el.child(
+                            // The page's one filled button (F11): 26px tall, 0×10,
+                            // `--text` bed, `--card` copy at 12px/500.
+                            crate::popover::btn_primary(
+                                theme,
+                                if is_busy { "Switching…" } else { "Switch" },
+                            )
+                            .id(("account-switch", ix))
+                            .flex_none()
+                            .h(px(widgets::ACTION_HEIGHT))
+                            .flex()
+                            .items_center()
+                            .px(px(10.0))
+                            .py(px(0.0))
+                            .rounded(px(Theme::RADIUS_CHIP))
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .when(is_busy, |el| el.opacity(0.5))
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.account_action(
+                                        methods::ACTIVATE_AGENT_ACCOUNT,
+                                        &switch_account,
+                                        cx,
+                                    );
+                                },
+                            )),
+                        )
+                    })
+                });
+        if supports_login(account.harness) {
+            actions = actions.child(
+                widgets::ghost_action(theme)
+                    .id(("account-resign", ix))
+                    .hover(widgets::ghost_hover(theme))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.start_resign(&resign_account, cx);
+                    }))
+                    .child(SharedString::from("Re-sign")),
+            );
+        }
+        let actions = Some(actions);
 
         div()
             .px(px(widgets::ROW_PAD_X))
@@ -1307,6 +1813,15 @@ impl AccountsPage {
                             .child(badges)
                             .children(plan_control),
                     )
+                    .when_some(health_note, |el, (note, tone)| {
+                        el.child(
+                            div()
+                                .truncate()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(tone)
+                                .child(note),
+                        )
+                    })
                     .map(|el| {
                         // Meters XOR the quiet fallback line — never both
                         // (comet: `usage ? meters : "Usage unavailable"…`).
@@ -1324,16 +1839,12 @@ impl AccountsPage {
                             )
                         } else {
                             el.child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(ROW_BODY_GAP))
-                                    .children(
-                                        account
-                                            .usage_windows
-                                            .iter()
-                                            .map(|w| self.render_usage_meter(w, theme, now)),
-                                    ),
+                                div().flex().flex_col().gap(px(ROW_BODY_GAP)).children(
+                                    account
+                                        .usage_windows
+                                        .iter()
+                                        .map(|w| self.render_usage_meter(w, theme, now)),
+                                ),
                             )
                         }
                     }),
@@ -1353,6 +1864,9 @@ impl AccountsPage {
         let red_text = theme.danger_text();
         let login = self.login.as_ref()?;
         let title = login.title();
+        // A re-sign speaks of the slot it is refreshing rather than of adding
+        // an account, in the body copy as well as the title.
+        let resign_label = self.resign.as_ref().map(|r| r.label.clone());
         let url_link =
             |id: &'static str, label: &'static str, url: &str, cx: &mut Context<Self>| {
                 let open_url = url.to_string();
@@ -1375,6 +1889,77 @@ impl AccountsPage {
                 .mt(px(8.0))
                 .child(popover::skeleton_rows(&theme, 2, cx.entity_id(), cx))
                 .into_any_element(),
+            LoginFlow::Verifying { .. } => div()
+                .mt(px(16.0))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(crate::loaders::gradient_spinner(
+                            &theme,
+                            3.0,
+                            cx.entity_id(),
+                            cx,
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_DENSE))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(
+                                    "Checking the fresh login against its provider…",
+                                )),
+                        ),
+                )
+                .child(
+                    div().mt(px(16.0)).flex().flex_row().justify_end().child(
+                        popover::btn_ghost(&theme, "Close", "login-cancel")
+                            .id("login-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                    ),
+                )
+                .into_any_element(),
+            LoginFlow::Settled { outcome, .. } => {
+                let ok = outcome.ok();
+                let headline = outcome.headline();
+                let detail = outcome.detail();
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .mt(px(10.0))
+                            .text_size(px(Theme::TEXT_BODY))
+                            .line_height(px(20.0))
+                            .text_color(if ok { theme.settled_text() } else { red_text })
+                            .child(headline),
+                    )
+                    .when_some(detail, |el, detail| {
+                        el.child(
+                            div()
+                                .mt(px(6.0))
+                                .text_size(px(Theme::TEXT_DENSE))
+                                .line_height(px(18.0))
+                                .text_color(theme.text_subtle)
+                                .child(detail),
+                        )
+                    })
+                    .child(
+                        div().mt(px(16.0)).flex().flex_row().justify_end().child(
+                            popover::btn_primary(&theme, "Done")
+                                .id("resign-done")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.login = None;
+                                    this.resign = None;
+                                    cx.notify();
+                                })),
+                        ),
+                    )
+                    .into_any_element()
+            }
             LoginFlow::PasteCode {
                 start,
                 submitting,
@@ -1385,12 +1970,25 @@ impl AccountsPage {
                 div()
                     .flex()
                     .flex_col()
-                    .child(div().mt(px(8.0)).child(popover::dialog_body(
-                        &theme,
-                        "A browser window opened. Sign in to the account you want to add, \
-                         approve access, then paste the code Anthropic shows you below. Your \
-                         current login is untouched until you switch.",
-                    )))
+                    .child(
+                        div().mt(px(8.0)).child(popover::dialog_body(
+                            &theme,
+                            match &resign_label {
+                                Some(slot) => format!(
+                                    "A browser window opened. Sign in to the account that \
+                                 belongs in this slot ({slot}), approve access, then paste \
+                                 the code Anthropic shows you below. Signing into a \
+                                 different account is named out loud before anything reads \
+                                 as fixed."
+                                ),
+                                None => "A browser window opened. Sign in to the account you \
+                                     want to add, approve access, then paste the code \
+                                     Anthropic shows you below. Your current login is \
+                                     untouched until you switch."
+                                    .to_string(),
+                            },
+                        )),
+                    )
                     .child(url_link(
                         "login-open-url",
                         "Reopen the authorization page",
@@ -1433,6 +2031,8 @@ impl AccountsPage {
                                     &theme,
                                     if submitting {
                                         "Verifying…"
+                                    } else if resign_label.is_some() {
+                                        "Re-sign"
                                     } else {
                                         "Add account"
                                     },
@@ -1468,20 +2068,37 @@ impl AccountsPage {
                 div()
                     .flex()
                     .flex_col()
-                    .child(div().mt(px(8.0)).child(popover::dialog_body(
-                        &theme,
-                        if device_code {
-                            "That device has no browser to finish in, so it is waiting on \
-                             OpenAI for a code instead. Sign in here to the account you want \
-                             to add, enter the code below, and leave this open. The new login \
-                             is captured in an isolated profile over there — its current \
-                             session is untouched until you switch."
-                        } else {
-                            "Finish signing in to OpenAI in your browser. The new login is \
-                             captured in an isolated profile — your current session is \
-                             untouched until you switch."
-                        },
-                    )))
+                    .child(
+                        div().mt(px(8.0)).child(popover::dialog_body(
+                            &theme,
+                            match (&resign_label, device_code) {
+                                (Some(slot), true) => format!(
+                                    "That device has no browser to finish in, so it is waiting \
+                                 on OpenAI for a code instead. Sign in here to the account \
+                                 that belongs in this slot ({slot}), enter the code below, \
+                                 and leave this open."
+                                ),
+                                (Some(slot), false) => format!(
+                                    "Finish signing in to OpenAI in your browser — to the \
+                                 account that belongs in this slot ({slot}). Signing into a \
+                                 different account is named out loud before anything reads \
+                                 as fixed."
+                                ),
+                                (None, true) => "That device has no browser to finish in, so it \
+                                             is waiting on OpenAI for a code instead. Sign in \
+                                             here to the account you want to add, enter the \
+                                             code below, and leave this open. The new login is \
+                                             captured in an isolated profile over there — its \
+                                             current session is untouched until you switch."
+                                    .to_string(),
+                                (None, false) => "Finish signing in to OpenAI in your browser. \
+                                              The new login is captured in an isolated profile \
+                                              — your current session is untouched until you \
+                                              switch."
+                                    .to_string(),
+                            },
+                        )),
+                    )
                     .child(url_link(
                         "login-open-url-browser",
                         if device_code {
@@ -1570,7 +2187,7 @@ impl AccountsPage {
             }
         };
         let card = popover::dialog_card(&theme)
-            .child(popover::dialog_title(&theme, title))
+            .child(popover::dialog_title(&theme, &title))
             .child(body)
             .into_any_element();
         Some(popover::modal("add-account-dialog", viewport, card))
@@ -1895,7 +2512,7 @@ impl Render for AccountsPage {
                                 .text_color(theme.text_subtle)
                                 .hover(|s| s.text_color(theme.text))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.start_login(harness, cx);
+                                    this.start_login(harness, None, cx);
                                 }))
                                 .child(
                                     // An svg paints from its OWN text colour —
@@ -2208,5 +2825,155 @@ mod tests {
     fn the_session_window_uses_the_reference_duration_copy() {
         assert_eq!(usage_window_label("Session"), "5 hours");
         assert_eq!(usage_window_label("Week"), "Week");
+    }
+
+    // ---- per-slot freshness (gh#599) ----
+
+    fn verdict(id: &str, state: AgentAccountState) -> AgentAccountHealth {
+        AgentAccountHealth {
+            id: id.into(),
+            harness: HarnessId::ClaudeCode,
+            email: None,
+            state,
+            detail: "the probe's own sentence".into(),
+        }
+    }
+
+    /// The engine's three-way verdict maps onto the page's badge — and no
+    /// verdict at all (probe in flight, slot missing from the reply) maps to
+    /// NO badge, because absence must not read as fine.
+    #[test]
+    fn a_verdict_becomes_a_badge_and_silence_becomes_none() {
+        use AgentAccountState::{Ok, Stale, Unknown};
+        assert_eq!(
+            freshness(Some(&verdict("a", Ok))),
+            Some(Freshness::Verified)
+        );
+        assert_eq!(
+            freshness(Some(&verdict("a", Stale))),
+            Some(Freshness::Stale)
+        );
+        assert_eq!(
+            freshness(Some(&verdict("a", Unknown))),
+            Some(Freshness::Unverified)
+        );
+        assert_eq!(freshness(None), None);
+        // The badge words are doctor's words, not a GUI dialect.
+        assert_eq!(Freshness::Verified.label(), "Verified");
+        assert_eq!(Freshness::Stale.label(), "Stale");
+        assert_eq!(Freshness::Unverified.label(), "Not verified");
+    }
+
+    /// The wrong-account rule from `comet-board relogin`, pinned here: the
+    /// asked-for slot counts only when ITS snapshot moved past the watermark;
+    /// otherwise whichever other slot moved is named — and if nothing moved,
+    /// nothing is claimed.
+    #[test]
+    fn a_login_lands_where_the_snapshot_actually_moved() {
+        let account = |id: &str, saved_at: Option<i64>| AgentAccount {
+            id: id.into(),
+            harness: HarnessId::ClaudeCode,
+            email: Some(format!("{id}@example.com")),
+            plan_label: None,
+            active: false,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at,
+        };
+        let slots = [
+            account("wanted", Some(100)),
+            account("other", Some(200)),
+            account("untouched", Some(50)),
+        ];
+
+        // The normal ending: the named slot is the one that refreshed.
+        let moved = vec![account("wanted", Some(300)), account("other", Some(200))];
+        assert_eq!(
+            landing(&moved, "wanted", 250),
+            Landing::Requested(account("wanted", Some(300)))
+        );
+
+        // Signed into the wrong account: the OTHER slot moved, and that is
+        // what gets reported rather than a green tick on `wanted`.
+        let stray = vec![
+            account("wanted", Some(100)),
+            account("stray-new", Some(400)),
+        ];
+        assert_eq!(
+            landing(&stray, "wanted", 250),
+            Landing::Elsewhere(account("stray-new", Some(400)))
+        );
+
+        // A flow that completed without writing anything claims nothing.
+        assert_eq!(landing(&slots, "wanted", 250), Landing::Nowhere);
+        assert_eq!(landing(&[], "wanted", 0), Landing::Nowhere);
+    }
+
+    /// Only a verified right-slot landing is success; everything else says
+    /// what happened instead, naming who moved and quoting the provider.
+    #[test]
+    fn an_outcome_is_ok_only_when_the_right_slot_verified() {
+        let sam = login("slot-a", Some("sam@example.com"));
+        let ok = resign_outcome(
+            "slot-a",
+            Landing::Requested(sam.clone()),
+            Some(verdict("slot-a", AgentAccountState::Ok)),
+        );
+        assert!(ok.ok());
+        assert_eq!(
+            ok.headline(),
+            "Signed in as sam@example.com — this slot is verified working."
+        );
+        assert_eq!(ok.detail().as_deref(), Some("the probe's own sentence"));
+
+        // The requested slot moved but the provider refused the fresh token:
+        // not success, and the refusal is quoted.
+        let stale = resign_outcome(
+            "slot-a",
+            Landing::Requested(sam.clone()),
+            Some(verdict("slot-a", AgentAccountState::Stale)),
+        );
+        assert!(!stale.ok());
+        assert!(stale.headline().contains("did not pass verification"));
+        assert_eq!(stale.detail().as_deref(), Some("the probe's own sentence"));
+
+        // Wrong account: named as such even when THAT login verified fine.
+        let wrong = resign_outcome(
+            "slot-a",
+            Landing::Requested(login("slot-b", Some("pat@example.com"))),
+            Some(verdict("slot-b", AgentAccountState::Ok)),
+        );
+        assert!(!wrong.ok());
+        assert!(
+            wrong.headline().contains("NOT slot slot-a"),
+            "{}",
+            wrong.headline()
+        );
+
+        let stray = resign_outcome(
+            "slot-a",
+            Landing::Elsewhere(login("slot-b", Some("pat@example.com"))),
+            None,
+        );
+        assert!(!stray.ok());
+        assert!(
+            stray.headline().contains("pat@example.com"),
+            "{}",
+            stray.headline()
+        );
+        assert!(stray.detail().is_none(), "no verdict, no borrowed one");
+
+        // Nothing moved / could not be asked: honest non-answers.
+        assert!(!resign_outcome("slot-a", Landing::Nowhere, None).ok());
+        let unverifiable = resign_outcome("slot-a", Landing::Requested(sam), None);
+        assert!(!unverifiable.ok());
+        assert!(unverifiable.headline().contains("could not verify"));
+        assert_eq!(
+            ReSignOutcome::NoChange.headline(),
+            "The sign-in finished, but no slot changed on this device."
+        );
     }
 }
