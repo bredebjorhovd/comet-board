@@ -218,7 +218,8 @@ impl Harness for OpencodeHarness {
             return Ok(models.clone());
         }
         let exe = self.resolve_executable()?;
-        let (mut child, base, _stderr) = spawn_server(&exe, None, None, None, &[], &[]).await?;
+        let (mut child, base, _stderr) =
+            spawn_server(&exe, None, None, None, &[], &[], &[]).await?;
         let models = {
             let client = Client::new(base);
             client
@@ -252,6 +253,7 @@ impl Harness for OpencodeHarness {
             controls.chat_id.as_deref(),
             controls.push.as_ref(),
             &controls.bin_dirs,
+            &controls.tool_dirs,
             &controls.mcp_servers,
         )
         .await?;
@@ -404,6 +406,7 @@ async fn spawn_server(
     chat_id: Option<&str>,
     push: Option<&crate::PushCredentials>,
     bin_dirs: &[std::path::PathBuf],
+    tool_dirs: &[std::path::PathBuf],
     mcp_servers: &[comet_proto::McpServer],
 ) -> Result<(Child, String, crate::StderrTail), HarnessError> {
     let mut cmd = Command::new(exe);
@@ -426,6 +429,9 @@ async fn spawn_server(
     if let Some(push) = push {
         push.apply(&mut cmd);
     }
+    // Toolchain gap-fillers behind everything (gh#561): they fill what a GUI
+    // launch's PATH lacks without shadowing anything resolved above.
+    crate::append_missing_to_path(&mut cmd, tool_dirs);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -750,6 +756,7 @@ async fn run_session(session: Session) {
         push: _,
         bin_dirs: _,
         mcp_servers: _,
+        tool_dirs: _,
     } = controls;
     let request_input = Arc::new(request_input);
 

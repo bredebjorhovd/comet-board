@@ -45,6 +45,7 @@ struct Recorded {
     chat_id: Option<String>,
     push: Option<comet_harness::PushCredentials>,
     bin_dirs: Vec<std::path::PathBuf>,
+    tool_dirs: Vec<std::path::PathBuf>,
 }
 
 #[async_trait]
@@ -79,6 +80,7 @@ impl Harness for RecordingHarness {
                 chat_id: controls.chat_id.clone(),
                 push: controls.push.clone(),
                 bin_dirs: controls.bin_dirs.clone(),
+                tool_dirs: controls.tool_dirs.clone(),
             });
         Ok(futures::stream::iter(vec![Ok(AgentEvent::Done {
             status: DoneStatus::Completed,
@@ -490,6 +492,21 @@ async fn a_dispatched_chats_run_carries_the_boards_credentials_and_a_plain_one_d
             run_for(chat).bin_dirs,
             vec![dir.to_path_buf()],
             "{chat} could not have run comet-board"
+        );
+    }
+
+    // gh#561: and behind that PATH ride the toolchain directories — computed
+    // once from this box's install locations and handed to the harness
+    // unchanged, so a GUI-launched engine's children can still find `node`.
+    for chat in ["chat-dispatched", "chat-authored", "chat-plain"] {
+        assert_eq!(
+            run_for(chat).tool_dirs,
+            comet_board::toolchain::agent_tool_dirs(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .as_deref()
+            ),
+            "{chat} could not have found the repo toolchain"
         );
     }
 

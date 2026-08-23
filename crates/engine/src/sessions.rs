@@ -130,6 +130,13 @@ struct Inner {
     /// the process lives. Empty when there is no `comet-board` beside the
     /// engine, which leaves the child's PATH untouched.
     agent_bin_dirs: Vec<std::path::PathBuf>,
+    /// Toolchain directories appended behind every harness child's PATH
+    /// (gh#561) — Homebrew, `~/.local/bin`, `~/.cargo/bin`, the Node version
+    /// managers. A GUI/systemd launch inherits none of them, so without this a
+    /// dispatched agent cannot run the very toolchains the repo's tests need
+    /// (`node` above all) and ships work it never verified. Computed once:
+    /// like [`Self::agent_bin_dirs`], a property of the box, not of a run.
+    agent_tool_dirs: Vec<std::path::PathBuf>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -181,6 +188,11 @@ impl SessionsEngine {
                 agent_bin_dirs: comet_board::git_credentials::agent_bin_dir()
                     .into_iter()
                     .collect(),
+                agent_tool_dirs: comet_board::toolchain::agent_tool_dirs(
+                    std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .as_deref(),
+                ),
             }),
         }
     }
@@ -576,6 +588,7 @@ impl SessionsEngine {
             account,
             push,
             bin_dirs: self.inner.agent_bin_dirs.clone(),
+            tool_dirs: self.inner.agent_tool_dirs.clone(),
             mcp_servers: fork_config
                 .as_ref()
                 .map(|config| config.mcp_servers.clone())

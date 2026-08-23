@@ -686,6 +686,34 @@ pub fn doctor(
                     ));
                 }
             }
+
+            // What a dispatch into each local route's repo will reach for, and
+            // whether an agent's PATH can supply it (gh#561). Beside the agent
+            // PATH check below because it is that question continued: comet-board
+            // resolving is the floor; `node` and `cargo` are what actually run
+            // the tests. Local routes only — another device's checkout is not
+            // on this disk to read, and `comet-board doctor` there answers it.
+            let local_repos: Vec<std::path::PathBuf> = cfg
+                .routes
+                .iter()
+                .filter(|r| {
+                    matches!(
+                        space_host(spaces, engine.device.as_deref(), &engine.devices, r),
+                        SpaceHost::Here
+                    )
+                })
+                .map(|r| r.repo_path())
+                .filter(|repo| repo.join(".git").exists())
+                .collect();
+            checks.push(agent_toolchain_check(
+                &local_repos,
+                git_credentials::agent_bin_dir().into_iter().collect(),
+                crate::toolchain::agent_tool_dirs(
+                    std::env::var_os("HOME")
+                        .map(std::path::PathBuf::from)
+                        .as_deref(),
+                ),
+            ));
         }
     }
 
@@ -2831,6 +2859,93 @@ fn agent_path_check(app_root: &Path, resolved: Option<&Path>) -> Check {
     Check { name, ok, detail }
 }
 
+/// Can a dispatched agent on this box run what its routed repos need (gh#561)?
+///
+/// The continuation of [`agent_path_check`], one question over: that one
+/// asks whether an agent can find `comet-board`; this asks whether it can find
+/// the tools the routed repos' own verification needs. gh#553 and gh#557 both
+/// landed edge changes whose tests were never run because `node` was nowhere
+/// on a dispatched agent's PATH — and every agent that noticed paid for
+/// rediscovering the workaround mid-run (`PATH=/opt/homebrew/bin:$PATH npm
+/// test`), while the ones that did not shipped author-unverified work. A
+/// toolchain gap is exactly the kind of thing an operator wants named before
+/// the attempt, not in its review.
+///
+/// The repos are this box's local routed checkouts; the tools are detected
+/// from their markers ([`crate::toolchain::repo_tools`]); the PATH they are
+/// resolved over is the one the engine actually gives a child — the directory
+/// holding the board's own binaries, plus the gap-fillers
+/// [`crate::toolchain::agent_tool_dirs`] appends behind whatever the engine
+/// inherited. What the *engine's* launcher happened to put on PATH is
+/// deliberately not counted: from here it is invisible, and a check that
+/// passes on the operator's shell and fails in dispatch is the lie gh#184 was.
+fn agent_toolchain_check(
+    repos: &[std::path::PathBuf],
+    board_dirs: Vec<std::path::PathBuf>,
+    tool_dirs: Vec<std::path::PathBuf>,
+) -> Check {
+    let name = "repo toolchains".to_string();
+    // Board-first, then the gap-fillers — the same composition the engine
+    // stamps onto every child, in the same order.
+    let mut dirs = board_dirs;
+    dirs.extend(tool_dirs);
+
+    // Which tool is needed by which repo — one row per need, so the detail can
+    // say what a repair unblocks rather than a bare list of names.
+    let mut needed: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for repo in repos {
+        for tool in crate::toolchain::repo_tools(repo) {
+            match needed.iter_mut().find(|(t, _)| *t == tool) {
+                Some((_, who)) => who.push(repo.display().to_string()),
+                None => needed.push((tool, vec![repo.display().to_string()])),
+            }
+        }
+    }
+    if needed.is_empty() {
+        return Check {
+            name,
+            ok: true,
+            detail: "no local routed repo declares a toolchain (or no routes) — nothing to \
+                     check"
+                .to_string(),
+        };
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut found: Vec<String> = Vec::new();
+    for (tool, who) in &needed {
+        match crate::toolchain::find_tool(tool, &dirs) {
+            Some(path) => found.push(format!(
+                "{tool} ({})",
+                crate::config::shorten_home(
+                    &path.parent().map(Path::to_path_buf).unwrap_or(path.clone())
+                )
+            )),
+            None => missing.push(format!("{tool} — needed by {}", who.join(", "))),
+        }
+    }
+    let ok = missing.is_empty();
+    let detail = if ok {
+        format!(
+            "an agent on this box can run everything the routed repos need: {}",
+            found.join(", ")
+        )
+    } else {
+        format!(
+            "not on an agent's PATH: {}. Dispatches into those repos will ship work they \
+             could not verify — install each tool where a GUI-launched process finds it \
+             (e.g. `brew install node`, rustup), then re-run `comet-board doctor`{}",
+            missing.join("; "),
+            if found.is_empty() {
+                String::new()
+            } else {
+                format!(" — the rest is fine: {}", found.join(", "))
+            }
+        )
+    };
+    Check { name, ok, detail }
+}
+
 /// Which GitHub credential is live, and what it can reach (gh#58).
 ///
 /// Two facts an operator cannot get anywhere else. "GITHUB_TOKEN present" was
@@ -4149,6 +4264,65 @@ mod tests {
             "{}",
             c.detail
         );
+    }
+
+    // --- repo toolchains (gh#561) --------------------------------------------
+
+    /// A routed JS repo whose `node` is installed where the agent PATH looks:
+    /// green, and named.
+    #[test]
+    fn a_repo_whose_tools_resolve_reads_green() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("repo/edge")).unwrap();
+        std::fs::write(d.path().join("repo/edge/package.json"), "{}").unwrap();
+        // A "tool" dir holding node, handed to the check as the board's own
+        // bin dir (what `agent_bin_dir` resolves to on a managed box).
+        let bin = d.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("node"), "").unwrap();
+        std::fs::write(bin.join("npm"), "").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let c = agent_toolchain_check(&[d.path().join("repo")], vec![bin], Vec::new());
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("node"), "{}", c.detail);
+    }
+
+    /// The gh#553/gh#557 box: a repo that needs `node`, nowhere an agent's
+    /// PATH can supply it. The check names the tool, the repo it blocks, and
+    /// what shipping anyway costs.
+    #[test]
+    fn a_missing_toolchain_is_named_with_the_repo_it_blocks() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("repo/edge")).unwrap();
+        std::fs::write(d.path().join("repo/edge/package.json"), "{}").unwrap();
+
+        // No board dir, no gap-fillers: nothing anywhere holds node.
+        let c = agent_toolchain_check(
+            &[d.path().join("repo")],
+            Vec::new(),
+            vec![d.path().join("empty-tool-dir")],
+        );
+        assert!(!c.ok, "{}", c.detail);
+        assert!(c.detail.contains("node — needed by"), "{}", c.detail);
+        assert!(c.detail.contains("could not verify"), "{}", c.detail);
+    }
+
+    /// A repo with no markers asks for nothing, and the check says so rather
+    /// than implying it looked and found everything.
+    #[test]
+    fn a_repo_with_no_declared_toolchain_is_said_so() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("repo")).unwrap();
+        std::fs::write(d.path().join("repo/README.md"), "hi").unwrap();
+        let c = agent_toolchain_check(&[d.path().join("repo")], Vec::new(), Vec::new());
+        assert!(c.ok, "{}", c.detail);
+        assert!(c.detail.contains("no local routed repo"), "{}", c.detail);
     }
 
     // --- board hosts (gh#195) ------------------------------------------------

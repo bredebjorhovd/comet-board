@@ -84,6 +84,7 @@ fn fake_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        tool_dirs: Vec::new(),
         mcp_servers: Vec::new(),
     };
     (controls, steer_tx, token)
@@ -715,6 +716,7 @@ fn real_controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToke
         account: None,
         push: None,
         bin_dirs: Vec::new(),
+        tool_dirs: Vec::new(),
         mcp_servers: Vec::new(),
     };
     (controls, steer_tx, token)

@@ -1190,6 +1190,14 @@ pub enum FindingKind {
     NeverPassed,
     /// Commands ran; none of them checked anything.
     Unchecked,
+    /// The branch adds tests the attempt never ran (gh#561). Distinct from
+    /// [`FindingKind::Unchecked`] — which needs commands that checked nothing —
+    /// because the two attempts that taught gh#561 both had long command
+    /// lists *and* a growing suite nobody executed, and "nothing verifies
+    /// anything" does not say the new tests are the unverified part. Loud on
+    /// purpose: an author-unverified pull request is what CI is for, and a
+    /// reviewer should know they are being asked to be it.
+    TestsNeverRun,
     /// The attempt never answered the claim contract. Distinct from claiming
     /// nothing, and it must never render as one.
     NeverClaimed,
@@ -1210,6 +1218,7 @@ impl FindingKind {
             | FindingKind::Uncommitted
             | FindingKind::UnsupportedClaims
             | FindingKind::NeverPassed
+            | FindingKind::TestsNeverRun
             | FindingKind::MalformedClaims
             | FindingKind::Unchecked => Tone::Alarm,
             FindingKind::NeverClaimed | FindingKind::NoDiff => Tone::Unknown,
@@ -1365,6 +1374,30 @@ impl AttemptReview {
                 text: format!(
                     "{} anchored to files nothing happened to",
                     count(unsupported, "claim is", "claims are")
+                ),
+            });
+        }
+        // gh#561, and the reason this is a finding and not only the chip: the
+        // tests chip said "never run" on both attempts that shipped unverified
+        // edge work, and neither pull request mentioned it. Tests the branch
+        // adds but the attempt never executed are exactly what the review
+        // exists to catch — the one verification only the author could have
+        // run, skipped — so they get the loud voice instead of a suffix.
+        let tests_added: u32 = self.effects.files.iter().map(|f| f.tests_added).sum();
+        if self.effects.read
+            && tests_added > 0
+            && matches!(
+                crate::effects::test_run(&self.evidence),
+                crate::effects::TestRun::NeverRun
+            )
+        {
+            out.push(Finding {
+                kind: FindingKind::TestsNeverRun,
+                text: format!(
+                    "{} added on this branch {} never run — the pull request ships \
+                     them unverified",
+                    count(tests_added as usize, "new test", "new tests"),
+                    if tests_added == 1 { "is" } else { "are" }
                 ),
             });
         }
@@ -2201,6 +2234,76 @@ mod tests {
         );
         assert_eq!(quiet.findings()[0].kind, FindingKind::Unchecked);
         assert!(quiet.findings()[0].text.ends_with("across 2 commands"));
+    }
+
+    /// gh#561, twice over: a branch that adds tests and never runs them is a
+    /// finding of its own — not only the chip — whether the run was silent or
+    /// merely busy with commands that check nothing. And when the tests *were*
+    /// run, the finding has nothing to say.
+    #[test]
+    fn tests_added_but_never_run_is_its_own_finding() {
+        use crate::effects::{Effects, FileScan};
+        let effects = Effects {
+            read: true,
+            files: vec![FileScan {
+                path: "edge/src/room.ts".into(),
+                kind: None,
+                tests_added: 9,
+                tests_removed: 0,
+                api: 0,
+                schema: 0,
+                config_keys: 0,
+            }],
+            deps_known: true,
+            ..Default::default()
+        };
+        let attempt = attempt_with(
+            parse("Did it :: edge/src/", None).unwrap(),
+            Some("2026-08-09T10:00:00Z"),
+        );
+        let task = task_with(attempt.clone());
+        // A busy run whose 59 commands verify nothing (gh#557's shape): the
+        // Unchecked finding fires AND the new one names what it missed.
+        let busy = review(
+            &task,
+            &attempt,
+            vec![changed("edge/src/room.ts")],
+            DiffSource::Checkout,
+            Some(0),
+            crate::evidence::gather(&[ran("ls -la", false)]),
+            effects.clone(),
+            None,
+        );
+        let kinds: Vec<_> = busy.findings().iter().map(|f| f.kind).collect();
+        assert!(kinds.contains(&FindingKind::TestsNeverRun), "{kinds:?}");
+        let findings = busy.findings();
+        let finding = findings
+            .iter()
+            .find(|f| f.kind == FindingKind::TestsNeverRun)
+            .unwrap();
+        assert_eq!(
+            finding.text,
+            "9 new tests added on this branch are never run — the pull request \
+             ships them unverified"
+        );
+        assert!(finding.kind.tone().loud());
+
+        // The same branch with the suite actually executed: quiet about it.
+        let run = review(
+            &task,
+            &attempt,
+            vec![changed("edge/src/room.ts")],
+            DiffSource::Checkout,
+            Some(0),
+            crate::evidence::gather(&[ran("npm test", false)]),
+            effects,
+            None,
+        );
+        assert!(
+            !run.findings()
+                .iter()
+                .any(|f| f.kind == FindingKind::TestsNeverRun)
+        );
     }
 
     /// No diff means no denominator. Every other finding would be computed

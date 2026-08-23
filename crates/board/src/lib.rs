@@ -51,4 +51,5 @@ pub mod spin;
 pub mod stacks;
 pub mod stats;
 pub mod sync;
+pub mod toolchain;
 pub mod verdict;
