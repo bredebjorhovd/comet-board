@@ -313,6 +313,13 @@ smoke also probes `WatchBoard` on every engine device, where a board-less device
 *refusing* is a pass — what that asserts is that a stream frame comes back at
 all.
 
+The smoke's live legs (the ListModels catalog probe and the phone-originated
+chat) run on `mock` by default; `-e2eHarness opencode` drives them through the
+host's real opencode login instead — the run only settles if the host resolves
+the harness and its credentials work (gh#574). Stale device rows from earlier
+rigs are stepped around: whichever engine device answers the relay is the one
+the live legs ride.
+
 ### Distribution
 
 Personal-device sideload via Xcode free provisioning works and re-signs every

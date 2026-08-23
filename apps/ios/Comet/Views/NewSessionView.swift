@@ -599,12 +599,13 @@ struct ModelPickerSheet: View {
     /// One-line hints for the ladder (the special modes deserve explanation).
     static func effortHint(_ level: String) -> String? {
         switch level {
+        case "minimal": return "Leanest, fastest responses"
         case "low": return "Fastest responses"
         case "medium": return "Balanced speed and depth"
         case "high": return "Thorough reasoning"
         case "xhigh": return "Extended reasoning"
         case "max": return "Maximum reasoning budget"
-        case "ultra": return "Highest Codex tier"
+        case "ultra": return "Highest reasoning tier"
         case "ultracode": return "X-High plus the ultracode setting"
         case "ultrathink": return "Deep-thinking prompt mode"
         default: return nil
