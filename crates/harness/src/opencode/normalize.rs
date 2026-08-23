@@ -11,7 +11,10 @@
 //!   `status` walks pending → running → completed, with the tool `input`
 //!   populated once running.
 //! - `message.updated` — message lifecycle; an assistant message's
-//!   `info.time.completed` marks the steering boundary.
+//!   `info.time.completed` marks the steering boundary, and its
+//!   `info.finish` names why the provider stream ended for that message
+//!   (`"tool-calls"` mid-loop — the turn means to continue; `"stop"` at a
+//!   real turn end).
 //! - `session.status` / `session.idle` — busy/idle transitions (a turn ends
 //!   on idle).
 //! - `session.error` — a run error; `MessageAbortedError` means abort.
@@ -296,6 +299,17 @@ pub(crate) fn assistant_message_completed(info: &Value) -> bool {
         .is_some()
 }
 
+/// The assistant message's provider finish reason (`info.finish`), when the
+/// update carries one: `"tool-calls"` while the agentic loop means to run
+/// tools and continue, `"stop"` at a message that ends its turn. Absent on
+/// older servers — callers must treat `None` as "unknown", never as either.
+pub(crate) fn assistant_message_finish(info: &Value) -> Option<String> {
+    info.get("finish")
+        .and_then(Value::as_str)
+        .filter(|f| !f.is_empty())
+        .map(str::to_owned)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,5 +460,21 @@ mod tests {
         assert!(!assistant_message_completed(&json!({"id": "m1", "time": {"created": 1}})));
         assert!(assistant_message_completed(&json!({"id": "m1", "time": {"created": 1, "completed": 2}})));
         assert_eq!(assistant_message_id(&json!({"id": "m1"})), "m1");
+    }
+
+    #[test]
+    fn assistant_finish_reason_is_read_when_carried_and_absent_means_unknown() {
+        assert_eq!(
+            assistant_message_finish(&json!({"id": "m1", "finish": "tool-calls"})),
+            Some("tool-calls".to_string())
+        );
+        assert_eq!(
+            assistant_message_finish(&json!({"id": "m1", "finish": "stop"})),
+            Some("stop".to_string())
+        );
+        // Older servers carry no finish at all, and an empty string is no
+        // reason either — both must read as unknown, not as a value.
+        assert_eq!(assistant_message_finish(&json!({"id": "m1"})), None);
+        assert_eq!(assistant_message_finish(&json!({"id": "m1", "finish": ""})), None);
     }
 }

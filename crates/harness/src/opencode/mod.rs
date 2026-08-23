@@ -570,6 +570,27 @@ fn new_message_id() -> String {
 /// settling — the server claimed a completion it never delivered (gh#37).
 const STALLED_TURN: &str = "opencode went idle without completing the assistant message";
 
+/// The turn ended with its last settled assistant message still asking for
+/// tools (`finish: "tool-calls"`) — or with a tool result as the last thing
+/// the model was ever sent — so the agentic loop broke right after tool
+/// execution: the model answered, the tools ran, and the follow-up step that
+/// consumes their results never happened (gh#600). Live capture against
+/// 1.18.21: each mid-loop message settles `time.completed` +
+/// `finish:"tool-calls"` BEFORE the next step's message is created, so a
+/// provider death in that window lands here — a settled message, an idle,
+/// and no continuation. Reported Completed until gh#600.
+const CUT_OFF_AFTER_TOOLS: &str = "opencode ended the turn after executing tools, before the \
+                                   model produced the follow-up message that acts on their \
+                                   results";
+
+/// The [`CUT_OFF_AFTER_TOOLS`] shape arriving through the EOF path instead of
+/// an idle: the feed itself stopped mid-loop. Same diagnosis, different
+/// witness — say which, so the reader knows whether opencode ended the turn
+/// or the stream merely stopped (gh#600).
+const STREAM_STOPPED_AFTER_TOOLS: &str = "the opencode event stream stopped after executing \
+                                          tools, before the model produced the follow-up \
+                                          message that acts on their results";
+
 /// How long a run that is already erroring waits for a serve exit it may be
 /// racing before settling on the [`STALLED_TURN`] wording (gh#79). A dying
 /// serve closes its sockets and terminates near-simultaneously, so the idle /
@@ -602,6 +623,24 @@ async fn crash_if_exited(
         },
     };
     Some(crate::crash_message("opencode serve", status, stderr_tail))
+}
+
+/// Did the turn end mid-loop, after tool execution but before the model could
+/// act on its tools' results? Two independent witnesses (gh#600):
+///
+/// - `finish` — the settled message's provider finish reason. `"tool-calls"`
+///   means the loop was mid-flight by the server's own account: it ran the
+///   requested tools and owed the model another step that never arrived.
+/// - `spoke_after_tools` — harness-side, needing no server support: false
+///   once a tool result has been forwarded and no text/reasoning delta has
+///   followed it. A turn whose last act was executing a tool never consumed
+///   that result; it did not finish its work however "settled" the message
+///   looks.
+///
+/// A turn with no tool traffic at all keeps the initial `true` here, so pure
+/// text turns are judged on `finish` alone (and on gh#37's completion check).
+fn turn_ended_mid_loop(finish: Option<&str>, spoke_after_tools: bool) -> bool {
+    finish == Some("tool-calls") || !spoke_after_tools
 }
 
 /// Rotate the assistant message id; returns (previous, next).
@@ -859,12 +898,21 @@ async fn run_session(session: Session) {
     let mut done_after_interrupt = false;
     // A non-aborted `session.error` failed the current turn.
     let mut turn_error: Option<String> = None;
-    // The in-flight assistant message (the last one `message.updated` named)
-    // and whether it reached completion (`time.completed`) — the signal that a
-    // turn actually settled. An `Idle` that lands before the current message
-    // completed is a mid-stream stall (gh#37), not a completion.
+    // The in-flight assistant message (the last one `message.updated` named),
+    // whether it reached completion (`time.completed`) — the signal that a
+    // turn actually settled — and why its provider stream ended (`finish`):
+    // "tool-calls" mid-loop, "stop" at a turn end. An `Idle` that lands
+    // before the current message completed is a mid-stream stall (gh#37);
+    // one that lands on a settled-but-mid-loop message is a cutoff after
+    // tool execution (gh#600).
     let mut current_msg: Option<String> = None;
     let mut current_msg_completed = false;
+    let mut current_msg_finish: Option<String> = None;
+    // Forwarded a tool result and heard no model output since? Starts true
+    // (no tools yet), goes false at each ToolResult, back to true at the
+    // first delta that follows. False at turn end means the model never
+    // spoke after its last tool ran (gh#600).
+    let mut spoke_after_last_tool_result = true;
     let mut steering_open = true;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -872,6 +920,9 @@ async fn run_session(session: Session) {
         tokio::select! {
             ev = incoming.recv() => match ev {
                 Some(Event::Delta { field, delta }) => {
+                    // Model output — text or reasoning — is the follow-up a
+                    // tool result waits for (gh#600).
+                    spoke_after_last_tool_result = true;
                     let event = if field == "reasoning" {
                         AgentEvent::ReasoningDelta { text: delta }
                     } else {
@@ -897,6 +948,10 @@ async fn run_session(session: Session) {
                     }
                     if matches!(status.as_str(), "completed" | "error" | "failed") {
                         let is_error = status != "completed" || exit.is_some_and(|e| e != 0);
+                        // The result is now owed a model step to consume it;
+                        // until a delta proves otherwise, the loop is
+                        // mid-flight (gh#600).
+                        spoke_after_last_tool_result = false;
                         if !send(&event_tx, AgentEvent::ToolResult { id: part_id, is_error }).await {
                             break 'main;
                         }
@@ -907,14 +962,22 @@ async fn run_session(session: Session) {
                     let id = normalize::assistant_message_id(&info);
                     let completed = normalize::assistant_message_completed(&info);
                     // Track the in-flight assistant message: a new id starts a
-                    // fresh (not yet settled) message; a completion settles it.
-                    // The completion must precede the turn's idle for the turn
-                    // to count as Completed (gh#37).
+                    // fresh (not yet settled) message; a completion settles
+                    // it. The completion must precede the turn's idle for the
+                    // turn to count as Completed (gh#37), and how the message
+                    // finished (`finish`) says whether the turn was still
+                    // mid-loop when it settled (gh#600).
                     if current_msg.as_deref() != Some(id.as_str()) {
                         current_msg = Some(id.clone());
                         current_msg_completed = completed;
-                    } else if completed {
-                        current_msg_completed = true;
+                        current_msg_finish = normalize::assistant_message_finish(&info);
+                    } else {
+                        if completed {
+                            current_msg_completed = true;
+                        }
+                        if let Some(finish) = normalize::assistant_message_finish(&info) {
+                            current_msg_finish = Some(finish);
+                        }
                     }
                     if completed && !completed_msgs.contains(&id) {
                         completed_msgs.insert(id.clone());
@@ -968,6 +1031,29 @@ async fn run_session(session: Session) {
                                     None => STALLED_TURN.into(),
                                 },
                             );
+                        }
+                        // And a turn whose message DID settle but whose loop
+                        // was still mid-flight — the message asks for tools,
+                        // or the model never spoke after its last tool result
+                        // — ended in the cutoff shape of gh#600: the provider
+                        // stream died between steps and the idle fired over an
+                        // unfinished task. Completed here is the clean-looking
+                        // stop the transcript must not show.
+                        else if error.is_none()
+                            && turn_was_active
+                            && turn_ended_mid_loop(
+                                current_msg_finish.as_deref(),
+                                spoke_after_last_tool_result,
+                            )
+                        {
+                            tracing::warn!(
+                                target: "comet_harness::opencode",
+                                finish = current_msg_finish.as_deref().unwrap_or(""),
+                                spoke_after_last_tool_result,
+                                "turn ended after tool execution without a follow-up model \
+                                 message (gh#600 cutoff shape)"
+                            );
+                            error = Some(CUT_OFF_AFTER_TOOLS.into());
                         }
                         let status = if error.is_some() {
                             DoneStatus::Errored
@@ -1125,9 +1211,30 @@ async fn run_session(session: Session) {
                 // A turn error already booked keeps its own wording.
                 Some(error) => Some(error),
                 // The assistant message settled: Completed, unless the feed
-                // ended because the serve is already gone.
+                // ended because the serve is already gone — or because the
+                // turn was still mid-loop when the stream stopped, which is
+                // gh#600's cutoff shape arriving without an idle. The crash
+                // probe runs either way: a dead serve's exit status beats our
+                // own wording.
                 None if current_msg_completed => {
-                    crash_if_exited(&mut child, &stderr_tail, Duration::ZERO).await
+                    match crash_if_exited(&mut child, &stderr_tail, Duration::ZERO).await {
+                        Some(crash) => Some(crash),
+                        None if turn_ended_mid_loop(
+                            current_msg_finish.as_deref(),
+                            spoke_after_last_tool_result,
+                        ) =>
+                        {
+                            tracing::warn!(
+                                target: "comet_harness::opencode",
+                                finish = current_msg_finish.as_deref().unwrap_or(""),
+                                spoke_after_last_tool_result,
+                                "event stream ended mid-turn after tool execution (gh#600 \
+                                 cutoff shape)"
+                            );
+                            Some(STREAM_STOPPED_AFTER_TOOLS.into())
+                        }
+                        None => None,
+                    }
                 }
                 // A turn still streaming when the feed died never settled — a
                 // stall, Errored (gh#37) — unless the feed died because the
@@ -1220,6 +1327,25 @@ mod tests {
         );
         assert_eq!(parse_listening_port("some other log line"), None);
         assert_eq!(parse_listening_port("listening on http://127.0.0.1:ab12"), None);
+    }
+
+    /// gh#600, unit form: a settled message still asking for tools
+    /// (`finish: "tool-calls"`), or a tool result sitting unconsumed with no
+    /// model output after it — either witness alone ends the turn mid-loop;
+    /// a real stop (`finish: "stop"`) or a turn that never touched tools
+    /// does not.
+    #[test]
+    fn a_turn_that_owes_its_model_a_step_after_tools_ended_mid_loop() {
+        // The gh#600 shape: settled mid-loop message (the live 1.18.21 trace).
+        assert!(turn_ended_mid_loop(Some("tool-calls"), true));
+        // Harness-side witness alone: the last thing heard was a tool result.
+        assert!(turn_ended_mid_loop(None, false));
+        assert!(turn_ended_mid_loop(Some("stop"), false));
+        // Both witnesses clear — a genuine end.
+        assert!(!turn_ended_mid_loop(Some("stop"), true));
+        // No finish reason (older server) + no tool traffic: not mid-loop on
+        // this evidence; gh#37's completion check governs instead.
+        assert!(!turn_ended_mid_loop(None, true));
     }
 
     #[test]
