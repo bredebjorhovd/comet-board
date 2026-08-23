@@ -586,7 +586,10 @@ fn run_askpass(
 /// recently written can be refused because some other thread forked while the
 /// write handle was open. So this is written against a `Command` rather than
 /// against a shim path — gh#385 was the `gh` shim's own test hitting it, one
-/// caller away from the code that already knew about it.
+/// caller away from the code that already knew about it, and gh#582 was the
+/// git shim's test doing the same two fixes later. Tests exec shims through
+/// [`run_shim_to_completion`], which wraps this; production callers call it
+/// directly.
 ///
 /// Nothing else is waited on. No such file, not executable, exec'd and exited
 /// non-zero for a reason of its own — each is answered immediately, because none
@@ -915,6 +918,22 @@ mod tests {
         dir
     }
 
+    /// Run an installed shim to completion, waiting out an `ETXTBSY` that a
+    /// sibling thread's `fork` put on its inode.
+    ///
+    /// [`install_shim`] closes its own handle before returning, but it cannot
+    /// retract a copy a concurrent fork already handed a child — the one writer
+    /// no write-side ordering reaches (see [`verify_askpass`] for the anatomy).
+    /// Third time the race has cost a build: gh#301 taught production to wait,
+    /// gh#385 found the `gh` shim's test still spawning bare, and gh#582 found
+    /// the git shim's test doing the same. This is the one way a test here
+    /// execs what it just installed; reaching for `Command::new(..)` directly
+    /// is how the fourth appearance gets written.
+    fn run_shim_to_completion(cmd: &mut std::process::Command) -> std::process::Output {
+        let program = cmd.get_program().to_string_lossy().into_owned();
+        exec_waiting_out_busy(cmd).unwrap_or_else(|e| panic!("running the shim at {program}: {e}"))
+    }
+
     /// gh#184: the directory an agent gets on PATH is the one the resolved
     /// binary sits in — so it always holds a `comet-board`, and it is the same
     /// copy the askpass helper runs as.
@@ -1110,12 +1129,16 @@ mod tests {
             "chat-488",
         )
         .unwrap();
-        let status = std::process::Command::new(bin.join("git"))
-            .env("COMET_BOARD_CHAT_ID", "hostile")
-            .env("GIT_ASKPASS", "/ambient")
-            .status()
-            .unwrap();
-        assert!(status.success());
+        // Through [`run_shim_to_completion`], not a bare spawn: this execs a
+        // file written microseconds ago, and on Linux a sibling thread's fork
+        // can still hold its inode open for writing — the gh#582 flake, third
+        // appearance of the race gh#301 and gh#385 already paid for.
+        let out = run_shim_to_completion(
+            std::process::Command::new(bin.join("git"))
+                .env("COMET_BOARD_CHAT_ID", "hostile")
+                .env("GIT_ASKPASS", "/ambient"),
+        );
+        assert!(out.status.success());
         assert!(marker.exists(), "the guarded origin mutation did not occur");
     }
 
@@ -1143,10 +1166,10 @@ mod tests {
             state_dir: dir.join("state"),
         };
         verify_askpass(&shim, &paths).expect("the credential path answers");
-        let out = std::process::Command::new(&shim)
-            .arg("Password for 'https://x-access-token@github.com': ")
-            .output()
-            .unwrap();
+        let out = run_shim_to_completion(
+            std::process::Command::new(&shim)
+                .arg("Password for 'https://x-access-token@github.com': "),
+        );
         let seen = String::from_utf8_lossy(&out.stderr);
         assert!(seen.contains("git-askpass"), "{seen}");
         assert!(seen.contains("Password for"), "{seen}");
@@ -1677,7 +1700,7 @@ mod tests {
     /// The shim is a real script `sh` will run, not just text that looks like
     /// one — including with a space in the path it execs.
     ///
-    /// Exec'd through [`exec_waiting_out_busy`], for the reason
+    /// Exec'd through [`run_shim_to_completion`], for the reason
     /// [`verify_askpass`] gives at length: this test writes three files and
     /// runs them, inside a `cargo test` binary whose other threads are forking
     /// the whole time, and on Linux a child that has not reached its own `exec`
@@ -1709,14 +1732,13 @@ mod tests {
             }
         }
         let bin = install_gh_shim(&dir.join("bin"), &broken, &fake_gh).unwrap();
-        let out = exec_waiting_out_busy(
+        let out = run_shim_to_completion(
             std::process::Command::new(bin.join("gh"))
                 .arg("pr")
                 .env(ASKPASS_REPO_ENV, "o/r")
                 .env("GH_TOKEN", "ambient-box-token")
                 .env_remove("GITHUB_TOKEN"),
-        )
-        .unwrap();
+        );
         assert!(!out.status.success());
         assert!(out.stdout.is_empty(), "ambient gh ran: {out:?}");
         assert!(
