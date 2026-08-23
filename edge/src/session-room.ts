@@ -1831,13 +1831,24 @@ export class SessionRoom implements DurableObject {
         lastRowError = e;
       }
     }
-    if (rowsFailed > 0 && rowsFailed === rows && !snapshotLoaded) {
-      // The replay produced NOTHING: no snapshot, and not one row of the log
-      // would import. That is not a poisoned row, it is stored state this
-      // instance cannot materialize — and it is the gh#554 shape exactly, where
-      // the corruption is small enough to sail past the size guard (the
-      // 2026-08-19 room was 1.67MB with `snapshotBytes: 0`, 5% of the
-      // threshold, and recorded zero refusals all evening).
+    if (rowsFailed > 0 && !snapshotLoaded) {
+      // The replay started from NOTHING and lost ops on the way: no snapshot,
+      // and at least one row of the log would not import. That is not a
+      // poisoned row, it is stored state this instance cannot materialize —
+      // and it is the gh#554 shape exactly, where the corruption is small
+      // enough to sail past the size guard (the 2026-08-19 room was 1.67MB
+      // with `snapshotBytes: 0`, 5% of the threshold, and recorded zero
+      // refusals all evening).
+      //
+      // It used to demand `rowsFailed === rows`, and that is why the same room
+      // was still looping five days later at 1.94MB with `failed=5/71`. A
+      // PARTIAL failure with no snapshot is not a milder version of this
+      // fault, it is the same one: the doc begins empty, so a dropped row is a
+      // hole no later row fills, every client update depends on ops the room
+      // no longer has, and each one throws `Invalid array buffer length` out
+      // of the message handler until the socket dies. Serving that doc is
+      // strictly worse than refusing it — the refusal is what reaches
+      // LOAD_REFUSAL_LIMIT and reseeds from the replicas every engine holds.
       //
       // Deliberately narrow. A log that fails BEHIND a snapshot that loaded
       // keeps the skip above: the doc still holds the room's history, the next
