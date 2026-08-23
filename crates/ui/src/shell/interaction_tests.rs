@@ -5,7 +5,9 @@
 use super::*;
 use async_trait::async_trait;
 use futures::{StreamExt, channel::mpsc, stream};
-use gpui::{Action as _, KeyDownEvent, Keystroke, MenuItem, TestAppContext, VisualTestContext};
+use gpui::{
+    Action as _, KeyDownEvent, Keystroke, MenuItem, Modifiers, TestAppContext, VisualTestContext,
+};
 use std::sync::{Arc, Mutex};
 
 use comet_proto::{Chat, ChatCreationState, Space};
@@ -428,6 +430,61 @@ fn failures_do_not_orphan_or_duplicate_and_menu_uses_same_action(cx: &mut TestAp
         panic!("New Session menu entry must dispatch an action");
     };
     assert_eq!(action.name(), commands::NEW_SESSION.action().name());
+}
+
+/// Clicking the strip's trailing `+` must create exactly what ⌘T creates: one
+/// createChat for the session's workspace, through the same durable intent,
+/// with no chooser when a workspace is already selected (gh#575). The click is
+/// a real hit-test event at the button's rendered slot — first tab width plus
+/// the strip's gap, centered in the 28px chip two px below the titlebar top.
+#[gpui::test]
+fn clicking_plus_creates_what_cmd_t_creates(cx: &mut TestAppContext) {
+    let mut rig = rig(
+        cx,
+        vec![chat("existing", "alpha", ChatCreationState::Ready)],
+        vec![space("alpha")],
+    );
+    rig.state.update(&mut rig.cx, |state, cx| {
+        state.select_chat(Some("existing".into()), cx)
+    });
+    rig.cx.cx.refresh().unwrap();
+    drain(&rig.cx, &rig.runtime);
+    let tabs_left = rig
+        .shell
+        .read_with(&rig.cx.cx, |shell, _| shell.title_bar_content_start());
+    let plus_center = gpui::point(
+        gpui::px(tabs_left + tabs::SESSION_TAB_WIDTH + 6.0 + 14.0),
+        gpui::px(Theme::TITLEBAR_TOP_PAD + 14.0),
+    );
+    rig.cx.simulate_click(plus_center, Modifiers::default());
+    drain(&rig.cx, &rig.runtime);
+
+    let calls = rig.rpc.create_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].1, "alpha");
+    drop(calls);
+    assert!(
+        !rig.shell
+            .read_with(&rig.cx.cx, |shell, _| shell.new_session_chooser.is_some()),
+        "a resolved workspace must not open the chooser"
+    );
+    rig.rpc.publish_chats();
+    drain(&rig.cx, &rig.runtime);
+    assert_eq!(rig.selection().1.as_deref(), Some("alpha"));
+    assert!(
+        rig.selection()
+            .0
+            .as_deref()
+            .is_some_and(|id| id != "existing")
+    );
+    assert!(rig.cx.update(|window, cx| {
+        rig.shell
+            .read(cx)
+            .composer
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+    }));
 }
 
 #[gpui::test]
