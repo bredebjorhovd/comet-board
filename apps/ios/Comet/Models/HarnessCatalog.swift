@@ -1,6 +1,7 @@
 // Harness + model catalogs — ports of crates/harness's curated static
-// catalogs (claude/catalog.rs, codex/catalog.rs). The desktop overlays these
-// on runtime discovery; the phone uses them directly for the pickers.
+// catalogs (claude/catalog.rs, codex/catalog.rs, opencode/catalog.rs). The
+// desktop overlays these on runtime discovery; the phone uses them directly
+// for the pickers (and as fallback under the device's live ListModels).
 // Defaults mirror pickers.rs: first catalog row, reasoning xhigh where the
 // ladder has it, else high.
 
@@ -23,6 +24,7 @@ enum HarnessCatalog {
     static let harnesses: [HarnessInfo] = [
         HarnessInfo(id: "claude-code", label: "Claude Code"),
         HarnessInfo(id: "codex", label: "Codex"),
+        HarnessInfo(id: "opencode", label: "OpenCode"),
     ]
 
     private static let fullLadder = ["low", "medium", "high", "xhigh", "max", "ultracode", "ultrathink"]
@@ -30,9 +32,44 @@ enum HarnessCatalog {
     private static let codexUltraLadder = ["low", "medium", "high", "xhigh", "max", "ultra"]
     private static let codexMaxLadder = ["low", "medium", "high", "xhigh", "max"]
     private static let codexXhighLadder = ["low", "medium", "high", "xhigh"]
+    // opencode/catalog.rs ladders, in the unified lowercase wire values. The
+    // claude-only modes are absent on purpose — catalog.to_effort clamps them
+    // to xhigh, so the ladder tops out at ultra.
+    private static let opencodeFullLadder = ["low", "medium", "high", "xhigh", "max", "ultra"]
+    private static let opencodeMaxLadder = ["low", "medium", "high", "xhigh", "max"]
+    private static let opencodeDefaultLadder = ["low", "medium", "high", "max"]
 
     static func models(for harness: String) -> [ModelInfo] {
         switch harness {
+        case "opencode":
+            // opencode/catalog.rs static_models — ids are `provider/model`,
+            // the CLI's own spelling (the run wire splits on the slash).
+            return [
+                ModelInfo(id: "opencode/big-pickle", label: "Big Pickle",
+                          description: "OpenCode's flagship model",
+                          reasoningLevels: opencodeFullLadder),
+                ModelInfo(id: "deepseek/deepseek-v4-pro", label: "DeepSeek V4 Pro",
+                          description: "Frontier reasoning model",
+                          reasoningLevels: opencodeFullLadder),
+                ModelInfo(id: "deepseek/deepseek-v4-flash", label: "DeepSeek V4 Flash",
+                          description: "Fast, capable everyday model",
+                          reasoningLevels: opencodeMaxLadder),
+                ModelInfo(id: "openai/gpt-5.5", label: "GPT-5.5",
+                          description: "Frontier coding model",
+                          reasoningLevels: opencodeFullLadder),
+                ModelInfo(id: "openai/gpt-5.4", label: "GPT-5.4",
+                          description: "Reliable general coding",
+                          reasoningLevels: opencodeMaxLadder),
+                ModelInfo(id: "openai/gpt-5.4-mini", label: "GPT-5.4 Mini",
+                          description: "Small, fast and capable",
+                          reasoningLevels: opencodeDefaultLadder),
+                ModelInfo(id: "anthropic/claude-sonnet-5", label: "Claude Sonnet 5",
+                          description: "Balanced agent work",
+                          reasoningLevels: opencodeFullLadder),
+                ModelInfo(id: "anthropic/claude-haiku-4-5", label: "Claude Haiku 4.5",
+                          description: "Fast everyday tasks",
+                          reasoningLevels: opencodeDefaultLadder),
+            ]
         case "codex":
             return [
                 ModelInfo(id: "gpt-5.6-sol", label: "GPT-5.6-Sol",
@@ -80,6 +117,7 @@ enum HarnessCatalog {
 
     static func reasoningLabel(_ level: String) -> String {
         switch level {
+        case "minimal": return "Minimal"
         case "low": return "Low"
         case "medium": return "Medium"
         case "high": return "High"

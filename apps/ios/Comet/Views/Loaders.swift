@@ -176,8 +176,8 @@ struct HarnessBadge: View {
     let harness: String
     var size: CGFloat = 14
     var dimmed = false
-    /// Color for marks that carry no brand color of their own (codex, cursor).
-    /// Claude keeps its orange regardless.
+    /// Color for marks that carry no brand color of their own
+    /// (codex, cursor, opencode). Claude keeps its orange regardless.
     var neutral: Color = Theme.textMuted
 
     var body: some View {

@@ -25,6 +25,20 @@ enum E2ERunner {
         }
     }
 
+    /// The harness for the live legs (the catalog probe and the
+    /// phone-originated chat). Defaults to `mock`, which every rig box can
+    /// run; pass `-e2eHarness opencode` to drive a real CLI login end to end
+    /// (gh#574) — the run only settles if the host resolves the harness AND
+    /// its login works.
+    static func e2eHarness() -> String {
+        let args = ProcessInfo.processInfo.arguments
+        if let i = args.firstIndex(of: "-e2eHarness"), i + 1 < args.count,
+           !args[i + 1].hasPrefix("-") {
+            return args[i + 1]
+        }
+        return "mock"
+    }
+
     static func run(model: AppModel) async {
         try? FileManager.default.removeItem(at: logURL)
         log("start")
@@ -48,21 +62,34 @@ enum E2ERunner {
         log("OK workspace synced; engine device \(device.id) (\(device.name))")
 
         // 2. Device relay: ListFolders on every engine device (stale rig
-        // devices linger in the dev workspace doc — report each).
+        // devices linger in the dev workspace doc — report each). The first
+        // device that ANSWERS becomes the host for the live legs below.
         var listing: FolderListing?
+        var liveDevice: DeviceRow?
         for candidate in workspace.devices where candidate.platform != "ios" {
             do {
                 let l = try await workspace.listFoldersDetailed(deviceId: candidate.id, path: nil)
                 log("OK relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(l.path) → \(l.entries.count) entries")
                 listing = l
+                if liveDevice == nil { liveDevice = candidate }
             } catch {
                 log("FAIL relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(error.localizedDescription)")
             }
         }
+        // The live legs must ride a device that actually answers: the dev
+        // workspace doc keeps rows from every rig that ever used this edge,
+        // and `device` (the first row) is often one of those ghosts.
+        guard let host = liveDevice else {
+            log("FAIL no engine device answered the relay")
+            return
+        }
 
-        // 2b. Live model catalog over the relay.
-        let models = await workspace.listModels(deviceId: device.id, harness: "mock")
-        log(models != nil ? "OK relay ListModels: \(models!.map(\.id))" : "FAIL relay ListModels nil")
+        // 2b. Live model catalog over the relay — the same ListModels call
+        // the pickers make. With `-e2eHarness opencode` the ids come back as
+        // provider/model, the CLI's own spelling (gh#574).
+        let harness = e2eHarness()
+        let models = await workspace.listModels(deviceId: host.id, harness: harness)
+        log(models != nil ? "OK relay ListModels[\(harness)]: \(models!.map(\.id))" : "FAIL relay ListModels nil")
 
         // 2c. The board's stream path (gh#114). This is the plumbing check, not
         // a board check: a dev engine usually hosts no board, and the engine
@@ -74,8 +101,9 @@ enum E2ERunner {
             await probeBoardStream(config: config, devices: workspace.devices)
         }
 
-        // 3. Space + chat + first run through the command plane (mock harness).
-        let spaceId = await workspace.createSpace(deviceId: device.id,
+        // 3. Space + chat + first run through the command plane, on the
+        // device that answered (see 2b for the harness).
+        let spaceId = await workspace.createSpace(deviceId: host.id,
                                                   path: listing?.path ?? "/tmp", gitDetected: false)
         log("space created \(spaceId)")
         // Relay-created spaces land via doc sync — eventually consistent.
@@ -88,7 +116,8 @@ enum E2ERunner {
         }
         let chatId = workspace.createChat(
             space: space,
-            config: ChatConfig(harness: "mock", model: nil, reasoning: nil, sandbox: "workspace-write"))
+            config: ChatConfig(harness: harness, model: nil, reasoning: nil,
+                               sandbox: "workspace-write"))
         guard let chat = workspace.chats.first(where: { $0.id == chatId }),
               let store = model.sessionStore(for: chat) else {
             log("FAIL chat/session store")
