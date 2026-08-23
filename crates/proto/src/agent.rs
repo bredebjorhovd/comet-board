@@ -15,6 +15,23 @@ pub enum HarnessId {
     Mock,
 }
 
+impl HarnessId {
+    /// The canonical name — the wire word serde writes and the spelling a
+    /// dispatch override sends, a directory under the accounts root, and a
+    /// picker row are all expected to agree with. Kept beside the enum because
+    /// it must list every variant: a harness added without a name here fails
+    /// to compile rather than defaulting to something no caller recognises.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+            Self::Cursor => "cursor",
+            Self::Opencode => "opencode",
+            Self::Mock => "mock",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ReasoningLevel {
@@ -939,5 +956,24 @@ mod tests {
             serde_json::to_string(&HarnessId::Opencode).unwrap(),
             "\"opencode\""
         );
+    }
+
+    /// The name a harness is known by everywhere outside the type system is
+    /// the serde wire word: one mapping, not several that can drift.
+    #[test]
+    fn as_str_is_the_wire_word_for_every_harness() {
+        for (harness, name) in [
+            (HarnessId::ClaudeCode, "claude-code"),
+            (HarnessId::Codex, "codex"),
+            (HarnessId::Cursor, "cursor"),
+            (HarnessId::Opencode, "opencode"),
+            (HarnessId::Mock, "mock"),
+        ] {
+            assert_eq!(harness.as_str(), name, "{name}");
+            assert_eq!(
+                serde_json::to_string(&harness).unwrap(),
+                format!("\"{name}\"")
+            );
+        }
     }
 }

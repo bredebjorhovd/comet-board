@@ -252,11 +252,6 @@ impl FileScan {
     }
 }
 
-/// How much unified diff [`scan`] will read. Same bound and same reason as
-/// [`crate::claims::MAX_DIFF_BYTES`]: past this the remainder, not the chip
-/// row, is the thing worth reading.
-pub const MAX_DIFF_BYTES: usize = 4 << 20;
-
 /// Read a `git diff -U0` of the branch into one scan per changed file.
 ///
 /// `changed` fixes the set and the order — a path only the diff text mentions
@@ -264,6 +259,10 @@ pub const MAX_DIFF_BYTES: usize = 4 << 20;
 /// that actually moved. Context is not evidence, which is the same rule
 /// [`crate::claims::attach_symbols`] is built on and for the same reason: a
 /// `pub fn` three lines above an edit is not a public API change.
+///
+/// The walk itself is [`crate::claims::for_each_moved_line`], so this reader
+/// and the symbol index cannot drift apart about headers, moved lines, or the
+/// read bound ([`crate::claims::MAX_DIFF_BYTES`]).
 pub fn scan(changed: &[ChangedFile], diff: &str) -> Vec<FileScan> {
     let mut scans: Vec<FileScan> = changed
         .iter()
@@ -273,36 +272,16 @@ pub fn scan(changed: &[ChangedFile], diff: &str) -> Vec<FileScan> {
             ..Default::default()
         })
         .collect();
-    let by_path: std::collections::HashMap<String, usize> = scans
-        .iter()
-        .enumerate()
-        .map(|(ix, s)| (s.path.clone(), ix))
-        .collect();
+    let paths: Vec<String> = scans.iter().map(|s| s.path.clone()).collect();
+    // Deduplicated per file as we go: a config key repeats on every line that
+    // touches it, and the chip counts the key once.
     let mut keys: std::collections::HashSet<(usize, String)> = Default::default();
-    let mut current: Option<usize> = None;
-    let mut read = 0usize;
-    for line in diff.lines() {
-        read += line.len() + 1;
-        if read > MAX_DIFF_BYTES {
-            break;
-        }
-        if let Some(path) = line.strip_prefix("+++ ") {
-            current = crate::claims::header_path(path).and_then(|p| by_path.get(p).copied());
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("--- ") {
-            if let Some(p) = crate::claims::header_path(path) {
-                current = by_path.get(p).copied();
-            }
-            continue;
-        }
-        let Some(ix) = current else { continue };
-        let added = line.starts_with('+') && !line.starts_with("+++");
-        let removed = line.starts_with('-') && !line.starts_with("---");
-        if !added && !removed {
-            continue;
-        }
-        let body = &line[1..];
+    crate::claims::for_each_moved_line(diff, &paths, &mut |line| {
+        let crate::claims::MovedLine {
+            file: ix,
+            added,
+            body,
+        } = line;
         let kind = scans[ix].kind();
         if is_test_decl(kind, body) {
             if added {
@@ -324,7 +303,7 @@ pub fn scan(changed: &[ChangedFile], diff: &str) -> Vec<FileScan> {
         {
             scans[ix].config_keys += 1;
         }
-    }
+    });
     scans
 }
 

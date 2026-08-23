@@ -256,6 +256,33 @@ fn drop_quietly<T>(value: T) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(value)));
 }
 
+/// Wait out one burst of fs kicks, trailing-debounced.
+///
+/// Resolves once after a burst of sends has gone quiet for `debounce` — the
+/// first kick resolves nothing by itself; every kick inside the window just
+/// restarts the wait. `Some(())` means "run the pass"; `None` means the
+/// channel closed (the entry was dropped mid-burst), and the caller should
+/// return rather than fire on a dead watch.
+///
+/// Shared by the two services that watch directories ([`crate::diff_sync`]
+/// checkouts and [`crate::spaces`]): the trailing-debounce shape looks trivial
+/// and is not — the closed-channel arm must read as "never fire again" and not
+/// as "fire now" — so the one copy lives with the watcher plumbing both
+/// services already share.
+pub(crate) async fn settled_burst(
+    kick_rx: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    debounce: std::time::Duration,
+) -> Option<()> {
+    kick_rx.recv().await?; // first kick opens the burst
+    loop {
+        match tokio::time::timeout(debounce, kick_rx.recv()).await {
+            Ok(Some(())) => continue,
+            Ok(None) => return None,   // entry dropped mid-burst
+            Err(_) => return Some(()), // quiet long enough
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

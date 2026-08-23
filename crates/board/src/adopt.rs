@@ -371,6 +371,30 @@ pub struct Adopted {
     pub labels: Option<Vec<String>>,
 }
 
+impl Adopted {
+    /// What was written, in routing.toml vocabulary — one phrase per thing
+    /// this adoption put in the file. The one renderer of these fields: both
+    /// surfaces that report an adoption (onboard's summary and the CLI's
+    /// step-by-step print) read it, so the wording cannot drift between them.
+    pub fn wrote_items(&self) -> Vec<String> {
+        let mut wrote = Vec::new();
+        if self.wrote_route {
+            wrote.push("a [[route]]".to_string());
+        }
+        if self.wrote_repo {
+            wrote.push("[github] repos".to_string());
+        }
+        if let Some(l) = &self.labels {
+            wrote.push(if l.is_empty() {
+                "a [[github.repo]] polling every open issue".to_string()
+            } else {
+                format!("a [[github.repo]] filter: {}", l.join(", "))
+            });
+        }
+        wrote
+    }
+}
+
 /// Adopt a repo, polling it for everything its `[github] labels` lets through.
 pub fn adopt(path: &Path, u: &Unadopted) -> Result<Adopted> {
     adopt_with(path, u, None)

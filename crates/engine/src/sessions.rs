@@ -1668,7 +1668,7 @@ fn say_stale_login(
          access token ran out at {when} — it died authenticating, not working. Re-sign \
          that login (`comet-board relogin {account_id}`) and retry. ({message})",
         email = expired.email,
-        harness = crate::agent_accounts::harness_slug(harness),
+        harness = harness.as_str(),
         when = crate::agent_accounts::stamp(expired.expired_at),
     ))
 }

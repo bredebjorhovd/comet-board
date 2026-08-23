@@ -261,6 +261,47 @@ pub trait Rest {
     }
 }
 
+/// A borrowed client is a client (gh#369). `doctor` holds one [`HttpRest`] and
+/// hands it to several checks, one of which wants to ask a question through
+/// [`Github`] — which owns its transport.
+impl<T: Rest + ?Sized> Rest for &T {
+    fn get(&self, path: &str) -> Result<Value> {
+        (**self).get(path)
+    }
+    fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).post(path, body)
+    }
+    fn patch(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).patch(path, body)
+    }
+    fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).put(path, body)
+    }
+    fn put_reply(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        (**self).put_reply(path, body)
+    }
+}
+
+impl Rest for Box<dyn Rest> {
+    fn get(&self, path: &str) -> Result<Value> {
+        (**self).get(path)
+    }
+    fn post(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).post(path, body)
+    }
+    fn patch(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).patch(path, body)
+    }
+    fn put(&self, path: &str, body: &Value) -> Result<Value> {
+        (**self).put(path, body)
+    }
+    // Forwarded rather than left to the default, which would call `put` and
+    // invent the 200 the inner client was answering for itself.
+    fn put_reply(&self, path: &str, body: &Value) -> Result<(u16, Value)> {
+        (**self).put_reply(path, body)
+    }
+}
+
 /// One authorized round trip, already carrying whichever bearer the caller
 /// resolved.
 ///

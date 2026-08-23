@@ -388,7 +388,7 @@ impl AgentAccounts {
                 EngineError::Other(format!(
                     "no saved {} login with id `{account_id}` — sign it in under Agent \
                      accounts first.",
-                    harness_slug(harness)
+                    harness.as_str()
                 ))
             })?;
         let dir = self.account_dir(&slot.id);
@@ -1705,7 +1705,7 @@ impl AgentAccounts {
     // ── slot files ──────────────────────────────────────────────────────────
 
     fn slots_dir(&self, harness: HarnessId) -> Result<PathBuf, EngineError> {
-        let dir = self.inner.config.root_dir().join(harness_slug(harness));
+        let dir = self.inner.config.root_dir().join(harness.as_str());
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
@@ -1779,7 +1779,7 @@ impl AgentAccounts {
         is_active: bool,
         force: bool,
     ) -> Option<Vec<AgentUsageWindow>> {
-        let key = format!("{}:{}", harness_slug(harness), slot.account_key);
+        let key = format!("{}:{}", harness.as_str(), slot.account_key);
         if let Some((usage, at)) = lock(&self.inner.usage_cache).get(&key)
             && at.elapsed() < USAGE_TTL
         {
@@ -2050,16 +2050,6 @@ mod keychain {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-pub(crate) fn harness_slug(harness: HarnessId) -> &'static str {
-    match harness {
-        HarnessId::ClaudeCode => "claude-code",
-        HarnessId::Codex => "codex",
-        HarnessId::Cursor => "cursor",
-        HarnessId::Opencode => "opencode",
-        HarnessId::Mock => "mock",
-    }
-}
-
 fn read_json(file: &Path) -> Option<serde_json::Value> {
     let raw = std::fs::read_to_string(file).ok()?;
     serde_json::from_str(&raw)
@@ -2182,7 +2172,7 @@ fn is_stale(file: &Path, harness: HarnessId, credentials: &serde_json::Value) ->
 }
 
 pub(crate) fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
-    let digest = Sha256::digest(format!("{}:{account_key}", harness_slug(harness)).as_bytes());
+    let digest = Sha256::digest(format!("{}:{account_key}", harness.as_str()).as_bytes());
     crate::repos::hex(&digest)[..16].to_string()
 }
 

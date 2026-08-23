@@ -109,9 +109,9 @@ pub const MIN_SYMBOL: usize = 3;
 /// as a silent match.
 pub const MAX_FILE_SYMBOLS: usize = 200;
 
-/// How much unified diff [`attach_symbols`] will read. A branch that moved more
-/// than this is one where the remainder, not the symbol index, is the thing
-/// worth reading.
+/// How much unified diff [`for_each_moved_line`] reads. A branch that moved
+/// more than this is one where the remainder, not the symbol index, is the
+/// thing worth reading.
 pub const MAX_DIFF_BYTES: usize = 4 << 20;
 
 /// One claim: a sentence, and the anchors it is about.
@@ -840,61 +840,28 @@ pub fn names_symbol(symbol: &str, file: &ChangedFile) -> bool {
 /// lose symbols, and losing one costs an anchor its match, which the review
 /// reports. Neither can invent one.
 pub fn attach_symbols(files: &mut [ChangedFile], diff: &str) {
-    let by_path: std::collections::HashMap<String, usize> = files
-        .iter()
-        .enumerate()
-        .map(|(ix, f)| (f.path.clone(), ix))
-        .collect();
+    let paths: Vec<String> = files.iter().map(|f| f.path.clone()).collect();
     // Deduplicated per file as we go: a diff repeats an identifier on every
     // line it touched, and the column stores the set.
     let mut seen: std::collections::HashSet<(usize, &str)> = Default::default();
-    let mut current: Option<usize> = None;
-    let mut read = 0usize;
-    for line in diff.lines() {
-        read += line.len() + 1;
-        if read > MAX_DIFF_BYTES {
-            break;
-        }
-        // `+++ b/path` names the file the following hunks are about. A deleted
-        // file's is `/dev/null`, so `--- a/path` is the fallback and not the
-        // primary: on every other file the two agree and the `+++` is the one
-        // that is right about a rename.
-        if let Some(path) = line.strip_prefix("+++ ") {
-            current = header_path(path).and_then(|p| by_path.get(p).copied());
-            continue;
-        }
-        if let Some(path) = line.strip_prefix("--- ") {
-            if let Some(p) = header_path(path) {
-                current = by_path.get(p).copied();
-            }
-            continue;
-        }
-        let Some(ix) = current else { continue };
-        let Some(body) = line
-            .strip_prefix('+')
-            .or_else(|| line.strip_prefix('-'))
-            .filter(|_| !line.starts_with("+++") && !line.starts_with("---"))
-        else {
-            continue;
-        };
+    for_each_moved_line(diff, &paths, &mut |MovedLine { file, body, .. }| {
         for ident in identifiers(body) {
-            if files[ix].symbols.len() >= MAX_FILE_SYMBOLS {
+            if files[file].symbols.len() >= MAX_FILE_SYMBOLS {
                 break;
             }
-            if seen.insert((ix, ident)) {
-                files[ix].symbols.push(ident.to_string());
+            if seen.insert((file, ident)) {
+                files[file].symbols.push(ident.to_string());
             }
         }
-    }
+    });
 }
 
 /// The path out of a `+++ b/crates/board/src/db.rs` header, or `None` for
 /// `/dev/null` and for the `+++` of a diff that carries no path.
 ///
-/// Shared with [`crate::effects`], which walks the same `-U0` diff for a
-/// different question (§gh#236): two readers of one diff format must agree
-/// about which file a hunk belongs to, and the way to guarantee that is one
-/// function.
+/// Shared with [`crate::effects`] through [`for_each_moved_line`]: the two
+/// readers of the `-U0` diff format must agree about which file a hunk belongs
+/// to, and one header parser is how that is guaranteed.
 pub(crate) fn header_path(header: &str) -> Option<&str> {
     let path = header.split('\t').next()?.trim();
     if path.is_empty() || path == "/dev/null" {
@@ -905,6 +872,72 @@ pub(crate) fn header_path(header: &str) -> Option<&str> {
             .or_else(|| path.strip_prefix("b/"))
             .unwrap_or(path),
     )
+}
+
+/// One moved line of a unified diff, resolved to the file it belongs to.
+pub(crate) struct MovedLine<'a> {
+    /// Index into `paths`, the changed set the caller is filling.
+    pub file: usize,
+    /// Added (`+`) rather than removed (`-`). Both count as moved; context
+    /// lines never arrive here.
+    pub added: bool,
+    /// The line with its leading `+`/`-` stripped.
+    pub body: &'a str,
+}
+
+/// Walk a `-U0` unified diff, handing every moved line to `on_line` paired
+/// with its file's index in `paths`.
+///
+/// Shared with [`crate::effects::scan`], which walks the same diff for a
+/// different question (§gh#236): two readers of one format must agree about
+/// which file a hunk belongs to, where a line moved, and where the read stops
+/// ([`MAX_DIFF_BYTES`]) — so the walk is one function, not two edits kept in
+/// step. A file a header never names yields no lines: nothing is invented.
+pub(crate) fn for_each_moved_line<'a>(
+    diff: &'a str,
+    paths: &[String],
+    on_line: &mut impl FnMut(MovedLine<'a>),
+) {
+    let by_path: std::collections::HashMap<&str, usize> = paths
+        .iter()
+        .enumerate()
+        .map(|(ix, p)| (p.as_str(), ix))
+        .collect();
+    // `+++ b/path` names the file the following hunks are about. A deleted
+    // file's is `/dev/null`, so `--- a/path` is the fallback and not the
+    // primary: on every other file the two agree and the `+++` is the one
+    // that is right about a rename.
+    let mut current: Option<usize> = None;
+    let mut read = 0usize;
+    for line in diff.lines() {
+        read += line.len() + 1;
+        if read > MAX_DIFF_BYTES {
+            break;
+        }
+        if let Some(path) = line.strip_prefix("+++ ") {
+            current = header_path(path).and_then(|p| by_path.get(p).copied());
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("--- ")
+            && let Some(p) = header_path(path)
+        {
+            current = by_path.get(p).copied();
+            continue;
+        }
+        let Some(file) = current else { continue };
+        // The prefix checks exclude the `+++`/`---` headers themselves, which
+        // also start with their sign.
+        let added = line.starts_with('+') && !line.starts_with("+++");
+        let removed = line.starts_with('-') && !line.starts_with("---");
+        if !added && !removed {
+            continue;
+        }
+        on_line(MovedLine {
+            file,
+            added,
+            body: &line[1..],
+        });
+    }
 }
 
 /// The identifiers on one changed line: runs of `[A-Za-z0-9_]` that start with

@@ -476,15 +476,10 @@ async fn entry_task(
     entry: Weak<CheckoutEntry>,
     mut kick_rx: mpsc::UnboundedReceiver<()>,
 ) {
-    while kick_rx.recv().await.is_some() {
-        // Trailing debounce: wait for the burst to settle.
-        loop {
-            match tokio::time::timeout(WATCH_DEBOUNCE, kick_rx.recv()).await {
-                Ok(Some(())) => continue,
-                Ok(None) => return, // entry closed mid-burst
-                Err(_) => break,
-            }
-        }
+    while crate::fs_watch::settled_burst(&mut kick_rx, WATCH_DEBOUNCE)
+        .await
+        .is_some()
+    {
         let (Some(inner), Some(entry)) = (inner.upgrade(), entry.upgrade()) else {
             return;
         };
