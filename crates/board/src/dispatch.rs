@@ -113,6 +113,9 @@ pub fn prompt_vars<'a>(
 /// [`crate::claims::brief`] closes it, on the same rule and for the failure
 /// gh#339 opened on: a brief that asked for a commit, a push and a pull request
 /// and never mentioned the review contract got exactly what it asked for.
+/// Between the base line and the claims block sits the closing-reference ask
+/// ([`crate::closing::brief`], gh#548) — also about the pull request, and so
+/// also appended whatever a route's template says.
 pub fn resolve_prompt(
     route: &Route,
     task: &Task,
@@ -135,6 +138,14 @@ pub fn resolve_prompt(
     let mut prompt = interpolate(&template, &vars);
     if let Some(base) = pr_base(base) {
         prompt.push_str(&pr_base_line(base));
+    }
+    // The closing reference (gh#548) sits beside the base line because both
+    // are about the pull request the agent is about to open, and both are
+    // facts about the dispatch a route author cannot know when they write the
+    // template. GitHub-issue tasks only: nothing else has an issue for
+    // `Closes` to name.
+    if let Some(ask) = crate::closing::brief(task) {
+        prompt.push_str(&ask);
     }
     if stack {
         prompt.push_str(&crate::stacks::stack_brief(branch, pr_base(base)));
@@ -1379,6 +1390,52 @@ mod tests {
             prompt.contains("comet-board claim --task gh:owner/widget#7"),
             "{prompt}"
         );
+    }
+
+    // ---- the closing reference reaches the agent (§gh#548) ---------------
+
+    /// The headline: a GitHub issue's request has to close that issue from
+    /// GitHub's side, which only a parseable reference in the body does.
+    #[test]
+    fn a_github_issue_brief_names_the_closing_line_github_parses() {
+        let spec = build_spec(
+            &RoutingConfig::default(),
+            &route(),
+            &task(),
+            &space(),
+            &DispatchOverrides::default(),
+            None,
+        )
+        .unwrap();
+        assert!(spec.prompt.contains("`Closes #7`"), "{}", spec.prompt);
+        // "On its own line" is how an agent reliably produces text GitHub
+        // parses; prose closure in the repo's own language stays welcome.
+        assert!(spec.prompt.contains("on its own line"), "{}", spec.prompt);
+        // The Tally spelling is named as the thing that links nothing, so an
+        // agent can recognise its own draft as the failure.
+        assert!(spec.prompt.contains("`gh#7`"), "{}", spec.prompt);
+    }
+
+    /// A Linear task names no GitHub issue — there is nothing for `Closes` to
+    /// name, and asking would teach the agent to write references to nothing.
+    #[test]
+    fn a_linear_task_is_not_asked_for_a_closing_reference() {
+        let mut task = task();
+        task.id = "linear:AGE-14".into();
+        task.identifier = "AGE-14".into();
+        let prompt = resolve_prompt(&route(), &task, "board/age-14", "origin/HEAD", false, false);
+        assert!(!prompt.contains("Closes #"), "{prompt}");
+        assert!(!prompt.contains("closing reference"), "{prompt}");
+    }
+
+    /// And it reaches a route that wrote its own brief, on `pr_base_line`'s
+    /// rule again.
+    #[test]
+    fn a_route_with_its_own_prompt_still_gets_the_closing_reference() {
+        let mut route = route();
+        route.prompt = Some("Do {title}. Commit, push, open a PR.".into());
+        let prompt = resolve_prompt(&route, &task(), "board/gh-7", "origin/HEAD", false, false);
+        assert!(prompt.contains("`Closes #7`"), "{prompt}");
     }
 
     // ---- the credential preflight reaches the first prompt (gh#440) ------

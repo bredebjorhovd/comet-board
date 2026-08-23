@@ -18,6 +18,7 @@ pub mod autopick;
 pub mod billing;
 pub mod board_cli;
 pub mod claims;
+pub mod closing;
 pub mod config;
 pub mod conventions;
 pub mod credential_ledger;

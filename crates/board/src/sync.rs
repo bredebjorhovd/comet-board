@@ -869,6 +869,10 @@ impl SyncEngine {
                 continue;
             };
             let pr = link.pr;
+            // First sight of this request on this row — the moment the ask in
+            // the brief (gh#548) is checkable, because the body exists and the
+            // board knows which issue it was supposed to close.
+            let fresh_request = task.pr_url.as_deref() != Some(pr.url.as_str());
             self.db
                 .set_pr(&task.id, Some(&pr.url), Some(pr.number), link.open)?;
             // A Linear issue's PR is topologically a PR like any other, and 7/9
@@ -895,6 +899,26 @@ impl SyncEngine {
                 self.finish_on_merge(&task, &pr.repo, pr.number)?;
             }
             self.db.set_pr_merged(&task.id, link.merged)?;
+            // The board's own verification of the ask (gh#548). Writeback
+            // closes the issue on settle, so the loop looks whole either way —
+            // but that is the board doing it, not GitHub: a request whose body
+            // carries nothing GitHub's parser acts on shows no linked issue and
+            // closes nothing when merged by a human outside the board. Warned
+            // once per request, at first sight, rather than every poll — the
+            // log is where an operator or a follow-up dispatch will see it, and
+            // a body fixed later is honoured silently by the same check.
+            if fresh_request
+                && link.open
+                && let Some(issue) = crate::model::gh_number(&task.id)
+                && !crate::closing::parses_as_closing(pr.body.as_deref(), issue)
+            {
+                self.log.warn(format!(
+                    "{}: {} announces closure in prose GitHub cannot parse — \
+                     merging it closes nothing on GitHub. Edit the pull request \
+                     body to put `Closes #{issue}` on its own line.",
+                    task.identifier, pr.url
+                ));
+            }
             if check_mergeable
                 && pr.open
                 && let Some(gh) = gh
@@ -8557,6 +8581,94 @@ max_duration = "{max_duration}"
         assert!(e.db.get_task("linear:LIN-142").unwrap().unwrap().pr_open);
         // The unrelated task must not pick up the PR.
         assert!(!e.db.get_task("linear:LIN-999").unwrap().unwrap().pr_open);
+    }
+
+    /// gh#548. The brief asks for a closing reference; this is the board
+    /// checking the answer at first sight of the request. A body GitHub cannot
+    /// parse — Tally's `**Lukker gh#932.**`, Norwegian keyword, board-flavoured
+    /// reference — is warned about once, with the repair in the warning.
+    #[test]
+    fn a_request_that_announces_closure_in_prose_is_warned_about_once() {
+        let mut e = engine();
+        let log_path = e.paths.state_dir.join("syncd.log");
+        e.log = Arc::new(Logger::new(&log_path, false));
+        seed(&e, "gh:o/r#7", "gh#7", UpstreamState::Started);
+        dispatch(&e, "gh:o/r#7", "chat-9");
+
+        let pr = PullRequest {
+            repo: "o/r".into(),
+            number: 291,
+            title: "Add retry".into(),
+            body: Some("**Lukker gh#7.**".into()),
+            url: "https://github.com/o/r/pull/291".into(),
+            head_ref: "board/lin-142".into(),
+            base_ref: "main".into(),
+            head_repo: None,
+            base_sha: None,
+            open: true,
+            merged: false,
+            draft: false,
+            stack: None,
+            updated_at: crate::db::now(),
+        };
+        e.link_pull_requests(std::slice::from_ref(&pr)).unwrap();
+        let logged = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            logged(&log_path).contains("announces closure in prose"),
+            "{}",
+            logged(&log_path)
+        );
+        assert!(
+            logged(&log_path).contains("`Closes #7`"),
+            "{}",
+            logged(&log_path)
+        );
+
+        // Once per request: the next poll re-links everything it saw, and a
+        // warning that repeats every cycle is noise an operator filters out.
+        std::fs::write(&log_path, "").unwrap();
+        e.link_pull_requests(std::slice::from_ref(&pr)).unwrap();
+        assert!(
+            !logged(&log_path).contains("announces closure in prose"),
+            "{}",
+            logged(&log_path)
+        );
+    }
+
+    /// And the check accepts what GitHub accepts, so a body carrying the real
+    /// thing is never warned about.
+    #[test]
+    fn a_parseable_closing_reference_is_never_warned_about() {
+        let mut e = engine();
+        let log_path = e.paths.state_dir.join("syncd.log");
+        e.log = Arc::new(Logger::new(&log_path, false));
+        seed(&e, "gh:o/r#7", "gh#7", UpstreamState::Started);
+        dispatch(&e, "gh:o/r#7", "chat-9");
+
+        let pr = PullRequest {
+            repo: "o/r".into(),
+            number: 291,
+            title: "Add retry".into(),
+            body: Some("Håndterer tilstanden.\n\nCloses #7.".into()),
+            url: "https://github.com/o/r/pull/291".into(),
+            head_ref: "board/lin-142".into(),
+            base_ref: "main".into(),
+            head_repo: None,
+            base_sha: None,
+            open: true,
+            merged: false,
+            draft: false,
+            stack: None,
+            updated_at: crate::db::now(),
+        };
+        e.link_pull_requests(std::slice::from_ref(&pr)).unwrap();
+        // The logger opens its file lazily on first write; silence here means
+        // no file at all, which is exactly the absence being asserted.
+        assert!(
+            !std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .contains("announces")
+        );
     }
 
     #[test]

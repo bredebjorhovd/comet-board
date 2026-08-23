@@ -435,6 +435,18 @@ pub fn pr_url_number(url: &str) -> Option<i64> {
     parts.next()?.parse().ok()
 }
 
+/// The issue number a GitHub task id closes with — `gh:owner/repo#932` → 932.
+///
+/// The number is the tail of the *id* and of nowhere else on the row:
+/// `source_id` holds GitHub's node id (gh#471-era rows predate the repo in the
+/// id, but every id that parses here has the number in it), and the identifier
+/// (`gh#932`) is its short form. Splits on `#` only — the `!` form
+/// (`gh:owner/repo!508`) is a pull request's own row, and a pull request is
+/// not something another pull request closes.
+pub fn gh_number(task_id: &str) -> Option<i64> {
+    task_id.strip_prefix("gh:")?.split('#').nth(1)?.parse().ok()
+}
+
 #[derive(Debug, Clone)]
 pub struct Attempt {
     pub id: i64,
