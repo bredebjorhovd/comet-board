@@ -848,20 +848,23 @@ async fn an_archived_chat_never_holds_a_watcher_slot_and_unarchive_reclaims_it()
     );
 
     // Dead means dead: repeated repair passes over an all-archived roster
-    // must not probe the checkout with git at all.
-    // (Space rechecks are debounced — wait them out so a regression's spawns
-    // actually land before the counter is read, the same way gh#526 does.)
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    let before = core.repos.git_spawn_attempts();
+    // must not probe the checkout at all. `resolve_identity` is what runs
+    // for an eligible chat's cwd — the stat gate and the git spawn alike —
+    // and it never runs for an archived chat, so nothing repopulates the
+    // cwd cache the release prune emptied. That cache count is the
+    // deterministic observable here: counting Repos' git spawns races the
+    // spaces-sync debounced recheck over the same still-existing tree (the
+    // gh#526 sweep makes its background spawns fail; this checkout is
+    // alive, so they land whenever a loaded runner gets around to them).
     for _ in 0..3 {
         core.diff_sync.reconcile_now().await;
+        assert_eq!(
+            core.diff_sync.cached_cwd_count(),
+            0,
+            "an archived chat's cwd was resolved — statted or probed with git — on a \
+             reconcile pass"
+        );
     }
-    tokio::time::sleep(Duration::from_millis(900)).await;
-    assert_eq!(
-        core.repos.git_spawn_attempts(),
-        before,
-        "an archived chat must not be probed on reconcile passes"
-    );
 
     // Unarchive reclaims eligibility — the entry re-forms, watchers included.
     core.workspace
@@ -879,6 +882,13 @@ async fn an_archived_chat_never_holds_a_watcher_slot_and_unarchive_reclaims_it()
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    // …and reclaim goes through the same resolution path: the prune left the
+    // cache empty, so a formed entry means the cwd was asked about again.
+    assert_eq!(
+        core.diff_sync.cached_cwd_count(),
+        1,
+        "the unarchived chat's cwd was not resolved again"
+    );
     core.shutdown().await;
 }
 
