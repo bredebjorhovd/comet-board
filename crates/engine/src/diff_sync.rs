@@ -236,6 +236,12 @@ impl CheckoutDiffSync {
     /// Live entries — a test/diagnostics probe in the shape of
     /// [`crate::repos::Repos::git_spawn_attempts`].
     #[doc(hidden)]
+    /// Cached cwd resolutions — same probe surface as above.
+    #[doc(hidden)]
+    pub fn cached_cwd_count(&self) -> usize {
+        lock(&self.inner.identities).len()
+    }
+
     pub fn tracked_checkout_count(&self) -> usize {
         lock(&self.inner.entries).len()
     }
