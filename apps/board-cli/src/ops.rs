@@ -1815,6 +1815,321 @@ pub fn print_roster(roster: &Roster, host: Option<&str>, json: bool) -> Result<(
     Ok(())
 }
 
+// ---- relogin (guided re-auth for one agent-account slot, gh#576) --------
+
+/// Per-login freshness as the engine just verified it — `None` when the
+/// engine could not be asked (an engine predating the verb, or a dead one),
+/// which callers render as "not verified" rather than as either verdict.
+pub async fn account_health(
+    board: &Board,
+    account_id: Option<&str>,
+) -> Option<Vec<comet_proto::AgentAccountHealth>> {
+    let reply = board
+        .client
+        .call(
+            methods::VERIFY_AGENT_ACCOUNTS,
+            board.params(serde_json::json!({ "accountId": account_id })),
+        )
+        .await
+        .ok()?;
+    serde_json::from_value(reply).ok()
+}
+
+/// How long the guided flow waits for the operator's browser round trip.
+/// Device codes and paste-codes are both live for 15 minutes; waiting one
+/// tick past that is how the operator learns it expired from *us* rather
+/// than from silence.
+const LOGIN_FLOW_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Re-sign one saved agent-account login: the harness's own OAuth flow, run
+/// on the device that holds the slot, walked from a plain terminal — which
+/// is what an SSH session on the always-on box is. Success is only declared
+/// once the fresh login has been put to its provider and accepted; until
+/// then this says what actually happened instead.
+///
+/// Always the no-browser-on-the-box flows (`remote`): paste-code for Claude
+/// (open the URL anywhere, bring the code back by hand) and `--device-auth`
+/// for Codex. The loopback flow is nicer when a browser is right there, but
+/// a verb whose caller is usually on another machine cannot assume one.
+pub async fn relogin(board: &Board, target: Option<&str>) -> Result<()> {
+    let Some(accounts) = agent_accounts(board).await else {
+        bail!(
+            "could not read this device's agent accounts — start `comet` or \
+             `comet headless` first"
+        );
+    };
+    if accounts.is_empty() {
+        bail!(
+            "this device has no saved agent logins to re-sign — add one under \
+             Agent accounts in the app first"
+        );
+    }
+    let account = pick_account(&accounts, target)?;
+    match account.harness {
+        comet_proto::HarnessId::ClaudeCode | comet_proto::HarnessId::Codex => {}
+        other => bail!(
+            "`{other:?}` has no login to re-sign — its credentials are provider \
+             keys managed outside the board"
+        ),
+    }
+
+    // The watermark every later comparison is against: whichever slot's
+    // snapshot moves past this is the one this login landed in — usually the
+    // named one, but an operator who signs into the wrong account deserves
+    // to be told which slot they DID just refresh.
+    let before_max_saved = accounts
+        .iter()
+        .filter_map(|a| a.saved_at)
+        .max()
+        .unwrap_or(0);
+
+    println!(
+        "Re-signing {} ({} · slot {})",
+        account.email.as_deref().unwrap_or("unnamed login"),
+        runtime_name(account.harness),
+        account.id
+    );
+    let start: comet_proto::AgentLoginStart = {
+        let reply = board
+            .client
+            .call(
+                methods::START_AGENT_LOGIN,
+                board.params(serde_json::json!({
+                    "harness": serde_json::to_value(account.harness)?,
+                    "remote": true,
+                })),
+            )
+            .await?;
+        serde_json::from_value(reply)?
+    };
+
+    if start.mode == comet_proto::AgentLoginMode::PasteCode {
+        // Claude: the operator carries the code back by hand — the flow that
+        // never needed a browser on this box in the first place.
+        println!(
+            "\n1. Open this URL in a browser — any device will do:\n   {}\n\
+             2. Sign in to the account that belongs in this slot.\n\
+             3. Paste the code#state it shows you here and press Enter:",
+            start.url
+        );
+        let mut code = String::new();
+        tokio::io::AsyncBufReadExt::read_line(
+            &mut tokio::io::BufReader::new(tokio::io::stdin()),
+            &mut code,
+        )
+        .await?;
+        let code = code.trim().to_string();
+        if code.is_empty() {
+            // The flow dies with the terminal; cancel so the throwaway
+            // state behind it does not linger out the TTL either way.
+            board
+                .client
+                .call(
+                    methods::CANCEL_AGENT_LOGIN,
+                    board.params(serde_json::json!({ "loginId": start.login_id })),
+                )
+                .await
+                .ok();
+            bail!("no code entered — run `comet-board relogin` again when ready");
+        }
+        board
+            .client
+            .call(
+                methods::COMPLETE_AGENT_LOGIN,
+                board.params(serde_json::json!({
+                    "loginId": start.login_id,
+                    "code": code,
+                })),
+            )
+            .await?;
+    } else {
+        // DeviceCode — and Browser, which should not happen with `remote`
+        // forced but is driven identically if an old codex build answers
+        // with it anyway.
+        if let Some(code) = &start.user_code {
+            println!(
+                "\n1. Open this URL in a browser — any device will do:\n   {}\n\
+                 2. Enter this one-time code there: {code}\n\n\
+                 Waiting for the sign-in to land…",
+                start.url
+            );
+        } else {
+            println!(
+                "\nFinish the sign-in at {} (a browser has to be reachable \
+                 from wherever this opens).\n\nWaiting…",
+                start.url
+            );
+        }
+        poll_login(board, &start.login_id).await?;
+    }
+
+    verify_and_report(board, account.id.as_str(), before_max_saved).await
+}
+
+/// Poll a device-code login to completion, printing the failure the engine
+/// saw when it lands dead. Bounded like the flow itself: past 15 minutes the
+/// code has expired upstream regardless of what the CLI is still doing.
+async fn poll_login(board: &Board, login_id: &str) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + LOGIN_FLOW_TIMEOUT;
+    loop {
+        let poll: comet_proto::AgentLoginPoll = {
+            let reply = board
+                .client
+                .call(
+                    methods::POLL_AGENT_LOGIN,
+                    board.params(serde_json::json!({ "loginId": login_id })),
+                )
+                .await?;
+            serde_json::from_value(reply)?
+        };
+        match poll.status {
+            comet_proto::AgentLoginStatus::Done => return Ok(()),
+            comet_proto::AgentLoginStatus::Error => {
+                bail!(
+                    "the sign-in failed{}",
+                    poll.message.map(|m| format!(": {m}")).unwrap_or_default()
+                )
+            }
+            comet_proto::AgentLoginStatus::Pending => {}
+        }
+        if tokio::time::Instant::now() > deadline {
+            bail!("gave up after 15 minutes — the code has expired; start again");
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+/// The last step, and the one gh#576 exists for: find which slot this login
+/// actually landed in, put its stored credential to the provider, and say
+/// success only when the provider agreed.
+async fn verify_and_report(board: &Board, wanted: &str, before_max_saved: i64) -> Result<()> {
+    let accounts = agent_accounts(board)
+        .await
+        .context("the login finished but the account list would not reload")?;
+    // The slot this login wrote: the named one if it moved, else whichever
+    // row moved — signing into the wrong account must not read as a fix for
+    // the right slot.
+    let landed = accounts
+        .iter()
+        .find(|a| a.id == wanted && a.saved_at.is_some_and(|at| at > before_max_saved))
+        .or_else(|| {
+            accounts
+                .iter()
+                .find(|a| a.saved_at.is_some_and(|at| at > before_max_saved))
+        });
+    let Some(landed) = landed else {
+        bail!(
+            "the login completed but no slot changed on this device — try again, \
+             and check `comet-board doctor`"
+        );
+    };
+    let health = account_health(board, Some(&landed.id))
+        .await
+        .and_then(|all| all.into_iter().find(|h| h.id == landed.id));
+    let who = landed.email.as_deref().unwrap_or("unnamed login");
+    match health {
+        Some(h) if h.state == comet_proto::AgentAccountState::Ok => {
+            println!(
+                "Signed in as {who} — slot {} ({}) verified: {}",
+                landed.id,
+                runtime_name(landed.harness),
+                h.detail
+            );
+            if landed.id != wanted {
+                bail!(
+                    "but that was NOT the slot you asked about ({wanted}) — you signed \
+                     into a different account. `{wanted}` still holds its old login."
+                );
+            }
+            Ok(())
+        }
+        Some(h) => bail!(
+            "signed in as {who} (slot {}), but verification did not pass: {}. \
+             Run `comet-board doctor` and try again.",
+            landed.id,
+            h.detail
+        ),
+        None => bail!(
+            "signed in as {who} (slot {}), but the engine could not verify it — \
+             run `comet-board doctor` to check this slot",
+            landed.id
+        ),
+    }
+}
+
+/// Which login to re-sign: exact id, exact email, or a unique email prefix.
+/// Ambiguity refuses with the menu rather than guessing — a wrong guess here
+/// overwrites somebody's live login.
+fn pick_account(
+    accounts: &[comet_proto::AgentAccount],
+    target: Option<&str>,
+) -> Result<comet_proto::AgentAccount> {
+    let menu = || {
+        accounts
+            .iter()
+            .map(|a| {
+                format!(
+                    "  {} · {} · {}",
+                    a.id,
+                    runtime_name(a.harness),
+                    a.email.as_deref().unwrap_or("unnamed login")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let Some(target) = target.map(str::trim).filter(|t| !t.is_empty()) else {
+        if let [only] = accounts {
+            return Ok(only.clone());
+        }
+        bail!(
+            "several agent logins exist on this device — name one:\n{}\n\
+             e.g. `comet-board relogin <id-or-email>`",
+            menu()
+        );
+    };
+    let matches: Vec<&comet_proto::AgentAccount> = accounts
+        .iter()
+        .filter(|a| {
+            a.id.eq_ignore_ascii_case(target)
+                || a.email
+                    .as_deref()
+                    .is_some_and(|e| e.eq_ignore_ascii_case(target))
+        })
+        .collect();
+    if let [one] = matches.as_slice() {
+        return Ok((*one).clone());
+    }
+    if matches.len() > 1 {
+        bail!(
+            "`{target}` matches more than one login — use its slot id:\n{}",
+            menu()
+        );
+    }
+    // No exact hit: a unique email prefix is still worth accepting — ids are
+    // for machines, and half-typed addresses are what people have.
+    let prefixes: Vec<&comet_proto::AgentAccount> = accounts
+        .iter()
+        .filter(|a| {
+            a.email
+                .as_deref()
+                .is_some_and(|e| e.to_lowercase().starts_with(&target.to_lowercase()))
+        })
+        .collect();
+    match prefixes.as_slice() {
+        [one] => Ok((*one).clone()),
+        [] => bail!(
+            "no saved login matches `{target}` — this device holds:\n{}",
+            menu()
+        ),
+        _ => bail!(
+            "`{target}` is a prefix of several emails — be more specific:\n{}",
+            menu()
+        ),
+    }
+}
+
 // ---- new ----------------------------------------------------------------
 
 /// A new ticket, always written to GitHub (gh#471).
@@ -2657,7 +2972,10 @@ mod tests {
             text.contains("no attempt · codex/restore-green-main · opened outside the board"),
             "{text}"
         );
-        assert!(!text.contains("still running"), "nothing is running: {text}");
+        assert!(
+            !text.contains("still running"),
+            "nothing is running: {text}"
+        );
         assert!(
             text.contains("nothing dispatched this pull request"),
             "{text}"

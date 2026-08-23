@@ -495,6 +495,9 @@ impl SessionsEngine {
         let (account, account_lease) =
             self.inner
                 .account_for(chat_id, harness_id, fork_config.as_ref())?;
+        // The slot's id, kept out of the move below: it names the subject of
+        // a stale-login attribution if this run dies authenticating (gh#576).
+        let account_id = account.as_ref().map(|a| a.id.clone());
         // A board-dispatched GitHub chat must never fall back to ambient box
         // credentials if its late-minting handoff disappeared after dispatch.
         // Resolve and verify it before writing the user message or spawning.
@@ -637,6 +640,7 @@ impl SessionsEngine {
                 resume_injected,
                 handoff_carried,
             },
+            account_id,
             account_lease,
         ));
         Ok(run_id)
@@ -1597,6 +1601,65 @@ fn say_oom(
     Some(said)
 }
 
+/// Say out loud that a run died on an expired agent-account login (gh#576).
+///
+/// The shape of [`attribute_oom`], pointed at the other silent killer: a
+/// dispatched chat spends a *named* slot, and when that slot's stored token
+/// has run its course the child dies authenticating — surfacing as whatever
+/// sentence the harness produces for "401", pages into a task that was never
+/// the problem. The transcript now leads with the fact and the repair.
+///
+/// Conservative by construction, in both directions. Only a chat that NAMES
+/// an account is attributed — the box's own CLI login manages itself, and
+/// guessing at it would blame a login nobody on this board owns. And the
+/// fact checked is offline-only: the slot's stored token is past its expiry
+/// stamp **at the moment the run errored**, with no probe and no refresh
+/// attempted (a mid-attribution rotation is exactly the write to somebody's
+/// login this must never be). A CLI that refreshed successfully before dying
+/// leaves fresh tokens behind in its config dir; the read sees them and
+/// stays silent.
+///
+/// Returns what it said, for the log line.
+fn attribute_stale_login(
+    inner: &Arc<Inner>,
+    harness: HarnessId,
+    account_id: Option<&str>,
+    event: &mut AgentEvent,
+) -> Option<String> {
+    let AgentEvent::Done {
+        status: DoneStatus::Errored,
+        error: Some(message),
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let said = say_stale_login(inner.accounts.get(), harness, account_id, message)?;
+    *message = said.clone();
+    Some(said)
+}
+
+/// The half of [`attribute_stale_login`] that decides — given the accounts
+/// service, the slot, and the harness's own sentence, whether an expired
+/// login gets named and what to say instead. Testable without a doc.
+fn say_stale_login(
+    accounts: Option<&crate::agent_accounts::AgentAccounts>,
+    harness: HarnessId,
+    account_id: Option<&str>,
+    message: &str,
+) -> Option<String> {
+    let account_id = account_id?;
+    let expired = accounts?.expired_login(harness, account_id)?;
+    Some(format!(
+        "This run spent the agent account {email} (slot {account_id}, {harness}), whose \
+         access token ran out at {when} — it died authenticating, not working. Re-sign \
+         that login (`comet-board relogin {account_id}`) and retry. ({message})",
+        email = expired.email,
+        harness = crate::agent_accounts::harness_slug(harness),
+        when = crate::agent_accounts::stamp(expired.expired_at),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn drive_run(
     inner: Arc<Inner>,
@@ -1609,6 +1672,9 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    // The agent-account slot this run spends, when its chat names one — the
+    // subject of the stale-login attribution below (gh#576).
+    account_id: Option<String>,
     // Held, not read: dropping it at the end of the run releases the account
     // for the usage refresher (gh#59). Nothing in here needs the value.
     _account_lease: Option<crate::agent_accounts::AccountLease>,
@@ -1627,6 +1693,10 @@ async fn drive_run(
     let mut stream = match harness.run(request, controls).await {
         Ok(stream) => stream,
         Err(err) => {
+            // No stale-login attribution here on purpose: this arm is a
+            // refusal to *spawn* (binary missing, IO), not an authentication
+            // death — that one surfaces as an errored Done from the child,
+            // which is where [`attribute_stale_login`] speaks.
             let message = err.to_string();
             inner.publish(
                 &chat_id,
@@ -1853,6 +1923,10 @@ async fn drive_run(
         // The night of 2026-08-19 this said "claude exited unexpectedly (killed
         // by signal 9)" four times and was read as phone flake.
         attribute_oom(&oom, &chat_id, &mut event);
+        // …and a run that died on an expired agent-account login says so in
+        // its own words, not the harness's (gh#576). Same placement as the
+        // attribution above: before journal and doc, so every copy agrees.
+        attribute_stale_login(&inner, harness_id, account_id.as_deref(), &mut event);
         // First event after parking idle = the next turn beginning (a routed
         // dispatch steered in): the session is Working again.
         //
@@ -2453,5 +2527,104 @@ mod tests {
             message_of(&event),
             "claude exited unexpectedly (killed by signal 9)"
         );
+    }
+
+    // ---- a run that died on an expired login says so (gh#576) --------------
+
+    /// An accounts service whose every path sits in `dir` — nothing here may
+    /// see, let alone write, a real `~/.claude`.
+    fn slot_store(dir: &std::path::Path) -> crate::agent_accounts::AgentAccounts {
+        crate::agent_accounts::AgentAccounts::new(crate::agent_accounts::AgentAccountsConfig {
+            data_dir: dir.to_path_buf(),
+            claude_config_dir: dir.join("live-claude"),
+            claude_config_file: dir.join("live-claude").join(".claude.json"),
+            codex_home: dir.join("live-codex"),
+            opencode_auth_file: dir.join("live-opencode").join("auth.json"),
+        })
+    }
+
+    fn claude_slot_with_expiry(
+        dir: &std::path::Path,
+        id_key: &str,
+        expires_at: i64,
+    ) -> (crate::agent_accounts::AgentAccounts, String) {
+        let service = slot_store(dir);
+        let id = crate::agent_accounts::slot_id_for(HarnessId::ClaudeCode, id_key);
+        service
+            .write_slot(&crate::agent_accounts::Slot {
+                id: id.clone(),
+                harness: HarnessId::ClaudeCode,
+                account_key: id_key.to_string(),
+                profile: crate::agent_accounts::SlotProfile {
+                    email: format!("{id_key}@example.com"),
+                    display_name: None,
+                    organization: None,
+                    plan: None,
+                    auth_kind: comet_proto::AgentAuthKind::Oauth,
+                },
+                credentials: serde_json::json!({
+                    "claudeAiOauth": {
+                        "accessToken": "at",
+                        "refreshToken": "r",
+                        "expiresAt": expires_at,
+                    }
+                }),
+                claude_config: None,
+                saved_at: 1,
+                created_at: Some(1),
+            })
+            .unwrap();
+        (service, id)
+    }
+
+    /// The gh#576 sentence: an errored run on an expired slot leads with the
+    /// account it spent, when the token ran out, and how to fix it — with
+    /// the harness's own words kept behind it as evidence.
+    #[test]
+    fn an_errored_run_on_an_expired_slot_names_the_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, id) = claude_slot_with_expiry(dir.path(), "sam", now_ms() - 1);
+        let original = "claude exited unexpectedly (exit code 1): invalid api key";
+        let said = say_stale_login(
+            Some(&service),
+            HarnessId::ClaudeCode,
+            Some(id.as_str()),
+            original,
+        )
+        .expect("an expired slot is named");
+        assert!(said.contains("sam@example.com"), "{said}");
+        assert!(said.contains(&format!("relogin {id}")), "{said}");
+        assert!(
+            said.contains(original),
+            "the harness's own error survives behind the attribution: {said}"
+        );
+    }
+
+    /// Every other shape stays untouched: a fresh token, no account named at
+    /// all, or no accounts service wired — none of them may be blamed on a
+    /// stale login.
+    #[test]
+    fn nothing_else_is_blamed_on_a_stale_login() {
+        let dir = tempfile::tempdir().unwrap();
+        let (service, fresh_id) = claude_slot_with_expiry(dir.path(), "kim", now_ms() + 3_600_000);
+        for (accounts, id) in [
+            (
+                Some(&service) as Option<&crate::agent_accounts::AgentAccounts>,
+                Some(fresh_id.as_str()),
+            ),
+            (Some(&service), None),
+            (None, Some("anything")),
+        ] {
+            assert!(
+                say_stale_login(
+                    accounts,
+                    HarnessId::ClaudeCode,
+                    id,
+                    "codex exited unexpectedly (exit code 1)"
+                )
+                .is_none(),
+                "a fresh token or an unnamed account claims nothing"
+            );
+        }
     }
 }

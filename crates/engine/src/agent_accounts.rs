@@ -66,8 +66,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use comet_proto::{
-    AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
-    AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
+    AgentAccount, AgentAccountHealth, AgentAccountState, AgentAccountWarning,
+    AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
+    AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
 
 use crate::repos::home_dir;
@@ -102,6 +103,11 @@ const USAGE_TTL: Duration = Duration::from_secs(60);
 /// An abandoned login flow (dialog dismissed without Cancel) is reaped past this.
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+/// An access token this close to its stamp is treated as already gone — the
+/// same margin [`AgentAccounts::claude_usage`] applies before it will spend
+/// one. A token with seconds left is not a verdict a doctor line should
+/// print green and watch die.
+const EXPIRY_MARGIN_MS: i64 = 30_000;
 /// How long `start_login` waits for `codex` to print its banner. The loopback
 /// flow's URL is built locally and appears at once; the device-code banner
 /// costs a round trip to OpenAI first, and that one is worth waiting out —
@@ -184,36 +190,36 @@ impl AgentAccountsConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct SlotProfile {
-    email: String,
+pub(crate) struct SlotProfile {
+    pub(crate) email: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    display_name: Option<String>,
+    pub(crate) display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    organization: Option<String>,
+    pub(crate) organization: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    plan: Option<String>,
-    auth_kind: AgentAuthKind,
+    pub(crate) plan: Option<String>,
+    pub(crate) auth_kind: AgentAuthKind,
 }
 
 /// One saved login (`{slotId}.json`), same field surface as comet's slot files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Slot {
-    id: String,
-    harness: HarnessId,
+pub(crate) struct Slot {
+    pub(crate) id: String,
+    pub(crate) harness: HarnessId,
     /// The provider-side identity the slot is keyed by (account uuid/email).
-    account_key: String,
-    profile: SlotProfile,
+    pub(crate) account_key: String,
+    pub(crate) profile: SlotProfile,
     /// Claude: the `.credentials.json`/Keychain payload. Codex: `auth.json`.
-    credentials: serde_json::Value,
+    pub(crate) credentials: serde_json::Value,
     /// Claude only: `{oauthAccount, userID}` merged into `~/.claude.json` on swap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    claude_config: Option<serde_json::Value>,
-    saved_at: i64,
+    pub(crate) claude_config: Option<serde_json::Value>,
+    pub(crate) saved_at: i64,
     /// First time this account was saved — the STABLE sort key, so switching the
     /// active account (which re-snapshots and bumps `saved_at`) never reorders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    created_at: Option<i64>,
+    pub(crate) created_at: Option<i64>,
 }
 
 /// A live detection result (before it's persisted into a slot).
@@ -299,6 +305,15 @@ pub struct AgentAccounts {
 pub struct AccountLease {
     inner: Arc<Inner>,
     account_id: String,
+}
+
+/// What [`AgentAccounts::expired_login`] found: the login a dying run spent,
+/// and when its stored token stopped being any good.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpiredLogin {
+    pub email: String,
+    /// Epoch ms at which the stored access token's stamp ran out.
+    pub expired_at: i64,
 }
 
 impl Drop for AccountLease {
@@ -1359,6 +1374,207 @@ impl AgentAccounts {
         }
     }
 
+    // ── credential freshness (gh#576) ───────────────────────────────────────
+
+    /// Would a run under each saved login work right now?
+    ///
+    /// The verdict is minted where a timestamp cannot answer it. An access
+    /// token whose expiry stamp is still ahead is ok on its face; one past
+    /// its stamp is put to the provider with a read-only authenticated GET —
+    /// Claude's profile view, Codex's usage view, the same calls their own
+    /// CLIs render — before anything is claimed. Accepted ⇒ the login works,
+    /// whatever the stamp says; refused ⇒ the next run under it dies at its
+    /// first request, which is exactly the fact this exists to name.
+    ///
+    /// Deliberately read-only: no refresh grant is exercised from here.
+    /// Refresh tokens are commonly single-use, so a probe that rotates one
+    /// is a *write* to somebody's login, and a freshness check must be safe
+    /// to run at any moment — mid-run against a slot an agent is spending
+    /// included. Healing an expired-but-refreshable slot stays where it
+    /// already lives (the usage refresher); replacing a dead one is what
+    /// [`AgentAccounts::start_login`] is for.
+    pub async fn health(&self, account_id: Option<&str>) -> Vec<AgentAccountHealth> {
+        let snapshot = match self.list(false).await {
+            Ok(snapshot) => snapshot,
+            // Detection failing wholesale (a config dir gone unreadable) is
+            // one unknown answer per known slot, not an error page: doctor
+            // renders "could not ask", which is what happened.
+            Err(err) => {
+                return self
+                    .all_slot_ids()
+                    .filter(|(id, _)| account_id.is_none_or(|want| want == id.as_str()))
+                    .map(|(id, harness)| AgentAccountHealth {
+                        id,
+                        harness,
+                        email: None,
+                        state: AgentAccountState::Unknown,
+                        detail: format!("could not detect logins: {err}"),
+                    })
+                    .collect();
+            }
+        };
+        let mut out = Vec::new();
+        for account in &snapshot.accounts {
+            if let Some(want) = account_id
+                && account.id != want
+            {
+                continue;
+            }
+            out.push(self.account_health(account).await);
+        }
+        out
+    }
+
+    /// One row of [`AgentAccounts::health`]. Kept small: everything it decides
+    /// is either a timestamp comparison or one probe.
+    async fn account_health(&self, account: &AgentAccount) -> AgentAccountHealth {
+        let health = |state, detail| AgentAccountHealth {
+            id: account.id.clone(),
+            harness: account.harness,
+            email: account.email.clone(),
+            state,
+            detail,
+        };
+        match account.harness {
+            // Provider keys, not logins: nothing here expires, so there is
+            // nothing to verify — saying so beats inventing a green tick.
+            HarnessId::Opencode => health(
+                AgentAccountState::Ok,
+                "provider API keys — nothing to expire".into(),
+            ),
+            // A live login we know exists but could not read (macOS Keychain
+            // denied): the honest answer is that it was not checked.
+            _ if !account.switchable && account.saved_at.is_none() => health(
+                AgentAccountState::Unknown,
+                "credentials present but unreadable — approve the macOS Keychain \
+                 prompt, then re-run"
+                    .into(),
+            ),
+            harness @ (HarnessId::ClaudeCode | HarnessId::Codex) => {
+                let slot = self
+                    .read_slots(harness)
+                    .into_iter()
+                    .find(|s| s.id == account.id);
+                let Some(slot) = slot else {
+                    return health(
+                        AgentAccountState::Unknown,
+                        "slot file missing — refresh the accounts list".into(),
+                    );
+                };
+                if slot.profile.auth_kind == AgentAuthKind::ApiKey {
+                    return health(AgentAccountState::Ok, "API key — nothing to expire".into());
+                }
+                match token_expiry(harness, &slot.credentials) {
+                    Some(expires_at) if expires_at > now_ms() + EXPIRY_MARGIN_MS => health(
+                        AgentAccountState::Ok,
+                        format!("access token until {}", stamp(expires_at)),
+                    ),
+                    _ => {
+                        let (state, detail) = self.probe(harness, &slot).await;
+                        health(state, detail)
+                    }
+                }
+            }
+            other => health(
+                AgentAccountState::Unknown,
+                format!("{other:?} has no login flow to verify"),
+            ),
+        }
+    }
+
+    /// Put one slot's stored access token to its provider, read-only. The
+    /// three-way outcome maps straight onto [`AgentAccountState`].
+    async fn probe(&self, harness: HarnessId, slot: &Slot) -> (AgentAccountState, String) {
+        let request = match harness {
+            HarnessId::ClaudeCode => {
+                let oauth = slot.credentials.get("claudeAiOauth");
+                let Some(token) = oauth.and_then(|o| str_field(o, "accessToken")) else {
+                    return (
+                        AgentAccountState::Unknown,
+                        "stored login carries no access token — sign in again".into(),
+                    );
+                };
+                self.inner
+                    .http
+                    .get(CLAUDE_PROFILE_URL)
+                    .bearer_auth(token)
+                    .header("anthropic-beta", "oauth-2025-04-20")
+            }
+            HarnessId::Codex => {
+                let tokens = slot.credentials.get("tokens");
+                let Some(token) = tokens.and_then(|t| str_field(t, "access_token")) else {
+                    return (
+                        AgentAccountState::Unknown,
+                        "stored login carries no access token — sign in again".into(),
+                    );
+                };
+                self.inner
+                    .http
+                    .get(CODEX_USAGE_URL)
+                    .bearer_auth(token)
+                    .header(
+                        "chatgpt-account-id",
+                        tokens
+                            .and_then(|t| str_field(t, "account_id"))
+                            .unwrap_or_default(),
+                    )
+            }
+            _ => return (AgentAccountState::Unknown, "nothing to probe".into()),
+        };
+        match request.send().await {
+            Ok(res) if res.status().is_success() => (
+                AgentAccountState::Ok,
+                "verified: the provider accepted this login just now".into(),
+            ),
+            Ok(res) if res.status() == 401 || res.status() == 403 => (
+                AgentAccountState::Stale,
+                format!(
+                    "{} refused this login — the next run under it fails. Sign in again",
+                    match harness {
+                        HarnessId::ClaudeCode => "Anthropic",
+                        HarnessId::Codex => "ChatGPT",
+                        _ => "the provider",
+                    }
+                ),
+            ),
+            Ok(res) => (
+                AgentAccountState::Unknown,
+                format!("could not ask ({}) — no verdict", res.status()),
+            ),
+            Err(err) => (
+                AgentAccountState::Unknown,
+                format!("could not ask ({err}) — no verdict"),
+            ),
+        }
+    }
+
+    /// The named slot's own expiry, OFFLINE — no detection, no probes, no
+    /// writes beyond the slot-dir absorption [`AgentAccounts::read_slots`]
+    /// already does on any read. What a dying run's transcript attribution is
+    /// allowed to claim about the login it spent (gh#576): a fact off the
+    /// stored token, never a guess about why the child failed.
+    pub fn expired_login(&self, harness: HarnessId, account_id: &str) -> Option<ExpiredLogin> {
+        let slot = self
+            .read_slots(harness)
+            .into_iter()
+            .find(|s| s.id == account_id)?;
+        let expired_at = token_expiry(harness, &slot.credentials).filter(|at| *at <= now_ms())?;
+        Some(ExpiredLogin {
+            email: slot.profile.email,
+            expired_at,
+        })
+    }
+
+    /// Every slot id this device holds, with its harness — the fallback
+    /// answer space when detection itself failed (see [`AgentAccounts::health`]).
+    fn all_slot_ids(&self) -> impl Iterator<Item = (String, HarnessId)> {
+        [HarnessId::ClaudeCode, HarnessId::Codex]
+            .into_iter()
+            .flat_map(move |h| self.read_slots(h).into_iter().map(move |s| (s.id, h)))
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
     // ── detection ───────────────────────────────────────────────────────────
 
     async fn detect_claude(&self) -> (Option<Detected>, Option<String>) {
@@ -1535,7 +1751,7 @@ impl AgentAccounts {
         slots
     }
 
-    fn write_slot(&self, slot: &Slot) -> Result<(), EngineError> {
+    pub(crate) fn write_slot(&self, slot: &Slot) -> Result<(), EngineError> {
         let file = self
             .slots_dir(slot.harness)?
             .join(format!("{}.json", slot.id));
@@ -1834,7 +2050,7 @@ mod keychain {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
-fn harness_slug(harness: HarnessId) -> &'static str {
+pub(crate) fn harness_slug(harness: HarnessId) -> &'static str {
     match harness {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
@@ -1915,6 +2131,43 @@ fn freshness(harness: HarnessId, credentials: &serde_json::Value) -> Option<i64>
     }
 }
 
+/// When a credential payload's access token stops working, in epoch ms —
+/// the freshness question asked of one payload rather than of two.
+///
+/// Claude stamps it plainly (`claudeAiOauth.expiresAt`). Codex stamps only
+/// its own refresh bookkeeping (`last_refresh`), so the expiry is mined out
+/// of the access token's own JWT claims, unverified — the same trade
+/// [`jwt_claims`] makes: identity facts off a token the CLI already trusts,
+/// never an authentication decision.
+///
+/// `None` = no dated token in the payload (an API key, which does not
+/// expire) or no readable stamp — "unknown", which callers report as such
+/// rather than as either verdict.
+fn token_expiry(harness: HarnessId, credentials: &serde_json::Value) -> Option<i64> {
+    match harness {
+        HarnessId::ClaudeCode => credentials
+            .get("claudeAiOauth")
+            .and_then(|o| o.get("expiresAt"))
+            .and_then(|v| v.as_i64()),
+        HarnessId::Codex => {
+            let token = str_field(credentials.get("tokens")?, "access_token")?;
+            jwt_claims(&token)?
+                .get("exp")
+                .and_then(|v| v.as_i64())
+                .map(|secs| secs * 1000)
+        }
+        _ => None,
+    }
+}
+
+/// A wall-clock moment a person can read. Health lines and re-login
+/// transcripts quote these; epoch millis are for machines.
+pub(crate) fn stamp(expires_at_ms: i64) -> String {
+    DateTime::<Utc>::from_timestamp_millis(expires_at_ms)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| format!("{expires_at_ms}"))
+}
+
 /// Should `file` be (re)written from a slot holding `credentials`? Missing is
 /// stale; present-and-at-least-as-fresh is not — once the dir exists the CLI
 /// owns it, and only a genuinely newer slot (a re-login) may stamp over it.
@@ -1928,7 +2181,7 @@ fn is_stale(file: &Path, harness: HarnessId, credentials: &serde_json::Value) ->
     freshness(harness, credentials) > freshness(harness, &live)
 }
 
-fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
+pub(crate) fn slot_id_for(harness: HarnessId, account_key: &str) -> String {
     let digest = Sha256::digest(format!("{}:{account_key}", harness_slug(harness)).as_bytes());
     crate::repos::hex(&digest)[..16].to_string()
 }
@@ -2552,5 +2805,75 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ── credential freshness (gh#576) ───────────────────────────────────────
+
+    /// A codex access token whose `exp` claim is the only stamp there is:
+    /// mined unverified, like every other identity fact off a JWT.
+    #[test]
+    fn codex_expiry_comes_from_the_tokens_own_claims() {
+        // exp = 2100-01-01, base64url payload {"exp":4070908800}.
+        let jwt = "header.eyJleHAiOjQwNzA5MDg4MDB9.signature";
+        assert_eq!(
+            token_expiry(
+                HarnessId::Codex,
+                &serde_json::json!({ "tokens": { "access_token": jwt } })
+            ),
+            Some(4_070_908_800_000)
+        );
+        // No JWT, no verdict — reported as unknown, never as either answer.
+        assert_eq!(
+            token_expiry(
+                HarnessId::Codex,
+                &serde_json::json!({ "tokens": { "access_token": "garbage" } })
+            ),
+            None
+        );
+    }
+
+    /// The offline half of the transcript attribution: a slot whose stored
+    /// token is past its stamp is named; one that still has time on it, an
+    /// API key, or an id nothing on this device holds is not.
+    #[test]
+    fn expired_login_names_only_a_past_its_stamp_slot() {
+        let tmp = TempDir::new("expired-login");
+        let service = accounts(&tmp.0);
+        let dead = claude_slot("teammate-a", claude_creds(1_000, "ra"));
+        let alive = claude_slot("teammate-b", claude_creds(now_ms() + 3_600_000, "rb"));
+        service.write_slot(&dead).unwrap();
+        service.write_slot(&alive).unwrap();
+
+        let expired = service
+            .expired_login(HarnessId::ClaudeCode, &dead.id)
+            .expect("the stale slot is named");
+        assert_eq!(expired.email, "teammate-a@example.com");
+        assert_eq!(expired.expired_at, 1_000);
+
+        assert_eq!(
+            service.expired_login(HarnessId::ClaudeCode, &alive.id),
+            None,
+            "a token with time left is not expired"
+        );
+        assert_eq!(
+            service.expired_login(HarnessId::ClaudeCode, "nonexistent000"),
+            None,
+            "an id this device does not hold claims nothing"
+        );
+    }
+
+    /// An API-key slot never reads as expired, whatever its file looks like.
+    #[test]
+    fn an_api_key_slot_is_never_expired() {
+        let tmp = TempDir::new("api-key-slot");
+        let service = accounts(&tmp.0);
+        let mut slot = claude_slot(
+            "keyed",
+            serde_json::json!({ "claudeAiOauth": { "accessToken": "at" } }),
+        );
+        slot.profile.auth_kind = AgentAuthKind::ApiKey;
+        service.write_slot(&slot).unwrap();
+        // The payload carries no expiry at all, so there is nothing to be past.
+        assert_eq!(service.expired_login(HarnessId::ClaudeCode, &slot.id), None);
     }
 }
