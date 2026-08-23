@@ -121,13 +121,7 @@ pub fn runtime_options() -> Vec<RuntimeOption> {
 /// dispatch override sends. The reverse of [`harness_for_runtime`], restricted
 /// to the canonical spelling (no aliases).
 pub fn runtime_name(harness: HarnessId) -> &'static str {
-    match harness {
-        HarnessId::ClaudeCode => "claude-code",
-        HarnessId::Codex => "codex",
-        HarnessId::Cursor => "cursor",
-        HarnessId::Opencode => "opencode",
-        HarnessId::Mock => "mock",
-    }
+    harness.as_str()
 }
 
 /// Derive the board's view of an agent from a comet session row.

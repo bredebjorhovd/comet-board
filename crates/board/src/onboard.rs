@@ -153,20 +153,7 @@ impl Onboarded {
 
 /// What one adoption wrote, in words.
 fn wrote_phrase(a: &Adopted) -> String {
-    let mut wrote = Vec::new();
-    if a.wrote_route {
-        wrote.push("a [[route]]".to_string());
-    }
-    if a.wrote_repo {
-        wrote.push("[github] repos".to_string());
-    }
-    if let Some(l) = &a.labels {
-        wrote.push(if l.is_empty() {
-            "a [[github.repo]] polling every open issue".to_string()
-        } else {
-            format!("a [[github.repo]] filter: {}", l.join(", "))
-        });
-    }
+    let wrote = a.wrote_items();
     if wrote.is_empty() {
         return "nothing to write".to_string();
     }
