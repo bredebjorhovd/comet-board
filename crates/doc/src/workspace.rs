@@ -576,25 +576,6 @@ impl WorkspaceDoc {
         Ok(repaired)
     }
 
-    /// Stamp where a chat was forked from (gh#425). Written once by the host
-    /// that made the fork; `false` when no such row.
-    ///
-    /// A set and not an upsert field for the same reason the branch and the
-    /// harness session are: the row is created first (so the fork exists even
-    /// if what follows fails), and this lands on it a moment later.
-    pub fn set_chat_forked_from(
-        &self,
-        chat_id: &str,
-        lineage: &comet_proto::ChatLineage,
-    ) -> Result<bool, DocError> {
-        let Some(row) = self.existing_row("chats", chat_id) else {
-            return Ok(false);
-        };
-        row.insert("forkedFrom", LoroValue::from(serde_json::to_value(lineage)?))?;
-        self.doc.commit();
-        Ok(true)
-    }
-
     /// Host-side resume continuity: the harness-native session id of the chat's
     /// latest run and the cwd it was created under (comet stored the same pair
     /// on the chats table). An empty

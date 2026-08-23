@@ -890,18 +890,6 @@ impl WorkspaceHost {
         }
     }
 
-    /// Record where a chat was forked from (gh#425) — written once, by the
-    /// host that made the fork, right after the row exists. An error here is
-    /// worth failing the fork over: a fork whose lineage never landed is a chat
-    /// that shares a checkout with another one and says nothing about it.
-    pub fn set_chat_lineage(
-        &self,
-        chat_id: &str,
-        lineage: &comet_proto::ChatLineage,
-    ) -> Result<bool, EngineError> {
-        Ok(self.inner.doc().set_chat_forked_from(chat_id, lineage)?)
-    }
-
     /// The chat row's stored harness session `(session_id, cwd)`, if stamped.
     /// The empty-string tombstone passes through — callers must treat it as
     /// "explicitly no resume" (and must NOT fall back to older sources).

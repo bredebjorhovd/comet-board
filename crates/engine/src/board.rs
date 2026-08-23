@@ -38,7 +38,7 @@ use comet_board::dispatch::{
     dispatcher_for, dispatcher_name, route_for, space_matches,
 };
 use comet_board::log::Logger;
-use comet_board::model::{AgentStatus, Outcome};
+use comet_board::model::Outcome;
 use comet_board::rows::{TaskDetail, TaskRow, board_rows, task_detail};
 use comet_board::runtime::{Runtime, agent_status};
 use comet_board::sources::github::{HttpRest, PushCapabilities};
@@ -1356,13 +1356,6 @@ pub fn board_enabled_from_env() -> bool {
         std::env::var("COMET_BOARD").as_deref().map(str::trim),
         Ok("0") | Ok("false") | Ok("off")
     )
-}
-
-/// Statuses for one chat id from an ad-hoc session list — kept next to the
-/// loop's mapping so the two cannot drift.
-pub fn status_for(sessions: &[Session], chat_id: &str) -> AgentStatus {
-    let now = chrono::Utc::now();
-    agent_status(sessions.iter().find(|s| s.chat_id == chat_id), now)
 }
 
 #[cfg(test)]

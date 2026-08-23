@@ -673,11 +673,6 @@ pub mod dot {
     /// Running. Amber, at the anchor: running is routine, and the ramp is what
     /// keeps it from shouting.
     pub const WORKING: (f32, f32, f32) = status::dark(status::WORKING);
-    /// Asking a question. The review hue — something wants your eyes, and it
-    /// must read differently from "busy" at a glance.
-    pub const AWAITING: (f32, f32, f32) = status::dark(status::REVIEW);
-    /// Errored. The blocked hue.
-    pub const ERRORED: (f32, f32, f32) = status::dark(status::BLOCKED);
     /// Finished but unseen. The settled hue — reads as "ready for you".
     pub const COMPLETED: (f32, f32, f32) = status::dark(status::SETTLED);
 }

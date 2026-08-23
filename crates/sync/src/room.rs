@@ -675,12 +675,6 @@ impl RoomClient {
         *self.presence.borrow()
     }
 
-    /// Watch [`Self::presence_joined`] (closes with the actor, like
-    /// [`Self::watch_connected`]).
-    pub fn watch_presence(&self) -> watch::Receiver<bool> {
-        self.presence.clone()
-    }
-
     /// What this room can honestly say about its CONTENT right now (gh#483).
     ///
     /// Strictly independent of [`Self::connected`]. A room can be joined,
@@ -690,12 +684,6 @@ impl RoomClient {
     /// Anything that renders "synced" must read this.
     pub fn convergence(&self) -> ConvergenceState {
         self.convergence.borrow().clone()
-    }
-
-    /// Watch [`Self::convergence`]. Closes with the actor, like
-    /// [`Self::watch_connected`].
-    pub fn watch_convergence(&self) -> watch::Receiver<ConvergenceState> {
-        self.convergence.clone()
     }
 
     /// Watch [`Self::connected`]. The channel CLOSES when the actor task ends

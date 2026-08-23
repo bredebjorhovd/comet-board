@@ -397,12 +397,6 @@ pub fn token_for_push(auth: &TokenProvider, repo: &str) -> Result<String> {
     }
 }
 
-/// This binary, for [`push_env`]. Falls back to the name on `PATH` when the
-/// current exe cannot be resolved.
-pub fn self_exe() -> PathBuf {
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("comet-board"))
-}
-
 // ---------------------------------------------------------------------------
 // The askpass shim
 // ---------------------------------------------------------------------------

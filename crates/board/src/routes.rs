@@ -438,21 +438,6 @@ fn kind_of(keys: &[(&str, Kind)], key: &str, table: &str) -> Result<Kind> {
     }
 }
 
-/// The route keys a caller may set, for a picker or a `--help`.
-pub fn route_keys() -> Vec<&'static str> {
-    ROUTE_KEYS.iter().map(|(k, _)| *k).collect()
-}
-
-/// The `[defaults]` keys a caller may set.
-pub fn default_keys() -> Vec<&'static str> {
-    DEFAULT_KEYS.iter().map(|(k, _)| *k).collect()
-}
-
-/// The `[[automation]]` keys a caller may set (gh#490).
-pub fn automation_keys() -> Vec<&'static str> {
-    AUTOMATION_KEYS.iter().map(|(k, _)| *k).collect()
-}
-
 /// Apply one edit and return the file as it now stands.
 ///
 /// The write goes through [`adopt::apply`], so the same three things happen as

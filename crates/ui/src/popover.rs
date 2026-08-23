@@ -465,21 +465,7 @@ pub fn key_hint_pair(
         .child(key_hint_label(theme, label))
 }
 
-/// A muted kbd hint chip inside menu rows (`⌘↵`-style accelerators).
-pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
-    div()
-        .flex_none()
-        .px(px(5.0))
-        .py(px(1.0))
-        .rounded(px(Theme::RADIUS_CHIP))
-        .bg(theme.white_alpha(0.05))
-        .text_size(px(Theme::TEXT_CAPTION))
-        .font_family(theme.font_mono.clone())
-        .text_color(theme.text_subtle)
-        .child(SharedString::from(label.to_string()))
-}
-
-/// The search/text input frame at the top of a picker popover (comet
+/// The search/text input frame at the top of the picker popover (comet
 /// `searchInput`: `w-full rounded-lg bg-white/[0.04] px-2.5 py-1.5
 /// text-[13px]` + `mb-1`, borderless — full width inside the card's own
 /// p-1, only a 4px bottom margin).
