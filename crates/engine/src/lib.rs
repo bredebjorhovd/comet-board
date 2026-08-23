@@ -21,6 +21,7 @@ pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod fork;
+pub mod fs_watch;
 pub mod instance_lock;
 pub mod org_devices;
 pub mod presence;
@@ -587,6 +588,10 @@ fn edge_health(
     // what happens during an outage — would zero anything kept per-handle.
     // That also makes it cover the workspace and registry rooms for free.
     let churn = comet_sync::churn::census();
+    // Local resource pressure (gh#552): the filesystem watcher population
+    // against its own bound — the reading whose absence let one process sit at
+    // 103 of the kernel's 128 inotify instances until EAGAIN panicked it.
+    let fs_watch = crate::fs_watch::census();
     let online = edge_url.is_some();
     comet_proto::EdgeHealth {
         edge_url: edge_url.clone(),
@@ -618,6 +623,10 @@ fn edge_health(
                 sessions_last_hour: room.sessions_last_hour,
             })
             .collect(),
+        fs_watchers_open: fs_watch.open,
+        fs_watchers_limit: fs_watch.limit,
+        fs_watchers_refused: fs_watch.refused_total,
+        fs_watchers_degraded: fs_watch.degraded_total,
     }
 }
 
@@ -756,6 +765,11 @@ impl Engine {
                 core.agent_accounts.clone(),
                 tokio::runtime::Handle::current(),
             ));
+            // A reclaimed worktree releases its watchers the moment the
+            // directory goes (gh#552), instead of waiting for a reconcile to
+            // notice — each held watcher is one OS instance against the cap
+            // that killed this box's engine four times in 48h.
+            runtime.set_diff_sync(Arc::new(core.diff_sync.clone()));
             // A dispatched agent pushes as the board's GitHub App rather than
             // as the box user (gh#68) — wired here rather than in the core
             // because it is the board's credential, and a device with no board

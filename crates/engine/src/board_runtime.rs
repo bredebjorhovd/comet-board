@@ -56,6 +56,11 @@ pub struct CometRuntime {
     /// board — a board that never gets one can still dispatch every route
     /// pointing at a space here, and refuses the cross-device ones by name.
     links: OnceLock<Arc<comet_rpc::LinkCache>>,
+    /// The checkout diff sync, attached after construction like the links
+    /// above. Reclaiming a worktree releases its watchers through this
+    /// (gh#552): the watcher slots come back with the directory instead of
+    /// waiting for the next reconcile to notice it is gone.
+    diff_sync: OnceLock<Arc<crate::diff_sync::CheckoutDiffSync>>,
     handle: Handle,
 }
 
@@ -79,12 +84,19 @@ impl CometRuntime {
             accounts,
             push: OnceLock::new(),
             links: OnceLock::new(),
+            diff_sync: OnceLock::new(),
             handle,
         }
     }
 
     pub fn set_push_credentials(&self, push: Arc<crate::push_credentials::PushCredentials>) {
         let _ = self.push.set(push);
+    }
+
+    /// Attach the diff sync — what lets a reclaimed worktree's watchers be
+    /// released the moment the directory goes (gh#552).
+    pub fn set_diff_sync(&self, diff_sync: Arc<crate::diff_sync::CheckoutDiffSync>) {
+        let _ = self.diff_sync.set(diff_sync);
     }
 
     /// Attach the peer link cache — what lets a dispatch reach the device that
@@ -588,6 +600,16 @@ impl Runtime for CometRuntime {
         self.handle
             .block_on(self.repos.delete_worktree(&repo, worktree, branch))
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        // The checkout is gone; its watchers go with it, now (gh#552) — not
+        // at the next reconcile that happens to notice the directory left.
+        // Each held watcher is one OS instance against a per-user kernel cap,
+        // and a worktree population that churns is exactly how the box filled
+        // its table. Best-effort: a runtime assembled without the diff sync
+        // still reclaims fine, and reconcile catches up within one repair
+        // tick either way.
+        if let Some(diff_sync) = self.diff_sync.get() {
+            diff_sync.release_under(worktree);
+        }
         Ok(())
     }
 

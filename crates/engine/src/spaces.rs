@@ -32,6 +32,7 @@ use tokio::sync::{mpsc, watch};
 
 use comet_proto::Space;
 
+use crate::fs_watch::{FsWatcher, WatcherSpawnError};
 use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
 
@@ -43,8 +44,10 @@ const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
 struct SpaceEntry {
     path: PathBuf,
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Keeps the folder + `.git` watchers alive; dropped on entry close.
-    _watchers: Vec<notify::RecommendedWatcher>,
+    /// Keeps the folder + `.git` watchers alive; dropped on entry close. Each
+    /// is one OS watcher instance, counted against the engine's budget
+    /// ([`crate::fs_watch`]).
+    _watchers: Vec<FsWatcher>,
 }
 
 struct SpacesSyncInner {
@@ -115,40 +118,48 @@ fn reconcile(inner: &Arc<SpacesSyncInner>, spaces: &[Space]) {
         // three git subprocesses per keystroke-driven rebuild. Watch failures
         // are fine (a folder that is not a repo has no `.git` to watch yet):
         // the repair tick still converges.
-        let watchers = [PathBuf::from(&space.path), Path::new(&space.path).join(".git")]
-            .into_iter()
-            .filter_map(|target| {
-                let tx = kick_tx.clone();
-                let result = notify::recommended_watcher(
-                    move |event: Result<notify::Event, notify::Error>| {
-                        let Ok(event) = event else { return };
-                        if event
-                            .paths
-                            .iter()
-                            .any(|p| p.file_name().is_some_and(|n| n == ".git" || n == "HEAD"))
-                        {
-                            let _ = tx.send(());
-                        }
-                    },
-                );
-                match result {
-                    Ok(mut watcher) => {
-                        use notify::Watcher as _;
-                        match watcher.watch(&target, notify::RecursiveMode::NonRecursive) {
-                            Ok(()) => Some(watcher),
-                            Err(err) => {
-                                tracing::debug!(path = %target.display(), error = %err, "spaces: watch failed");
-                                None
-                            }
-                        }
+        let watchers = [
+            PathBuf::from(&space.path),
+            Path::new(&space.path).join(".git"),
+        ]
+        .into_iter()
+        .filter_map(|target| {
+            // Counted against the engine's watcher budget (gh#552): a
+            // refusal here degrades one space's instant git-presence
+            // reactions to the repair tick, which still converges.
+            let tx = kick_tx.clone();
+            match FsWatcher::spawn(
+                &target,
+                notify::RecursiveMode::NonRecursive,
+                move |event: Result<notify::Event, notify::Error>| {
+                    let Ok(event) = event else { return };
+                    if event
+                        .paths
+                        .iter()
+                        .any(|p| p.file_name().is_some_and(|n| n == ".git" || n == "HEAD"))
+                    {
+                        let _ = tx.send(());
                     }
-                    Err(err) => {
-                        tracing::debug!(error = %err, "spaces: watcher create failed");
-                        None
-                    }
+                },
+            ) {
+                Ok(watcher) => Some(watcher),
+                Err(WatcherSpawnError::BudgetExhausted { open, limit }) => {
+                    tracing::warn!(
+                        path = %target.display(),
+                        held = open,
+                        limit,
+                        "spaces: filesystem-watcher budget exhausted; space falls back to the \
+                         repair tick"
+                    );
+                    None
                 }
-            })
-            .collect();
+                Err(err) => {
+                    tracing::debug!(path = %target.display(), error = %err, "spaces: watch failed");
+                    None
+                }
+            }
+        })
+        .collect();
         let entry = Arc::new(SpaceEntry {
             path: PathBuf::from(&space.path),
             kick_tx: kick_tx.clone(),

@@ -115,6 +115,29 @@ pub struct EdgeHealth {
     /// ordinary case and short in the bad one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unconverged_rooms: Vec<RoomConvergence>,
+    /// Filesystem watcher instances the engine holds right now (gh#552).
+    ///
+    /// Every `notify` watcher is one OS instance — an inotify fd on Linux —
+    /// against a per-user kernel cap (`fs.inotify.max_user_instances`), and
+    /// nothing used to read the engine's share anywhere: a box sat at 103 of
+    /// 128 until the kernel said EAGAIN and the engine panicked itself to
+    /// death four times in 48h.
+    #[serde(default)]
+    pub fs_watchers_open: usize,
+    /// The engine's own bound on [`Self::fs_watchers_open`] — deliberately
+    /// under any sane kernel cap so it refuses a watch (one checkout degrades
+    /// to repair-tick diffs) before the kernel refuses the process. Zero from
+    /// an engine too old to report it.
+    #[serde(default)]
+    pub fs_watchers_limit: usize,
+    /// Watchers refused lifetime-total because the engine was at its bound.
+    #[serde(default)]
+    pub fs_watchers_refused: u64,
+    /// Watcher deaths survived lifetime-total — poll failures and their
+    /// follow-up unwraps, which pre-gh#552 engines turned into a full crash
+    /// and every sync room dropped with it.
+    #[serde(default)]
+    pub fs_watchers_degraded: u64,
 }
 
 /// One room that keeps dying, as the census sees it (gh#527).
@@ -211,6 +234,21 @@ impl EdgeHealth {
     /// healthy has to ask this too.
     pub fn churning(&self) -> bool {
         self.rooms_churning > 0
+    }
+
+    /// Watchers have died and been survived (gh#552). Not fatal by design —
+    /// the repair tick keeps the data right — but it is a kernel-level fault
+    /// an operator should see, and it is what used to be a crash.
+    pub fn watchers_degraded(&self) -> bool {
+        self.fs_watchers_degraded > 0
+    }
+
+    /// The engine is refusing new watches because it is at its own bound:
+    /// every checkout opened from here on loses its live diff updates until
+    /// some close. The pre-crash state of gh#552's box, now visible before
+    /// anything panics.
+    pub fn watchers_saturated(&self) -> bool {
+        self.fs_watchers_limit > 0 && self.fs_watchers_open >= self.fs_watchers_limit
     }
 
     /// One line for `comet status` and `comet-board doctor`. Says what is
@@ -323,6 +361,26 @@ impl EdgeHealth {
             detail.push_str(&format!(
                 ", {} recovering from a shallow-history cut",
                 self.chat_rooms_recovering
+            ));
+        }
+        // Local resources (gh#552), said in the same line as the edge state:
+        // an operator reading "12 of 12 live" on a box whose engine is
+        // refusing watches — or surviving dead ones — is deciding whether to
+        // look based on what this sentence contains.
+        if self.watchers_saturated() {
+            detail.push_str(&format!(
+                " — filesystem watchers AT LIMIT ({}/{}): new checkouts will not be watched \
+                 live and their diffs fall back to the 2-minute repair tick (raise \
+                 COMET_MAX_FS_WATCHERS or close worktrees)",
+                self.fs_watchers_open, self.fs_watchers_limit
+            ));
+        }
+        if self.watchers_degraded() {
+            detail.push_str(&format!(
+                " — {} filesystem watcher(s) DEGRADED lifetime: their kernel event loops died \
+                 and were survived instead of crashing the engine; affected diffs rely on the \
+                 repair tick until their entries rebuild",
+                self.fs_watchers_degraded
             ));
         }
         // Name them, up to a line's worth. "1 chat room not converged" sends an
@@ -619,5 +677,46 @@ mod tests {
         };
         assert!(!health.dark());
         assert!(health.summary().contains("signed out"));
+    }
+
+    /// The gh#552 shapes. An engine at its watcher bound — the state that
+    /// box sat in at 103 of 128 kernel instances before anything panicked —
+    /// and an engine that survived dead watchers, both have to read in the
+    /// same line that renders "healthy" for every other axis.
+    #[test]
+    fn a_saturated_or_degraded_watcher_population_is_named() {
+        let saturated = EdgeHealth {
+            fs_watchers_open: 96,
+            fs_watchers_limit: 96,
+            ..online()
+        };
+        assert!(saturated.watchers_saturated());
+        let summary = saturated.summary();
+        assert!(summary.contains("AT LIMIT (96/96)"), "{summary}");
+        assert!(summary.contains("COMET_MAX_FS_WATCHERS"), "{summary}");
+
+        let degraded = EdgeHealth {
+            fs_watchers_degraded: 2,
+            ..online()
+        };
+        assert!(degraded.watchers_degraded());
+        let summary = degraded.summary();
+        assert!(
+            summary.contains("2 filesystem watcher(s) DEGRADED"),
+            "{summary}"
+        );
+    }
+
+    /// The ordinary case adds no watcher clauses, and an engine too old to
+    /// report any of it (zeros from serde defaults) is not failed for a state
+    /// it cannot see.
+    #[test]
+    fn a_quiet_watcher_population_adds_no_clauses() {
+        let health = online();
+        assert!(!health.watchers_saturated());
+        assert!(!health.watchers_degraded());
+        let summary = health.summary();
+        assert!(!summary.contains("AT LIMIT"), "{summary}");
+        assert!(!summary.contains("DEGRADED"), "{summary}");
     }
 }
