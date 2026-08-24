@@ -389,6 +389,7 @@ mod tests {
             status,
             started_at: None,
             updated_at: now() - chrono::Duration::milliseconds(age_ms),
+            activity: None,
         }
     }
 

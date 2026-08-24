@@ -31,7 +31,8 @@ use loro::{ExportMode, LoroDoc, LoroMap, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
 use comet_proto::{
-    Chat, ChatConfig, Device, GithubPushState, GithubPushStateError, Session, SessionStatus, Space,
+    Chat, ChatConfig, Device, GithubPushState, GithubPushStateError, Session, SessionActivity,
+    SessionStatus, Space,
 };
 
 use crate::schema::DocError;
@@ -635,6 +636,24 @@ impl WorkspaceDoc {
         row.insert("status", status_str(session.status))?;
         set_opt_ms(&row, "startedAt", session.started_at)?;
         row.insert("updatedAt", session.updated_at.timestamp_millis())?;
+        // The in-flight call (gh#605), as three flat fields so the row stays a
+        // shallow map of scalars + one JSON value. Cleared (keys deleted) when
+        // nothing is in flight — absence IS "nothing in flight".
+        match &session.activity {
+            Some(activity) => {
+                row.insert(
+                    "activityCall",
+                    LoroValue::from(serde_json::to_value(&activity.call)?),
+                )?;
+                set_opt_ms(&row, "activityStartedAt", Some(activity.started_at))?;
+                row.insert("activitySteps", activity.steps)?;
+            }
+            None => {
+                let _ = row.delete("activityCall");
+                let _ = row.delete("activityStartedAt");
+                let _ = row.delete("activitySteps");
+            }
+        }
         self.doc.commit();
         Ok(())
     }
@@ -944,6 +963,8 @@ impl From<RawChat> for Chat {
     }
 }
 
+/// Tolerant row shape: every gh#605 activity field is optional so rows from
+/// engines that predate it (and cleared rows) deserialize unchanged.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawSession {
@@ -954,6 +975,12 @@ struct RawSession {
     started_at: Option<i64>,
     #[serde(default)]
     updated_at: i64,
+    #[serde(default)]
+    activity_call: Option<serde_json::Value>,
+    #[serde(default)]
+    activity_started_at: Option<i64>,
+    #[serde(default)]
+    activity_steps: Option<u32>,
 }
 
 impl From<RawSession> for Session {
@@ -964,6 +991,20 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
+            // All three fields together or none: a half-written trio (a peer
+            // mid-commit) is not an activity worth inventing.
+            activity: match (raw.activity_call, raw.activity_started_at) {
+                (Some(call), Some(started_at)) => {
+                    let call = serde_json::from_value(call).ok();
+                    let steps = raw.activity_steps.unwrap_or(0);
+                    call.map(|call| SessionActivity {
+                        call,
+                        started_at: dt(started_at),
+                        steps,
+                    })
+                }
+                _ => None,
+            },
         }
     }
 }
@@ -1043,6 +1084,7 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            activity: None,
         }
     }
 
@@ -1371,6 +1413,58 @@ mod tests {
         assert!(ws.read_chats().unwrap().is_empty());
         assert!(ws.read_sessions().unwrap().is_empty());
         assert!(!ws.delete_chat("chat-1").unwrap());
+    }
+
+    /// gh#605: the in-flight call rides the session row — set, converged to a
+    /// second doc, and cleared (absence IS nothing-in-flight) without
+    /// leaving stale keys behind.
+    #[test]
+    fn session_activity_round_trips_and_clears() {
+        use comet_proto::SessionActivity;
+        let a = WorkspaceDoc::new();
+        let b = WorkspaceDoc::new();
+
+        let mut s = session("chat-1", "dev-a", SessionStatus::Working);
+        s.activity = Some(SessionActivity {
+            call: comet_proto::ToolCall::Exec {
+                command: "comet-board wait --timeout 40m".into(),
+            },
+            started_at: ts(4_000),
+            steps: 0,
+        });
+        a.upsert_session(&s).unwrap();
+        cross_sync(&a, &b);
+        assert_eq!(b.read_all().unwrap().sessions, vec![s.clone()]);
+
+        // Steps bump in place (a subagent step, gh#280's counter bubbled up).
+        s.activity.as_mut().unwrap().steps = 12;
+        a.upsert_session(&s).unwrap();
+        cross_sync(&a, &b);
+        assert_eq!(
+            b.read_all().unwrap().sessions[0]
+                .activity
+                .as_ref()
+                .unwrap()
+                .steps,
+            12
+        );
+
+        // The call returns: the row clears all three keys.
+        let mut settled = s.clone();
+        settled.activity = None;
+        a.upsert_session(&settled).unwrap();
+        cross_sync(&a, &b);
+        let read_back = b.read_all().unwrap().sessions;
+        assert_eq!(read_back.len(), 1);
+        assert_eq!(read_back[0].activity, None);
+
+        // And a snapshot import (what a cold-joining device reads) agrees.
+        let other = LoroDoc::new();
+        other.import(&b.export_snapshot().unwrap()).unwrap();
+        assert_eq!(
+            WorkspaceDoc::from_doc(other).read_all().unwrap().sessions,
+            read_back
+        );
     }
 
     #[test]

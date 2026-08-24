@@ -3899,14 +3899,40 @@ impl Shell {
             return strip.into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);
-        let elapsed_secs = state
-            .session_for(&chat_id)
+        let session = state.session_for(&chat_id);
+        let activity = session.and_then(|s| s.activity.clone());
+        let waiting = activity
+            .as_ref()
+            .is_some_and(|a| comet_proto::view::activity_is_waiting(a, now));
+        let elapsed_secs = session
             .and_then(|s| s.started_at)
             .map(|t| now.signed_duration_since(t).num_seconds())
             .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
 
         match indicator {
+            Indicator::Working if waiting => {
+                // Waiting beats silence (gh#605): once one call has held past
+                // the threshold, the strip names it instead of rotating a
+                // flavour word — "running `cargo test` · 4m12s" is a sentence
+                // about THIS run, and the warning tone says the wait is no
+                // longer ordinary.
+                let label = comet_proto::view::activity_label(
+                    activity.as_ref().expect("checked above"),
+                    now,
+                );
+                strip
+                    .child(loaders::gradient_spinner(&theme, 2.5, cx.entity_id(), cx))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(Theme::TEXT_DENSE))
+                            .text_color(theme.warning_text())
+                            .child(SharedString::from(label)),
+                    )
+                    .into_any_element()
+            }
             Indicator::Working => {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);

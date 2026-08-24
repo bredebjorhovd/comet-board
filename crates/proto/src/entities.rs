@@ -418,6 +418,27 @@ pub enum SessionStatus {
     Errored,
 }
 
+/// What the run is doing RIGHT NOW (gh#605) — the one in-flight tool call.
+///
+/// A session row's `status: working` says a turn is live; it says nothing
+/// about WHAT the turn is doing, so a healthy run inside a 40-minute command
+/// and a hung one render identically. The activity is the missing sentence:
+/// what it is doing, since when, and (for delegated work) how many steps the
+/// subagent has taken. Cleared by the host the moment the call returns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionActivity {
+    /// The in-flight call, sanitized exactly like its transcript part
+    /// ([`crate::ToolCall`] already carries only what renders).
+    pub call: crate::ToolCall,
+    /// When this call started — the clock every surface ticks against.
+    pub started_at: DateTime<Utc>,
+    /// Subagent steps counted onto a [`ToolCall::Task`] (gh#280's counter,
+    /// bubbled up to the row). Zero on everything else.
+    #[serde(default)]
+    pub steps: u32,
+}
+
 /// Live run status for a chat — drives the Working indicator and sidebar status dots.
 /// Staleness-checked client-side against `updated_at` so a crashed backend never shows
 /// an eternal "Working".
@@ -429,6 +450,11 @@ pub struct Session {
     pub status: SessionStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// The in-flight tool call, when there is one (gh#605). Absent on rows
+    /// from engines that predate the field and on settled runs — both read as
+    /// "nothing in flight".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionActivity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

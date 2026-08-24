@@ -77,7 +77,9 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    (id, deviceId, title, archived, cwd, branch, checkoutId, spaceId, lastSeenAt,
    lastMessagePreview/At, config), devices registry (id, name, platform, lastSeenAt), session
    status rows (Working indicator; staleness-checked client-side so a crashed backend never shows
-   eternal "Working"), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
+   eternal "Working"; plus the run's current in-flight tool call — what it is doing and since when,
+   gh#605 — so a healthy run inside a 40-minute command is distinguishable from a hung one without
+   opening the transcript), checkout-diff summary pointers. `lastSeenAt` is the synced LWW seen marker
    behind the "completed (unseen)" indicator. Lives in its own DO room (same SessionRoom DO
    class, doc id `ws4/{orgId}/{userId}` — see the generation ladder below), with presence
    via Loro `EphemeralStore` (replaces the 15s heartbeat writes). Presence is DERIVED by the edge

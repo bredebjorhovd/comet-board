@@ -34,6 +34,13 @@ pub enum MessagePart {
         /// True once a ToolResult arrived.
         #[serde(default)]
         resolved: bool,
+        /// When the call started, epoch millis (gh#605). Stamped by the host
+        /// when the event is folded, so an in-flight block can tick its own
+        /// elapsed — a chip that says its name but not how long it has been
+        /// running is bookkeeping, not liveness. `None` on parts written by
+        /// engines that predate the field.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        started_at_ms: Option<i64>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -130,6 +137,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     call: call.clone(),
                     is_error: false,
                     resolved: false,
+                    // The host stamps this the moment the part lands (see
+                    // the field's doc); a re-emitted call keeps the stamp it
+                    // already has.
+                    started_at_ms: None,
                 });
             }
         }
@@ -527,6 +538,7 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                started_at_ms: None,
             },
         ];
         let chunks = split_parts(&parts);

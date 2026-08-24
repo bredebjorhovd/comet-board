@@ -33,8 +33,8 @@ use comet_doc::{
 };
 use comet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use comet_proto::{
-    AgentEvent, ChatConfig, DoneStatus, HarnessId, RunRequest, Session, SessionStatus,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, ChatConfig, DoneStatus, HarnessId, RunRequest, Session, SessionActivity,
+    SessionStatus, ToolCall, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -1057,11 +1057,15 @@ impl Inner {
                     status,
                     started_at: None,
                     updated_at: now,
+                    activity: None,
                 });
             entry.status = status;
             entry.updated_at = now;
             if fresh_start {
                 entry.started_at = Some(now);
+                // A fresh turn begins between tool calls by definition: never
+                // let a previous run's in-flight call leak into it.
+                entry.activity = None;
             }
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
@@ -1077,6 +1081,37 @@ impl Inner {
             ws.record_session(&session);
         }
         self.kick_queue_on_settle(chat_id, status);
+    }
+
+    /// Publish the run's CURRENT ACTIVITY onto its session row (gh#605): the
+    /// one in-flight tool call, what it is, and since when. This is the
+    /// sentence that separates a healthy run inside a 40-minute command from
+    /// a hung one — every sidebar row reads it without opening the transcript.
+    ///
+    /// Same mirrors as [`Self::set_status`] minus the transition: the status
+    /// stays whatever the run last made it, only freshness and the activity
+    /// move. No throttle: this fires per tool START/END and per counted
+    /// subagent step, which is orders of magnitude rarer than the text
+    /// deltas whose mirroring [`touch_session`](Self::touch_session) exists
+    /// to bound.
+    fn set_activity(&self, chat_id: &str, activity: Option<SessionActivity>) {
+        let now = Utc::now();
+        let session = {
+            let mut statuses = lock(&self.statuses);
+            let Some(entry) = statuses.get_mut(chat_id) else {
+                return;
+            };
+            entry.activity = activity;
+            entry.updated_at = now;
+            let session = entry.clone();
+            let mut list: Vec<Session> = statuses.values().cloned().collect();
+            list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+            self.sessions_tx.send_replace(list);
+            session
+        };
+        if let Some(ws) = self.workspace() {
+            ws.record_session(&session);
+        }
     }
 
     /// A settled turn is what a queued follow-up has been waiting for (gh#424).
@@ -1454,15 +1489,38 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 call,
                 is_error,
                 resolved,
+                started_at_ms,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
                 is_error: *is_error,
                 resolved: *resolved,
+                started_at_ms: *started_at_ms,
             },
             other => other.clone(),
         })
         .collect()
+}
+
+/// Stamp `started_at_ms` on every tool part still missing one (gh#605).
+///
+/// Called with the live fold before each doc sync, so an in-flight block
+/// carries the moment it started from the first commit it appears in — that
+/// timestamp is what lets the chip tick its own elapsed. Idempotent: parts
+/// keep the stamp they got when they landed, and resolved parts (whose stamp
+/// was already written) are left untouched so a late pass cannot rewrite
+/// history.
+fn stamp_tool_starts(parts: &mut [MessagePart], now_ms: i64) {
+    for part in parts.iter_mut() {
+        if let MessagePart::Tool {
+            resolved: false,
+            started_at_ms: stamp @ None,
+            ..
+        } = part
+        {
+            *stamp = Some(now_ms);
+        }
+    }
 }
 
 /// The persisted assistant text of a folded segment (workspace preview source).
@@ -1800,6 +1858,13 @@ async fn drive_run(
     // the chat carries limits, which means off for every chat the board did
     // not dispatch.
     let mut spin = comet_board::spin::Watch::new(inner.turn_limits(&chat_id));
+    // The run's CURRENT ACTIVITY (gh#605): the one tool call in flight, kept
+    // beside the fold so its result can retire it. Published onto the session
+    // row as it changes — this is what a sidebar row reads to say "running
+    // `comet-board wait` for 4m12s" without opening the transcript, and what
+    // keeps subagent steps counting upward on the row while the delegation
+    // works.
+    let mut current_tool: Option<(String, SessionActivity)> = None;
     // What the kernel's OOM-kill counters said when this run started (gh#533).
     // Armed here for the reason the guardrails are counted here: this task owns
     // the run's whole life, and the counters only mean something as a delta
@@ -2190,6 +2255,58 @@ async fn drive_run(
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
         }
+        // gh#605, transcript half: every unresolved call in the live segment
+        // carries the moment it started, so its block can tick its own
+        // elapsed from the moment it appears. Idempotent — stamped parts keep
+        // their stamp.
+        stamp_tool_starts(&mut folded, now_ms());
+        // gh#605, row half: publish what is in flight onto the session row.
+        match &event {
+            AgentEvent::ToolCall { id, call } => {
+                // The sanitized shape — heavy inputs never leave the journal,
+                // not even as row metadata.
+                let activity = comet_proto::SessionActivity {
+                    call: sanitize_tool_call(call),
+                    started_at: Utc::now(),
+                    steps: 0,
+                };
+                current_tool = Some((id.clone(), activity.clone()));
+                inner.set_activity(&chat_id, Some(activity));
+            }
+            AgentEvent::ToolResult { id, .. }
+                if current_tool.as_ref().is_some_and(|(tid, _)| tid == id) =>
+            {
+                current_tool = None;
+                inner.set_activity(&chat_id, None);
+            }
+            AgentEvent::SubagentActivity { parent_tool_use_id }
+                if current_tool.as_ref().is_some_and(|(tid, activity)| {
+                    tid == parent_tool_use_id && matches!(activity.call, ToolCall::Task { .. })
+                }) =>
+            {
+                let Some((_, activity)) = current_tool.as_mut() else {
+                    unreachable!("guarded above")
+                };
+                // A subagent step is liveness you can COUNT (gh#280's counter,
+                // now on the row): the delegation visibly advances without a
+                // single byte of its own transcript reaching this chat.
+                activity.steps = activity.steps.saturating_add(1);
+                inner.set_activity(&chat_id, Some(activity.clone()));
+            }
+            // Turn boundaries retire whatever was in flight — the fold resets
+            // with them. Done lands here before the finalize below, so the
+            // settled row never advertises a call that has nowhere left to
+            // return to.
+            AgentEvent::SessionStarted { .. } | AgentEvent::Steered { .. }
+                if current_tool.take().is_some() =>
+            {
+                inner.set_activity(&chat_id, None);
+            }
+            AgentEvent::Done { .. } if current_tool.take().is_some() => {
+                inner.set_activity(&chat_id, None);
+            }
+            _ => {}
+        }
 
         if let AgentEvent::Done { status, .. } = &event {
             let message_status = match status {
@@ -2424,6 +2541,105 @@ mod tests {
             !sessions.chat_is_busy("chat-a"),
             "a failed turn is over too — nothing is streaming through this doc"
         );
+    }
+
+    /// gh#605: the in-flight call lives on the session row — set when a tool
+    /// starts, replaced as a subagent counts steps, cleared when its result
+    /// lands or a fresh turn begins.
+    #[test]
+    fn the_current_activity_rides_the_session_row() {
+        use comet_proto::{SessionActivity, ToolCall};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(RunJournal::open(dir.path().join("journals")).expect("journal"));
+        let sessions = SessionsEngine::new(
+            "device-a".into(),
+            journal,
+            Arc::new(crate::registry::default_registry()),
+        );
+
+        let activity = |command: &str| SessionActivity {
+            call: ToolCall::Exec {
+                command: command.into(),
+            },
+            started_at: Utc::now(),
+            steps: 0,
+        };
+
+        // No row yet: publishing an activity for an unknown chat is a no-op,
+        // not an invented row (same discipline as touch_session).
+        sessions
+            .inner
+            .set_activity("never-ran", Some(activity("ls")));
+        assert!(sessions.watch_sessions().borrow().is_empty());
+
+        sessions.set_status("chat-a", SessionStatus::Working, true);
+        sessions
+            .inner
+            .set_activity("chat-a", Some(activity("cargo test --workspace")));
+        let row = sessions
+            .watch_sessions()
+            .borrow()
+            .iter()
+            .find(|s| s.chat_id == "chat-a")
+            .expect("row exists")
+            .clone();
+        assert_eq!(
+            row.activity
+                .as_ref()
+                .map(comet_proto::view::activity_heading),
+            Some("run cargo test --workspace".into()),
+        );
+
+        // A fresh turn clears whatever was in flight — a new run must never
+        // inherit the previous one's sentence.
+        sessions.set_status("chat-a", SessionStatus::Working, true);
+        let row = sessions
+            .watch_sessions()
+            .borrow()
+            .iter()
+            .find(|s| s.chat_id == "chat-a")
+            .unwrap()
+            .clone();
+        assert_eq!(row.activity, None);
+    }
+
+    /// gh#605: `stamp_tool_starts` stamps every still-unresolved call once,
+    /// never rewrites a stamp it already wrote, and leaves resolved parts
+    /// alone.
+    #[test]
+    fn tool_start_stamps_are_idempotent_and_resolution_safe() {
+        let mut parts = vec![
+            MessagePart::Tool {
+                id: "done".into(),
+                call: comet_proto::ToolCall::Exec {
+                    command: "ls".into(),
+                },
+                is_error: false,
+                resolved: true,
+                started_at_ms: None,
+            },
+            MessagePart::Tool {
+                id: "live".into(),
+                call: comet_proto::ToolCall::Exec {
+                    command: "sleep 400".into(),
+                },
+                is_error: false,
+                resolved: false,
+                started_at_ms: None,
+            },
+        ];
+        fn stamp_of(parts: &[MessagePart], ix: usize) -> Option<i64> {
+            match &parts[ix] {
+                MessagePart::Tool { started_at_ms, .. } => *started_at_ms,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        stamp_tool_starts(&mut parts, 1_000);
+        assert_eq!(stamp_of(&parts, 0), None, "resolved stays unstamped");
+        assert_eq!(stamp_of(&parts, 1), Some(1_000));
+
+        stamp_tool_starts(&mut parts, 2_000);
+        assert_eq!(stamp_of(&parts, 1), Some(1_000), "the first stamp wins");
     }
 
     // ---- a killed child is a loud event (gh#533) --------------------------

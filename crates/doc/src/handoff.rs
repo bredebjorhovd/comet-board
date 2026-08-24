@@ -267,6 +267,7 @@ mod tests {
                         },
                         is_error: true,
                         resolved: true,
+                        started_at_ms: None,
                     },
                 ],
                 ..entry("m2", MessageRole::Assistant, "")
