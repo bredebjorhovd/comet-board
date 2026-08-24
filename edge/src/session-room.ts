@@ -39,6 +39,18 @@
  * it, so it is also the only thing that needs a budget of its own: see
  * ALARM_FAILURE_LIMIT and `alarm()` (gh#378).
  *
+ * THREE FAULT CLASSES, and they want three different cures. Reading one as
+ * another is what every incident in this file's history has actually been.
+ * - The stored doc will not materialize → [`DocLoadRefused`]. Refuse the join,
+ *   count it, evict and reseed at [`LOAD_REFUSAL_LIMIT`]. Never a wasm strike.
+ * - The wasm HEAP is exhausted → poison strikes and, past
+ *   `WASM_POISON_ABORT_AFTER`, `ctx.abort()`. Asked of the heap by
+ *   [`wasmHeapUsable`], never inferred from the shape of one exception.
+ * - ONE wasm object is wedged, the heap around it fine →
+ *   [`DocBorrowConflict`] (gh#607). Drop the wrapper, count it, reseed on the
+ *   same budget — and never abort, because recycling an isolate over one
+ *   object is the loop gh#557 exists to have stopped.
+ *
  * That discipline is why presence is derived here. Until gh#145 every engine
  * wrote `presence/{deviceId} → now` into this room's ephemeral store every 15s.
  * A `%EPH` frame is a real message, so it WAKES the object — a room with any
@@ -240,6 +252,31 @@ export class DocLoadRefused extends Error {
   }
 }
 
+/** THE THIRD FAULT CLASS (gh#607): a wasm-bindgen value stuck BORROWED.
+ *
+ * Not `DocLoadRefused`'s cousin by accident — it extends it, because the answer
+ * is the same one and every guard downstream already knows how to give it: say
+ * so on the wire as a `JoinError` the client backs off from, count it toward
+ * [`LOAD_REFUSAL_LIMIT`] so the evict-and-reseed runs, spend no alarm budget
+ * (see [`ALARM_REFUSAL_BUDGET`]). What it must NOT be is a wasm-poisoning
+ * strike: the heap is fine, ONE object in it is unusable, and `ctx.abort()`
+ * over that is the isolate-recycle loop gh#557 exists to have stopped.
+ *
+ * Distinct from `DocLoadRefused` all the same, and named, because the cure has
+ * an extra half: the poisoned WRAPPER has to be dropped from the cache too, or
+ * the next join reuses the same stuck object and the fault is permanent for the
+ * life of the instance (`isLive` cannot see it — see [`isWasmBorrowConflict`]). */
+export class DocBorrowConflict extends DocLoadRefused {
+  constructor(
+    readonly site: string,
+    readonly fault: unknown,
+    bytes: number
+  ) {
+    super(`wasm borrow conflict at ${site}: ${String(fault)}`, bytes);
+    this.name = "DocBorrowConflict";
+  }
+}
+
 /** A wasm-bindgen wrapper whose `free()` already ran has `__wbg_ptr === 0`;
  * any method call on it throws `Error("null pointer passed to rust")`. Several
  * flows (trim, fold, alarm, idle release) free-and-replace the cached doc
@@ -248,9 +285,93 @@ export class DocLoadRefused extends Error {
  * every join/update/tail on the ws3 workspace room threw for 2.5h fleet-wide,
  * and nothing recycled the instance because the error is neither a RangeError
  * nor a RuntimeError (the wasm-poison tripwire ignored it). Check liveness
- * before every reuse; rematerialization is a ~tens-of-ms cold replay. */
+ * before every reuse; rematerialization is a ~tens-of-ms cold replay.
+ *
+ * NOT a sufficient precondition, and gh#607 is why: a wrapper can be perfectly
+ * live and still unusable, because the borrow flag this asks nothing about
+ * lives in wasm linear memory and is unreadable from JS (see
+ * [`isWasmBorrowConflict`]). There is no predicate for that one — only a catch,
+ * and then `abandonDoc`. */
 const isLive = (obj: unknown): boolean =>
   (obj as { __wbg_ptr?: number } | undefined)?.__wbg_ptr !== 0;
+/** A wasm-bindgen value whose `WasmRefCell` still has an outstanding borrow
+ * (gh#607). `free()` — and any by-value method — calls `WasmRefCell::take`,
+ * which refuses with `attempted to take ownership of Rust value while it was
+ * borrowed`; a `&mut self` method on the same value answers `recursive use of
+ * an object detected …`. Both mean one object is wedged, and neither is
+ * anything the tripwires above can see.
+ *
+ * HOW A BORROW OUTLIVES ITS CALL, since the answer is not "our code kept one".
+ * wasm-bindgen scopes each borrow to a single exported call with a Rust guard,
+ * and JS is single-threaded, so no `await` of ours can interleave one. What CAN
+ * end a wasm frame without dropping its guard is an exception that unwinds
+ * THROUGH it: wasm has no destructor unwinding for a JS throw, and every
+ * borrowing loro call re-enters JS while borrowed (`toJSON` builds a JS Map;
+ * `export`/`import` read their options object back through serde). So on a
+ * pressed isolate — this room's whole history — a `RangeError: Invalid array
+ * buffer length` raised in one of those JS callbacks leaves the borrow set
+ * FOREVER on that object. Same for a CPU-limit kill landing mid-call, which is
+ * the failure `MAX_DOC_LOAD_BYTES` documents and this room keeps taking.
+ *
+ * Two things make it invisible to everything built so far. `__wbg_ptr` is still
+ * a live pointer, so [`isLive`] passes it. And the message is a plain `Error` —
+ * not a `RangeError`, not a `WebAssembly.RuntimeError`, not one of
+ * [`isWasmUseAfterFree`]'s strings — so `escalateWasmPoisoning` returns having
+ * counted nothing and the generic catch answers `internal error`.
+ *
+ * It is also, quietly, a permanent leak: `free()` zeroes `__wbg_ptr` and
+ * unregisters the FinalizationRegistry entry BEFORE calling into wasm, so a
+ * throwing free abandons the Rust value with nothing left to reclaim it — not
+ * a later free, not GC. Every occurrence is megabytes the isolate keeps until
+ * the runtime resets it at the 128MB cap, severing every co-located room.
+ *
+ * Our own classified error carries the signature in its message, so exclude it:
+ * re-classifying a `DocBorrowConflict` would double-count the refusal. */
+export const isWasmBorrowConflict = (e: unknown): boolean =>
+  e instanceof Error &&
+  !(e instanceof DocLoadRefused) &&
+  /attempted to take ownership of Rust value while it was borrowed|recursive use of an object detected/i.test(
+    e.message
+  );
+/** Isolate-wide count of wasm values this module could not free — MODULE state
+ * for the same reason as `wasmPoisonStrikes`: the leak is in the one linear
+ * memory every co-located SessionRoom shares, so the number that matters is the
+ * isolate's, not the room's. Surfaced on `/stats` beside the per-room count. */
+let wasmBorrowLeaks = 0;
+/** What a [`freeWasm`] attempt did. `leaked` is the one worth reading: the
+ * value is gone from JS and still resident in wasm, permanently. */
+type FreeOutcome = "freed" | "dangling" | "leaked" | "failed";
+/** Release a wasm-bindgen value, and NEVER throw at the caller (gh#607).
+ *
+ * Every `free()` in this file lives in a `finally` or a cleanup step, which is
+ * precisely where a throw does the most damage: it replaces the in-flight
+ * exception with its own — so the `RangeError` the guards were built to read
+ * arrives at the catch as `attempted to take ownership…` instead, matching
+ * nothing — and it skips every free after it, which is how one fault turns into
+ * several megabytes. Both halves of the 2026-08-24 `ws4` loop are that.
+ *
+ * A free that cannot happen is still worth saying out loud, so it is logged and
+ * counted rather than swallowed. */
+const freeWasm = (value: { free(): void } | undefined, site: string): FreeOutcome => {
+  if (value === undefined || !isLive(value)) return "dangling";
+  try {
+    value.free();
+    return "freed";
+  } catch (e) {
+    if (isWasmBorrowConflict(e)) {
+      wasmBorrowLeaks++;
+      console.error(
+        "wasm value could not be freed (stuck borrow); its memory is leaked for this isolate",
+        `site=${site}`,
+        `isolateLeaks=${wasmBorrowLeaks}`,
+        String(e)
+      );
+      return "leaked";
+    }
+    console.error("wasm free failed", `site=${site}`, String(e));
+    return "failed";
+  }
+};
 /** The use-after-free / detached-buffer signatures of a dangling wasm wrapper
  * — same terminal shape as heap poisoning (nothing in-instance recovers it),
  * so the tripwire must count these too. */
@@ -294,16 +415,11 @@ const wasmHeapUsable = (): boolean => {
   } catch {
     return false;
   } finally {
-    try {
-      probe?.free();
-    } catch {
-      /* poisoned beyond freeing — the return value already said so */
-    }
-    try {
-      echo?.free();
-    } catch {
-      /* same */
-    }
+    // freeWasm, not a bare try/catch: a probe that cannot be freed is a LEAK
+    // worth counting, not merely an error worth ignoring — and this function
+    // runs on exactly the failure paths where that is most likely.
+    freeWasm(probe, "heap-probe");
+    freeWasm(echo, "heap-probe-echo");
   }
 };
 
@@ -466,7 +582,12 @@ export const exportBackfillChunk = (
       more
     };
   } finally {
-    target.free();
+    // `target.toJSON()` above builds a JS Map from inside a borrow of this
+    // vector, so a throw out of that callback (an OOM on a pressed isolate)
+    // leaves it stuck borrowed. A bare `free()` here would then throw the
+    // borrow conflict IN PLACE OF whatever actually went wrong — the 2026-08-24
+    // `ws4` join, exactly (gh#607).
+    freeWasm(target, "backfill-target-vv");
   }
 };
 
@@ -727,6 +848,23 @@ export class SessionRoom implements DurableObject {
             limit: LOAD_REFUSAL_LIMIT,
             lastRefusal: this.readJsonMeta("lastLoadRefusal")
           },
+          // Stuck wasm borrows (gh#607). `conflicts` is how often this room has
+          // ever found its doc wedged and `strikes` how many in a row it is on
+          // now — the budget that ends in the same evict-and-reseed the load
+          // guard uses, which is why it carries the same limit. `leaked` counts
+          // the ones whose memory could not be handed back at all, which is the
+          // number that explains an isolate walking into its memory limit with
+          // every room reporting health; `isolateLeaked` is that count across
+          // all co-located rooms, because the leak is in the linear memory they
+          // share.
+          borrow: {
+            conflicts: Number(this.getMeta("borrowConflicts") ?? "0"),
+            strikes: Number(this.getMeta("borrowStrikes") ?? "0"),
+            limit: LOAD_REFUSAL_LIMIT,
+            leaked: Number(this.getMeta("borrowLeaks") ?? "0"),
+            isolateLeaked: wasmBorrowLeaks,
+            lastConflict: this.readJsonMeta("lastBorrowConflict")
+          },
           // Whether this room can still COMPACT (gh#557). `snapshotBytes: 0`
           // on a megabyte room was the only trace a fold had never landed, and
           // it reads identically to "nothing to fold yet" — so a room whose
@@ -893,12 +1031,20 @@ export class SessionRoom implements DurableObject {
         // Release the wasm memory rather than wait on GC finalizers — but only
         // if the wrapper is still live. A room that just aborted on a poisoned
         // heap is precisely a room whose cached `this.doc` is a dangling
-        // wrapper, and calling into a freed one throws (see `isLive`). The
-        // catch covers the rest: memory that is already gone is not an error
-        // worth propagating.
-        if (this.doc && isLive(this.doc)) this.doc.free();
+        // wrapper, and calling into a freed one throws (see `isLive`). A room
+        // that got here from a stuck borrow (gh#607) is one whose doc cannot be
+        // released at all; `abandonDoc` clears the field either way, which is
+        // what "force a fresh materialization next join" actually requires.
+        //
+        // It swallows the failure, and this step must not: the ask of gh#553 is
+        // failure-TOLERANT, not failure-blind — the drop happens regardless and
+        // the operator is still told which cleanup limped. Re-raise so
+        // `cleanup` records it in `problems`.
+        const outcome = this.abandonDoc("reset-log");
+        if (outcome === "leaked" || outcome === "failed") {
+          throw new Error(`cached doc could not be released (${outcome})`);
+        }
       });
-      this.doc = undefined; // force a fresh (empty) materialization next join
       // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
       // sessions bail and reconnect into the now-empty doc.
       cleanup("boot sockets", () => {
@@ -957,7 +1103,13 @@ export class SessionRoom implements DurableObject {
         default:
           ws.close(1002, "Unsupported message");
       }
-    } catch (e) {
+    } catch (raw) {
+      // Classify BEFORE anything else looks at it (gh#607). A stuck wasm borrow
+      // is neither a heap fault nor a bad-bytes fault, and read as either it
+      // gets the wrong cure — so it becomes a `DocBorrowConflict` here, which is
+      // a `DocLoadRefused`, and falls into the refusal branch below with the
+      // poisoned wrapper already dropped and the reseed already counting.
+      const e = this.reclassifyBorrow(raw, `ws-${decoded.type}`);
       if (e instanceof DocLoadRefused) {
         // A refusal is an ANSWER (gh#527), not a failure: the room has already
         // logged why it will not load and counted it toward the reseed. Say so
@@ -965,7 +1117,9 @@ export class SessionRoom implements DurableObject {
         // hot-dialing a room that cannot serve it, and never strike the wasm
         // tripwire — the heap is fine, the stored doc is not.
         console.warn(
-          "refusing a join: this room will not load",
+          e instanceof DocBorrowConflict
+            ? "refusing a join: this room's doc is wedged in wasm"
+            : "refusing a join: this room will not load",
           `room=${this.getMeta("chatId") ?? "?"}`,
           `device=${state?.deviceId ?? "unattributed"}`,
           e.message
@@ -1160,6 +1314,18 @@ export class SessionRoom implements DurableObject {
    * sheds every socket in it, and invites the reseed that reproduces the
    * fault — the loop this ticket is about. It is still recorded. */
   private escalateWasmPoisoning(e: unknown, site: string): void {
+    // A stuck borrow is the THIRD class (gh#607) and it must not reach the
+    // strike counter: aborting the isolate over one wedged object sheds every
+    // co-located room's sockets and invites the reseed that reproduces the
+    // fault. It is not merely declined, though — the cure still has to run, and
+    // this is the only hook the /tail, /stats, /snapshot, flush and alarm paths
+    // share. `reclassifyBorrow` drops the poisoned wrapper and counts the
+    // refusal; the fault it returns is thrown away because these callers have
+    // already answered theirs.
+    if (isWasmBorrowConflict(e)) {
+      this.reclassifyBorrow(e, site);
+      return;
+    }
     if (!(e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e))) {
       return;
     }
@@ -1183,12 +1349,7 @@ export class SessionRoom implements DurableObject {
     console.error(`wasm heap poisoned (${wasmPoisonStrikes} strikes); aborting isolate for a fresh heap`);
     // Best effort: if abort recycles only the DO instance (not the whole
     // isolate), at least this room's doc goes back to the wasm allocator.
-    try {
-      this.doc?.free();
-    } catch {
-      /* already poisoned beyond freeing */
-    }
-    this.doc = undefined;
+    this.abandonDoc("poison-abort");
     // gh#527: leave the reason DURABLY behind before the instance dies. An
     // abort severs every socket — the clients read 1006 — and takes the
     // invocation with it, so the console line above is the only account and
@@ -1295,7 +1456,7 @@ export class SessionRoom implements DurableObject {
           version: vv.encode()
         });
       } finally {
-        vv.free();
+        freeWasm(vv, "join-version-vv");
       }
       let backfill: Uint8Array<ArrayBufferLike> = new Uint8Array();
       let continueBackfill = false;
@@ -1327,7 +1488,7 @@ export class SessionRoom implements DurableObject {
                 const cmp = from.compare(since);
                 stale = cmp === undefined || cmp < 0;
               } finally {
-                since.free();
+                freeWasm(since, "join-shallow-since-vv");
               }
             }
             if (stale) {
@@ -1343,7 +1504,7 @@ export class SessionRoom implements DurableObject {
               continueBackfill = chunk.more;
             }
           } finally {
-            from.free();
+            freeWasm(from, "join-client-vv");
           }
         }
       } else {
@@ -1375,6 +1536,11 @@ export class SessionRoom implements DurableObject {
       // transient errors (observed 2026-08-04: ~1 abort/min with all rooms
       // already trimmed small). Poisoning is CONSECUTIVE failures.
       wasmPoisonStrikes = 0;
+      // And so is a wedged doc (gh#607): this join went in and out of the
+      // cached `LoroDoc` and came back with bytes, which is the only evidence
+      // that exists that the object is usable again. Same discipline, one room
+      // narrower — the borrow is per-object, so the counter is per-room.
+      if (this.getMeta("borrowStrikes")) this.setMeta("borrowStrikes", "0");
       return;
     }
 
@@ -1477,6 +1643,12 @@ export class SessionRoom implements DurableObject {
         // about the PUSH, not the isolate — rethrowing it left the sender with
         // no ack at all, so it redialled and re-sent the same payload, which is
         // the reseed half of the loop. Salvage below answers it instead.
+        // A stuck borrow (gh#607) is neither, and salvage is actively wrong for
+        // it: every retry below re-enters the same wedged object, fails, and
+        // ends with the SENDER in the penalty box for a fault that is the
+        // room's. Rethrow so the handler's classifier drops the doc and refuses
+        // the push honestly; the next materialization is clean.
+        if (isWasmBorrowConflict(e)) throw e;
         const wasmShaped =
           e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e);
         // Only the RangeError arm is ambiguous enough to be worth asking about
@@ -1779,8 +1951,32 @@ export class SessionRoom implements DurableObject {
     if (storedBytes > MAX_DOC_LOAD_BYTES) {
       this.refuseLoad(`stored doc exceeds the load guard (${MAX_DOC_LOAD_BYTES}B)`, storedBytes);
     }
-    const started = Date.now();
+    // FREE THE DOC ON THE THROW PATH (gh#607). Everything below builds a
+    // document that is not cached in `this.doc` until the very last step, and
+    // every throw in between — a refusal, a storage sync that fails, a wasm
+    // fault mid-replay — used to walk out of here leaving the whole
+    // materialization resident. On a room re-materializing ~2MB of history on
+    // every one of the 25-second dial cycles this ticket is about, that is the
+    // climb to the 128MB isolate cap by itself. The replay proper is a sibling
+    // method purely so this guard can own the only reference to the doc.
     const doc = new LoroDoc();
+    try {
+      return await this.replayInto(doc, storedBytes, attempts);
+    } catch (e) {
+      // `this.doc !== doc` is the whole question: a doc that reached the cache
+      // is the room's now and lives or dies with the instance, and one that did
+      // not is nobody's — freeing it here is the only chance it will ever get.
+      if (this.doc !== doc) freeWasm(doc, "cold-replay-abort");
+      throw e;
+    }
+  }
+
+  /** The cold replay proper: snapshot + log + buffered updates into `doc`, then
+   * cache it. Split out of [`ensureDoc`] so the doc has exactly one owner while
+   * it is uncached — see the guard there. Takes the numbers `ensureDoc` already
+   * computed rather than re-reading them, so the two cannot disagree. */
+  private async replayInto(doc: LoroDoc, storedBytes: number, attempts: number): Promise<LoroDoc> {
+    const started = Date.now();
     const snapshot = this.blobs.get("snapshot");
     let snapshotLoaded = false;
     if (snapshot && snapshot.length > 0) {
@@ -1801,7 +1997,7 @@ export class SessionRoom implements DurableObject {
         // A use-after-free stays exempt — it says nothing about the bytes.
         const blameTheBytes = e instanceof RangeError && wasmHeapUsable();
         if (isWasmShaped(e) && !blameTheBytes) {
-          doc.free();
+          freeWasm(doc, "cold-replay");
           throw e;
         }
         // Stored bytes that will not decode. Every cold start dies here
@@ -1809,7 +2005,7 @@ export class SessionRoom implements DurableObject {
         // which is the 1006 loop from the client's side and, when the throw
         // happens to be a RangeError, an abort loop from ours. Refuse
         // cleanly instead; LOAD_REFUSAL_LIMIT then evicts and reseeds.
-        doc.free();
+        freeWasm(doc, "cold-replay");
         this.refuseLoad(`snapshot will not import: ${String(e)}`, storedBytes);
       }
     }
@@ -1854,7 +2050,7 @@ export class SessionRoom implements DurableObject {
       // keeps the skip above: the doc still holds the room's history, the next
       // fold rewrites the log out of it, and evicting there would spend a good
       // snapshot on a bad tail.
-      doc.free();
+      freeWasm(doc, "cold-replay");
       const blameTheBytes = lastRowError instanceof RangeError && wasmHeapUsable();
       if (isWasmShaped(lastRowError) && !blameTheBytes) throw lastRowError;
       this.refuseLoad(
@@ -1963,25 +2159,115 @@ export class SessionRoom implements DurableObject {
       detail
     );
     if (refusals >= LOAD_REFUSAL_LIMIT) {
-      console.error(
-        "evicting unloadable stored state; the fleet reseeds this room on rejoin",
-        `room=${this.getMeta("chatId") ?? "?"}`,
-        `bytes=${bytes}`
-      );
-      this.dropLog();
       this.setMeta("loadRefusals", "0");
-      // Boot attached sockets exactly like the wedge break does: a redial with
-      // an empty VV re-uploads full state, where a live session's next writes
-      // would carry deps the emptied doc lacks and fail forever.
-      for (const sock of this.ctx.getWebSockets()) {
-        try {
-          sock.close(4411, "room reseed");
-        } catch {
-          /* already gone */
-        }
-      }
+      this.evictAndReseed(bytes, detail);
     }
     throw new DocLoadRefused(detail, bytes);
+  }
+
+  /** Throw away this room's stored doc and let the fleet rebuild it
+   * (gh#148/#207) — the escalation both consecutive-fault budgets end in.
+   *
+   * Extracted for gh#607, which needs the same ending from a counter of its
+   * own. `dropLog` sets `postReset`, so the R2 disaster copy is not overwritten
+   * by the emptied doc; booting the sockets is what makes the redial arrive
+   * with an EMPTY version vector and re-upload full state, where a live
+   * session's next writes would carry deps the emptied doc lacks. */
+  private evictAndReseed(bytes: number, why: string): void {
+    console.error(
+      "evicting this room's stored state; the fleet reseeds it on rejoin",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `bytes=${bytes}`,
+      why
+    );
+    this.dropLog();
+    for (const sock of this.ctx.getWebSockets()) {
+      try {
+        sock.close(4411, "room reseed");
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+
+  /** Drop the cached doc, whatever state it is in (gh#607).
+   *
+   * The order is load-bearing: the field is cleared FIRST, so a `free()` that
+   * throws can never leave the poisoned wrapper cached for the next join to
+   * pick up. That is the bug `releaseIdleDoc` had — its free threw the borrow
+   * conflict out of a bare timer and the line that cleared `this.doc` never
+   * ran, so the room went on serving the one object in the isolate that could
+   * not be used or released.
+   *
+   * A leaked free is recorded, not swallowed: a room that has abandoned
+   * megabytes into the shared wasm heap is the thing an operator needs to see
+   * on `/stats` when the isolate starts resetting on its memory limit. */
+  private abandonDoc(site: string): FreeOutcome {
+    const doc = this.doc;
+    this.doc = undefined;
+    const outcome = freeWasm(doc, site);
+    if (outcome === "leaked") {
+      const leaks = Number(this.getMeta("borrowLeaks") ?? "0") + 1;
+      try {
+        this.setMeta("borrowLeaks", String(leaks));
+      } catch {
+        /* diagnostics on an already-bad path */
+      }
+    }
+    return outcome;
+  }
+
+  /** Reclassify a caught fault before any other guard reads it (gh#607).
+   *
+   * Returns the fault to handle: `e` untouched unless it is a stuck wasm
+   * borrow, in which case the poisoned wrapper is dropped, the conflict is
+   * counted toward the reseed, and a [`DocBorrowConflict`] comes back — which
+   * IS a `DocLoadRefused`, so every catch downstream already answers it
+   * correctly and none of them strikes the poison tripwire.
+   *
+   * Dropping the wrapper is the half that usually ends it: the next
+   * materialization is a fresh `LoroDoc` off the same stored bytes, a ~tens of
+   * ms cold replay, and the room serves again. The counter is the backstop for
+   * when it does not — [`LOAD_REFUSAL_LIMIT`] in a row and the stored state
+   * that keeps producing the fault is evicted and reseeded from the replicas
+   * every engine holds.
+   *
+   * Its OWN counter, deliberately, spending the same limit. `loadRefusals` says
+   * "this doc will not materialize", and a successful cold replay clears it —
+   * which a borrow conflict always follows, because the wedge shows up on the
+   * doc AFTER it loaded. Booked there, the count would be reset by the very
+   * rematerialization that precedes the next conflict and the eviction could
+   * never arrive, which is (4) in the diagnosis wearing a different hat.
+   * Consecutive like every other budget here: cleared by a join that completes.
+   */
+  private reclassifyBorrow(e: unknown, site: string): unknown {
+    if (!isWasmBorrowConflict(e)) return e;
+    const bytes = this.storedDocBytes();
+    const outcome = this.abandonDoc(site);
+    const strikes = Number(this.getMeta("borrowStrikes") ?? "0") + 1;
+    try {
+      this.setMeta("borrowStrikes", String(strikes));
+      this.setMeta("borrowConflicts", String(Number(this.getMeta("borrowConflicts") ?? "0") + 1));
+      this.setMeta(
+        "lastBorrowConflict",
+        JSON.stringify({ at: Date.now(), site, outcome, error: String(e) }).slice(0, 512)
+      );
+    } catch {
+      /* storage refused the marker; the classification still stands */
+    }
+    console.error(
+      "wasm borrow conflict: one object is wedged, the heap is not (gh#607)",
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `site=${site}`,
+      `cachedDoc=${outcome}`,
+      `strikes=${strikes}/${LOAD_REFUSAL_LIMIT}`,
+      String(e)
+    );
+    if (strikes >= LOAD_REFUSAL_LIMIT) {
+      this.setMeta("borrowStrikes", "0");
+      this.evictAndReseed(bytes, `wasm borrow conflict at ${site}: ${String(e)}`);
+    }
+    return new DocBorrowConflict(site, e, bytes);
   }
 
   /** Idle-doc release (see DOC_IDLE_RELEASE_MS): a debounced timer frees the
@@ -2009,9 +2295,11 @@ export class SessionRoom implements DurableObject {
     // Same liveness rule as everywhere else (see `isLive`): the cached wrapper
     // can already have been freed by a flow that did not clear the field, and
     // `free()` on a zeroed pointer is a double free, not a no-op. This one fires
-    // from a bare timer, where the throw has no caller to answer to.
-    if (isLive(this.doc)) this.doc.free();
-    this.doc = undefined;
+    // from a bare timer, where the throw has no caller to answer to — which is
+    // why it goes through `abandonDoc`: that clears the field FIRST, so a doc
+    // stuck borrowed (gh#607) cannot survive its own failed release and be
+    // handed to the next join.
+    this.abandonDoc("idle-release");
   }
 
   /** Drop the persisted update log + snapshot (the /reset-log storage clear):
@@ -2324,9 +2612,11 @@ export class SessionRoom implements DurableObject {
       // into the shared wasm heap exactly when trimming was supposed to
       // relieve it (see handleJoin). The isLive guards keep a concurrent
       // interleaved trim from double-freeing what a sibling already returned
-      // to the allocator.
-      if (old && old !== fresh && isLive(old)) old.free();
-      if (doc !== fresh && doc !== old && isLive(doc)) doc.free();
+      // to the allocator. `freeWasm` carries that guard and adds the gh#607
+      // one: a doc stuck borrowed must not throw out of here and undo the trim
+      // that already landed — it is leaked, said so, and the room moves on.
+      if (old !== fresh) freeWasm(old, "trim-replaced-doc");
+      if (doc !== fresh && doc !== old) freeWasm(doc, "trim-caller-doc");
       return true;
     } catch {
       return false;
@@ -2369,7 +2659,13 @@ export class SessionRoom implements DurableObject {
     const attempts = failures + 1;
     try {
       await this.runScheduledWork();
-    } catch (e) {
+    } catch (raw) {
+      // Same reclassification the message handler does (gh#607), and for the
+      // same reason the refusal budget exists (gh#554): a wedged doc does not
+      // heal by waiting, the room already owns the escalation that repairs it,
+      // and spending the give-up budget on it would strand the trim, snapshot
+      // and backup of a room that is three attempts from reseeding itself.
+      const e = this.reclassifyBorrow(raw, "alarm");
       const refusals = Number(this.getMeta("alarmRefusals") ?? "0");
       if (e instanceof DocLoadRefused && refusals < ALARM_REFUSAL_BUDGET) {
         // gh#554: a refusal is not an alarm failure. The guard has already
@@ -2506,8 +2802,8 @@ export class SessionRoom implements DurableObject {
         } finally {
           // Explicit frees: see handleJoin — GC finalizers don't run under
           // wasm-side memory pressure.
-          prev?.free();
-          cur?.free();
+          freeWasm(prev, "backup-prev-vv");
+          freeWasm(cur, "backup-current-vv");
         }
       }
       if (advances) {
@@ -2519,7 +2815,7 @@ export class SessionRoom implements DurableObject {
         try {
           vvB64 = btoa(String.fromCharCode(...vv.encode()));
         } finally {
-          vv.free();
+          freeWasm(vv, "backup-vv");
         }
         await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
         this.setMeta("backupVV", vvB64);
