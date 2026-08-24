@@ -8,6 +8,10 @@ publish.workspace = true
 [dependencies]
 comet-proto.workspace = true
 comet-doc.workspace = true
+# The injection previews (gh#606) render through the harness adapters' own
+# MCP-config builders, so a settings page can never show a flag the run does
+# not get. Already in the graph via comet-engine.
+comet-harness.workspace = true
 # The board's config types (gh#75): the routing settings page renders
 # `RoutingConfig` as the board parsed it, rather than a second twin of the
 # same TOML that would drift key by key. Already in the graph via comet-engine.

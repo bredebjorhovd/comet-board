@@ -5001,6 +5001,16 @@ impl Render for Composer {
             }
             None => container,
         };
+        // The MCP editor (gh#606) sits closest to the pill: a full-width card
+        // rather than a popover, because three inputs per row do not fit a
+        // menu, and it is editing — standing state while open — not a menu.
+        let container = match self
+            .pickers
+            .update(cx, |pickers, cx| pickers.render_mcp_panel(cx))
+        {
+            Some(panel) => container.child(motion::fade_quick("composer-mcp", div().child(panel))),
+            None => container,
+        };
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.

@@ -1734,14 +1734,14 @@ impl RoutingConfig {
                 ));
             }
             if let Some(servers) = &r.mcp_servers {
-                mcp_server_problems(
+                problems_into(
                     &format!("route {} ({})", i + 1, r.display_name()),
                     servers,
                     &mut out,
                 );
             }
         }
-        mcp_server_problems("[defaults]", &self.defaults.mcp_servers, &mut out);
+        problems_into("[defaults]", &self.defaults.mcp_servers, &mut out);
         if let Err(e) = parse_max_duration(&self.defaults.max_duration) {
             out.push(format!("[defaults] max_duration {e}"));
         }
@@ -2163,7 +2163,18 @@ impl RoutingConfig {
 /// normalizers. Keep the common spelling deliberately small, and reject names
 /// that collapse onto the same prefix (`foo-bar` / `foo_bar`) before a harness
 /// gets to pick one silently.
-fn mcp_server_problems(scope: &str, servers: &[comet_proto::McpServer], out: &mut Vec<String>) {
+///
+/// Public because every writer of the list shares it: the validating edit seam
+/// ([`crate::routes`]) refuses on it before touching the file, and the GUI's
+/// MCP editor runs the very same function against its rows so what the page
+/// warns about is what the write would refuse — one rule, not two that drift.
+pub fn mcp_server_problems(scope: &str, servers: &[comet_proto::McpServer]) -> Vec<String> {
+    let mut out = Vec::new();
+    problems_into(scope, servers, &mut out);
+    out
+}
+
+fn problems_into(scope: &str, servers: &[comet_proto::McpServer], out: &mut Vec<String>) {
     let mut names = std::collections::BTreeSet::new();
     for (i, server) in servers.iter().enumerate() {
         let name = server.name.trim();

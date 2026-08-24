@@ -1339,6 +1339,7 @@ dependencies = [
  "comet-board",
  "comet-doc",
  "comet-engine",
+ "comet-harness",
  "comet-proto",
  "comet-rpc",
  "comet-update",

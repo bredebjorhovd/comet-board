@@ -35,6 +35,16 @@ pub use server::{serve_connection, serve_connection_as, serve_ws_listener};
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
     pub const LIST_MODELS: &str = "ListModels";
+    /// Which of these command names resolve on THIS device (gh#606). Params:
+    /// `{commands: [..]}` → `{found: {"<command>": "<path>"}}` — a command
+    /// with no entry, or `null`, resolves nowhere.
+    ///
+    /// The MCP editors ask it so "the agent will not find this command" is a
+    /// warning beside the field rather than an opaque dispatch failure later.
+    /// Forwardable, and it has to be: commands resolve where the harness child
+    /// spawns — the route's workspace device — and the device asking is
+    /// usually somebody's laptop, whose PATH proves nothing about the box.
+    pub const LOCATE_COMMANDS: &str = "LocateCommands";
     /// The skills and slash commands a run in this chat could invoke, for the
     /// composer's `/` picker (gh#134). Params: `{chatId?, cwd?, harness?}` →
     /// `[SkillDescriptor]`.

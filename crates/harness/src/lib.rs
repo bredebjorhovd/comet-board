@@ -231,6 +231,88 @@ pub fn locate_cli(harness: HarnessId) -> HarnessCli {
     }
 }
 
+/// Where a bare command name resolves on THIS device's PATH — `which`, as a
+/// function (gh#606).
+///
+/// The routing page and the composer's MCP editor ask this, relayed to the
+/// device the run would happen on, so a typo'd command is a warning beside the
+/// field instead of an opaque dispatch failure hours later. A command written
+/// as a path (any separator in it) is taken literally rather than searched
+/// for. Not the full spawn resolution — an adapter also prepends account and
+/// toolchain dirs at launch — but those add locations; they never take one
+/// away, so "not found here" is always true news.
+pub fn locate_on_path(command: &str) -> Option<std::path::PathBuf> {
+    locate_on_path_in(command, std::env::var_os("PATH").as_deref())
+}
+
+/// [`locate_on_path`] against an explicit PATH — same answer, no environment
+/// touched, so tests and callers holding a snapshot of what a *device* has can
+/// ask without racing whoever else is reading the process's own.
+pub fn locate_on_path_in(
+    command: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    if command.contains('/') || command.contains('\\') {
+        let direct = std::path::PathBuf::from(command);
+        return direct.is_file().then_some(direct);
+    }
+    let path = path?;
+    std::env::split_paths(path).find_map(|dir| {
+        let candidate = dir.join(command);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        // Windows spells its executables with a suffix; checking it costs
+        // nothing everywhere else.
+        let with_ext = dir.join(format!("{command}{}", std::env::consts::EXE_SUFFIX));
+        (with_ext.is_file()).then_some(with_ext)
+    })
+}
+
+/// What a harness does with [`RunControls::mcp_servers`] — the exact launch
+/// configuration its adapter builds, rendered for a person to read (gh#606).
+///
+/// The renderers are the adapters' own (`claude`'s `--mcp-config` JSON, codex'
+/// `-c` TOML overrides, opencode's inline config), not previews written twice:
+/// a preview that can drift from what actually spawns is worse than none.
+/// `None` when nothing would be injected — an empty list is configured
+/// silence, and showing a flag for it would read as a bug.
+///
+/// opencode's real merge starts from whatever `OPENCODE_CONFIG_CONTENT` the
+/// environment already carries; this renders against an empty base, which is
+/// precisely the part comet contributes.
+pub fn mcp_injection_preview(
+    harness: HarnessId,
+    servers: &[comet_proto::McpServer],
+) -> Option<String> {
+    if servers.is_empty() {
+        return None;
+    }
+    match harness {
+        HarnessId::ClaudeCode | HarnessId::Mock => {
+            claude::mcp_config_json(servers).map(|config| format!("--mcp-config {config}"))
+        }
+        HarnessId::Codex => {
+            let overrides = codex::mcp_config_overrides(servers);
+            (!overrides.is_empty()).then(|| overrides.join("\n"))
+        }
+        HarnessId::Opencode => opencode::opencode_inline_config(None, servers)
+            .ok()
+            .flatten()
+            .and_then(|config| serde_json::from_str::<serde_json::Value>(&config).ok())
+            .map(|value| {
+                serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string())
+            }),
+        // No adapter in this build — there is no injection to preview, and
+        // saying so beats inventing one.
+        HarnessId::Cursor => None,
+    }
+}
+
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
 /// init (fnm's per-shell multishells, nvm's shell function), which a
@@ -470,6 +552,92 @@ pub use opencode::OpencodeHarness;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp(name: &str, command: &str, args: &[&str]) -> comet_proto::McpServer {
+        comet_proto::McpServer {
+            name: name.into(),
+            command: command.into(),
+            args: args.iter().map(|a| (*a).into()).collect(),
+        }
+    }
+
+    /// The preview is what the adapters build, per harness — and an empty
+    /// list previews as nothing, because "no flags at all" is the truth.
+    #[test]
+    fn the_injection_preview_matches_each_harness_launch() {
+        let servers = [mcp("comet-board", "comet-board", &["mcp"])];
+        let claude = mcp_injection_preview(HarnessId::ClaudeCode, &servers).unwrap();
+        assert!(
+            claude.starts_with("--mcp-config {\"mcpServers\":{\"comet-board\":")
+                && claude.contains("\"command\":\"comet-board\"")
+                && claude.contains("\"args\":[\"mcp\"]"),
+            "{claude}"
+        );
+        // The mock scripts Claude-flavoured runs, so it reads Claude's flag.
+        assert_eq!(
+            mcp_injection_preview(HarnessId::Mock, &servers),
+            Some(claude.clone())
+        );
+
+        let codex = mcp_injection_preview(HarnessId::Codex, &servers).unwrap();
+        assert_eq!(
+            codex,
+            "mcp_servers.\"comet-board\"={ command = \"comet-board\", args = [\"mcp\"] }"
+        );
+
+        let opencode = mcp_injection_preview(HarnessId::Opencode, &servers).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&opencode).expect("pretty JSON");
+        assert_eq!(
+            value["mcp"]["comet-board"],
+            serde_json::json!({
+                "type": "local",
+                "command": ["comet-board", "mcp"],
+                "enabled": true,
+            })
+        );
+
+        // Two servers, two codex override lines.
+        let two = mcp_injection_preview(
+            HarnessId::Codex,
+            &[servers[0].clone(), mcp("docs", "context7", &[])],
+        )
+        .unwrap();
+        assert_eq!(two.lines().count(), 2);
+
+        // Configured silence previews as nothing.
+        assert_eq!(mcp_injection_preview(HarnessId::ClaudeCode, &[]), None);
+        // No adapter in this build, nothing to preview.
+        assert_eq!(mcp_injection_preview(HarnessId::Cursor, &servers), None);
+    }
+
+    /// `which`, as a function: found on PATH, found with a literal path,
+    /// missing when nowhere.
+    #[test]
+    fn locate_on_path_answers_the_three_ways_a_command_can_stand() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("preview-which-test-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let exe = bin.join("locatable-command");
+        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let path = std::env::join_paths([&bin]).unwrap();
+
+        assert!(locate_on_path_in("locatable-command", Some(&path)).is_some());
+        assert_eq!(locate_on_path_in("", Some(&path)), None);
+        assert_eq!(locate_on_path_in("  ", Some(&path)), None);
+        // A path-shaped command is taken literally, PATH or no PATH.
+        assert_eq!(
+            locate_on_path_in(exe.to_str().unwrap(), None),
+            Some(exe.clone())
+        );
+        assert_eq!(locate_on_path_in("/nonexistent/wherever", None), None);
+        // No PATH at all is an answer ("nowhere"), not a panic.
+        assert_eq!(locate_on_path_in("locatable-command", None), None);
+    }
 
     /// The env a command would spawn with, as `(name, value)` pairs.
     fn envs(cmd: &tokio::process::Command) -> Vec<(String, String)> {

@@ -230,7 +230,11 @@ impl ClaudeHarness {
 /// Claude's process-local MCP configuration. The CLI accepts this JSON string
 /// directly through `--mcp-config`, which keeps route-specific tools out of
 /// the reused `CLAUDE_CONFIG_DIR` (gh#273).
-fn mcp_config_json(servers: &[comet_proto::McpServer]) -> Option<String> {
+///
+/// `pub(crate)` because the injection preview (gh#606) renders the exact same
+/// JSON — one writer, so what a settings page shows can never drift from the
+/// flag this builds.
+pub(crate) fn mcp_config_json(servers: &[comet_proto::McpServer]) -> Option<String> {
     if servers.is_empty() {
         return None;
     }

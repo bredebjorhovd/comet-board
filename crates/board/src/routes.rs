@@ -257,6 +257,33 @@ pub enum Edit {
     /// itself until retention prunes it; work already running is untouched —
     /// deleting a rule prevents future dispatches, never cancels attempts.
     AutomationRemove { name: String },
+    /// Replace the whole `mcp_servers` list on the `route`-th `[[route]]`
+    /// (gh#606) — the structured write behind the routing page's MCP editor,
+    /// which moves rows of (name · command · args), not TOML text. With
+    /// `servers: null` the key is removed and the route falls back to
+    /// `[defaults]`, exactly as clearing any other per-route key does; with an
+    /// explicit list — including `[]` — it overrides, and `[]` opts the route
+    /// out of MCP injection entirely (the same reading the dispatch resolver
+    /// gives the file).
+    ///
+    /// Its own op rather than a [`Edit::Route`] key because the value is a
+    /// list of tables, not a string: every keyed edit renders what a text
+    /// field typed, and there is no text field spelling of this one that would
+    /// not be raw TOML by another name.
+    RouteMcp {
+        route: usize,
+        #[serde(default)]
+        servers: Option<Vec<comet_proto::McpServer>>,
+    },
+    /// Replace `[defaults].mcp_servers` (gh#606). `servers: null` removes the
+    /// key — which is not "no servers" but the built-in default (the board's
+    /// own `comet-board mcp`), because that is what absence means to the
+    /// parser's serde default. A route-level override is the way to run with
+    /// none.
+    DefaultMcp {
+        #[serde(default)]
+        servers: Option<Vec<comet_proto::McpServer>>,
+    },
 }
 
 /// The keys [`Edit::Route`] may set, and the TOML each writes.
@@ -546,7 +573,12 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
                 && let Ok(cfg) = toml::from_str::<RoutingConfig>(&after)
                 && let Some(rule) = cfg.automations.iter().find(|a| a.name == *automation)
                 && rule.enabled
-                && rule.account.as_deref().map(str::trim).unwrap_or("").is_empty()
+                && rule
+                    .account
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
             {
                 bail!(
                     "automation `{automation}` would be enabled with no billing account; \
@@ -567,11 +599,7 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
             // The creation questions land through the same keyed writer an
             // edit would use, so what one write creates and what four would
             // have cannot differ.
-            let seeds = [
-                ("labels", labels),
-                ("owner", owner),
-                ("account", account),
-            ];
+            let seeds = [("labels", labels), ("owner", owner), ("account", account)];
             for (key, value) in seeds {
                 let Some(value) = value else { continue };
                 let kind = kind_of(AUTOMATION_KEYS, key, "automation")?;
@@ -590,6 +618,31 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
                 }
             }
             adopt::join(&out, &before)
+        }
+        Edit::RouteMcp { route, servers } => {
+            // Refused here rather than left to `apply`'s revalidation so the
+            // error names the row somebody typed instead of reporting that the
+            // whole config would not have validated.
+            if let Some(servers) = servers {
+                refuse_bad_mcp_servers(servers, &format!("route {}", route + 1))?;
+            }
+            set_in_route(
+                &before,
+                *route,
+                "mcp_servers",
+                servers.as_ref().map(|s| render_mcp_servers(s)),
+            )?
+        }
+        Edit::DefaultMcp { servers } => {
+            if let Some(servers) = servers {
+                refuse_bad_mcp_servers(servers, "[defaults]")?;
+            }
+            set_in_table(
+                &before,
+                "[defaults]",
+                "mcp_servers",
+                servers.as_ref().map(|s| render_mcp_servers(s)),
+            )
         }
     };
     adopt::apply(&path, &before, &after)?;
@@ -681,6 +734,51 @@ fn add_automation(text: &str, name: &str, from: Option<&str>) -> Result<String> 
 
 fn rendered(kind: Kind, value: Option<&str>) -> Result<Option<String>> {
     value.map(|v| kind.render(v)).transpose()
+}
+
+/// The MCP server list as one line of TOML: an inline array of inline tables.
+///
+/// Rendered rather than re-serialized for the reason at the top of this file —
+/// every other edit here is a text edit, and `set_between` needs exactly one
+/// replacement line. Escaping goes through [`adopt::toml_string`], the same
+/// quoting every keyed edit uses, so a name with a quote in it survives the
+/// round trip the same way an account name would.
+fn render_mcp_servers(servers: &[comet_proto::McpServer]) -> String {
+    let items = servers
+        .iter()
+        .map(|server| {
+            let args = server
+                .args
+                .iter()
+                .map(|arg| adopt::toml_string(arg))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "{{ name = {}, command = {}, args = [{}] }}",
+                adopt::toml_string(&server.name),
+                adopt::toml_string(&server.command),
+                args
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
+/// The write seam's own refusal: what [`crate::config::mcp_server_problems`]
+/// would later report about the whole file, named against just this list so
+/// the caller sees the row that is wrong before anything touches the disk.
+fn refuse_bad_mcp_servers(servers: &[comet_proto::McpServer], scope: &str) -> Result<()> {
+    let problems = crate::config::mcp_server_problems(scope, servers);
+    match problems.first() {
+        Some(first) if problems.len() == 1 => bail!("{first}"),
+        Some(first) => bail!(
+            "{first}; and {} more: {}",
+            problems.len() - 1,
+            problems[1..].join("; ")
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Set (or, with `None`, remove) `key` inside the `n`-th `[[route]]` block.
@@ -1261,6 +1359,180 @@ max_duration = "banana"
         }))
         .unwrap();
         assert!(matches!(plan, Edit::Account { .. }));
+        // The structured MCP writes (gh#606): a list of tables on the wire,
+        // and an omitted `servers` is "back to inheriting", not "no servers".
+        let mcp: Edit = serde_json::from_value(serde_json::json!({
+            "op": "routeMcp", "route": 0,
+            "servers": [{"name": "comet-board", "command": "comet-board", "args": ["mcp"]}]
+        }))
+        .unwrap();
+        assert!(matches!(mcp, Edit::RouteMcp { route: 0, .. }));
+        let cleared_mcp: Edit =
+            serde_json::from_value(serde_json::json!({"op": "routeMcp", "route": 1})).unwrap();
+        assert!(matches!(cleared_mcp, Edit::RouteMcp { servers: None, .. }));
+        let defaults: Edit =
+            serde_json::from_value(serde_json::json!({"op": "defaultMcp", "servers": []})).unwrap();
+        assert!(matches!(
+            defaults,
+            Edit::DefaultMcp {
+                servers: Some(ref s),
+            } if s.is_empty()
+        ));
+    }
+
+    // ── the MCP server lists (gh#606) ──────────────────────────────────────
+
+    fn mcp(name: &str, command: &str, args: &[&str]) -> comet_proto::McpServer {
+        comet_proto::McpServer {
+            name: name.into(),
+            command: command.into(),
+            args: args.iter().map(|a| (*a).into()).collect(),
+        }
+    }
+
+    /// The editor's whole job in one write: rows of (name · command · args)
+    /// land as one inline array, the comments around it survive untouched.
+    #[test]
+    fn a_route_mcp_write_lands_as_one_line_and_keeps_the_comments() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let view = edit(
+            &paths,
+            &Edit::RouteMcp {
+                route: 0,
+                servers: Some(vec![
+                    mcp("comet-board", "comet-board", &["mcp"]),
+                    mcp("docs", "context7", &["--port", "8080"]),
+                ]),
+            },
+        )
+        .unwrap();
+        let cfg = view.config.as_ref().unwrap();
+        assert_eq!(
+            cfg.routes[0].mcp_servers.as_deref(),
+            Some(
+                &[
+                    mcp("comet-board", "comet-board", &["mcp"]),
+                    mcp("docs", "context7", &["--port", "8080"])
+                ][..]
+            ),
+        );
+        // Route 2 has none — the write is per-route.
+        assert!(cfg.routes[1].mcp_servers.is_none());
+        assert_eq!(cfg.mcp_servers(Some(&cfg.routes[0])).len(), 2);
+        assert!(view.text.contains("# Offhand's own work."));
+    }
+
+    /// Clearing falls back to `[defaults]`, exactly like every other
+    /// per-route key; the parse says so via `None`.
+    #[test]
+    fn clearing_a_route_mcp_list_removes_the_key() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        edit(
+            &paths,
+            &Edit::RouteMcp {
+                route: 0,
+                servers: Some(vec![mcp("x", "x", &[])]),
+            },
+        )
+        .unwrap();
+        let view = edit(
+            &paths,
+            &Edit::RouteMcp {
+                route: 0,
+                servers: None,
+            },
+        )
+        .unwrap();
+        assert!(
+            view.config.as_ref().unwrap().routes[0]
+                .mcp_servers
+                .is_none()
+        );
+        assert!(!view.text.contains("mcp_servers"));
+    }
+
+    /// An explicit empty list is NOT a removal — opting a route out of MCP
+    /// injection is a real choice (the dispatch resolver reads it that way).
+    #[test]
+    fn an_empty_list_is_an_explicit_opt_out_not_a_removal() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let view = edit(
+            &paths,
+            &Edit::RouteMcp {
+                route: 0,
+                servers: Some(Vec::new()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            view.config.as_ref().unwrap().routes[0]
+                .mcp_servers
+                .as_deref(),
+            Some(&[][..])
+        );
+        assert!(view.text.contains("mcp_servers = []"));
+    }
+
+    /// What the validator would say about the whole file, the write seam says
+    /// about the rows — before anything touches the disk.
+    #[test]
+    fn a_bad_mcp_list_is_named_and_refused() {
+        for (label, servers, expected) in [
+            (
+                "name",
+                vec![mcp("bad name!", "cmd", &[])],
+                "letters, numbers",
+            ),
+            ("command", vec![mcp("ok", "  ", &[])], "empty command"),
+            (
+                "collision",
+                vec![mcp("foo-bar", "a", &[]), mcp("Foo_Bar", "b", &[])],
+                "collides",
+            ),
+        ] {
+            let (_dir, paths) = paths_with(SAMPLE);
+            let err = edit(
+                &paths,
+                &Edit::RouteMcp {
+                    route: 0,
+                    servers: Some(servers),
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(expected), "{label}: {err}");
+            assert_eq!(
+                std::fs::read_to_string(paths.routing()).unwrap(),
+                SAMPLE,
+                "{label}: the file is untouched by a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn default_mcp_writes_its_table_and_removal_restores_the_builtin() {
+        let (_dir, paths) = paths_with(SAMPLE);
+        let view = edit(
+            &paths,
+            &Edit::DefaultMcp {
+                servers: Some(vec![mcp("team-tools", "team-mcp", &["serve"])]),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            view.config.as_ref().unwrap().defaults.mcp_servers,
+            vec![mcp("team-tools", "team-mcp", &["serve"])]
+        );
+
+        // Removal is not "none" — absence parses back to the shipped
+        // `comet-board mcp` default, which is what the key means to readers.
+        let view = edit(&paths, &Edit::DefaultMcp { servers: None }).unwrap();
+        let defaults = &view.config.as_ref().unwrap().defaults;
+        assert_eq!(
+            defaults.mcp_servers,
+            vec![mcp("comet-board", "comet-board", &["mcp"])]
+        );
+        assert!(!view.text.contains("team-tools"));
     }
 
     // ── the `[users]` map (gh#162) ──────────────────────────────────────────

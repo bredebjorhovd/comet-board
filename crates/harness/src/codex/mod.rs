@@ -564,7 +564,10 @@ impl Harness for CodexHarness {
 /// Codex CLI `-c` values for stdio MCP servers. Values are parsed as TOML; JSON
 /// strings and arrays are valid TOML values, and quoting the dotted-key segment
 /// prevents a server name from changing which setting is overridden.
-fn mcp_config_overrides(servers: &[comet_proto::McpServer]) -> Vec<String> {
+///
+/// `pub(crate)` for the injection preview (gh#606): the same strings the run
+/// actually gets, one writer.
+pub(crate) fn mcp_config_overrides(servers: &[comet_proto::McpServer]) -> Vec<String> {
     servers
         .iter()
         .map(|server| {
