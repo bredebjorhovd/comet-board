@@ -177,8 +177,10 @@ is this board's `review`.
   `gh stack` — one dependent concern per layer, foundations at the bottom —
   and each layer is reviewed on its own instead of as one wall of diff. Off
   unless asked for, on purpose: an agent opening five pull requests where one
-  was expected is a surprise, so pass it when the work is plainly several
-  stacked concerns and not on the chance that it might be. It changes the
+  was expected is a surprise, so pass it when the ticket's own text names
+  several separable, dependent concerns — the spec is the signal — and never
+  on size alone, which correlates without implying: a large change can be
+  indivisible and a small one hold two clean layers (gh#336). It changes the
   brief and nothing else. The layers are the attempt's own branch and that
   name with `-2`, `-3` on the end — that naming is how the board tells they
   are one attempt's work rather than pull requests belonging to nobody — and

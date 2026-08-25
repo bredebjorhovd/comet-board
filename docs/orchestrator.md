@@ -146,7 +146,8 @@ you are waiting; that is a reason to wait less, not a reason to say nothing.
 decompose its task into a stack of pull requests, one dependent concern per
 layer, so review happens in parallel instead of against one wall of diff. Pass
 it when the layers are already visible in the ticket — not on the chance that
-the agent will find some. Feedback on the bottom layer reaches its chat as
+the agent will find some, and not because the task looks big: the spec is the
+signal, size is not (gh#336). Feedback on the bottom layer reaches its chat as
 usual; feedback on the layers above it does not yet, so a stacked task is one
 you read rather than one you relay.
 
