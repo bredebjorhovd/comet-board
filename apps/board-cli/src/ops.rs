@@ -1146,7 +1146,17 @@ pub async fn cross_billing_preflight_for_row(
             "the agent accounts do not identify a payer for {account} under runtime `{runtime}`"
         ));
     };
-    if view::cross_billed(Some(billed), Some(payer)) {
+    // What else the box's `[users]` map ties to the payer (gh#546): a Claude
+    // login and a Codex login are two addresses on one person's plans, and the
+    // literal comparison alone called every run on the second one cross-billed.
+    // Unreadable is not permission — an empty list compares literally.
+    let own_logins = read_config(board)
+        .await
+        .ok()
+        .and_then(|cfg| cfg.routing.config)
+        .map(|cfg| comet_board::members::co_signins(&cfg, payer))
+        .unwrap_or_default();
+    if comet_board::billing::cross_billed_among(Some(billed), Some(payer), &own_logins) {
         CrossBillingPreflight::DifferentPayer(view::bills_warning(billed, harness))
     } else {
         CrossBillingPreflight::SamePayer
@@ -2518,6 +2528,7 @@ mod tests {
             dispatched_by_user: None,
             dispatched_by_verified: false,
             billed_to: None,
+            cross_billed: None,
             max_duration_secs: None,
             context: None,
         }

@@ -2525,6 +2525,118 @@ billing_guard = "{mode}"
         service.shutdown();
     }
 
+    /// gh#546's exit criterion: one human, two plans, two login addresses.
+    /// Unmapped, `require-own` refused every dispatch on the second address —
+    /// the guard read the box owner's own Codex slot as a stranger's plan.
+    /// Mapped under `[users]` with the same GitHub value as the first, the
+    /// same release walks through with no billing note anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_on_your_own_second_login_is_not_cross_billed() {
+        let paths = scratch_paths();
+        let route = r#"
+[[route]]
+match = { gh_repo = "owner/widget" }
+workspace = "widget"
+repo = "~/dev/widget"
+runtime = "mock"
+
+[defaults]
+billing_guard = "require-own"
+"#;
+        // First without the mapping: the refusal gh#546 is about, naming a
+        // payer who happens to be the dispatcher.
+        std::fs::write(paths.routing(), route).unwrap();
+        seed_task(&paths, "gh:owner/widget#545", "gh#545");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        {
+            let mut logins = runtime.logins.lock().unwrap();
+            logins.insert(
+                "slot-codex".into(),
+                "brede.bjorhovd@recognition.no".into(),
+            );
+        }
+        let brede = DispatchOrigin {
+            user: Some("brede@tally.no".into()),
+            ..DispatchOrigin::default()
+        };
+        let codex_slot = |o: &DispatchOverrides| DispatchOverrides {
+            account: Some("slot-codex".into()),
+            ..o.clone()
+        };
+        let err = service
+            .dispatch_task(
+                "gh:owner/widget#545",
+                brede.clone(),
+                codex_slot(&DispatchOverrides::default()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bills brede.bjorhovd@recognition.no"),
+            "{err}"
+        );
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        service.shutdown();
+
+        // Then with both addresses mapped to one member: released, recorded,
+        // and silent about billing.
+        std::fs::write(
+            paths.routing(),
+            format!(
+                "{route}\n[users]\n\
+                 \"brede@tally.no\" = \"1+bredebjorhovd@users.noreply.github.com\"\n\
+                 \"brede.bjorhovd@recognition.no\" = \
+                 \"1+bredebjorhovd@users.noreply.github.com\"\n"
+            ),
+        )
+        .unwrap();
+        seed_task(&paths, "gh:owner/widget#546", "gh#546");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        {
+            let mut logins = runtime.logins.lock().unwrap();
+            logins.insert(
+                "slot-codex".into(),
+                "brede.bjorhovd@recognition.no".into(),
+            );
+        }
+        service
+            .dispatch_task(
+                "gh:owner/widget#546",
+                brede,
+                codex_slot(&DispatchOverrides::default()),
+            )
+            .await
+            .expect("his own second login, not somebody else's plan");
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#546").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("released");
+        assert_eq!(
+            attempt.billed_to.as_deref(),
+            Some("brede.bjorhovd@recognition.no")
+        );
+        // And the upstream record accuses nobody: no suffix on a run that
+        // bills its own releaser, whatever address of theirs it spends.
+        let dispatch = db
+            .pending_writebacks(10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        assert!(
+            !dispatch.payload.contains("subscription"),
+            "{}",
+            dispatch.payload
+        );
+
+        service.shutdown();
+    }
+
     /// `require-own` is about *whose*, not about *which*: the owner releasing
     /// their own work walks straight through, and so does a dispatch nobody
     /// attributed — an unattributed release names no wronged party.

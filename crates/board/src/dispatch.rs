@@ -569,9 +569,19 @@ pub fn check_billing(
         return Ok(None);
     };
     let slot = effective_account(route, overrides);
+    // What else the box knows belongs to whoever released this (gh#546): the
+    // other addresses mapped to the same member. A Claude login and a Codex
+    // login are two subscriptions under two addresses; without this the guard
+    // read every run on the second one as spending a stranger's plan.
+    let dispatcher = origin.attribution();
+    let own_logins = dispatcher
+        .email()
+        .map(|by| crate::members::co_signins(cfg, by))
+        .unwrap_or_default();
     let billing = Billing {
         billed_to: account_email(harness, slot),
-        dispatcher: origin.attribution(),
+        dispatcher,
+        own_logins,
         harness,
         // The route's `account` counts as named: it is a decision somebody
         // wrote down, and the silent fall to the box's own login is the case
