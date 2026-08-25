@@ -24,6 +24,9 @@ mimalloc.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Evidence attachments ride the wire as base64 (gh#421), same encoding the
+# engine's upload chunks use.
+base64 = "0.22"
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -143,6 +143,8 @@ fn blank(task_id: &str, identifier: &str) -> AttemptReview {
     AttemptReview {
         automation: None,
         automation_owner: None,
+        // §gh#421's field, defaulted: this spec attaches no artifact.
+        evidence_artifacts: Vec::new(),
         task_id: task_id.into(),
         attempt: 1,
         attempt_number: 1,

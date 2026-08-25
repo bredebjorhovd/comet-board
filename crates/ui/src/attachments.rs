@@ -307,6 +307,62 @@ pub async fn read_attachment_image(
     })
 }
 
+/// The evidence twin of [`read_attachment_image`] (§gh#421): the same chunked
+/// read-back loop, addressed by task / attempt / artifact id instead of by
+/// path. The board's host resolves the id to its own file — no filesystem
+/// name ever crosses the wire in either direction.
+pub async fn read_evidence_image(
+    engine: &EngineHandle,
+    executor: &BackgroundExecutor,
+    target_device_id: Option<&str>,
+    task_id: &str,
+    attempt: Option<i64>,
+    artifact_id: &str,
+) -> Option<LoadedAttachmentImage> {
+    let mut name = String::new();
+    let mut mime = String::new();
+    let mut b64 = String::new();
+    let mut offset = 0u64;
+    let mut done = false;
+    for _ in 0..MAX_READ_CHUNKS {
+        let mut params =
+            serde_json::json!({ "taskId": task_id, "id": artifact_id, "offset": offset });
+        if let (Some(attempt), Some(map)) = (attempt, params.as_object_mut()) {
+            map.insert("attempt".into(), serde_json::json!(attempt));
+        }
+        let chunk = call_with_timeout(
+            engine,
+            executor,
+            methods::READ_ATTEMPT_EVIDENCE,
+            with_target(params, target_device_id),
+            READ_CHUNK_TIMEOUT,
+        )
+        .await
+        .ok()?;
+        name = chunk.get("name")?.as_str()?.to_string();
+        mime = chunk.get("mimeType")?.as_str()?.to_string();
+        b64.push_str(chunk.get("data")?.as_str()?);
+        done = chunk.get("done")?.as_bool()?;
+        if done {
+            break;
+        }
+        let next = chunk.get("nextOffset")?.as_u64()?;
+        if next <= offset {
+            return None;
+        }
+        offset = next;
+    }
+    if !done || b64.is_empty() {
+        return None;
+    }
+    let bytes = BASE64.decode(b64.as_bytes()).ok()?;
+    let format = ImageFormat::from_mime_type(&mime).unwrap_or(ImageFormat::Png);
+    Some(LoadedAttachmentImage {
+        name,
+        image: Arc::new(Image::from_bytes(format, bytes)),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Transcript image cache (transcript-attachment-cache.ts)
 // ---------------------------------------------------------------------------

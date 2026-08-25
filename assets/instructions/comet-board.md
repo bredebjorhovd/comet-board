@@ -36,6 +36,14 @@ the dependency you bumped and the function you edited in passing turn up. Do it
 before you say you are done — a settled attempt that claimed nothing arrives at
 the review window with nothing in the middle of it.
 
+**If the work changed something a reviewer would have to see, show it.**
+Capture the screen or flow however your environment already can, then
+`comet-board evidence --task <id> --kind screenshot --file shot.png
+--description "what it demonstrates"` — kind is `screenshot`, `recording`,
+`accessibility`, `console` or `log`, and the board stamps the commit SHA and
+dirty-file count itself, so the review shows pixels pinned to a code state.
+Attach right after you capture; backend-only work attaches nothing.
+
 **Work you delegate goes through the board.** A ticket buys a branch, a pull
 request, a review that reaches the agent that wrote it, a cap, and a bill with a
 name on it; your own harness's in-chat subagents buy none of that — agents

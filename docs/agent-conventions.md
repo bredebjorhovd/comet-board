@@ -395,6 +395,31 @@ makes its own. Submitting again replaces the set — correcting yourself is
 expected. `comet-board review --task <id> [--json]` prints the whole thing back:
 the brief, your claims, the commands your run actually ran, and the remainder.
 
+**Show what you tested.** A claim says what you did; a capture shows it. If
+your work changed something a reviewer would have to *see* — a screen, a flow,
+an empty state, an error state — attach one:
+
+```bash
+npx playwright screenshot --viewport-size=1440,900 http://localhost:5173/settings shot.png
+comet-board evidence --task gh:owner/repo#421 --kind screenshot --file shot.png \
+  --description "settings page, new danger zone" --url http://localhost:5173/settings \
+  --viewport 1440x900
+```
+
+`--kind` is `screenshot` (10 MiB), `recording` (24 MiB), `accessibility`,
+`console` or `log`; each kind has its own ceiling and all of them are enforced
+on the board's host. The description is required: an unlabelled screenshot is
+a puzzle, not evidence. What you do not supply the board does — it fingerprints
+your checkout with git at attach time (commit SHA, uncommitted-file count), so
+the review shows pixels pinned to a code state rather than a picture with no
+provenance, which is why you attach **right after** you capture: pixels taken
+before your last commit carry a stale tree beside a fresh fingerprint, and the
+uncommitted count is how a reviewer sees that. Eight artifacts per attempt;
+re-sending identical bytes dedupes; nothing here asks for captures when there
+was nothing to see — backend-only work attaches nothing and breaks nothing.
+Strip query strings from the URL you record (`--url` refuses them): a stored
+capture URL must never carry a token.
+
 **Screenshots go in the repo, not in a `raw.githubusercontent.com` link.** A
 ticket that asks for screenshots in the PR description is asking for something
 that keeps working, and the URL an agent reaches for first does not:

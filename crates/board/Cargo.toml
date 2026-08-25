@@ -31,6 +31,10 @@ dotenvy = "0.15"
 jsonwebtoken = { version = "9.3", default-features = false, features = [
     "use_pem",
 ] }
+# Content-addressing for evidence artifacts (gh#421): the sha256 an artifact's
+# identity, dedupe and stored file name all derive from. The same crate the
+# engine already uses for attachment mirrors, so the two hashes agree.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
