@@ -20,6 +20,21 @@ use comet_proto::{FolderEntry, FolderListing, Repo, RepoRef, Worktree};
 
 use crate::EngineError;
 
+/// The `git` binary engine children are spawned with, resolved past this
+/// board's own shim directories.
+///
+/// `PATH`'s first `git` is not always git. In a dispatched chat it is the
+/// board's guard wrapper (gh#488), which re-stamps the chat's credential at
+/// its exec boundary — right for an agent's own push, wrong for the engine,
+/// which would then clone and fetch as somebody else's credential; and every
+/// test driving this code from inside such a shell measures the shell instead
+/// of this code (§gh#386). [`comet_board::git_credentials::resolve_git`]
+/// skips everything under the state dir's shim root for exactly this reason.
+pub(crate) fn the_git() -> Result<std::path::PathBuf, EngineError> {
+    comet_board::git_credentials::resolve_git(None)
+        .ok_or_else(|| EngineError::Other("git is not installed on this device".into()))
+}
+
 /// Existence probe timeout for user-chosen / remembered paths, which can point at
 /// dead network mounts where a bare `stat` hangs for minutes.
 const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -302,7 +317,7 @@ impl Repos {
         env: &[(String, String)],
         noise: Noise,
     ) -> Result<String, EngineError> {
-        let mut cmd = tokio::process::Command::new("git");
+        let mut cmd = tokio::process::Command::new(the_git()?);
         cmd.args(args);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);

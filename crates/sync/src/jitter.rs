@@ -8,15 +8,36 @@
 //! Spreading each wait over a window is what turns N simultaneous dials into
 //! N dials smeared across that window.
 //!
-//! The entropy is the nanosecond field of the wall clock, taken modulo the
-//! span in milliseconds. Two callers a microsecond apart differ by ~1000 in
-//! that field, and the modulo scatters that microsecond of separation across
-//! the whole window — which is exactly the property a herd-breaker needs and
-//! the only one it needs. This is NOT a random number generator: it is not
-//! uniform to any standard worth quoting, it repeats on a 1s cycle, and
-//! nothing that wants unpredictability (an id, a token, a nonce) may use it.
+//! The entropy is two things mixed together, because either alone fails on a
+//! real box. The wall clock's sub-second nanosecond field is the obvious
+//! source, and the module shipped with it alone — until the wide pass
+//! (§gh#386) watched its own test fail on this Mac: a clock that ticks in
+//! whole *microseconds* makes that field a multiple of 1000 on every read, so
+//! `field % span` was one fixed delay forever for any span dividing 1000 —
+//! the 250 ms reconnect base among them. Zero jitter, permanently, on the
+//! platform least able to survive a synchronised herd. The other source is a
+//! process-local draw counter: atomic, so two callers drawing at the same
+//! instant still differ, and free in the sense the clock already was. Each is
+//! multiplied by an odd 64-bit constant before mixing (a bijection mod
+//! 2⁶⁴), which is what scatters a quantised input across the window instead
+//! of preserving its grid.
+//!
+//! This is NOT a random number generator: it is not uniform to any standard
+//! worth quoting, and nothing that wants unpredictability (an id, a token, a
+//! nonce) may use it.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Odd multipliers for the mix below. Oddness is what matters — it makes each
+/// multiply invertible mod 2⁶⁴ — and these two are splitmix64 finalizers,
+/// chosen for having no structure of their own worth avoiding.
+const MIX_NANOS: u64 = 0xff51_afd7_ed55_8ccd;
+const MIX_DRAWS: u64 = 0xc4ce_b9fe_1a85_ec53;
+
+/// How many draws this process has made. Two rooms redialing at the same
+/// moment must not draw the same delay even if they read the same clock.
+static DRAWS: AtomicU64 = AtomicU64::new(0);
 
 /// A pseudo-random duration in `[0, span)`.
 ///
@@ -30,7 +51,11 @@ pub fn spread(span: Duration) -> Duration {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| u64::from(since.subsec_nanos()));
-    Duration::from_millis(nanos % span_ms)
+    let draws = DRAWS.fetch_add(1, Ordering::Relaxed);
+    let mixed = nanos
+        .wrapping_mul(MIX_NANOS)
+        .wrapping_add(draws.wrapping_mul(MIX_DRAWS));
+    Duration::from_millis(mixed % span_ms)
 }
 
 #[cfg(test)]

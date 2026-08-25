@@ -180,7 +180,10 @@ fn fake_board(dir: &Path) -> PathBuf {
 /// `git ls-remote` against the listener, with the environment a dispatched
 /// push gets. Answers git's own stderr.
 fn ls_remote(url: &str, env: &[(String, String)], cwd: &Path) -> String {
-    let mut cmd = std::process::Command::new("git");
+    let Some(git) = comet_board::git_credentials::resolve_git(None) else {
+        return "no git outside the board's shims on this box — skipping".into();
+    };
+    let mut cmd = std::process::Command::new(git);
     cmd.arg("ls-remote").arg(url).current_dir(cwd);
     for (key, value) in env {
         cmd.env(key, value);
@@ -193,10 +196,7 @@ fn ls_remote(url: &str, env: &[(String, String)], cwd: &Path) -> String {
 }
 
 fn have_git() -> bool {
-    std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
+    comet_board::git_credentials::resolve_git(None).is_some()
 }
 
 // ---------------------------------------------------------------------------

@@ -50,6 +50,21 @@ the app. Do it for builds from
 [the project's releases](https://github.com/bredebjorhovd/comet-board/releases),
 not for a `Comet.app` that arrived some other way.
 
+## Updating by hand
+
+`comet update` is the ordinary path and needs none of this. When replacing
+`/Applications/Comet.app` by hand — a fresh dmg dragged over the old bundle —
+
+**quit Comet first.** The app bundle is also what runs this machine's headless
+engine, so deleting the folder out from under the running process kills it:
+sessions drop mid-turn, and the board reads every chat it was driving as gone.
+Found out the hard way on 2026-08-12; Finder makes it easy to do by accident,
+because dragging a new bundle onto Applications offers *Replace*, which is a
+delete.
+
+Quit, replace, relaunch — the engine comes back with the new bundle and the
+rooms rejoin.
+
 ## One extra tool, if the board you joined stacks
 
 Nothing above is affected by this, and the app does not need it. It is here
