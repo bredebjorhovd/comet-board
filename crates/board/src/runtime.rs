@@ -774,6 +774,7 @@ mod tests {
             status,
             started_at: None,
             updated_at: now - Duration::milliseconds(age_ms),
+            activity: None,
         }
     }
 

@@ -1918,3 +1918,160 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         "text deltas unaffected"
     );
 }
+
+/// gh#605: while a turn runs, the session row says WHAT is in flight and how
+/// far it has got — the sentence that separates a healthy run inside a long
+/// call from a hung one. A delegated Task counts subagent steps onto the row
+/// (gh#280's counter, bubbled up), and a settled turn advertises nothing.
+#[tokio::test]
+async fn the_row_says_what_is_in_flight_and_clears_when_the_turn_settles() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                },
+                AgentEvent::ToolCall {
+                    id: "task-1".into(),
+                    call: ToolCall::Task {
+                        description: "map the call sites".into(),
+                        subagent_type: Some("Explore".into()),
+                        steps: 0,
+                    },
+                },
+                AgentEvent::SubagentActivity {
+                    parent_tool_use_id: "task-1".into(),
+                },
+                AgentEvent::SubagentActivity {
+                    parent_tool_use_id: "task-1".into(),
+                },
+                AgentEvent::SubagentActivity {
+                    parent_tool_use_id: "task-1".into(),
+                },
+                done(DoneStatus::Completed),
+            ],
+            step_delay: Duration::from_millis(60),
+            hang_until_interrupt: false,
+        }),
+    );
+    let mut watch = core.sessions.watch_sessions();
+
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-activity",
+        SessionCommandPayload::Run {
+            request: run_request("delegate"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_steps = 0u32;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, watch.changed())
+            .await
+            .expect("session change before timeout")
+            .map(|_| watch.borrow().first().cloned())
+            .expect("watch alive");
+        if let Some(session) = frame {
+            if let Some(activity) = &session.activity {
+                assert!(
+                    matches!(activity.call, ToolCall::Task { .. }),
+                    "the in-flight call rides the row"
+                );
+                saw_steps = saw_steps.max(activity.steps);
+            }
+            if session.status == SessionStatus::Idle {
+                break;
+            }
+        }
+    }
+    assert_eq!(saw_steps, 3, "every subagent step counted on the row");
+    // Settled: nothing in flight, so nothing is advertised.
+    assert_eq!(watch.borrow().first().unwrap().activity, None);
+}
+
+/// gh#605, transcript half: an Exec still running at segment end (the mock's
+/// `COMET_MOCK_SUBAGENT` shape generalized) leaves its start stamp in the doc,
+/// and the sanitized fold keeps heavy inputs out of the synced part.
+#[tokio::test]
+async fn an_in_flight_call_is_stamped_and_sanitized_in_the_doc() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(
+        dir.path(),
+        Arc::new(ScriptedHarness {
+            script: vec![
+                AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: "/tmp".into(),
+                    session_id: "hs-1".into(),
+                    assistant_message_id: "a-1".into(),
+                },
+                AgentEvent::TextDelta {
+                    text: "Running now.".into(),
+                },
+                AgentEvent::ToolCall {
+                    id: "exec-1".into(),
+                    call: ToolCall::WriteFile {
+                        path: "/tmp/x".into(),
+                        content: Some("SECRET".into()),
+                    },
+                },
+                done(DoneStatus::Completed),
+            ],
+            step_delay: Duration::from_millis(40),
+            hang_until_interrupt: false,
+        }),
+    );
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-stamp",
+        SessionCommandPayload::Run {
+            request: run_request("write"),
+            message_id: "m-1".into(),
+        },
+    );
+
+    // Wait for the SETTLED transcript: the turn ends (status row flips Idle
+    // after the segment's terminal write) and the assistant entry reads back.
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .map(|s| s.status == SessionStatus::Idle)
+                .unwrap_or(false)
+                && entries(&core).iter().any(|m| m.id != "m-1")
+        },
+        "run settles",
+    )
+    .await;
+
+    let entry = entries(&core)
+        .into_iter()
+        .find(|m| m.id != "m-1")
+        .expect("assistant entry");
+    match entry.parts.last().expect("a tool part").clone() {
+        MessagePart::Tool {
+            resolved,
+            started_at_ms,
+            ..
+        } => {
+            // The turn ended before the result arrived: the chip is the
+            // in-flight shape, WITH its start stamp.
+            assert!(!resolved);
+            assert!(started_at_ms.is_some(), "start stamped when folded");
+        }
+        other => panic!("unexpected last part {other:?}"),
+    }
+}

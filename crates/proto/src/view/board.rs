@@ -2277,6 +2277,9 @@ pub struct AgentRow {
     pub started_at: Option<DateTime<Utc>>,
     /// The route's `max_duration`, when it has one.
     pub cap_secs: Option<u64>,
+    /// The attempt's in-flight tool call, off the session mirror (gh#605).
+    /// `None` between calls, and on engines that predate the field.
+    pub activity: Option<crate::SessionActivity>,
 }
 
 impl AgentRow {
@@ -2311,6 +2314,19 @@ impl AgentRow {
     /// `1h50m / 2h`, bare elapsed on an uncapped route, or nothing.
     pub fn elapsed_label(&self, now: DateTime<Utc>) -> Option<String> {
         agent_elapsed_label(self.started_at, self.cap_secs, now)
+    }
+
+    /// What the attempt is doing right now (gh#605) — `running <cmd> · 4m12s`.
+    pub fn activity_label(&self, now: DateTime<Utc>) -> Option<String> {
+        Some(crate::view::activity_label(self.activity.as_ref()?, now))
+    }
+
+    /// The activity has held past [`crate::view::WAITING_TOOL_SECS`]: render
+    /// it as waiting-on-a-long-call rather than ordinary progress.
+    pub fn activity_waiting(&self, now: DateTime<Utc>) -> bool {
+        self.activity
+            .as_ref()
+            .is_some_and(|a| crate::view::activity_is_waiting(a, now))
     }
 }
 
@@ -2403,6 +2419,7 @@ pub fn agent_rows(
                     .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
                     .map(|at| at.with_timezone(&Utc)),
                 cap_secs: row.max_duration_secs,
+                activity: session.and_then(|s| s.activity.clone()),
             })
         })
         .collect();
@@ -2499,6 +2516,8 @@ pub struct RunningRow {
     /// a viewport re-reads the clock on its own frames instead of rebuilding
     /// this list once a second to move a counter.
     pub started_at: Option<DateTime<Utc>>,
+    /// The run's in-flight tool call, off the session mirror (gh#605).
+    pub activity: Option<crate::SessionActivity>,
 }
 
 impl RunningRow {
@@ -2510,6 +2529,18 @@ impl RunningRow {
     /// read it against. `None` where the mirror cannot say when it started.
     pub fn elapsed_label(&self, now: DateTime<Utc>) -> Option<String> {
         agent_elapsed_label(self.started_at, None, now)
+    }
+
+    /// What the run is doing right now (gh#605) — see [`AgentRow::activity_label`].
+    pub fn activity_label(&self, now: DateTime<Utc>) -> Option<String> {
+        Some(crate::view::activity_label(self.activity.as_ref()?, now))
+    }
+
+    /// The activity has held past [`crate::view::WAITING_TOOL_SECS`].
+    pub fn activity_waiting(&self, now: DateTime<Utc>) -> bool {
+        self.activity
+            .as_ref()
+            .is_some_and(|a| crate::view::activity_is_waiting(a, now))
     }
 }
 
@@ -2572,6 +2603,7 @@ pub fn running_rows(
                 space_id: chat.space_id.clone(),
                 state,
                 started_at: session.and_then(|s| s.started_at),
+                activity: session.and_then(|s| s.activity.clone()),
             })
         })
         .collect();
@@ -2643,6 +2675,15 @@ impl ActiveRow {
         match self {
             ActiveRow::Agent(row) => row.started_at,
             ActiveRow::Unmanaged(row) => row.started_at,
+        }
+    }
+
+    /// The in-flight tool call either half carries, when it carries one
+    /// (gh#605).
+    pub fn activity(&self) -> Option<&crate::SessionActivity> {
+        match self {
+            ActiveRow::Agent(row) => row.activity.as_ref(),
+            ActiveRow::Unmanaged(row) => row.activity.as_ref(),
         }
     }
 }
@@ -3673,6 +3714,7 @@ mod tests {
             status,
             started_at: None,
             updated_at: now() - chrono::Duration::milliseconds(age_ms),
+            activity: None,
         }
     }
 
@@ -4488,5 +4530,90 @@ mod tests {
         r.workspace = None;
         r.branch = None;
         assert_eq!(placement_line(&r).unwrap(), "no route · claude-code");
+    }
+
+    // ---- current activity (gh#605) ----------------------------------------
+
+    use crate::SessionActivity;
+    use crate::{SessionStatus, ToolCall};
+
+    fn exec(command: &str, secs_ago: i64) -> SessionActivity {
+        SessionActivity {
+            call: ToolCall::Exec {
+                command: command.into(),
+            },
+            // Anchored to the module's fixed clock (`now()`), not wall time.
+            started_at: now() - chrono::Duration::seconds(secs_ago),
+            steps: 0,
+        }
+    }
+
+    /// gh#605: the row is where a person looks first. Whatever the session
+    /// mirror says is in flight must ride the row — both halves of the Active
+    /// list — so "what is it doing" never needs the transcript opened.
+    #[test]
+    fn live_rows_carry_the_in_flight_call_from_the_session_mirror() {
+        let mut r = row("live", BoardState::Working);
+        r.chat_id = Some("c".into());
+        let mut chat = chat("c", Some("board/gh-x"));
+        chat.space_id = Some("space".into());
+        let mut live = session("c", SessionStatus::Working, 0);
+        live.activity = Some(exec("comet-board wait --timeout 40m", 252));
+
+        let agents = agent_rows(&[r], &[chat.clone()], &[live.clone()], now());
+        assert_eq!(agents.len(), 1);
+        assert_eq!(
+            agents[0].activity_label(now()).as_deref(),
+            Some("run comet-board wait --timeout 40m · 4m12s")
+        );
+        assert!(agents[0].activity_waiting(now()));
+
+        // The unmanaged half carries it identically.
+        let running = running_rows(&[], &[chat], &[live], None, now());
+        assert_eq!(running.len(), 1);
+        assert_eq!(
+            running[0].activity_label(now()).as_deref(),
+            Some("run comet-board wait --timeout 40m · 4m12s")
+        );
+
+        // Under the threshold it is ordinary progress, not a wait.
+        let mut fresh = session("c2", SessionStatus::Working, 0);
+        fresh.activity = Some(exec("ls", 5));
+        let running = running_rows(&[], &[], &[fresh], None, now());
+        assert!(running.is_empty(), "no chat ⇒ no row; fixture sanity");
+    }
+
+    /// A settled run advertises nothing in flight.
+    #[test]
+    fn a_row_without_activity_says_nothing_about_it() {
+        let mut r = row("live", BoardState::Working);
+        r.chat_id = Some("c".into());
+        let chat = chat("c", None);
+        let idle_session = session("c", SessionStatus::Working, 0);
+        let agents = agent_rows(&[r], &[chat], &[idle_session], now());
+        assert_eq!(agents[0].activity_label(now()), None);
+        assert!(!agents[0].activity_waiting(now()));
+    }
+
+    /// Subagent steps counted onto a Task activity surface in the label
+    /// (gh#280's counter, bubbled to the row).
+    #[test]
+    fn a_delegated_activity_counts_its_steps_on_the_row() {
+        let mut r = row("live", BoardState::Working);
+        r.chat_id = Some("c".into());
+        let chat = chat("c", None);
+        let mut session = session("c", SessionStatus::Working, 0);
+        session.activity = Some(SessionActivity {
+            call: ToolCall::Task {
+                description: "map the normalizer".into(),
+                subagent_type: Some("Explore".into()),
+                steps: 0,
+            },
+            started_at: now(),
+            steps: 7,
+        });
+        let agents = agent_rows(&[r], &[chat], &[session], now());
+        let label = agents[0].activity_label(now()).unwrap();
+        assert!(label.contains("7 steps"), "{label}");
     }
 }

@@ -38,6 +38,7 @@ use gpui::{
 use comet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use comet_proto::ToolCall;
 
+use crate::loaders;
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
@@ -193,6 +194,10 @@ pub struct ToolItem {
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
+    /// When the call started, epoch millis (gh#605) — what an in-flight
+    /// chip's ticking elapsed counts from. `None` on parts written by older
+    /// engines; those chips simply say nothing about duration.
+    pub started_at_ms: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -302,6 +307,10 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         acc.extend_from_slice(label.as_bytes());
         acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
+        // The start stamp flips None→Some the first sync after a call lands;
+        // without it in the key, a chip would render resolved-less and
+        // elapsed-less forever (gh#605).
+        acc.extend_from_slice(&t.started_at_ms.unwrap_or(0).to_le_bytes());
     }
     acc.push(auto_open as u8);
     fnv1a(&acc)
@@ -393,6 +402,7 @@ pub fn rows_for_entry(
                 call: call @ ToolCall::Skill { .. },
                 is_error,
                 resolved,
+                ..
             } => {
                 flush_group(
                     &mut rows,
@@ -430,12 +440,14 @@ pub fn rows_for_entry(
                 call,
                 is_error,
                 resolved,
+                started_at_ms,
                 ..
             } => {
                 pending_group.push(ToolItem {
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
+                    started_at_ms: *started_at_ms,
                 });
                 group_last_part_ix = part_ix;
             }
@@ -719,13 +731,25 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 // Tool summaries / chips (pure)
 // ---------------------------------------------------------------------------
 
-/// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
+/// The ToolGroup summary line — "Ran 3 commands · edited 2 files", or, while
+/// calls are still in flight (gh#605), the live form: past-tense segments
+/// count only resolved calls and the in-flight ones get a present-tense
+/// segment.
 ///
 /// The rule lives in `comet_proto::view` so the terminal viewport reports the
 /// same summary; this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
-    let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
-    comet_proto::view::tool_group_summary(&pairs)
+    let resolved: Vec<(ToolCall, bool)> = tools
+        .iter()
+        .filter(|t| t.resolved)
+        .map(|t| (t.call.clone(), t.is_error))
+        .collect();
+    let pending: Vec<ToolCall> = tools
+        .iter()
+        .filter(|t| !t.resolved)
+        .map(|t| t.call.clone())
+        .collect();
+    comet_proto::view::tool_group_live_summary(&resolved, &pending)
 }
 
 // `single_line` and the per-kind chip label/detail are shared with the terminal
@@ -2000,7 +2024,27 @@ impl Transcript {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(auto_open);
         let target = if open { chips_height(tools.len()) } else { 0.0 };
-        let summary = tool_group_summary(tools);
+        // While any call in the group is in flight, the header says so in the
+        // present tense — "Ran 1 command · running 1 tool" is a run mid-work;
+        // a bare past-tense count on a group whose second command has been
+        // going for minutes was the healthy-run-looks-hung bug (gh#605).
+        let (summary, pending) = {
+            let resolved: Vec<(ToolCall, bool)> = tools
+                .iter()
+                .filter(|t| t.resolved)
+                .map(|t| (t.call.clone(), t.is_error))
+                .collect();
+            let pending: Vec<ToolCall> = tools
+                .iter()
+                .filter(|t| !t.resolved)
+                .map(|t| t.call.clone())
+                .collect();
+            let pending_len = pending.len();
+            (
+                comet_proto::view::tool_group_live_summary(&resolved, &pending),
+                pending_len,
+            )
+        };
 
         let toggle_id = row_id.clone();
         let tool_count = tools.len();
@@ -2040,6 +2084,20 @@ impl Transcript {
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(if open { "▾" } else { "▸" })),
             )
+            // A live group leads with the mini spinner, not just the word:
+            // motion is what separates it from every settled header above
+            // (and keeps frames coming while its elapsed would want to tick).
+            .when(pending > 0, |el| {
+                el.child(
+                    div()
+                        .w(px(10.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(loaders::mini_gradient_spinner(1.5, cx.entity_id(), cx)),
+                )
+            })
             .child(
                 div()
                     .min_w_0()
@@ -2047,12 +2105,20 @@ impl Transcript {
                     .child(SharedString::from(summary)),
             );
 
-        let chips = div()
-            .pt(px(CHIPS_TOP_PAD))
-            .flex()
-            .flex_col()
-            .gap(px(CHIP_GAP))
-            .children(tools.iter().map(|tool| tool_chip(tool, theme)));
+        let chips = {
+            // Built element-by-element rather than mapped: an in-flight chip
+            // asks the pulse clock for a frame lease (`&mut cx`) as it renders.
+            let mut chips: Vec<AnyElement> = Vec::with_capacity(tools.len());
+            for tool in tools.iter() {
+                chips.push(tool_chip(tool, cx.entity_id(), theme, cx));
+            }
+            div()
+                .pt(px(CHIPS_TOP_PAD))
+                .flex()
+                .flex_col()
+                .gap(px(CHIP_GAP))
+                .children(chips)
+        };
 
         // Fold body: 200ms committed-height tween on a USER toggle only — and
         // only within a short window of the click. Auto-open (streaming) and
@@ -2379,13 +2445,35 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// One tool chip row: a guide rail on the left (continuous across stacked
 /// chips — the rail spans the row's full height) threading the chips to their
 /// group toggle, then the chip card (comet tool-chip.tsx).
-fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
+///
+/// An UNRESOLVED call (gh#605) is a different thing from a finished one and
+/// renders like it: the mini spinner in the trailing slot, and — when the host
+/// stamped its start — a ticking elapsed. The block appears the moment the
+/// call starts, so a 40-minute command is visible for all forty minutes, not
+/// only once it has finished.
+fn tool_chip(
+    tool: &ToolItem,
+    view: gpui::EntityId,
+    theme: &Theme,
+    cx: &mut Context<Transcript>,
+) -> AnyElement {
     let (label, detail) = tool_chip_content(&tool.call);
     let tint = if tool.is_error {
         theme.danger
+    } else if !tool.resolved {
+        theme.text
     } else {
         theme.text_muted
     };
+    // Ticking elapsed for an in-flight call with a known start.
+    let running_elapsed: Option<SharedString> = (!tool.resolved)
+        .then_some(())
+        .and(tool.started_at_ms)
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|start| {
+            let secs = (chrono::Utc::now() - start).num_seconds().max(0);
+            format_elapsed(secs).into()
+        });
     div()
         .h(px(CHIP_HEIGHT))
         .w_full()
@@ -2415,7 +2503,11 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                 .overflow_hidden()
                 .rounded(px(Theme::RADIUS_ROW))
                 .border_1()
-                .border_color(theme.white_alpha(0.07))
+                .border_color(if !tool.resolved && !tool.is_error {
+                    theme.white_alpha(0.14)
+                } else {
+                    theme.white_alpha(0.07)
+                })
                 .bg(theme.white_alpha(0.03))
                 .px(px(8.0))
                 .text_size(px(Theme::TEXT_DENSE))
@@ -2433,7 +2525,7 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                         .child(
                             crate::icons::icon(tool_icon_path(&tool.call))
                                 .size(px(12.0))
-                                .text_color(theme.text_muted),
+                                .text_color(tint),
                         ),
                 )
                 .child(
@@ -2454,7 +2546,30 @@ fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
                             theme.text_muted
                         })
                         .child(SharedString::from(detail)),
-                ),
+                )
+                // In flight: spinner + elapsed in the trailing slot. The
+                // spinner doubles as the frame driver — its pulse lease keeps
+                // this view repainting, which is what makes the elapsed tick.
+                .when(!tool.resolved, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(loaders::mini_gradient_spinner(1.5, view, cx)),
+                    )
+                    .when_some(running_elapsed, |el, label| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_subtle)
+                                .child(label),
+                        )
+                    })
+                }),
         )
         .into_any_element()
 }
@@ -2771,6 +2886,7 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            started_at_ms: None,
         }
     }
 
@@ -2862,6 +2978,7 @@ mod tests {
             },
             is_error: false,
             resolved,
+            started_at_ms: None,
         };
         let entry = assistant(
             "m3",
@@ -3065,6 +3182,7 @@ mod tests {
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
+            started_at_ms: None,
         };
         let edit = |p: &str| ToolItem {
             call: ToolCall::EditFile {
@@ -3074,6 +3192,7 @@ mod tests {
             },
             is_error: false,
             resolved: true,
+            started_at_ms: None,
         };
         let tools = vec![
             exec("ls"),
@@ -3099,6 +3218,7 @@ mod tests {
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
+                started_at_ms: None,
             },
             ToolItem {
                 call: ToolCall::Glob {
@@ -3106,11 +3226,13 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                started_at_ms: None,
             },
             ToolItem {
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
+                started_at_ms: None,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
@@ -3191,7 +3313,8 @@ mod tests {
             ("Task", "tidy up · 1 step".to_string())
         );
         // Delegation is its own segment in a group summary — never folded
-        // into a generic "called 1 tool".
+        // into a generic "called 1 tool". While the delegation is IN FLIGHT
+        // (gh#605) it reads present-tense: the group is mid-work.
         let tools = vec![
             ToolItem {
                 call: ToolCall::Exec {
@@ -3199,6 +3322,7 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                started_at_ms: None,
             },
             ToolItem {
                 call: ToolCall::Task {
@@ -3208,6 +3332,28 @@ mod tests {
                 },
                 is_error: false,
                 resolved: false,
+                started_at_ms: Some(0),
+            },
+        ];
+        assert_eq!(
+            tool_group_summary(&tools),
+            "Ran 1 command · delegating 1 task"
+        );
+        // Once the result lands, the tense settles with it.
+        let tools = vec![
+            ToolItem {
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+                is_error: false,
+                resolved: true,
+                started_at_ms: None,
+            },
+            ToolItem {
+                call: tools[1].call.clone(),
+                is_error: false,
+                resolved: true,
+                started_at_ms: Some(0),
             },
         ];
         assert_eq!(

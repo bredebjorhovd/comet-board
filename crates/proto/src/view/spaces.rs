@@ -629,6 +629,7 @@ mod tests {
             state: super::super::board::AgentState::Working,
             started_at: None,
             cap_secs: None,
+            activity: None,
         })
     }
 

@@ -533,88 +533,217 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
 /// Takes `(call, is_error)` pairs so each viewport can keep its own row model;
 /// the summary itself is one implementation for both.
 pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
-    use crate::ToolCall;
-    let mut commands = 0usize;
-    let mut edited: Vec<&str> = Vec::new();
-    let mut reads = 0usize;
-    let mut searches = 0usize;
-    let mut fetches = 0usize;
-    let mut todos = 0usize;
-    let mut delegated = 0usize;
-    let mut other = 0usize;
-    let mut failed = 0usize;
-    for (call, is_error) in tools {
-        if *is_error {
-            failed += 1;
-        }
-        match call {
-            ToolCall::Exec { .. } => commands += 1,
-            ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
-                if !edited.contains(&path.as_str()) {
-                    edited.push(path);
-                }
-            }
-            ToolCall::ApplyPatch { path } => {
-                let p = path.as_deref().unwrap_or("patch");
-                if !edited.contains(&p) {
-                    edited.push(p);
-                }
-            }
-            ToolCall::ReadFile { .. } => reads += 1,
-            ToolCall::Search { .. } | ToolCall::Glob { .. } | ToolCall::WebSearch { .. } => {
-                searches += 1
-            }
-            ToolCall::WebFetch { .. } => fetches += 1,
-            ToolCall::Todo { .. } => todos += 1,
-            // Delegation gets its own segment rather than folding into the
-            // generic tool count: "called 3 tools" is the one summary that
-            // would hide the work that took the longest (gh#280).
-            ToolCall::Task { .. } => delegated += 1,
-            // Defensive: both viewports break a skill out of the group into a
-            // landmark of its own (gh#134), so one reaching here is a group
-            // that was assembled without that split — count it rather than
-            // dropping it from a summary that claims to cover the run.
-            ToolCall::Mcp { .. } | ToolCall::Skill { .. } | ToolCall::Unknown { .. } => other += 1,
-        }
-    }
-    let mut segments: Vec<String> = Vec::new();
-    if commands > 0 {
-        segments.push(format!("ran {}", plural(commands, "command", "commands")));
-    }
-    if !edited.is_empty() {
-        segments.push(format!("edited {}", plural(edited.len(), "file", "files")));
-    }
-    if reads > 0 {
-        segments.push(format!("read {}", plural(reads, "file", "files")));
-    }
-    if searches > 0 {
-        segments.push(format!("searched {}", plural(searches, "time", "times")));
-    }
-    if fetches > 0 {
-        segments.push(format!("fetched {}", plural(fetches, "page", "pages")));
-    }
-    if todos > 0 {
-        segments.push("updated todos".to_string());
-    }
-    if delegated > 0 {
-        segments.push(format!("delegated {}", plural(delegated, "task", "tasks")));
-    }
-    if other > 0 {
-        segments.push(format!("called {}", plural(other, "tool", "tools")));
-    }
+    let mut segments = SummaryCounts::default().count(tools).segments();
     if segments.is_empty() {
         segments.push(plural(tools.len(), "tool", "tools"));
     }
-    if failed > 0 {
-        segments.push(format!("{failed} failed"));
+    capitalize_first(&segments.join(" · "))
+}
+
+/// The ToolGroup summary line while the group still has calls in flight
+/// (gh#605): past-tense segments count only RESOLVED calls — an EditFile that
+/// has not returned has not edited anything — and every in-flight call gets a
+/// present-tense segment (`delegating 1 task` keeps gh#280's delegation
+/// visible while it runs). A group whose header kept saying "Ran 1 command"
+/// while its second command had been going for four minutes was exactly the
+/// healthy-run-looks-hung bug.
+pub fn tool_group_live_summary(
+    resolved: &[(crate::ToolCall, bool)],
+    pending: &[crate::ToolCall],
+) -> String {
+    let counts = SummaryCounts::default().count(resolved);
+    let mut segments = counts.segments();
+    let delegating = pending
+        .iter()
+        .filter(|c| matches!(c, crate::ToolCall::Task { .. }))
+        .count();
+    if delegating > 0 {
+        segments.push(format!(
+            "delegating {}",
+            plural(delegating, "task", "tasks")
+        ));
     }
-    let mut summary = segments.join(" · ");
-    // Capitalize the first segment only (comet's style).
+    let running = pending.len() - delegating;
+    if running > 0 {
+        segments.push(format!("running {}", plural(running, "tool", "tools")));
+    }
+    if segments.is_empty() {
+        segments.push(plural(pending.len(), "tool", "tools"));
+    }
+    capitalize_first(&segments.join(" · "))
+}
+
+/// The per-kind tallies behind both group-summary forms.
+#[derive(Default)]
+struct SummaryCounts {
+    commands: usize,
+    edited: Vec<String>,
+    reads: usize,
+    searches: usize,
+    fetches: usize,
+    todos: usize,
+    delegated: usize,
+    other: usize,
+    failed: usize,
+}
+
+impl SummaryCounts {
+    fn count(mut self, tools: &[(crate::ToolCall, bool)]) -> Self {
+        use crate::ToolCall;
+        for (call, is_error) in tools {
+            if *is_error {
+                self.failed += 1;
+            }
+            match call {
+                ToolCall::Exec { .. } => self.commands += 1,
+                ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
+                    if !self.edited.contains(path) {
+                        self.edited.push(path.clone());
+                    }
+                }
+                ToolCall::ApplyPatch { path } => {
+                    let p = path.as_deref().unwrap_or("patch");
+                    if !self.edited.contains(&p.to_string()) {
+                        self.edited.push(p.to_string());
+                    }
+                }
+                ToolCall::ReadFile { .. } => self.reads += 1,
+                ToolCall::Search { .. } | ToolCall::Glob { .. } | ToolCall::WebSearch { .. } => {
+                    self.searches += 1
+                }
+                ToolCall::WebFetch { .. } => self.fetches += 1,
+                ToolCall::Todo { .. } => self.todos += 1,
+                // Delegation gets its own segment rather than folding into the
+                // generic tool count: "called 3 tools" is the one summary that
+                // would hide the work that took the longest (gh#280).
+                ToolCall::Task { .. } => self.delegated += 1,
+                // Defensive: both viewports break a skill out of the group into a
+                // landmark of their own (gh#134), so one reaching here is a group
+                // that was assembled without that split — count it rather than
+                // dropping it from a summary that claims to cover the run.
+                ToolCall::Mcp { .. } | ToolCall::Skill { .. } | ToolCall::Unknown { .. } => {
+                    self.other += 1
+                }
+            }
+        }
+        self
+    }
+
+    fn segments(&self) -> Vec<String> {
+        let mut segments: Vec<String> = Vec::new();
+        if self.commands > 0 {
+            segments.push(format!(
+                "ran {}",
+                plural(self.commands, "command", "commands")
+            ));
+        }
+        if !self.edited.is_empty() {
+            segments.push(format!(
+                "edited {}",
+                plural(self.edited.len(), "file", "files")
+            ));
+        }
+        if self.reads > 0 {
+            segments.push(format!("read {}", plural(self.reads, "file", "files")));
+        }
+        if self.searches > 0 {
+            segments.push(format!(
+                "searched {}",
+                plural(self.searches, "time", "times")
+            ));
+        }
+        if self.fetches > 0 {
+            segments.push(format!("fetched {}", plural(self.fetches, "page", "pages")));
+        }
+        if self.todos > 0 {
+            segments.push("updated todos".to_string());
+        }
+        if self.delegated > 0 {
+            segments.push(format!(
+                "delegated {}",
+                plural(self.delegated, "task", "tasks")
+            ));
+        }
+        if self.other > 0 {
+            segments.push(format!("called {}", plural(self.other, "tool", "tools")));
+        }
+        if self.failed > 0 {
+            segments.push(format!("{} failed", self.failed));
+        }
+        segments
+    }
+}
+
+fn capitalize_first(summary: &str) -> String {
+    let mut summary = summary.to_string();
     if let Some(first) = summary.get(0..1) {
         let upper = first.to_uppercase();
         summary.replace_range(0..1, &upper);
     }
     summary
+}
+
+// ---------------------------------------------------------------------------
+// Session activity (gh#605) — "what is it doing right now"
+// ---------------------------------------------------------------------------
+
+/// How long one in-flight call may hold a row before "working" becomes
+/// "waiting on `<call>`" — the threshold past which silence stops reading as
+/// progress. A read or a search lands well inside it; a 40-minute command is
+/// exactly what the louder rendering exists for.
+pub const WAITING_TOOL_SECS: i64 = 60;
+
+/// Seconds an in-flight call has been running. Never negative (clock skew).
+pub fn activity_elapsed_secs(
+    activity: &crate::SessionActivity,
+    now: chrono::DateTime<chrono::Utc>,
+) -> i64 {
+    (now - activity.started_at).num_seconds().max(0)
+}
+
+/// Past [`WAITING_TOOL_SECS`]: the row says what it is stuck on, loudly.
+pub fn activity_is_waiting(
+    activity: &crate::SessionActivity,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    activity_elapsed_secs(activity, now) >= WAITING_TOOL_SECS
+}
+
+/// The activity as a chip-shaped call, with the live step count folded in —
+/// the engine bumps `SessionActivity::steps` per subagent step while the
+/// stored call's own count is whatever the harness last re-sent.
+fn activity_call(activity: &crate::SessionActivity) -> crate::ToolCall {
+    let mut call = activity.call.clone();
+    if let crate::ToolCall::Task { steps, .. } = &mut call {
+        *steps = activity.steps;
+    }
+    call
+}
+
+/// What the run is doing, in words: `running comet-board wait --timeout 40m`.
+/// The chip vocabulary ([`tool_chip_content`]), lower-cased into a sentence —
+/// the same tool named identically everywhere, now said by rows that never
+/// open the transcript.
+pub fn activity_heading(activity: &crate::SessionActivity) -> String {
+    let (label, detail) = tool_chip_content(&activity_call(activity));
+    match detail.is_empty() {
+        true => label.to_lowercase(),
+        false => format!("{} {detail}", label.to_lowercase()),
+    }
+}
+
+/// The full row label: `running <cmd> · 4m12s`, with subagent steps already
+/// inside the heading (`delegated Explore · map calls · 12 steps`). `None`
+/// only when there is nothing in flight.
+pub fn activity_label(
+    activity: &crate::SessionActivity,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "{} · {}",
+        activity_heading(activity),
+        board::format_elapsed(activity_elapsed_secs(activity, now))
+    )
 }
 
 /// The status ramp: four hues at one lightness and one chroma (gh#173).
@@ -957,5 +1086,132 @@ mod ticket_tests {
             chat_ticket("gh#171 · a system · not a dozen greys"),
             (Some("gh#171"), "a system · not a dozen greys")
         );
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use crate::{SessionActivity, ToolCall};
+    use chrono::Utc;
+
+    fn exec_activity(command: &str, secs_ago: i64) -> SessionActivity {
+        SessionActivity {
+            call: ToolCall::Exec {
+                command: command.into(),
+            },
+            started_at: Utc::now() - chrono::Duration::seconds(secs_ago),
+            steps: 0,
+        }
+    }
+
+    #[test]
+    fn an_activity_names_the_call_and_ticks_its_own_clock() {
+        let a = exec_activity("comet-board wait --timeout 40m", 252);
+        assert_eq!(activity_heading(&a), "run comet-board wait --timeout 40m");
+        assert_eq!(
+            activity_label(&a, Utc::now()),
+            "run comet-board wait --timeout 40m · 4m12s"
+        );
+        // Clock skew never counts up from the future.
+        let skewed = exec_activity("ls", -30);
+        assert!(activity_label(&skewed, Utc::now()).ends_with("· 0s"));
+    }
+
+    #[test]
+    fn waiting_is_a_threshold_not_a_mood() {
+        // A read that has been going 5s is ordinary progress.
+        assert!(!activity_is_waiting(
+            &exec_activity("read x", 5),
+            Utc::now()
+        ));
+        // The same command at the threshold and past it is a wait worth naming.
+        assert!(activity_is_waiting(
+            &exec_activity("cargo test", WAITING_TOOL_SECS),
+            Utc::now()
+        ));
+        assert!(
+            !activity_is_waiting(
+                &exec_activity("cargo test", WAITING_TOOL_SECS - 1),
+                Utc::now()
+            ),
+            "strictly-inside stays working"
+        );
+    }
+
+    #[test]
+    fn a_delegated_activity_counts_its_steps_in_words() {
+        let mut a = SessionActivity {
+            call: ToolCall::Task {
+                description: "map the call sites".into(),
+                subagent_type: Some("Explore".into()),
+                steps: 0,
+            },
+            started_at: Utc::now(),
+            steps: 0,
+        };
+        assert_eq!(activity_heading(&a), "task Explore · map the call sites");
+        // The live step count rides the stored call's slot (gh#280's counter,
+        // bubbled up): the row says how far the delegation has got.
+        a.steps = 12;
+        assert_eq!(
+            activity_heading(&a),
+            "task Explore · map the call sites · 12 steps"
+        );
+        assert_eq!(
+            activity_label(&a, Utc::now()),
+            "task Explore · map the call sites · 12 steps · 0s"
+        );
+    }
+
+    #[test]
+    fn live_group_summaries_speak_in_the_right_tense() {
+        use crate::ToolCall;
+        let ran = vec![
+            (
+                ToolCall::Exec {
+                    command: "ls".into(),
+                },
+                false,
+            ),
+            (
+                ToolCall::EditFile {
+                    path: "a.rs".into(),
+                    old_string: None,
+                    new_string: None,
+                },
+                false,
+            ),
+        ];
+        // All settled: identical to the plain summary.
+        assert_eq!(
+            tool_group_live_summary(&ran.clone(), &[]),
+            tool_group_summary(&ran),
+        );
+        // One command still in flight: past tense only for what finished.
+        assert_eq!(
+            tool_group_live_summary(
+                &ran,
+                &[ToolCall::Exec {
+                    command: "sleep 400".into()
+                }]
+            ),
+            "Ran 1 command · edited 1 file · running 1 tool"
+        );
+        // A pending delegation keeps its own verb.
+        assert_eq!(
+            tool_group_live_summary(
+                &[],
+                &[ToolCall::Task {
+                    description: "x".into(),
+                    subagent_type: None,
+                    steps: 3,
+                }]
+            ),
+            "Delegating 1 task"
+        );
+        // Nothing resolved and nothing pending cannot happen (a group exists
+        // because a call did), but the fallback must not divide by zero.
+        assert_eq!(tool_group_live_summary(&[], &[]), "0 tools");
     }
 }

@@ -1685,6 +1685,7 @@ mod tests {
             status,
             started_at: None,
             updated_at: chrono::Utc::now(),
+            activity: None,
         }
     }
 

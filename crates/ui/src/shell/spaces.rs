@@ -576,6 +576,7 @@ impl Shell {
             device_names,
             device_presence,
             attention,
+            animating,
             slugs,
             local_device,
             has_orchestrator,
@@ -606,8 +607,13 @@ impl Shell {
                     .collect();
             // Spaces with a live/awaiting session get an aggregate dot (the
             // most urgent member status wins) so the attention signal survives
-            // a collapsed row.
+            // a collapsed row. `animating` records whether ANY member is
+            // working — the collapsed row's dot then animates like its hidden
+            // rows' rails do, so "N running" never counts rows that all sit
+            // still (gh#605).
             let mut attention: std::collections::HashMap<String, ChatIndicator> =
+                std::collections::HashMap::new();
+            let mut animating: std::collections::HashMap<String, bool> =
                 std::collections::HashMap::new();
             for chat in state.visible_chats() {
                 let status = state.display_status_for(chat, now);
@@ -621,7 +627,7 @@ impl Shell {
                     continue;
                 };
                 attention
-                    .entry(space_id)
+                    .entry(space_id.clone())
                     .and_modify(|held| {
                         if crate::state::attention_rank(status)
                             < crate::state::attention_rank(*held)
@@ -630,6 +636,7 @@ impl Shell {
                         }
                     })
                     .or_insert(status);
+                *animating.entry(space_id).or_insert(false) |= status == ChatIndicator::Working;
             }
             (
                 spaces,
@@ -637,6 +644,7 @@ impl Shell {
                 device_names,
                 device_presence,
                 attention,
+                animating,
                 state.space_slugs.clone(),
                 state.local_device_id.clone(),
                 state.orchestrator_slot(now).is_some(),
@@ -798,6 +806,7 @@ impl Shell {
                         &borrowed_active,
                     );
                     let running = shelf.running;
+                    let animating = animating.get(&id).copied().unwrap_or(false);
                     let row = self.render_space_row(
                         ix,
                         device_id.clone(),
@@ -808,6 +817,7 @@ impl Shell {
                         expanded,
                         is_selected,
                         space_attention,
+                        animating,
                         running,
                         theme,
                         cx,
@@ -1035,6 +1045,8 @@ impl Shell {
     /// (gh#138) — the fact that keeps the two surfaces tied together now that
     /// the shelf below no longer repeats those rows. `attention` colours the
     /// dot in front of that count: the most urgent state among them.
+    /// `animating` says at least one of them is WORKING, so the dot becomes
+    /// the animated rail and a collapsed row stays visibly alive (gh#605).
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
         &self,
@@ -1047,6 +1059,7 @@ impl Shell {
         expanded: bool,
         selected: bool,
         attention: Option<ChatIndicator>,
+        animating: bool,
         running: usize,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -1171,16 +1184,33 @@ impl Shell {
                         .flex_row()
                         .items_center()
                         .gap(px(5.0))
-                        .child(
-                            div()
-                                .size(px(5.0))
-                                // round-ok: status dot
-                                .rounded_full()
+                        // The dot is liveness first (gh#605): while any member
+                        // chat is WORKING it is the animated rail, not a
+                        // static colour — this row is what a collapsed space
+                        // shows instead of its children's spinners, and a
+                        // healthy run behind a collapsed row must still be
+                        // distinguishable from a hung one at a glance.
+                        .child(match animating {
+                            true => div()
+                                .w(px(5.0))
                                 .flex_none()
-                                .bg(attention
-                                    .map(|status| status_dot_color(status, theme))
-                                    .unwrap_or_else(|| theme.white_alpha(0.14))),
-                        )
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(loaders::mini_gradient_spinner(1.5, cx.entity_id(), cx))
+                                .into_any_element(),
+                            false => {
+                                div()
+                                    .size(px(5.0))
+                                    // round-ok: status dot
+                                    .rounded_full()
+                                    .flex_none()
+                                    .bg(attention
+                                        .map(|status| status_dot_color(status, theme))
+                                        .unwrap_or_else(|| theme.white_alpha(0.14)))
+                                    .into_any_element()
+                            }
+                        })
                         .child(
                             div()
                                 .flex_none()
@@ -2081,14 +2111,35 @@ impl Shell {
                         .child(SharedString::from(row.state.label())),
                 )
             })
-            .when_some(row.elapsed_label(now), |el, label| {
+            // What it is doing RIGHT NOW outranks the run's total age
+            // (gh#605): with a call in flight the trailing label is `running
+            // <cmd> · 4m12s`, warning-toned once that call has held past the
+            // waiting threshold. Without one, the plain elapsed as before.
+            .when_some(row.activity_label(now), |el, label| {
                 el.child(
                     div()
                         .flex_none()
+                        .max_w(px(200.0))
+                        .truncate()
                         .text_size(px(Theme::TEXT_CAPTION))
-                        .text_color(subline)
+                        .text_color(if row.activity_waiting(now) {
+                            theme.warning_text()
+                        } else {
+                            subline
+                        })
                         .child(SharedString::from(label)),
                 )
+            })
+            .when(row.activity_label(now).is_none(), |el| {
+                el.when_some(row.elapsed_label(now), |el, label| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(subline)
+                            .child(SharedString::from(label)),
+                    )
+                })
             })
             .into_any_element()
     }
@@ -2192,6 +2243,12 @@ impl Shell {
             )
             // Line 2: the branch, aligned under the identifier. A row with no
             // branch says what it is doing instead of leaving the line blank.
+            // The in-flight call rides here too (gh#605) — `running <cmd> ·
+            // 4m12s` — because this row is where a person looks first, and
+            // what the attempt is doing RIGHT NOW is the question the elapsed
+            // counter alone cannot answer. Past the waiting threshold the
+            // line takes the warning tone: silence that long is no longer
+            // ordinary progress.
             .child(
                 div()
                     .w_full()
@@ -2217,13 +2274,32 @@ impl Shell {
                                 .child(SharedString::from(branch)),
                         )
                     })
-                    .when(agent.branch.is_none(), |el| {
+                    .when(
+                        agent.branch.is_none() && agent.activity_label(now).is_none(),
+                        |el| {
+                            el.child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .line_height(px(14.0))
+                                    .text_color(accent)
+                                    .child(SharedString::from(agent.state.label())),
+                            )
+                        },
+                    )
+                    .when_some(agent.activity_label(now), |el, label| {
                         el.child(
                             div()
+                                .flex_none()
+                                .max_w(px(200.0))
+                                .truncate()
                                 .text_size(px(Theme::TEXT_CAPTION))
                                 .line_height(px(14.0))
-                                .text_color(accent)
-                                .child(SharedString::from(agent.state.label())),
+                                .text_color(if agent.activity_waiting(now) {
+                                    theme.warning_text()
+                                } else {
+                                    subline
+                                })
+                                .child(SharedString::from(label)),
                         )
                     }),
             )

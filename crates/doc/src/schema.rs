@@ -71,6 +71,9 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Tool parts only (gh#605): when the call started, epoch millis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    started_at_ms: Option<i64>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -87,6 +90,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             call,
             is_error,
             resolved,
+            started_at_ms,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -94,6 +98,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             // TS shape parity: `isError` is written only once the tool result arrived;
             // its presence IS the resolution marker.
             is_error: if *resolved { Some(*is_error) } else { None },
+            started_at_ms: *started_at_ms,
             ..Default::default()
         },
         MessagePart::Input {
@@ -126,6 +131,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 call,
                 is_error: p.is_error.unwrap_or(false),
                 resolved: p.is_error.is_some(),
+                started_at_ms: p.started_at_ms,
             },
             None => MessagePart::Text {
                 id: p.id,
@@ -596,6 +602,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(is_error) = doc_part.is_error {
         map.insert("isError", is_error)?;
     }
+    if let Some(started_at_ms) = doc_part.started_at_ms {
+        map.insert("startedAtMs", started_at_ms)?;
+    }
     if let Some(questions) = &doc_part.questions {
         map.insert("questions", loro_value_from_json(questions))?;
     }
@@ -815,6 +824,9 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(is_error) = doc_part.is_error {
         map.insert("isError", is_error)?;
     }
+    if let Some(started_at_ms) = doc_part.started_at_ms {
+        map.insert("startedAtMs", started_at_ms)?;
+    }
     if let Some(questions) = &doc_part.questions {
         map.insert("questions", loro_value_from_json(questions))?;
     }
@@ -1025,6 +1037,61 @@ mod tests {
             } => {
                 assert!(*resolved);
                 assert!(!*is_error);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// gh#605: an in-flight call's start stamp survives the doc round trip —
+    /// the chip's ticking elapsed counts from a timestamp every replica
+    /// holds, not from when this one happened to render.
+    #[test]
+    fn a_tool_part_keeps_its_start_stamp_through_the_doc() {
+        let doc = SessionDoc::init("chat-1").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ToolCall {
+                id: "tool-1".into(),
+                call: ToolCall::Exec {
+                    command: "sleep 400".into(),
+                },
+            },
+        );
+        // The host stamps before each sync (engine-side `stamp_tool_starts`).
+        for part in folded.iter_mut() {
+            if let crate::MessagePart::Tool {
+                started_at_ms: slot @ None,
+                ..
+            } = part
+            {
+                *slot = Some(1_775_000_000_000);
+            }
+        }
+        writer.sync(&folded).unwrap();
+
+        // Still unresolved in the doc: the stamp is there and isError absent.
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            crate::MessagePart::Tool {
+                resolved,
+                started_at_ms,
+                ..
+            } => {
+                assert!(!*resolved);
+                assert_eq!(*started_at_ms, Some(1_775_000_000_000));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // And through an independent snapshot import (what a joining device reads).
+        let reopened = LoroDoc::new();
+        reopened.import(&doc.export_snapshot().unwrap()).unwrap();
+        let entries = SessionDoc::from_doc(reopened).read_entries().unwrap();
+        match &entries[0].parts[0] {
+            crate::MessagePart::Tool { started_at_ms, .. } => {
+                assert_eq!(*started_at_ms, Some(1_775_000_000_000));
             }
             other => panic!("unexpected {other:?}"),
         }
