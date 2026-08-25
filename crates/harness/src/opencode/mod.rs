@@ -80,7 +80,11 @@ pub(crate) fn resolve_opencode_executable() -> Option<PathBuf> {
     {
         return Some(PathBuf::from(p));
     }
-    let exe = if cfg!(windows) { "opencode.exe" } else { "opencode" };
+    let exe = if cfg!(windows) {
+        "opencode.exe"
+    } else {
+        "opencode"
+    };
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)
@@ -222,10 +226,7 @@ impl Harness for OpencodeHarness {
             spawn_server(&exe, None, None, None, &[], &[], &[]).await?;
         let models = {
             let client = Client::new(base);
-            client
-                .models()
-                .await
-                .unwrap_or_else(static_models)
+            client.models().await.unwrap_or_else(static_models)
         };
         shutdown_child(&mut child, self.kill_grace).await;
         let cached = models.clone();
@@ -410,7 +411,11 @@ async fn spawn_server(
     mcp_servers: &[comet_proto::McpServer],
 ) -> Result<(Child, String, crate::StderrTail), HarnessError> {
     let mut cmd = Command::new(exe);
-    cmd.arg("serve").arg("--port").arg("0").arg("--hostname").arg("127.0.0.1");
+    cmd.arg("serve")
+        .arg("--port")
+        .arg("0")
+        .arg("--hostname")
+        .arg("127.0.0.1");
     crate::prepend_exe_dir_to_path(&mut cmd, exe);
     if let Some(chat_id) = chat_id {
         cmd.env("COMET_BOARD_CHAT_ID", chat_id);
@@ -504,7 +509,10 @@ async fn spawn_server(
 /// config (gh#273). Existing inline settings — including values supplied by an
 /// operator through the environment — survive value-for-value; only same-named
 /// MCP entries are replaced. Nothing is written to the checkout or user config.
-fn opencode_inline_config(
+///
+/// `pub(crate)` for the injection preview (gh#606), which renders the same
+/// object against an empty base — exactly the part comet contributes.
+pub(crate) fn opencode_inline_config(
     existing: Option<&str>,
     servers: &[comet_proto::McpServer],
 ) -> Result<Option<String>, HarnessError> {
@@ -683,11 +691,7 @@ type RequestInputFn = Box<
 
 /// Read the `/event` SSE stream and pump parsed [`Event`]s (filtered to our
 /// session) into the loop's channel.
-async fn event_reader(
-    res: reqwest::Response,
-    tx: mpsc::Sender<Event>,
-    session_id: &str,
-) {
+async fn event_reader(res: reqwest::Response, tx: mpsc::Sender<Event>, session_id: &str) {
     let mut stream = Box::pin(res.bytes_stream());
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -751,7 +755,9 @@ async fn answer_questions(
     questions: &[UserInputQuestion],
     request_input: &Arc<RequestInputFn>,
 ) {
-    let answers = (request_input)(questions.to_vec()).await.unwrap_or_default();
+    let answers = (request_input)(questions.to_vec())
+        .await
+        .unwrap_or_default();
     let mut by_index: HashMap<usize, Vec<String>> = HashMap::new();
     for answer in &answers {
         if let Some((_, idx)) = answer.question_id.rsplit_once(':')
@@ -822,7 +828,10 @@ async fn run_session(session: Session) {
     // The prompt fails on a STALE/foreign resume id (the session's gone from
     // opencode's db) — retry once as a fresh session, exactly like the engine's
     // failed-resume fallback for the other harnesses.
-    if let Err(e) = client.prompt_async(&session_id, &request.prompt, &model_ref).await {
+    if let Err(e) = client
+        .prompt_async(&session_id, &request.prompt, &model_ref)
+        .await
+    {
         if request.resume.is_some() {
             tracing::warn!(target: "comet_harness::opencode", resume = %request.resume.as_deref().unwrap_or(""), "resumed session rejected (starting fresh): {e}");
             match client.create_session().await {
@@ -839,9 +848,7 @@ async fn run_session(session: Session) {
                     let _ = send(
                         &event_tx,
                         AgentEvent::Error {
-                            message: format!(
-                                "opencode failed to start the run: {create_err}"
-                            ),
+                            message: format!("opencode failed to start the run: {create_err}"),
                         },
                     )
                     .await;
@@ -860,7 +867,10 @@ async fn run_session(session: Session) {
                 }
             }
         }
-        if let Err(e2) = client.prompt_async(&session_id, &request.prompt, &model_ref).await {
+        if let Err(e2) = client
+            .prompt_async(&session_id, &request.prompt, &model_ref)
+            .await
+        {
             let _ = send(
                 &event_tx,
                 AgentEvent::Error {
@@ -1326,7 +1336,10 @@ mod tests {
             Some(54466)
         );
         assert_eq!(parse_listening_port("some other log line"), None);
-        assert_eq!(parse_listening_port("listening on http://127.0.0.1:ab12"), None);
+        assert_eq!(
+            parse_listening_port("listening on http://127.0.0.1:ab12"),
+            None
+        );
     }
 
     /// gh#600, unit form: a settled message still asking for tools

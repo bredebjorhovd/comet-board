@@ -23,7 +23,7 @@ use gpui::{
 
 use comet_engine::registry::HarnessDescriptor;
 use comet_proto::{
-    ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel,
+    ChatConfig, FolderListing, HarnessId, McpServer, Model, ReasoningLevel, RepoRef, SandboxLevel,
 };
 use comet_rpc::methods;
 
@@ -33,6 +33,7 @@ use comet_rpc::methods;
 const MAX_REF_ROWS: usize = 300;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::mcp::{BUILTIN_ARGS, BUILTIN_COMMAND, BUILTIN_NAME, CommandLocations, McpRowInputs};
 use crate::motion;
 use crate::popover::{self, Loadable, MenuKey};
 use crate::settings::composer::ComposerDefaults;
@@ -53,6 +54,11 @@ pub struct DraftConfig {
     pub reasoning: Option<ReasoningLevel>,
     /// option id → choice id (only non-defaults are meaningful).
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// Per-chat MCP override picked before the first send (gh#606). `None` is
+    /// the ordinary case — the chat starts with whatever its origin gave it,
+    /// nothing for a composer-created one — and `Some`, including an empty
+    /// list, is an explicit choice.
+    pub mcp_servers: Option<Vec<McpServer>>,
     /// The picked ref (base branch in NewWorktree mode; a worktree's branch
     /// when reusing one). `None` = the repo's current branch.
     pub branch: Option<String>,
@@ -95,6 +101,10 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// The MCP servers this chat's runs start (gh#606): the chat config's
+    /// list for an existing chat — stamped there by its dispatching route
+    /// when it has one — or the draft's explicit picks.
+    pub mcp_servers: Vec<McpServer>,
 }
 
 impl ResolvedRunConfig {
@@ -117,7 +127,7 @@ impl ResolvedRunConfig {
             // …and the turn guardrails are the board's too (gh#270): a chat
             // somebody is sitting in front of is not one that needs watching.
             turn_limits: Default::default(),
-            mcp_servers: Vec::new(),
+            mcp_servers: self.mcp_servers.clone(),
         })
     }
 }
@@ -355,6 +365,27 @@ pub struct Pickers {
     /// it — `popover::error_headline` — and the log keeps the rest, gh#317).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
+    // ---- the per-chat MCP panel (gh#606) ----
+    /// The panel is open (it renders as a card above the composer pill).
+    mcp_open: bool,
+    /// Custom-editing mode on an existing chat: rows are live inputs whose
+    /// Save writes the config. Off = read-only view of what the chat carries.
+    /// Drafts are always editable — there is nothing inherited to protect.
+    mcp_custom: bool,
+    /// What "restore" puts back on an existing chat: the list as it stood
+    /// when custom mode was entered — for a dispatched chat, the route's
+    /// servers as stamped at creation. Session-scoped on purpose: the wire
+    /// has no way to say "inherited" versus "an identical custom list", and
+    /// inventing schema to fake the distinction would be worse than saying
+    /// plainly that restore works within this session's knowledge.
+    mcp_inherited: Option<Vec<McpServer>>,
+    mcp_rows: Vec<McpRowInputs>,
+    /// Command resolution on the chat's space device (gh#606), same shape as
+    /// the routing page keeps.
+    mcp_located: std::collections::HashMap<String, Option<String>>,
+    mcp_device_label: Option<String>,
+    /// One locate check in flight; a new keystroke replaces it.
+    mcp_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
 }
@@ -399,6 +430,14 @@ impl Pickers {
                 this.config.reasoning = None;
                 this.config.model_options.clear();
                 this.switch_error = None;
+                // The MCP panel belongs to the chat it was opened on (gh#606):
+                // a selection change closes it and drops its editing state,
+                // exactly like the draft picks beside it.
+                this.mcp_open = false;
+                this.mcp_custom = false;
+                this.mcp_inherited = None;
+                this.mcp_rows.clear();
+                this.mcp_located.clear();
             }
             // A space switch invalidates the branch draft + cache — the folder
             // (and possibly the device) changed under them.
@@ -459,6 +498,13 @@ impl Pickers {
             switch_task: None,
             switch_error: None,
             mutate_task: None,
+            mcp_open: false,
+            mcp_custom: false,
+            mcp_inherited: None,
+            mcp_rows: Vec::new(),
+            mcp_located: std::collections::HashMap::new(),
+            mcp_device_label: None,
+            mcp_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
         }
@@ -618,7 +664,24 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            mcp_servers: self.effective_mcp_servers(cx),
         }
+    }
+
+    /// The MCP servers this chat's runs receive right now (gh#606): an
+    /// existing chat's config list — stamped there by its dispatching route
+    /// when it has one — or, on the draft canvas, whatever was explicitly
+    /// picked. Unsaved row edits are deliberately NOT read here: what runs
+    /// receive is what has been saved, and the panel says so.
+    fn effective_mcp_servers(&self, cx: &App) -> Vec<McpServer> {
+        if let Some(chat) = self.state.read(cx).selected_chat_row() {
+            return chat
+                .config
+                .as_ref()
+                .map(|c| c.mcp_servers.clone())
+                .unwrap_or_default();
+        }
+        self.config.mcp_servers.clone().unwrap_or_default()
     }
 
     // ---- open/close ----
@@ -1211,6 +1274,489 @@ impl Pickers {
                 tracing::warn!(error = %err, "setChatConfig mutate failed");
             }
         }));
+    }
+
+    // ---- the per-chat MCP panel (gh#606) ----
+
+    /// Open or close the MCP panel. Opening seeds the rows with what this
+    /// chat carries right now — a dispatched chat's route-stamped list, an
+    /// older chat's saved picks, or nothing on the draft canvas.
+    fn toggle_mcp_panel(&mut self, cx: &mut Context<Self>) {
+        self.mcp_open = !self.mcp_open;
+        if self.mcp_open {
+            self.seed_mcp_rows(cx);
+            // Fresh answers beat remembered ones: commands may have come and
+            // gone since last time.
+            self.mcp_located.clear();
+            self.check_mcp_commands(cx);
+        }
+        cx.notify();
+    }
+
+    fn mcp_subscribe_row(row: &mut McpRowInputs, cx: &mut Context<Self>) {
+        for input in [&row.name, &row.command, &row.args] {
+            let event = cx.subscribe(input, |this: &mut Self, _, event, cx| {
+                if matches!(event, ComposerInputEvent::Edited(_)) {
+                    this.check_mcp_commands(cx);
+                }
+            });
+            row.events.push(event);
+        }
+    }
+
+    fn seed_mcp_rows(&mut self, cx: &mut Context<Self>) {
+        let seed = self.effective_mcp_servers(cx);
+        let mut rows: Vec<McpRowInputs> = seed
+            .iter()
+            .map(|server| {
+                McpRowInputs::new(&server.name, &server.command, &server.args.join(" "), cx)
+            })
+            .collect();
+        for row in &mut rows {
+            Self::mcp_subscribe_row(row, cx);
+        }
+        self.mcp_rows = rows;
+    }
+
+    fn mcp_servers_from_rows(&self, cx: &App) -> Vec<McpServer> {
+        let tuples: Vec<(String, String, String)> =
+            self.mcp_rows.iter().map(|row| row.values(cx)).collect();
+        crate::mcp::collect_servers(
+            &tuples
+                .iter()
+                .map(|(n, c, a)| (n.as_str(), c.as_str(), a.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// The board validator's verdict on the rows — the same rules its writer
+    /// enforces and the routing page shows, so both editors speak one dialect.
+    fn mcp_row_problems(&self, cx: &App) -> Vec<String> {
+        comet_board::config::mcp_server_problems("this chat", &self.mcp_servers_from_rows(cx))
+    }
+
+    fn mcp_add_row(&mut self, cx: &mut Context<Self>) {
+        let mut row = McpRowInputs::new("", "", "", cx);
+        Self::mcp_subscribe_row(&mut row, cx);
+        self.mcp_rows.push(row);
+        cx.notify();
+    }
+
+    /// One click for the server most chats want: the board's own dispatch
+    /// seam (`comet-board mcp`), which needs no arguments.
+    fn mcp_add_builtin(&mut self, cx: &mut Context<Self>) {
+        if self
+            .mcp_rows
+            .iter()
+            .any(|row| row.values(cx).0.trim().eq_ignore_ascii_case(BUILTIN_NAME))
+        {
+            return;
+        }
+        let mut row = McpRowInputs::new(BUILTIN_NAME, BUILTIN_COMMAND, &BUILTIN_ARGS.join(" "), cx);
+        Self::mcp_subscribe_row(&mut row, cx);
+        self.mcp_rows.push(row);
+        cx.notify();
+    }
+
+    fn mcp_remove_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.mcp_rows.remove(ix);
+        self.check_mcp_commands(cx);
+        cx.notify();
+    }
+
+    fn mcp_move_row(&mut self, ix: usize, delta: isize, cx: &mut Context<Self>) {
+        let to = ix as isize + delta;
+        if to < 0 || to as usize >= self.mcp_rows.len() {
+            return;
+        }
+        self.mcp_rows.swap(ix, to as usize);
+        cx.notify();
+    }
+
+    /// Enter custom mode on an existing chat: remember what the chat carries
+    /// now so Restore can put it back, and make the rows live.
+    fn mcp_enter_custom(&mut self, cx: &mut Context<Self>) {
+        if self.editing_draft(cx) {
+            return;
+        }
+        if self.mcp_inherited.is_none() {
+            self.mcp_inherited = Some(self.effective_mcp_servers(cx));
+        }
+        self.seed_mcp_rows(cx);
+        self.mcp_custom = true;
+        self.check_mcp_commands(cx);
+        cx.notify();
+    }
+
+    /// Put back what was there before customizing (this session's knowledge —
+    /// see [`Self::mcp_inherited`]) and drop the edits in progress.
+    fn mcp_restore_inherited(&mut self, cx: &mut Context<Self>) {
+        let Some(inherited) = self.mcp_inherited.clone() else {
+            return;
+        };
+        if self.editing_draft(cx) {
+            self.config.mcp_servers = (!inherited.is_empty()).then_some(inherited);
+        } else {
+            self.update_chat_config(cx, move |config| config.mcp_servers = inherited);
+        }
+        self.mcp_custom = false;
+        self.mcp_inherited = None;
+        self.seed_mcp_rows(cx);
+        cx.notify();
+    }
+
+    /// Persist the rows. Drafts accumulate onto the first-send config;
+    /// existing chats go through the same `Mutate setChatConfig` write every
+    /// other picker uses — next runs in this chat receive exactly this list.
+    fn mcp_save(&mut self, cx: &mut Context<Self>) {
+        let servers = self.mcp_servers_from_rows(cx);
+        if !comet_board::config::mcp_server_problems("this chat", &servers).is_empty() {
+            return;
+        }
+        if self.editing_draft(cx) {
+            self.config.mcp_servers = Some(servers.clone());
+        } else {
+            self.update_chat_config(cx, move |config| config.mcp_servers = servers);
+        }
+        // Saved is the new baseline: restore-from-here would just rewrite it.
+        self.mcp_custom = false;
+        self.mcp_inherited = None;
+        self.seed_mcp_rows(cx);
+        cx.notify();
+    }
+
+    /// Ask the space's device which of the typed commands resolve there — the
+    /// device whose PATH a run's harness child inherits, not this laptop's.
+    fn check_mcp_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        let mut commands: Vec<String> = Vec::new();
+        for row in &self.mcp_rows {
+            let (_, command, _) = row.values(cx);
+            let command = command.trim().to_string();
+            if !command.is_empty() && !commands.contains(&command) {
+                commands.push(command);
+            }
+        }
+        if commands.is_empty() || !self.mcp_open {
+            return;
+        }
+        let target = self.space_target(cx);
+        self.mcp_device_label = {
+            let state = self.state.read(cx);
+            let device_id = state.selected_space_row().map(|s| s.device_id.as_str());
+            device_id.and_then(|id| {
+                state
+                    .devices
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map(|d| d.name.clone())
+            })
+        };
+        let mut params = serde_json::json!({ "commands": commands });
+        if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
+            object.insert("targetDeviceId".into(), serde_json::json!(target));
+        }
+        self.mcp_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::LOCATE_COMMANDS, params).await;
+            this.update(cx, |pickers, cx| match result {
+                Ok(value) => {
+                    if let Some(locations) = CommandLocations::from_reply(&value) {
+                        pickers.mcp_located = locations.found;
+                        cx.notify();
+                    }
+                }
+                Err(err) => tracing::warn!(error = %err, "LocateCommands failed"),
+            })
+            .ok();
+        }));
+    }
+
+    /// The panel itself, rendered by the composer above the pill (the same
+    /// slot the `/` menu grows from): full-width card, because three inputs
+    /// per row do not fit a popover.
+    pub fn render_mcp_panel(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.mcp_open {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        let draft = self.editing_draft(cx);
+        let problems = self.mcp_row_problems(cx);
+        let editing = draft || self.mcp_custom;
+
+        let mode_caption: SharedString = if draft {
+            SharedString::from(
+                "MCP servers this chat starts its runs with. Dispatched chats \
+                 instead inherit their route's list.",
+            )
+        } else if self.mcp_custom {
+            SharedString::from(
+                "Custom to this chat — every run here receives these servers, \
+                 replacing what the dispatch stamped.",
+            )
+        } else {
+            SharedString::from(
+                "Inherited: what this chat's dispatch stamped on it (its route's \
+                 servers). Customize to change what future runs receive.",
+            )
+        };
+
+        let mut card = popover::popover_card(&theme)
+            .id("mcp-panel")
+            .w_full()
+            .mb(px(6.0))
+            .max_h(px(420.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(px(8.0));
+
+        card = card.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_start()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_BODY))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(SharedString::from("MCP servers")),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_subtle)
+                                .child(mode_caption),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("mcp-panel-close")
+                        .cursor_pointer()
+                        .rounded(px(Theme::RADIUS_CHIP))
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .hover(|s| s.bg(theme.element_hover))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_mcp_panel(cx);
+                        }))
+                        .child(crate::icons::icon(crate::icons::CLOSE).size(px(12.0))),
+                ),
+        );
+
+        if self.mcp_rows.is_empty() && !editing {
+            card = card.child(
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .text_color(theme.text_subtle)
+                    .child(SharedString::from("No MCP servers.")),
+            );
+        }
+
+        for (ix, row) in self.mcp_rows.iter().enumerate() {
+            let (_, command, _) = row.values(cx);
+            let trimmed = command.trim();
+            let missing =
+                !trimmed.is_empty() && self.mcp_located.get(trimmed).is_some_and(|h| h.is_none());
+            let mut line = div().flex().flex_col().gap(px(3.0)).child(if editing {
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .gap(px(4.0))
+                    .child(div().w(px(110.0)).child(row.name.clone()))
+                    .child(div().flex_1().min_w_0().child(row.command.clone()))
+                    .child(div().flex_1().min_w_0().child(row.args.clone()))
+                    .into_any_element()
+            } else {
+                let (name, command, args) = row.values(cx);
+                let summary: SharedString = if args.trim().is_empty() {
+                    format!("{name} · {command}").into()
+                } else {
+                    format!("{name} · {command} · {}", args.trim()).into()
+                };
+                div()
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .child(summary)
+                    .into_any_element()
+            });
+            if missing {
+                let label = self
+                    .mcp_device_label
+                    .clone()
+                    .unwrap_or_else(|| "this space's device".into());
+                line = line.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.warning_text())
+                        .child(SharedString::from(format!(
+                            "`{trimmed}` was not found on {label} — runs here would fail \
+                             to start this server."
+                        ))),
+                );
+            }
+            let mut actions = div().flex().flex_row().gap(px(4.0));
+            if editing {
+                actions = actions
+                    .when(ix > 0, |el| {
+                        el.child(
+                            mcp_icon_button(&theme, "mcp-panel-up", ix)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mcp_move_row(ix, -1, cx);
+                                }))
+                                .child(crate::icons::icon(crate::icons::ARROW_UP).size(px(12.0))),
+                        )
+                    })
+                    .when(ix + 1 < self.mcp_rows.len(), |el| {
+                        el.child(
+                            mcp_icon_button(&theme, "mcp-panel-down", ix)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mcp_move_row(ix, 1, cx);
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::ALT_ARROW_DOWN).size(px(12.0)),
+                                ),
+                        )
+                    })
+                    .child(
+                        mcp_icon_button(&theme, "mcp-panel-remove", ix)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.mcp_remove_row(ix, cx);
+                            }))
+                            .child(
+                                crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                    .size(px(12.0)),
+                            ),
+                    );
+            }
+            line = line.child(actions);
+            card = card.child(line);
+        }
+
+        for problem in &problems {
+            card = card.child(
+                div()
+                    .text_size(px(Theme::TEXT_CAPTION))
+                    .text_color(theme.warning_text())
+                    .child(problem.clone()),
+            );
+        }
+
+        // Footer: affordances left, decisions right — same arrangement as the
+        // routing page's editor, so the two surfaces read as one feature.
+        card = card.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .when(editing, |el| {
+                            el.child(
+                                mcp_text_button(&theme, "mcp-panel-add")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mcp_add_row(cx);
+                                    }))
+                                    .child(SharedString::from("+ Add server")),
+                            )
+                            .child(
+                                mcp_text_button(&theme, "mcp-panel-builtin")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mcp_add_builtin(cx);
+                                    }))
+                                    .child(SharedString::from("+ comet-board")),
+                            )
+                        })
+                        .when(!editing, |el| {
+                            el.child(
+                                mcp_text_button(&theme, "mcp-panel-customize")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mcp_enter_custom(cx);
+                                    }))
+                                    .child(SharedString::from("Customize…")),
+                            )
+                        }),
+                )
+                .when(editing, |el| {
+                    el.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(6.0))
+                            .when(!draft && self.mcp_inherited.is_some(), |el| {
+                                el.child(
+                                    mcp_text_button(&theme, "mcp-panel-restore")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.mcp_restore_inherited(cx);
+                                        }))
+                                        .child(SharedString::from("Restore inherited")),
+                                )
+                            })
+                            .child(
+                                mcp_text_button(&theme, "mcp-panel-save")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if this.mcp_row_problems(cx).is_empty() {
+                                            this.mcp_save(cx);
+                                        }
+                                    }))
+                                    .when(!problems.is_empty(), |el| el.opacity(0.4))
+                                    .child(SharedString::from("Save")),
+                            ),
+                    )
+                }),
+        );
+
+        // What THIS chat's harness would receive — one preview, not three,
+        // because the chat has already picked its agent.
+        if let Some(harness) = self.effective_harness(cx) {
+            let label = match harness {
+                HarnessId::ClaudeCode | HarnessId::Mock => "claude-code",
+                HarnessId::Codex => "codex",
+                HarnessId::Opencode => "opencode",
+                HarnessId::Cursor => "cursor",
+            };
+            if let Some(preview) =
+                comet_harness::mcp_injection_preview(harness, &self.effective_mcp_servers(cx))
+            {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .border_t_1()
+                        .border_color(theme.white_alpha(0.06))
+                        .pt(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(format!("{label} receives"))),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_subtle)
+                                .child(SharedString::from(preview)),
+                        ),
+                );
+            }
+        }
+
+        Some(card.into_any_element())
     }
 
     // ---- keyboard ----
@@ -2455,6 +3001,35 @@ impl Pickers {
     }
 }
 
+/// A small icon button for the MCP panel rows (up / down / remove): the
+/// footer-chip voice at icon size.
+fn mcp_icon_button(theme: &Theme, id: &'static str, ix: usize) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id((id, ix))
+        .cursor_pointer()
+        .rounded(px(Theme::RADIUS_CHIP))
+        .px(px(5.0))
+        .py(px(2.0))
+        .text_color(theme.text_subtle)
+        .hover(|s| s.bg(theme.element_hover))
+}
+
+/// A small text button for the MCP panel footer (add / customize / restore /
+/// save): hairline key-cap, caption type.
+fn mcp_text_button(theme: &Theme, id: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .cursor_pointer()
+        .rounded(px(Theme::RADIUS_CHIP))
+        .border_1()
+        .border_color(theme.border)
+        .px(px(8.0))
+        .py(px(3.0))
+        .text_size(px(Theme::TEXT_CAPTION))
+        .text_color(theme.text_muted)
+        .hover(|s| s.bg(theme.element_hover))
+}
+
 /// A segmented choice chip for the traits inspector (reasoning ladder /
 /// model options): the key-cap voice — every chip carries a faint fill so it
 /// reads as a pressable segment (bare text read as labels, not buttons).
@@ -2681,16 +3256,58 @@ impl Render for Pickers {
             Some(PickerKind::Traits) | None => None,
         };
 
-        // Left cluster (the branch chip moved to the composer FOOTER row).
-        // Right cluster: agent+model and traits — the composer appends
-        // attach + send after this element (comet composer-actions.tsx
-        // arrangement).
+        // Left cluster: the MCP affordance (gh#606). The count is the
+        // effective list — a dispatched chat shows its route's servers before
+        // anybody opens the panel, which is the point of the stamp.
+        let mcp_count = self.effective_mcp_servers(cx).len();
+        let mcp_label: SharedString = if mcp_count > 0 {
+            format!("MCP · {mcp_count}").into()
+        } else {
+            "MCP".into()
+        };
         let left = div()
             .flex()
             .flex_row()
             .items_center()
             .min_w_0()
-            .gap(px(4.0));
+            .gap(px(4.0))
+            .child(
+                div()
+                    .id("picker-mcp")
+                    .h(px(20.0))
+                    .max_w(px(280.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .px(px(6.0))
+                    .rounded(px(Theme::RADIUS_CHIP))
+                    .text_size(px(Theme::TEXT_DENSE))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(motion::hover_blend(
+                        "picker-mcp",
+                        theme.text_subtle,
+                        theme.text_muted,
+                    ))
+                    .bg(if self.mcp_open {
+                        theme.element_hover
+                    } else {
+                        motion::hover_blend(
+                            "picker-mcp",
+                            gpui::transparent_black(),
+                            theme.element_hover,
+                        )
+                    })
+                    .on_hover(motion::hover_listener("picker-mcp"))
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_mcp_panel(cx)))
+                    .child(
+                        crate::icons::icon(crate::icons::WIDGET)
+                            .size(px(12.0))
+                            .text_color(theme.text_subtle),
+                    )
+                    .child(div().min_w_0().truncate().child(mcp_label)),
+            );
         // ONE combined model+effort chip (user request): brand icon + model
         // name, then the effort level muted with no icon — a single button
         // opening the single merged menu.
@@ -2858,6 +3475,28 @@ mod tests {
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+    }
+
+    /// The draft's explicit MCP picks ride the first-send config (gh#606):
+    /// what the panel saved before the first send is what createChat records,
+    /// and an empty-but-explicit list stays empty rather than reverting.
+    #[test]
+    fn resolved_chat_config_carries_the_drafts_mcp_picks() {
+        let mut resolved = ResolvedRunConfig {
+            harness: Some(HarnessId::Codex),
+            model: Some("gpt-5".into()),
+            ..ResolvedRunConfig::default()
+        };
+        assert!(resolved.chat_config().unwrap().mcp_servers.is_empty());
+
+        resolved.mcp_servers = vec![crate::mcp::builtin_board_server()];
+        let config = resolved.chat_config().unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].name, crate::mcp::BUILTIN_NAME);
+
+        // An explicit opt-out is preserved as exactly that.
+        resolved.mcp_servers = Vec::new();
+        assert!(resolved.chat_config().unwrap().mcp_servers.is_empty());
     }
 
     #[test]

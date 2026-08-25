@@ -31,13 +31,19 @@ use gpui::{
 
 use comet_board::adopt::Unadopted;
 use comet_board::config::Route;
+use comet_board::dispatch::space_matches;
 use comet_board::onboard::{Candidate, Onboarded};
 use comet_board::routes::{RoutingView, cap_summary, match_summary};
+use comet_proto::McpServer;
 use comet_proto::view::board;
 use comet_rpc::methods;
 use serde::Deserialize;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::mcp::{
+    BUILTIN_ARGS, BUILTIN_COMMAND, BUILTIN_NAME, CommandLocations, McpRowInputs, collect_servers,
+    route_mcp_summary,
+};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -115,6 +121,35 @@ struct FieldDialog {
     _events: Subscription,
 }
 
+/// The per-route MCP servers editor (gh#606): rows of (name · command · args)
+/// written through the board's validating writer as one structured op — never
+/// raw TOML.
+///
+/// The rows are seeded with the list the route *resolves to* (its own, else
+/// `[defaults]`), so "customize what you have" costs nothing; saving always
+/// writes an explicit list for the route, and the reset action removes the
+/// key, falling back to `[defaults]` — the same two states
+/// [`comet_board::config::Route::mcp_servers`] has on the wire.
+struct McpEditor {
+    route: usize,
+    route_name: String,
+    workspace: String,
+    /// What the route itself declares. `None` is inheriting: the caption says
+    /// so and says what it is inheriting, because a list on screen that comes
+    /// from somewhere else must not read as this route's own.
+    declared: Option<Vec<McpServer>>,
+    /// The defaults' resolved list, shown beside the inherit note.
+    inherited: Vec<McpServer>,
+    rows: Vec<McpRowInputs>,
+    /// Command resolution on the route's workspace device: trimmed command →
+    /// where it was found, or `None` when nowhere. Commands never checked yet
+    /// are simply absent, so a stale answer can't dress up as fresh.
+    located: std::collections::HashMap<String, Option<String>>,
+    /// The device the answers above describe — named in the warnings, since
+    /// "not found" without "where looked" is half a diagnosis.
+    device_label: Option<String>,
+}
+
 /// The "Onboard a repo…" panel (gh#97).
 ///
 /// The list is the board App's *grant*, fetched from the host — not the
@@ -145,6 +180,8 @@ pub struct RoutingPage {
     host: Option<String>,
     config: Option<BoardConfig>,
     dialog: Option<FieldDialog>,
+    /// The open MCP editor, if any (one at a time; it is a card on the page).
+    mcp_editor: Option<McpEditor>,
     onboard: Option<OnboardFlow>,
     /// What the last onboard did, kept on screen until the panel is closed —
     /// it is the only record of a clone that happened on a machine the reader
@@ -163,6 +200,10 @@ pub struct RoutingPage {
     /// Onboarding runs on its own slot: dropping a gpui `Task` cancels it, and a
     /// config reload landing mid-clone must not look like a cancelled clone.
     onboard_task: Option<Task<()>>,
+    /// Command-existence checks (gh#606) run on their own slot too — a keystroke
+    /// in a command field replaces the check in flight rather than queueing
+    /// one per character.
+    locate_task: Option<Task<()>>,
     _observe: Subscription,
 }
 
@@ -174,6 +215,7 @@ impl RoutingPage {
             host: None,
             config: None,
             dialog: None,
+            mcp_editor: None,
             onboard: None,
             onboarded: None,
             error: None,
@@ -182,6 +224,7 @@ impl RoutingPage {
             loaded: false,
             task: None,
             onboard_task: None,
+            locate_task: None,
             _observe: observe,
         };
         page.reload(cx);
@@ -507,6 +550,262 @@ impl RoutingPage {
     fn ignore(&mut self, slug: String, cx: &mut Context<Self>) {
         self.write(serde_json::json!({ "op": "ignore", "slug": slug }), cx);
     }
+
+    // ---- the per-route MCP servers editor (gh#606) ----
+
+    /// Open the editor on `route`, seeded with what that route resolves to —
+    /// its own list when it has one, `[defaults]` when it inherits.
+    fn open_mcp_editor(&mut self, route_ix: usize, cx: &mut Context<Self>) {
+        let Some(config) = self.config.as_ref() else {
+            return;
+        };
+        let Some(parsed) = config.routing.config.as_ref() else {
+            return;
+        };
+        let Some(route) = parsed.routes.get(route_ix) else {
+            return;
+        };
+        let declared = route.mcp_servers.clone();
+        let inherited = parsed.defaults.mcp_servers.clone();
+        let seed = declared.as_deref().unwrap_or(&inherited);
+        let mut rows: Vec<McpRowInputs> = seed
+            .iter()
+            .map(|server| {
+                McpRowInputs::new(&server.name, &server.command, &server.args.join(" "), cx)
+            })
+            .collect();
+        for row in &mut rows {
+            Self::subscribe_row(row, cx);
+        }
+        let editor = McpEditor {
+            route: route_ix,
+            route_name: route.display_name().to_string(),
+            workspace: route.workspace.clone(),
+            declared,
+            inherited,
+            rows,
+            located: std::collections::HashMap::new(),
+            device_label: None,
+        };
+        self.mcp_editor = Some(editor);
+        self.error = None;
+        // The first sanity check is free to run now: a typo'd command should
+        // be news before anybody presses Save.
+        self.check_mcp_commands(cx);
+        cx.notify();
+    }
+
+    fn subscribe_row(row: &mut McpRowInputs, cx: &mut Context<Self>) {
+        for input in [&row.name, &row.command, &row.args] {
+            let event = cx.subscribe(input, |this: &mut Self, _, event, cx| {
+                if matches!(event, ComposerInputEvent::Edited(_)) {
+                    this.check_mcp_commands(cx);
+                }
+            });
+            row.events.push(event);
+        }
+    }
+
+    fn close_mcp_editor(&mut self, cx: &mut Context<Self>) {
+        self.mcp_editor = None;
+        cx.notify();
+    }
+
+    /// The servers the rows currently spell, trimmed and split exactly as the
+    /// validating writer would parse them back.
+    fn mcp_servers_from_rows(&self, cx: &gpui::App) -> Vec<McpServer> {
+        let Some(editor) = self.mcp_editor.as_ref() else {
+            return Vec::new();
+        };
+        let tuples: Vec<(String, String, String)> =
+            editor.rows.iter().map(|row| row.values(cx)).collect();
+        collect_servers(
+            &tuples
+                .iter()
+                .map(|(n, c, a)| (n.as_str(), c.as_str(), a.as_str()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// What the board's own validator says about the rows — the very function
+    /// the write seam refuses on, so a warning here is a refusal there.
+    fn mcp_row_problems(&self, cx: &gpui::App) -> Vec<String> {
+        let Some(editor) = self.mcp_editor.as_ref() else {
+            return Vec::new();
+        };
+        comet_board::config::mcp_server_problems(
+            &format!("route {}", editor.route + 1),
+            &self.mcp_servers_from_rows(cx),
+        )
+    }
+
+    fn mcp_add_row(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.mcp_editor.as_mut() else {
+            return;
+        };
+        let mut row = McpRowInputs::new("", "", "", cx);
+        Self::subscribe_row(&mut row, cx);
+        editor.rows.push(row);
+        cx.notify();
+    }
+
+    /// One click for the server every route usually wants: the board's own
+    /// dispatch seam, which needs no arguments.
+    fn mcp_add_builtin(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.mcp_editor.as_mut() else {
+            return;
+        };
+        if editor
+            .rows
+            .iter()
+            .any(|row| row.values(cx).0.trim().eq_ignore_ascii_case(BUILTIN_NAME))
+        {
+            return;
+        }
+        let mut row = McpRowInputs::new(BUILTIN_NAME, BUILTIN_COMMAND, &BUILTIN_ARGS.join(" "), cx);
+        Self::subscribe_row(&mut row, cx);
+        editor.rows.push(row);
+        cx.notify();
+    }
+
+    fn mcp_remove_row(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(editor) = self.mcp_editor.as_mut() else {
+            return;
+        };
+        editor.rows.remove(ix);
+        self.check_mcp_commands(cx);
+        cx.notify();
+    }
+
+    fn mcp_move_row(&mut self, ix: usize, delta: isize, cx: &mut Context<Self>) {
+        let Some(editor) = self.mcp_editor.as_mut() else {
+            return;
+        };
+        let to = ix as isize + delta;
+        if to < 0 || to as usize >= editor.rows.len() {
+            return;
+        }
+        let to = to as usize;
+        editor.rows.swap(ix, to);
+        cx.notify();
+    }
+
+    /// Write the rows as the route's explicit list. The writer re-validates;
+    /// the page's own strips already showed the same problems, so Save sits
+    /// quiet while any stand.
+    fn save_mcp_editor(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.mcp_editor.take() else {
+            return;
+        };
+        let servers = self.mcp_servers_from_rows(cx);
+        if !comet_board::config::mcp_server_problems("route", &servers).is_empty() {
+            self.mcp_editor = Some(editor);
+            return;
+        }
+        self.write(
+            serde_json::json!({
+                "op": "routeMcp",
+                "route": editor.route,
+                "servers": servers,
+            }),
+            cx,
+        );
+    }
+
+    /// Remove the route's explicit list: back to inheriting `[defaults]`.
+    fn reset_mcp_to_default(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.mcp_editor.take() else {
+            return;
+        };
+        self.write(
+            serde_json::json!({
+                "op": "routeMcp",
+                "route": editor.route,
+                "servers": serde_json::Value::Null,
+            }),
+            cx,
+        );
+    }
+
+    /// Ask the route's workspace device which of the typed commands actually
+    /// resolve there. Commands run where the harness child spawns — not where
+    /// this window is open, and not necessarily where the board's file lives.
+    ///
+    /// Fired on open and on every command edit; the single task slot means a
+    /// burst of keystrokes leaves one check in flight, and dropping the old
+    /// `Task` cancels it.
+    fn check_mcp_commands(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let Some(editor) = self.mcp_editor.as_ref() else {
+            return;
+        };
+        let mut commands: Vec<String> = Vec::new();
+        let values: Vec<(String, String, String)> =
+            editor.rows.iter().map(|row| row.values(cx)).collect();
+        for (_, command, _) in &values {
+            let command = command.trim().to_string();
+            if !command.is_empty() && !commands.contains(&command) {
+                commands.push(command);
+            }
+        }
+        if commands.is_empty() {
+            return;
+        }
+        let workspace = editor.workspace.clone();
+        let (target, device_label) = {
+            let state = self.state.read(cx);
+            let space = state
+                .spaces
+                .iter()
+                .find(|s| space_matches(s.name.as_deref(), &s.path, &workspace))
+                .map(|s| s.device_id.clone());
+            let label = space.as_deref().and_then(|id| {
+                state
+                    .devices
+                    .iter()
+                    .find(|d| d.id == id)
+                    .map(|d| d.name.clone())
+            });
+            // This device's engine answers without a relay hop; anything else
+            // is addressed by id like every forwardable call.
+            let target = match (&space, state.local_device_id.as_deref()) {
+                (Some(id), Some(local)) if id == local => None,
+                (Some(id), _) => Some(id.clone()),
+                (None, _) => None,
+            };
+            (target, label)
+        };
+        if let Some(editor) = self.mcp_editor.as_mut() {
+            editor.device_label = device_label;
+        }
+        let mut params = serde_json::json!({ "commands": commands });
+        if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
+            object.insert("targetDeviceId".into(), serde_json::json!(target));
+        }
+        self.locate_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(methods::LOCATE_COMMANDS, params).await;
+            this.update(cx, |page, cx| {
+                let Some(editor) = page.mcp_editor.as_mut() else {
+                    return;
+                };
+                match result {
+                    Ok(value) => {
+                        if let Some(locations) = CommandLocations::from_reply(&value) {
+                            editor.located = locations.found;
+                        }
+                    }
+                    // A failed check stays silent on the page: no answer is
+                    // not a "not found", and inventing one would warn about
+                    // the network instead of the command.
+                    Err(err) => tracing::warn!(error = %err, "LocateCommands failed"),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
 }
 
 impl Render for RoutingPage {
@@ -613,6 +912,12 @@ impl Render for RoutingPage {
             column = column.child(self.render_dialog(&theme, dialog, cx));
         }
 
+        // The MCP editor renders like the field dialogs do: a card at the
+        // bottom of the page, close to where the write's refusal strip lands.
+        if let Some(editor) = self.mcp_editor.as_ref() {
+            column = column.child(self.render_mcp_editor(&theme, editor, cx));
+        }
+
         div()
             .id("routing-page")
             .size_full()
@@ -646,6 +951,7 @@ impl RoutingPage {
             .unwrap_or_else(|| "device login".into())
             .into();
         let runtime: SharedString = route.runtime.clone().into();
+        let mcp: SharedString = route_mcp_summary(route.mcp_servers.as_deref()).into();
 
         let field_button = |field: RouteField, label: SharedString, route: &Route| {
             let current = field.current(route);
@@ -702,7 +1008,20 @@ impl RoutingPage {
                                 RouteField::MaxDuration,
                                 format!("cap: {}", cap_summary(route, default_cap)).into(),
                                 route,
-                            )),
+                            ))
+                            .child(
+                                widgets::ghost_action(theme)
+                                    .id(("route-mcp", ix))
+                                    .hover(widgets::ghost_hover(theme))
+                                    .when(busy, |el| el.opacity(0.4))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if this.busy {
+                                            return;
+                                        }
+                                        this.open_mcp_editor(ix, cx);
+                                    }))
+                                    .child(format!("mcp: {mcp}")),
+                            ),
                     ),
             )
             .child(widgets::badge(theme, format!("{}", ix + 1)))
@@ -1043,6 +1362,300 @@ impl RoutingPage {
                     ),
             )
             .into_any_element()
+    }
+
+    /// The MCP editor card (gh#606): rows of (name · command · args) with
+    /// add / remove / reorder, the built-in server one click away, the same
+    /// warnings the writer would raise, a per-harness injection preview, and
+    /// the command-not-found check against the route's workspace device.
+    fn render_mcp_editor(
+        &self,
+        theme: &Theme,
+        editor: &McpEditor,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let problems = self.mcp_row_problems(cx);
+        let servers = self.mcp_servers_from_rows(cx);
+        let busy = self.busy;
+
+        let mut card = widgets::section_card(theme).child(
+            widgets::card_row(theme, true)
+                .flex_col()
+                .items_start()
+                .gap(px(8.0))
+                .child(widgets::row_title(
+                    theme,
+                    format!("MCP servers — {}", editor.route_name),
+                ))
+                .child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.text_subtle)
+                        .child(SharedString::from(match editor.declared.as_deref() {
+                            // The rows show the defaults' list; saying where
+                            // they came from is the difference between
+                            // "editing my route" and "about to make this
+                            // explicit".
+                            None => format!(
+                                "Inheriting [defaults] ({} below). Saving writes \
+                                 this list as the route's own.",
+                                if editor.inherited.is_empty() {
+                                    "no servers".to_string()
+                                } else {
+                                    format!(
+                                        "{} server{})",
+                                        editor.inherited.len(),
+                                        if editor.inherited.len() == 1 { "" } else { "s" }
+                                    )
+                                }
+                            ),
+                            Some([]) => "This route opts out — no MCP servers are \
+                                 injected on its dispatches."
+                                .to_string(),
+                            Some(list) => format!(
+                                "Custom to this route ({} server{}). Reset removes \
+                                 it and falls back to [defaults].",
+                                list.len(),
+                                if list.len() == 1 { "" } else { "s" }
+                            ),
+                        })),
+                ),
+        );
+
+        // The rows.
+        for (ix, row) in editor.rows.iter().enumerate() {
+            let (_, command, _) = row.values(cx);
+            let command_missing = !command.trim().is_empty()
+                && editor
+                    .located
+                    .get(command.trim())
+                    .is_some_and(|hit| hit.is_none());
+            let mut line = widgets::card_row(theme, false)
+                .flex_col()
+                .items_start()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .gap(px(4.0))
+                        .child(div().w(px(110.0)).child(row.name.clone()))
+                        .child(div().flex_1().min_w_0().child(row.command.clone()))
+                        .child(div().flex_1().min_w_0().child(row.args.clone())),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(4.0))
+                        .when(ix > 0, |el| {
+                            el.child(
+                                widgets::ghost_action(theme)
+                                    .id(("mcp-up", ix))
+                                    .hover(widgets::ghost_hover(theme))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.mcp_move_row(ix, -1, cx);
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::ARROW_UP).size(px(12.0)),
+                                    ),
+                            )
+                        })
+                        .when(ix + 1 < editor.rows.len(), |el| {
+                            el.child(
+                                widgets::ghost_action(theme)
+                                    .id(("mcp-down", ix))
+                                    .hover(widgets::ghost_hover(theme))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.mcp_move_row(ix, 1, cx);
+                                    }))
+                                    .child(
+                                        crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                                            .size(px(12.0)),
+                                    ),
+                            )
+                        })
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id(("mcp-remove", ix))
+                                .hover(widgets::ghost_hover(theme))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.mcp_remove_row(ix, cx);
+                                }))
+                                .child(
+                                    crate::icons::icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                        .size(px(12.0)),
+                                ),
+                        ),
+                );
+            // The warning rides the row it is about: three servers, one bad
+            // command, and a single strip at the bottom would leave somebody
+            // counting rows.
+            if command_missing {
+                let label = editor
+                    .device_label
+                    .clone()
+                    .unwrap_or_else(|| format!("workspace “{}”", editor.workspace));
+                line = line.child(
+                    div()
+                        .text_size(px(Theme::TEXT_CAPTION))
+                        .text_color(theme.warning_text())
+                        .child(SharedString::from(format!(
+                            "`{command}` was not found on {label} — its dispatch would \
+                             fail to start this server."
+                        ))),
+                );
+            }
+            card = card.child(line);
+        }
+
+        // Validation, before the buttons: what Save would be refused for,
+        // named while it is still being typed.
+        for problem in &problems {
+            card = card.child(widgets::warning_strip(theme, problem.clone()));
+        }
+
+        // Footer: add affordances left, decisions right.
+        card = card.child(
+            widgets::card_row(theme, false)
+                .flex_col()
+                .items_start()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("mcp-add-row")
+                                .hover(widgets::ghost_hover(theme))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.mcp_add_row(cx);
+                                }))
+                                .child(crate::icons::icon(crate::icons::PLUS).size(px(12.0)))
+                                .child(SharedString::from("Add server")),
+                        )
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("mcp-add-builtin")
+                                .hover(widgets::ghost_hover(theme))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.mcp_add_builtin(cx);
+                                }))
+                                .child(SharedString::from("Add comet-board")),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(6.0))
+                        .when(editor.declared.is_some(), |el| {
+                            el.child(
+                                widgets::ghost_action(theme)
+                                    .id("mcp-reset")
+                                    .hover(widgets::ghost_hover(theme))
+                                    .when(busy, |el| el.opacity(0.4))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if this.busy {
+                                            return;
+                                        }
+                                        this.reset_mcp_to_default(cx);
+                                    }))
+                                    .child(SharedString::from("Use [defaults]")),
+                            )
+                        })
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("mcp-close")
+                                .hover(widgets::ghost_hover(theme))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_mcp_editor(cx);
+                                }))
+                                .child(SharedString::from("Cancel")),
+                        )
+                        .child(
+                            widgets::ghost_action(theme)
+                                .id("mcp-save")
+                                .hover(widgets::ghost_hover(theme))
+                                // Quiet rather than hidden while invalid: the
+                                // strips above say why, an absent button says
+                                // nothing.
+                                .when(busy || !problems.is_empty(), |el| el.opacity(0.4))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.busy || !this.mcp_row_problems(cx).is_empty() {
+                                        return;
+                                    }
+                                    this.save_mcp_editor(cx);
+                                }))
+                                .child(SharedString::from("Save")),
+                        ),
+                ),
+        );
+
+        // What each harness would actually receive, rendered by the adapters'
+        // own functions so it cannot drift from what spawns. Empty rows mean
+        // nothing is injected anywhere — worth saying, not showing.
+        card = card.child(self.render_mcp_preview(theme, &servers));
+        card.into_any_element()
+    }
+
+    /// Per-harness injection previews for `servers`, as caption blocks.
+    fn render_mcp_preview(&self, theme: &Theme, servers: &[McpServer]) -> AnyElement {
+        let harnesses: [(&str, comet_proto::HarnessId); 3] = [
+            ("claude-code", comet_proto::HarnessId::ClaudeCode),
+            ("codex", comet_proto::HarnessId::Codex),
+            ("opencode", comet_proto::HarnessId::Opencode),
+        ];
+        let mut block = div().mt(px(4.0)).flex().flex_col().gap(px(4.0)).child(
+            div()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .text_color(theme.text_subtle)
+                .child(SharedString::from(
+                    "What a run receives from these servers:",
+                )),
+        );
+        for (label, harness) in harnesses {
+            match comet_harness::mcp_injection_preview(harness, servers) {
+                Some(preview) => {
+                    block = block.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .px(px(8.0))
+                            .py(px(6.0))
+                            .rounded(px(Theme::RADIUS_ROW))
+                            .bg(theme.white_alpha(0.04))
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(theme.text_muted)
+                                    .child(SharedString::from(label)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(Theme::TEXT_CAPTION))
+                                    .text_color(theme.text_subtle)
+                                    .child(SharedString::from(preview)),
+                            ),
+                    );
+                }
+                None => {
+                    block = block.child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_subtle)
+                            .child(SharedString::from(format!("{label}: nothing injected"))),
+                    );
+                }
+            }
+        }
+        block.into_any_element()
     }
 }
 

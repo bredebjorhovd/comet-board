@@ -1989,6 +1989,9 @@ fn forwardable(method: &str) -> bool {
         method,
         methods::LIST_HARNESSES
             | methods::LIST_MODELS
+            // Command existence is a fact about the device the run happens
+            // on (gh#606) — the laptop asking has its own, different PATH.
+            | methods::LOCATE_COMMANDS
             // Skills are files on the chat's host, and which files depends on
             // the agent account that chat names (gh#134) — a laptop answering
             // from its own `~/.claude` would offer what the run cannot invoke.
@@ -2381,6 +2384,37 @@ impl RpcService for EngineRpc {
         }
         match method {
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            // Which of these commands exist on this device (gh#606). The
+            // device's own PATH first — the resolution a bare command gets —
+            // then the launch-time gap-fillers (the app payload's bin dir,
+            // the toolchain dirs), because `comet-board` itself lives in one
+            // of those and a plain-PATH check would cry wolf about the one
+            // server every route ships by default.
+            methods::LOCATE_COMMANDS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    commands: Vec<String>,
+                }
+                let p: P = parse_params(params)?;
+                let gap_fillers = self.sessions.path_dirs();
+                let found: std::collections::BTreeMap<String, Option<String>> = p
+                    .commands
+                    .into_iter()
+                    .map(|command| {
+                        let hit = comet_harness::locate_on_path(&command)
+                            .or_else(|| {
+                                gap_fillers.iter().find_map(|dir| {
+                                    let candidate = dir.join(command.trim());
+                                    candidate.is_file().then_some(candidate)
+                                })
+                            })
+                            .map(|path| path.display().to_string());
+                        (command, hit)
+                    })
+                    .collect();
+                RpcReply::value(&serde_json::json!({ "found": found }))
+            }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self

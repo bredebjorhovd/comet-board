@@ -203,6 +203,20 @@ impl SessionsEngine {
         self.inner.journal.clone()
     }
 
+    /// The directories every run's PATH is launched with beyond the device's
+    /// own (the app payload's bin dir, gh#184, plus the toolchain gap-fillers,
+    /// gh#561). The "does this command resolve here" check (gh#606) asks for
+    /// them so it answers about where runs actually resolve, not merely about
+    /// a bare login shell.
+    pub fn path_dirs(&self) -> Vec<std::path::PathBuf> {
+        self.inner
+            .agent_bin_dirs
+            .iter()
+            .chain(self.inner.agent_tool_dirs.iter())
+            .cloned()
+            .collect()
+    }
+
     /// Is this chat's journal still open — last event not `Done`? Those chats
     /// belong to [`Self::recover_stale`], which closes the journal and decides
     /// revival; the doc-level orphan sweep must leave them alone (gh#528).
