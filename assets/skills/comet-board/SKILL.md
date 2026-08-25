@@ -110,6 +110,33 @@ under it says `no test covers this`. Neither is an instruction to write a test
 you would not otherwise write; it is what a reviewer sees, so it is worth
 knowing it is being read.
 
+## Show what you tested
+
+If the work changed something a reviewer would have to *see* — a screen, a
+flow, an empty state, a diff view — show it. Capture it however your
+environment already can, then attach it:
+
+```bash
+npx playwright screenshot --viewport-size=1440,900 http://localhost:5173/settings shot.png
+comet-board evidence --task gh:owner/repo#421 --kind screenshot --file shot.png \
+  --description "settings page, new danger zone" --url http://localhost:5173/settings \
+  --viewport 1440x900
+```
+
+`--kind` is `screenshot`, `recording`, `accessibility`, `console` or `log`
+(each with its own size cap); `--description` is required and is one sentence
+on what the artifact demonstrates. The board supplies what you do not: it
+fingerprints your checkout itself — commit SHA and dirty-file count, read
+with git at attach time — so the review shows pixels pinned to a code state,
+not just a picture. Attach right after you capture; the fingerprint is taken
+when you attach, so pixels captured before your last commit carry a stale
+tree beside a fresh one, and the uncommitted count is how that reads.
+
+Attach after your last commit, alongside the claims. Eight artifacts per
+attempt; re-sending identical bytes stores nothing twice. Nothing here asks
+you to capture when there was nothing to see — backend-only work attaches
+nothing and breaks nothing.
+
 **Releasing and waiting:**
 
 ```bash
@@ -197,6 +224,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |
 | `wait` | `--task`, `--state`, `--blocked-is-settled`, `--timeout`, `--json` | Block until watched work settles. The counterpart to `dispatch` |
 | `claim` | `--task`, `--claim`, `--json` | Say what your attempt did, in claims a reviewer can check |
+| `evidence` | `--task`, `--file`, `--kind`, `--description`, `--url`, `--viewport`, `--json` | Show what you tested: attach one visual/runtime artifact to your attempt (§gh#421) — a screenshot, a short recording, an accessibility snapshot, a console excerpt or a log |
 | `review` | `--task`, `--attempt`, `--json` | What an attempt was asked to do, what it says it did, and what it did not account for |
 | `verdict` | `--task`, `--attempt`, `--comment`, `--approve`, `--request-changes`, `--json` | Give the verdict: record it, hand it to the agent still standing in the checkout, and post it on the pull request |
 | `merge` | `--task`, `--yes`, `--json` | Merge a task's pull request. Asks first, on the row's own words: merging a layer of a stack merges every open layer beneath it as one group, and the confirmation names them |

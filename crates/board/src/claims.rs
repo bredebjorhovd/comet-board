@@ -414,6 +414,13 @@ pub struct AttemptReview {
     /// checkout to ask.
     pub uncommitted: Option<u32>,
     pub evidence: RunEvidence,
+    /// The visual/runtime artifacts this attempt published (§gh#421) —
+    /// screenshots, recordings, accessibility trees, excerpts — each carrying
+    /// the commit/dirty fingerprint the board read out of the worktree at
+    /// attach time. Empty is "nothing was shown", which a frontend review is
+    /// entitled to read as exactly what it says.
+    #[serde(default)]
+    pub evidence_artifacts: Vec<crate::evidence::EvidenceArtifact>,
     /// What sandbox the run that produced all of the above actually had
     /// (§gh#349) — read off the harness's own report, never off the dispatch.
     ///
@@ -1092,6 +1099,7 @@ pub fn review(
         diff,
         uncommitted,
         evidence,
+        evidence_artifacts: Vec::new(),
         sandbox,
         effects,
         automation: attempt.automation.clone(),
@@ -1155,6 +1163,9 @@ pub fn pull_request_review(
         diff,
         uncommitted: None,
         evidence: RunEvidence::default(),
+        // Nothing ran where the board could watch it, so nothing was shown to
+        // it either (§gh#421).
+        evidence_artifacts: Vec::new(),
         sandbox: None,
         effects: crate::effects::Effects::default(),
         // Nothing dispatched it, so no automation did either.

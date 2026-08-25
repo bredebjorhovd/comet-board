@@ -260,6 +260,27 @@ pub mod methods {
     /// the next client does not have. The reply carries the remainder so the
     /// agent learns what it did not account for while it can still act on it.
     pub const SUBMIT_CLAIMS: &str = "SubmitClaims";
+    /// Attach one visual/runtime artifact to an attempt (§gh#421) — a
+    /// screenshot, recording, accessibility tree or excerpt that shows what
+    /// the work did on screen. Params:
+    /// `{taskId, kind, description?, url?, viewport?, dataB64}` → the same
+    /// `AttemptReview` [`READ_ATTEMPT_REVIEW`] answers, artifacts included.
+    ///
+    /// The bytes are base64 in the params because they are the payload: an
+    /// agent attaching a capture is standing in the checkout where it was
+    /// taken, which is usually not the box. Everything the agent could have
+    /// invented and the board could instead read — commit SHA, dirty-file
+    /// count, size, hash — is stamped on the board's host, and the bounds are
+    /// enforced there too, so every client gets the same refusal.
+    pub const ATTACH_BOARD_EVIDENCE: &str = "AttachBoardEvidence";
+    /// The stored bytes of one attached artifact (§gh#421), chunked like an
+    /// attachment read-back. Params: `{taskId, attempt?, id, offset}` →
+    /// `{name, mimeType, data, nextOffset, done}`.
+    ///
+    /// Resolved **by id on the board's host** — the caller never names a path,
+    /// so there is nothing to jail — which makes this safe to forward anywhere
+    /// a review can be read: same relay gate as every other board verb.
+    pub const READ_ATTEMPT_EVIDENCE: &str = "ReadAttemptEvidence";
     /// One attempt's review (§gh#183): the brief, the agent's claims, the
     /// evidence the board observed for itself, and the changes no claim
     /// accounts for. Params: `{taskId, attempt?}` — omit `attempt` for the

@@ -42,7 +42,7 @@ use crate::sources::github::{
     AsUser, Github, HttpAsUser, HttpRest, MergeStatus, PullRequest, PushCapabilities, Rest,
     pr_matches_branch,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Command;
@@ -413,6 +413,9 @@ impl SyncEngine {
         // as long as the cheap one. After `collect_worktrees` so a checkout
         // reclaimed whole this cycle is not walked for a cache that went with it.
         self.sweep_build_output(runtime);
+        // And the evidence artifacts whose retention clock ran out (§gh#421),
+        // on the same interval: the records stay, the pixels go.
+        self.sweep_expired_artifacts();
         // Beside them, on the same clock and the same rule: the three are one
         // attempt's leavings, and a box that reclaimed the checkout while
         // keeping the chat forever would have tidied half the mess (gh#139).
@@ -1893,6 +1896,188 @@ impl SyncEngine {
         self.review(task_id, Some(attempt.id))
     }
 
+    /// Publish one visual/runtime artifact onto an attempt (§gh#421): the
+    /// screenshot, recording, accessibility tree or excerpt that shows what
+    /// the work did on screen.
+    ///
+    /// The provenance split is the point. `input` is everything the agent
+    /// supplies and [`crate::evidence::validate_artifact`] bounds; everything
+    /// else is stamped here — the attempt's chat, the board's clock, and above
+    /// all the commit SHA and dirty-file count read out of the attempt's own
+    /// worktree with git, which the agent does not get to type. A screenshot
+    /// whose record says "commit `a1b2c3d`, three files uncommitted" pins
+    /// pixels to code state the way a claim's anchor pins a sentence to the
+    /// diff, and like every other piece of evidence on the review screen it is
+    /// something the agent did not author.
+    ///
+    /// Idempotent on (kind, sha256): a retry after a lost reply finds its own
+    /// artifact already there and answers with the review as it now stands,
+    /// storing nothing twice. The bytes land on disk **before** the row is
+    /// written — an artifact whose record exists but whose file does not would
+    /// be a review promising pixels nobody can fetch.
+    pub fn attach_evidence(
+        &self,
+        task_id: &str,
+        input: crate::evidence::ArtifactInput,
+        bytes: Vec<u8>,
+    ) -> Result<crate::claims::AttemptReview> {
+        let tasks = self.db.load_tasks()?;
+        let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
+        let attempt = task
+            .live_attempt()
+            .or_else(|| task.attempts.last())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "{} has no attempts — evidence belongs to a run, and nothing has run",
+                    task.identifier
+                )
+            })?
+            .clone();
+        let existing = self.db.attempt_artifacts(attempt.id)?;
+        crate::evidence::validate_artifact(&input, existing.len(), bytes.len() as u64)?;
+        let sha256 = crate::evidence::fingerprint(&bytes);
+        let id = crate::evidence::EvidenceArtifact::identity(input.kind, &sha256);
+        if existing.iter().any(|a| a.id == id) {
+            // The same bytes of the same kind are already published. Not an
+            // error and not a second row: return the review as it stands.
+            return self.review(task_id, Some(attempt.id));
+        }
+        // The fingerprint the agent does not supply: what the checkout holds
+        // *now*. No readable checkout attaches honestly without one — stated
+        // as absent rather than guessed at.
+        let (commit_sha, dirty_files) = match attempt.worktree.as_deref() {
+            Some(worktree) => (
+                git_out(worktree, &["rev-parse", "HEAD"]).filter(|s| !s.is_empty()),
+                git_out(worktree, &["status", "--porcelain"])
+                    .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count() as u32)
+                    .unwrap_or(0),
+            ),
+            None => (None, 0),
+        };
+        let ext = crate::evidence::sniff_ext(&bytes).unwrap_or(input.kind.default_ext());
+        let file = format!("{id}.{ext}");
+        let dir = self
+            .paths
+            .state_dir
+            .join("evidence")
+            .join(attempt.id.to_string());
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating evidence dir {}", dir.display()))?;
+        let path = dir.join(&file);
+        std::fs::write(&path, &bytes).with_context(|| format!("writing {}", path.display()))?;
+        let mut artifacts = existing;
+        artifacts.push(crate::evidence::EvidenceArtifact {
+            id,
+            kind: input.kind,
+            description: input.description.trim().to_string(),
+            url: input.url.as_deref().map(crate::evidence::strip_query),
+            viewport: input.viewport,
+            attached_at: crate::db::now(),
+            commit_sha,
+            dirty_files,
+            bytes: bytes.len() as u64,
+            sha256,
+            file,
+        });
+        if let Err(e) = self.db.set_attempt_artifacts(attempt.id, &artifacts) {
+            // Leave no file behind for a record that was never written.
+            let _ = std::fs::remove_file(&path);
+            return Err(e);
+        }
+        self.log.info(format!(
+            "{}: attempt {} attached a {} artifact ({}, {} bytes)",
+            task.identifier,
+            attempt.id,
+            input.kind,
+            artifacts.last().map(|a| a.id.as_str()).unwrap_or("?"),
+            bytes.len()
+        ));
+        self.review(task_id, Some(attempt.id))
+    }
+
+    /// Delete artifact bytes whose retention clock ran out (§gh#421), keeping
+    /// the records: provenance stays true after the pixels are gone, and a
+    /// review of an expired artifact says "expired" instead of pretending to
+    /// show nothing happened. Per-file by mtime on the gc interval; empty
+    /// directories go with their last file.
+    fn sweep_expired_artifacts(&self) {
+        let root = self.paths.state_dir.join("evidence");
+        let Ok(attempts) = std::fs::read_dir(&root) else {
+            return;
+        };
+        let cutoff = chrono::Duration::days(crate::evidence::RETAIN_EVIDENCE_DAYS as i64);
+        for entry in attempts.flatten() {
+            let Ok(files) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let expired = file
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(chrono::DateTime::<chrono::Utc>::from)
+                    .map(|at| chrono::Utc::now().signed_duration_since(at))
+                    .is_some_and(|age| age > cutoff);
+                if expired && std::fs::remove_file(file.path()).is_ok() {
+                    self.log.info(format!(
+                        "expired evidence removed: {}",
+                        file.path().display()
+                    ));
+                }
+            }
+            // A directory whose last pixel went is not worth keeping.
+            let empty = std::fs::read_dir(entry.path())
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(false);
+            if empty {
+                let _ = std::fs::remove_dir(entry.path());
+            }
+        }
+    }
+
+    /// The stored bytes of one of an attempt's artifacts, resolved **by id**
+    /// (§gh#421). The caller never names a path — an unknown id has no file,
+    /// and a known id has exactly one under the attempt's evidence directory —
+    /// so this needs no path jail: there is nothing in the request to jail.
+    pub fn read_evidence_bytes(
+        &self,
+        task_id: &str,
+        attempt: Option<i64>,
+        artifact_id: &str,
+    ) -> Result<(String, String, Vec<u8>)> {
+        let tasks = self.db.load_tasks()?;
+        let task = crate::dispatch::task_by_reference(&tasks, task_id)?;
+        let found = match attempt {
+            Some(id) => task.attempts.iter().find(|a| a.id == id),
+            None => task.attempts.last(),
+        }
+        .ok_or_else(|| anyhow::anyhow!("{} has no such attempt", task.identifier))?;
+        let artifact = self
+            .db
+            .attempt_artifacts(found.id)?
+            .into_iter()
+            .find(|a| a.id == artifact_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no artifact `{artifact_id}` on {}'s attempt",
+                    task.identifier
+                )
+            })?;
+        let path = self
+            .paths
+            .state_dir
+            .join("evidence")
+            .join(found.id.to_string())
+            .join(&artifact.file);
+        let bytes = std::fs::read(&path).map_err(|_| {
+            anyhow::anyhow!(
+                "artifact `{artifact_id}` has expired — its bytes were retained {} days",
+                crate::evidence::RETAIN_EVIDENCE_DAYS
+            )
+        })?;
+        Ok((artifact.file.clone(), mime_for(&artifact, &path), bytes))
+    }
+
     /// Everything a review of one attempt is made of (§gh#183): the brief, the
     /// claims, the evidence, and the changes no claim accounts for.
     ///
@@ -1965,6 +2150,7 @@ impl SyncEngine {
             effects,
             self.db.attempt_sandbox(attempt.id)?,
         );
+        review.evidence_artifacts = self.db.attempt_artifacts(attempt.id)?;
         self.count_call_sites(&attempt, &mut review);
         crate::stacks::place_in_stack(&tasks, task, &mut review);
         Ok(review)
@@ -5418,6 +5604,29 @@ fn unreadable_diff(attempt: &Attempt) -> String {
              measure its diff against"
             .into(),
         _ => "the checkout could not be read".into(),
+    }
+}
+
+/// The content type an artifact's bytes are served under (§gh#421): the
+/// sniffed format for binary kinds, plain text for the excerpts — never
+/// trusted from the caller, for the same reason the file extension is not.
+fn mime_for(artifact: &crate::evidence::EvidenceArtifact, path: &std::path::Path) -> String {
+    match artifact.kind {
+        crate::evidence::ArtifactKind::Console | crate::evidence::ArtifactKind::Log => {
+            "text/plain; charset=utf-8".to_string()
+        }
+        crate::evidence::ArtifactKind::Accessibility => "text/plain; charset=utf-8".to_string(),
+        crate::evidence::ArtifactKind::Screenshot | crate::evidence::ArtifactKind::Recording => {
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("png") => "image/png",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                Some("webp") => "image/webp",
+                Some("webm") => "video/webm",
+                Some("mp4") => "video/mp4",
+                _ => "application/octet-stream",
+            }
+            .to_string()
+        }
     }
 }
 
@@ -12721,6 +12930,202 @@ max_duration = "{max_duration}"
         };
         assert!(reason.contains("reclaimed"), "{reason}");
         assert!(!review.claimed());
+    }
+
+    /// The visual half of the contract (§gh#421): one agent run attaches one
+    /// screenshot, the board fingerprints its checkout itself, and the
+    /// artifact rides every later read of the review — with the bytes on disk
+    /// under the attempt's own evidence directory, fetchable by id alone.
+    #[test]
+    fn an_attached_artifact_rides_the_review_with_board_stamped_provenance() {
+        let (_repo, dir, base) = checkout_with_a_base();
+        let e = engine();
+        let a = attempt_in(&e, &dir, &base);
+        std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
+        commit_all(&dir, "work");
+        let head = git_out(dir.to_str().unwrap(), &["rev-parse", "HEAD"]).unwrap();
+
+        // A real PNG header: the stored extension is sniffed off the bytes,
+        // never trusted from a name.
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(b"pixels");
+        let input = crate::evidence::ArtifactInput {
+            kind: crate::evidence::ArtifactKind::Screenshot,
+            description: "signed-in dashboard, empty state".into(),
+            url: Some("http://localhost:5173/".into()),
+            viewport: Some("1440x900".into()),
+        };
+        // A capture URL carrying a query string is refused outright — the
+        // token it would store is exactly what this field must never record.
+        let mut leaky = input.clone();
+        leaky.url = Some("http://localhost:5173/?token=secret".into());
+        let err = e
+            .attach_evidence("linear:LIN-142", leaky, png.clone())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("query string"), "{err}");
+        let review = e
+            .attach_evidence("linear:LIN-142", input, png.clone())
+            .unwrap();
+
+        assert_eq!(review.evidence_artifacts.len(), 1);
+        let artifact = &review.evidence_artifacts[0];
+        // The board's own reading of the tree, not anything the agent typed.
+        assert!(artifact.commit_sha.is_some());
+        assert_eq!(artifact.commit_sha.as_deref(), Some(head.as_str()));
+        assert_eq!(artifact.dirty_files, 0, "the work was committed");
+        // The URL is stored query-stripped by the board: no token survives.
+        assert_eq!(artifact.url.as_deref(), Some("http://localhost:5173/"));
+        assert!(artifact.file.ends_with(".png"), "{}", artifact.file);
+
+        let path = e
+            .paths
+            .state_dir
+            .join("evidence")
+            .join(a.to_string())
+            .join(&artifact.file);
+        assert_eq!(std::fs::read(&path).unwrap(), png, "the exact bytes");
+
+        // Fetchable by id alone — the caller never names a path.
+        let (name, mime, bytes) = e
+            .read_evidence_bytes("linear:LIN-142", None, &artifact.id)
+            .unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(mime, "image/png");
+        assert_eq!(name, artifact.file);
+
+        // …and a fresh review reads it back off the row.
+        let again = e.review("linear:LIN-142", None).unwrap();
+        assert_eq!(again.evidence_artifacts.len(), 1);
+        assert_eq!(again.evidence_artifacts[0].sha256, artifact.sha256);
+    }
+
+    /// The same bytes of the same kind are the same artifact: a retry after a
+    /// lost reply stores nothing twice. A *changed* tree between attachments
+    /// is visible in the fingerprint the board stamps — dirty files count,
+    /// because capture happened before they did.
+    #[test]
+    fn reattaching_dedupes_and_a_dirty_tree_says_so() {
+        let (_repo, dir, base) = checkout_with_a_base();
+        let e = engine();
+        let _a = attempt_in(&e, &dir, &base);
+        std::fs::write(dir.join("src/db.rs"), "// changed\n").unwrap();
+        commit_all(&dir, "work");
+
+        let input = |description: &str| crate::evidence::ArtifactInput {
+            kind: crate::evidence::ArtifactKind::Screenshot,
+            description: description.into(),
+            url: None,
+            viewport: None,
+        };
+        let first = e
+            .attach_evidence("linear:LIN-142", input("one"), b"v1".to_vec())
+            .unwrap();
+        let retried = e
+            .attach_evidence("linear:LIN-142", input("one"), b"v1".to_vec())
+            .unwrap();
+        assert_eq!(
+            first.evidence_artifacts.len(),
+            retried.evidence_artifacts.len(),
+            "same kind + bytes → same artifact"
+        );
+
+        std::fs::write(dir.join("src/new.rs"), "// uncommitted\n").unwrap();
+        let second = e
+            .attach_evidence("linear:LIN-142", input("two"), b"v2".to_vec())
+            .unwrap();
+        assert_eq!(second.evidence_artifacts.len(), 2);
+        assert_eq!(
+            second.evidence_artifacts[1].dirty_files, 1,
+            "the uncommitted file the board counted, not one the agent mentioned"
+        );
+    }
+
+    /// Every bound is enforced where the artifact is accepted — the board's
+    /// host — so the refusal is identical whichever client sent it.
+    #[test]
+    fn artifacts_are_refused_past_their_bounds_and_the_refusal_says_which() {
+        let (_repo, dir, base) = checkout_with_a_base();
+        let e = engine();
+        let _a = attempt_in(&e, &dir, &base);
+
+        let input = crate::evidence::ArtifactInput {
+            kind: crate::evidence::ArtifactKind::Console,
+            description: "console excerpt".into(),
+            url: None,
+            viewport: None,
+        };
+        // Over the console ceiling, though far under any other.
+        let err = e
+            .attach_evidence("linear:LIN-142", input.clone(), vec![b'x'; 300 * 1024])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cap for console"), "{err}");
+
+        for n in 0..crate::evidence::MAX_ARTIFACTS {
+            e.attach_evidence(
+                "linear:LIN-142",
+                crate::evidence::ArtifactInput {
+                    description: format!("artifact {n}"),
+                    ..input.clone()
+                },
+                format!("bytes-{n}").into_bytes(),
+            )
+            .unwrap();
+        }
+        let err = e
+            .attach_evidence("linear:LIN-142", input, b"one too many".to_vec())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max 8"), "{err}");
+    }
+
+    /// Retention: the record outlives the pixels. Bytes past
+    /// `RETAIN_EVIDENCE_DAYS` are swept per file by mtime, empty directories
+    /// go with them, and recent ones stay.
+    #[test]
+    fn expired_artifact_bytes_are_swept_while_the_record_stays() {
+        let e = engine();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let dir = e.paths.state_dir.join("evidence").join("999");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let old = dir.join("screenshot-aaaaaaaa.png");
+        let fresh = dir.join("screenshot-bbbbbbbb.png");
+        std::fs::write(&old, b"old").unwrap();
+        std::fs::write(&fresh, b"fresh").unwrap();
+        let expired = chrono::Utc::now()
+            - chrono::Duration::days(crate::evidence::RETAIN_EVIDENCE_DAYS as i64 + 1);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(expired.into()))
+            .unwrap();
+
+        e.sweep_expired_artifacts();
+        assert!(!old.exists(), "past the window: gone");
+        assert!(fresh.exists(), "inside the window: kept");
+        assert!(
+            dir.exists(),
+            "the directory stays while it still holds an unexpired file"
+        );
+
+        // A directory whose last pixel went is pruned with it.
+        let lone = e.paths.state_dir.join("evidence").join("998");
+        std::fs::create_dir_all(&lone).unwrap();
+        let only = lone.join("console-cccccccc.txt");
+        std::fs::write(&only, b"old excerpt").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&only)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(expired.into()))
+            .unwrap();
+        e.sweep_expired_artifacts();
+        assert!(!only.exists());
+        assert!(!lone.exists(), "the empty directory goes with its file");
     }
 
     /// The evidence half: what the run's own commands did, off the journal,

@@ -27,8 +27,272 @@
 //! the evidence, which makes a review *more* suspicious rather than less. The
 //! totals beside the list are what keep the miss visible — "0 checks among 214
 //! commands" is itself a finding, and it is a finding the list cannot suppress.
+//!
+//! ## Visual/runtime evidence (§gh#421)
+//!
+//! The other blind spot: behavior that has to be *seen*. Everything above
+//! answers a question about code; nothing here answered "what did it look
+//! like when you ran it?". An [`EvidenceArtifact`] is one bounded capture —
+//! pixels, a recording, an accessibility tree, an excerpt — published onto an
+//! attempt, with provenance split by author: the agent supplies kind, bytes,
+//! URL, viewport and description; the **board** stamps task, attempt,
+//! producing chat, receive time, and the commit/dirty fingerprint it reads out
+//! of the worktree itself. The design is
+//! docs/board/gh-421-show-the-ui-it-tested.md.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+// ---- visual/runtime evidence (§gh#421) ------------------------------------
+
+/// One bounded visual/runtime artifact an attempt published (§gh#421).
+///
+/// Every field the agent could have invented and the board could instead read,
+/// the board read: `commit_sha`, `dirty_files`, `bytes`, `sha256` and
+/// `attached_at` are never taken from the submitter. That is what makes this
+/// evidence rather than illustration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceArtifact {
+    /// `<kind>-<first 8 hex of sha256>` — unique within the attempt by
+    /// construction, since re-attaching the same bytes of the same kind is the
+    /// no-op that returns the artifact already there.
+    pub id: String,
+    pub kind: ArtifactKind,
+    /// What it demonstrates, in the agent's words. Bounded prose with no
+    /// checker behind it — unlike a claim, nothing here is matched against the
+    /// diff, which is exactly why the board-stamped fields beside it matter.
+    pub description: String,
+    /// The URL the capture was taken at, query stripped: a URL field that
+    /// recorded tokens would be the leak this feature does not get to have.
+    pub url: Option<String>,
+    /// The viewport, spelled `WxH`.
+    pub viewport: Option<String>,
+    /// When the **board** received it, its own clock.
+    pub attached_at: String,
+    /// What the attempt's worktree pointed at when the board fingerprinted it.
+    /// `None` when there was no readable checkout — stated, never guessed.
+    pub commit_sha: Option<String>,
+    /// Uncommitted changed files at fingerprint time. The honest tell for
+    /// stale pixels: capture happened before attach, and a large count beside
+    /// fresh commits says the tree moved in between.
+    pub dirty_files: u32,
+    pub bytes: u64,
+    /// Over the exact bytes stored — dedupe key within the attempt, and the
+    /// integrity check any reader can run.
+    pub sha256: String,
+    /// File name under the attempt's evidence directory, relative to it.
+    pub file: String,
+}
+
+impl EvidenceArtifact {
+    /// The identity two attachments are compared on: same kind and same bytes
+    /// is the same artifact, however many times the call retried.
+    pub fn identity(kind: ArtifactKind, sha256: &str) -> String {
+        format!("{kind}-{}", &sha256[..8.min(sha256.len())])
+    }
+}
+
+/// What kind of thing an artifact shows. The kind decides the ceiling
+/// ([`ArtifactKind::max_bytes`]) and how a review renders it, and it is
+/// parsed from the agent's spelling so a typo costs an error naming the valid
+/// set — never a silent default to screenshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactKind {
+    Screenshot,
+    Recording,
+    Accessibility,
+    Console,
+    Log,
+}
+
+impl ArtifactKind {
+    /// Parse the agent's spelling. `a11y` is accepted as accessibility because
+    /// it is the spelling every frontend agent actually writes.
+    pub fn parse(kind: &str) -> Option<ArtifactKind> {
+        match kind.trim().to_ascii_lowercase().as_str() {
+            "screenshot" | "screen" => Some(ArtifactKind::Screenshot),
+            "recording" | "video" => Some(ArtifactKind::Recording),
+            "accessibility" | "a11y" | "ax" => Some(ArtifactKind::Accessibility),
+            "console" | "network" => Some(ArtifactKind::Console),
+            "log" | "logs" => Some(ArtifactKind::Log),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArtifactKind::Screenshot => "screenshot",
+            ArtifactKind::Recording => "recording",
+            ArtifactKind::Accessibility => "accessibility",
+            ArtifactKind::Console => "console",
+            ArtifactKind::Log => "log",
+        }
+    }
+
+    /// The byte ceiling for one artifact of this kind. A recording may be
+    /// twenty-four times a screenshot because moving pixels cost more than
+    /// still ones; everything text-shaped is bounded far below both, because
+    /// an excerpt nobody scrolls is worth more than a log nobody finishes.
+    pub fn max_bytes(self) -> u64 {
+        const MIB: u64 = 1024 * 1024;
+        match self {
+            ArtifactKind::Screenshot => 10 * MIB,
+            ArtifactKind::Recording => 24 * MIB,
+            ArtifactKind::Accessibility => MIB,
+            ArtifactKind::Console => 256 * 1024,
+            ArtifactKind::Log => MIB,
+        }
+    }
+
+    /// The file extension stored bytes get when they are not one of the
+    /// formats [`sniff_ext`] recognises — text kinds are text because the
+    /// agent said so and the byte ceiling keeps any lie small.
+    pub fn default_ext(self) -> &'static str {
+        match self {
+            ArtifactKind::Accessibility | ArtifactKind::Console | ArtifactKind::Log => "txt",
+            ArtifactKind::Screenshot | ArtifactKind::Recording => "bin",
+        }
+    }
+}
+
+impl std::fmt::Display for ArtifactKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// How many artifacts one attempt may publish. Eight covers both surfaces of
+/// a mid-sized frontend change at desktop and phone widths with room for the
+/// console excerpt that explains them; more than that is a gallery, and the
+/// review is not one.
+pub const MAX_ARTIFACTS: usize = 8;
+
+/// How long one artifact's description may be.
+pub const MAX_DESCRIPTION: usize = 300;
+
+/// How long a captured URL may be.
+pub const MAX_URL: usize = 2048;
+
+/// How many days an artifact's *bytes* live after receipt. The record is
+/// permanent — provenance stays true after the pixels are gone — and expiry
+/// is visible wherever the artifact would have rendered.
+pub const RETAIN_EVIDENCE_DAYS: u64 = 90;
+
+/// Everything an agent supplies when attaching one artifact, validated as a
+/// set by [`validate_artifact`]. The bytes ride separately; they are the bulk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactInput {
+    pub kind: ArtifactKind,
+    pub description: String,
+    pub url: Option<String>,
+    pub viewport: Option<String>,
+}
+
+/// Validate one attachment the way the board's host does, before anything is
+/// written. Every refusal names the bound it hit, so the caller's next
+/// attempt can be right rather than merely smaller.
+pub fn validate_artifact(
+    input: &ArtifactInput,
+    existing: usize,
+    bytes_len: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        existing < MAX_ARTIFACTS,
+        "this attempt already carries {existing} artifacts (max {MAX_ARTIFACTS}) — \
+         attach the ones that carry the review"
+    );
+    let description = input.description.trim();
+    anyhow::ensure!(
+        !description.is_empty(),
+        "say what the artifact demonstrates — an unlabelled screenshot is a puzzle, \
+         not evidence"
+    );
+    anyhow::ensure!(
+        description.chars().count() <= MAX_DESCRIPTION,
+        "the description is {} characters; keep it under {MAX_DESCRIPTION} — \
+         the artifact shows, the sentence points",
+        description.chars().count()
+    );
+    if let Some(url) = &input.url {
+        anyhow::ensure!(
+            url.chars().count() <= MAX_URL,
+            "the URL is {} characters (max {MAX_URL})",
+            url.chars().count()
+        );
+        let stripped = strip_query(url);
+        anyhow::ensure!(
+            stripped == *url,
+            "the URL carries a query string — strip it (`{stripped}`): a stored capture \
+             URL must never record a token"
+        );
+    }
+    if let Some(viewport) = &input.viewport {
+        anyhow::ensure!(
+            is_viewport(viewport),
+            "`{viewport}` is not a viewport — spell it `WxH`, e.g. `1440x900`"
+        );
+    }
+    let max = input.kind.max_bytes();
+    anyhow::ensure!(bytes_len > 0, "{} is empty — nothing to show", input.kind);
+    anyhow::ensure!(
+        bytes_len <= max,
+        "this {} is {bytes_len} bytes; the cap for {} is {max} — trim the excerpt or \
+         shorten the recording",
+        input.kind,
+        input.kind
+    );
+    Ok(())
+}
+
+/// Is this the `WxH` spelling a viewport is kept in?
+pub fn is_viewport(viewport: &str) -> bool {
+    let Some((w, h)) = viewport.split_once(['x', 'X']) else {
+        return false;
+    };
+    !w.is_empty()
+        && !h.is_empty()
+        && w.chars().all(|c| c.is_ascii_digit())
+        && h.chars().all(|c| c.is_ascii_digit())
+        && w.len() <= 5
+        && h.len() <= 5
+}
+
+/// The URL with its query string removed — the only transformation the URL
+/// field gets, applied by the board rather than trusted from the caller.
+pub fn strip_query(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => base.to_string(),
+        None => url.to_string(),
+    }
+}
+
+/// What format binary artifact bytes actually are, read off their magic — the
+/// extension a file is stored under comes from this and never from the name
+/// the agent's tool happened to give it.
+pub fn sniff_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("png")
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        Some("jpg")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if bytes.starts_with(b"\x1a\x45\xdf\xa3") {
+        // Matroska/WebM (EBML) — screencast frames and most recorder output.
+        Some("webm")
+    } else if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
+        Some("mp4")
+    } else {
+        None
+    }
+}
+
+/// SHA-256 over the exact bytes, hex — the content address everything else
+/// (id, file name, dedupe) derives from.
+pub fn fingerprint(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// One command a run executed, as the journal recorded it.
 ///
@@ -463,5 +727,145 @@ mod tests {
         let e = gather(&[]);
         assert_eq!(e, RunEvidence::default());
         assert!(!e.checked());
+    }
+
+    // ---- artifacts (§gh#421) ----
+
+    fn input(kind: ArtifactKind) -> ArtifactInput {
+        ArtifactInput {
+            kind,
+            description: "signed-in dashboard, empty state".into(),
+            url: Some("http://localhost:5173/".into()),
+            viewport: Some("1440x900".into()),
+        }
+    }
+
+    #[test]
+    fn kinds_parse_from_the_spellings_agents_write() {
+        for (spelling, kind) in [
+            ("screenshot", ArtifactKind::Screenshot),
+            ("SCREENSHOT", ArtifactKind::Screenshot),
+            ("recording", ArtifactKind::Recording),
+            ("a11y", ArtifactKind::Accessibility),
+            ("accessibility", ArtifactKind::Accessibility),
+            ("console", ArtifactKind::Console),
+            ("log", ArtifactKind::Log),
+        ] {
+            assert_eq!(ArtifactKind::parse(spelling), Some(kind), "{spelling}");
+        }
+        assert_eq!(ArtifactKind::parse("png"), None);
+        assert_eq!(ArtifactKind::parse(""), None);
+    }
+
+    #[test]
+    fn a_valid_attachment_validates_and_the_refusals_name_their_bound() {
+        assert!(validate_artifact(&input(ArtifactKind::Screenshot), 0, 1024).is_ok());
+
+        let err = validate_artifact(&input(ArtifactKind::Screenshot), MAX_ARTIFACTS, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("max 8"), "{err}");
+
+        let mut unlabelled = input(ArtifactKind::Screenshot);
+        unlabelled.description = "   ".into();
+        assert!(validate_artifact(&unlabelled, 0, 10).is_err());
+
+        let mut long = input(ArtifactKind::Console);
+        long.description = "x".repeat(MAX_DESCRIPTION + 1);
+        let err = validate_artifact(&long, 0, 10).unwrap_err().to_string();
+        assert!(err.contains("characters"), "{err}");
+
+        let mut query = input(ArtifactKind::Screenshot);
+        query.url = Some("http://localhost:5173/?token=secret".into());
+        let err = validate_artifact(&query, 0, 10).unwrap_err().to_string();
+        assert!(
+            err.contains("query string") && err.contains("strip it"),
+            "the refusal names the leak: {err}"
+        );
+
+        let mut bad_viewport = input(ArtifactKind::Screenshot);
+        bad_viewport.viewport = Some("big".into());
+        let err = validate_artifact(&bad_viewport, 0, 10)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("WxH"), "{err}");
+
+        let err = validate_artifact(&input(ArtifactKind::Log), 0, 2 * 1024 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cap for log"), "{err}");
+
+        assert!(validate_artifact(&input(ArtifactKind::Recording), 0, 24 * 1024 * 1024).is_ok());
+    }
+
+    /// The URL field's one rule, applied by the board and not trusted from the
+    /// caller: `strip_query` is what stores, so even if validation were
+    /// bypassed the stored value cannot carry the token.
+    #[test]
+    fn the_stored_url_never_carries_a_query() {
+        assert_eq!(
+            strip_query("http://localhost:5173/settings?tab=billing"),
+            "http://localhost:5173/settings"
+        );
+        assert_eq!(
+            strip_query("http://localhost:5173/"),
+            "http://localhost:5173/"
+        );
+    }
+
+    #[test]
+    fn identity_is_kind_plus_content_so_a_retry_dedupes() {
+        let sha = fingerprint(b"pixels");
+        assert_eq!(
+            EvidenceArtifact::identity(ArtifactKind::Screenshot, &sha),
+            format!("screenshot-{}", &sha[..8])
+        );
+        // Same bytes under another kind are a different artifact: they say
+        // different things.
+        assert_ne!(
+            EvidenceArtifact::identity(ArtifactKind::Recording, &sha),
+            EvidenceArtifact::identity(ArtifactKind::Screenshot, &sha)
+        );
+    }
+
+    #[test]
+    fn binary_formats_are_sniffed_not_asserted() {
+        let png = b"\x89PNG\r\n\x1a\nrest".as_slice();
+        assert_eq!(sniff_ext(png), Some("png"));
+        assert_eq!(sniff_ext(b"\xff\xd8\xff\xe0jpeg"), Some("jpg"));
+        assert_eq!(sniff_ext(b"RIFF\x00\x00\x00\x00WEBPVP8 "), Some("webp"));
+        assert_eq!(sniff_ext(b"\x1a\x45\xdf\xa3matroska"), Some("webm"));
+        assert_eq!(sniff_ext(b"\x00\x00\x00\x18ftypmp42"), Some("mp4"));
+        assert_eq!(sniff_ext(b"GET /index.html 200"), None);
+        // An unrecognized binary screenshot is stored as `.bin` rather than
+        // being renamed to something it may not be.
+        assert_eq!(ArtifactKind::Screenshot.default_ext(), "bin");
+        assert_eq!(ArtifactKind::Console.default_ext(), "txt");
+    }
+
+    /// The provenance split, at the type level: everything an agent could
+    /// invent round-trips through serde unchanged, and every field the board
+    /// stamps is plain data on the struct — there is no `AgentReport` wrapper
+    /// the board's copy could be confused with.
+    #[test]
+    fn an_artifact_round_trips_through_its_wire_shape() {
+        let sha = fingerprint(b"pixels");
+        let artifact = EvidenceArtifact {
+            id: EvidenceArtifact::identity(ArtifactKind::Screenshot, &sha),
+            kind: ArtifactKind::Screenshot,
+            description: "signed-in dashboard".into(),
+            url: Some(strip_query("http://localhost:5173/?token=x")),
+            viewport: Some("1440x900".into()),
+            attached_at: "2026-08-25T10:00:00Z".into(),
+            commit_sha: Some("a1b2c3d4e5f6a7b8".into()),
+            dirty_files: 3,
+            bytes: 2048,
+            sha256: sha,
+            file: "screenshot-a1b2c3d4.png".into(),
+        };
+        let json = serde_json::to_string(&artifact).unwrap();
+        assert!(json.contains("\"kind\":\"screenshot\""), "{json}");
+        let back: EvidenceArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, artifact);
     }
 }

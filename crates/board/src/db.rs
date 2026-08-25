@@ -374,6 +374,14 @@ impl Db {
               -- fact and least likely to still be readable, since a resumed
               -- chat overwrites the journal's answer with its own.
               run_sandbox TEXT,
+              -- The visual/runtime artifacts this attempt published (§gh#421)
+              -- — screenshots, recordings, accessibility trees, excerpts —
+              -- each with the commit/dirty fingerprint the board read out of
+              -- the worktree at attach time. JSON and read on review like the
+              -- three above; the *bytes* live under the state dir's evidence/
+              -- with their own retention clock, so a record whose pixels have
+              -- expired is still the true provenance it always was.
+              evidence_artifacts TEXT,
               -- The attempt this one's branch was cut from, when it was
               -- dispatched onto a sibling instead of onto trunk (gh#285). An
               -- attempt id rather than the base branch name, because the branch
@@ -641,6 +649,10 @@ impl Db {
                 // those rows are, and which the chips say out loud rather than
                 // rendering as five clean results.
                 ("effects", "TEXT"),
+                // Visual/runtime evidence (§gh#421). NULL on every row that
+                // came before, which is what those rows are: nothing could
+                // attach a capture then, so none of them published one.
+                ("evidence_artifacts", "TEXT"),
                 // Direct Comet chats can author reviewable PRs too. Existing
                 // attempts were created by Board dispatch and remain managed.
                 ("board_managed", "INTEGER NOT NULL DEFAULT 1"),
@@ -1510,6 +1522,27 @@ impl Db {
         self.conn.execute(
             "UPDATE attempts SET run_sandbox = ?2 WHERE id = ?1",
             params![attempt_id, serde_json::to_string(sandbox)?],
+        )?;
+        Ok(())
+    }
+
+    /// The visual/runtime artifacts this attempt published (§gh#421). Empty
+    /// for every attempt that published none — which is not the same as "the
+    /// run showed nothing", and a review must not say it was.
+    pub fn attempt_artifacts(&self, attempt_id: i64) -> Result<Vec<crate::evidence::EvidenceArtifact>> {
+        Ok(self
+            .attempt_json("evidence_artifacts", attempt_id)?
+            .unwrap_or_default())
+    }
+
+    pub fn set_attempt_artifacts(
+        &self,
+        attempt_id: i64,
+        artifacts: &[crate::evidence::EvidenceArtifact],
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET evidence_artifacts = ?2 WHERE id = ?1",
+            params![attempt_id, serde_json::to_string(artifacts)?],
         )?;
         Ok(())
     }

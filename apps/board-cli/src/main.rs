@@ -294,6 +294,43 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Show what you tested: attach one visual/runtime artifact to your
+    /// attempt (§gh#421) — a screenshot, a short recording, an accessibility
+    /// snapshot, a console excerpt or a log.
+    ///
+    /// Capture it however your environment already can (`npx playwright
+    /// screenshot --viewport-size=1440,900 <url> shot.png`, `chrome
+    /// --headless=new --screenshot=… --window-size=1440,900 <url>`), then
+    /// attach it here. The board stamps what you do not supply — commit SHA,
+    /// dirty-file count, size, hash — so the review shows pixels pinned to a
+    /// code state, not just a picture.
+    Evidence {
+        /// The task whose attempt this artifact belongs to.
+        #[arg(long)]
+        task: String,
+        /// The file to attach. Read whole; caps are per kind and enforced on
+        /// the board's host.
+        #[arg(long = "file")]
+        file: std::path::PathBuf,
+        /// What kind of capture this is: screenshot, recording,
+        /// accessibility, console or log.
+        #[arg(long)]
+        kind: String,
+        /// What the artifact demonstrates, in one sentence. Required — an
+        /// unlabelled screenshot is a puzzle, not evidence.
+        #[arg(short = 'd', long = "description")]
+        description: String,
+        /// The URL the capture was taken at. Query strings are refused: never
+        /// record a token.
+        #[arg(long)]
+        url: Option<String>,
+        /// The viewport, spelled `WxH` — `1440x900`.
+        #[arg(long = "viewport")]
+        viewport: Option<String>,
+        /// Print the whole review as JSON instead of the summary.
+        #[arg(long)]
+        json: bool,
+    },
     /// What an attempt was asked to do, what it says it did, and what it did
     /// not account for.
     ///
@@ -1020,6 +1057,30 @@ fn main() -> Result<()> {
                 ops::submit_claims(&board, &task, &text).await
             })?;
             ops::print_claim_result(&review, json)
+        }
+        Command::Evidence {
+            task,
+            file,
+            kind,
+            description,
+            url,
+            viewport,
+            json,
+        } => {
+            let review = runtime.block_on(async {
+                let board = ops::attach(port, device).await?;
+                ops::attach_evidence(
+                    &board,
+                    &task,
+                    &kind,
+                    &description,
+                    url.as_deref(),
+                    viewport.as_deref(),
+                    &file,
+                )
+                .await
+            })?;
+            ops::print_evidence_result(&review, json)
         }
         Command::Review {
             task,
