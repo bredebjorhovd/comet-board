@@ -1120,6 +1120,9 @@ mod tests {
             // `read = false` — "not read" rather than five clean results, so
             // a fixture that does not exercise effects asserts nothing.
             effects: Default::default(),
+            // §gh#421 added this after the fixture was written. Empty is what
+            // it asserts: no artifact, and the tests below do not read one.
+            evidence_artifacts: Vec::new(),
             task_id: "gh:bredebjorhovd/comet-board#138".into(),
             attempt: 7,
             attempt_number: 1,

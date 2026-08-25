@@ -100,14 +100,21 @@ pub enum Signal {
     },
 }
 
-/// The two ways an attempt blocks. Both read [`crate::model::AgentStatus`]
+/// The ways an attempt blocks. Both read [`crate::model::AgentStatus`]
 /// `Blocked`; only the run journal tells them apart, so a board with no
 /// runtime to ask reports [`Stopped::Unknown`] rather than guessing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stopped {
     /// The run is alive and waiting on an answer — a question, or an approval
     /// the harness will not grant itself.
     Asking,
+    /// The run stopped because a provider usage window ran out (gh#545).
+    /// Not a dead run: the work is intact and the move that works is a
+    /// *decision* — switch model, switch account, wait for the reset —
+    /// while plain retrying is the one move that fails again. `window`
+    /// names the window when the harness clocked one (`"5-hour"`), so a
+    /// reader can tell a lunch break from a week.
+    Limited { window: Option<String> },
     /// The run died. The chat is intact with its full context, so this is a
     /// retry-or-cancel decision rather than a failed attempt.
     Errored,
@@ -115,10 +122,22 @@ pub enum Stopped {
     Unknown,
 }
 
+impl From<comet_proto::StopReason> for Stopped {
+    fn from(stop: comet_proto::StopReason) -> Stopped {
+        match stop {
+            // The one classified stop with its own kind (gh#545); every other
+            // cause stays the retry-or-cancel decision it always was.
+            comet_proto::StopReason::UsageLimit { window } => Stopped::Limited { window },
+            _ => Stopped::Errored,
+        }
+    }
+}
+
 impl Stopped {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             Stopped::Asking => "asking",
+            Stopped::Limited { .. } => "limited",
             Stopped::Errored => "errored",
             Stopped::Unknown => "unknown",
         }
@@ -130,6 +149,7 @@ impl Stopped {
     pub fn parse(s: &str) -> Stopped {
         match s {
             "asking" => Stopped::Asking,
+            "limited" => Stopped::Limited { window: None },
             "errored" => Stopped::Errored,
             _ => Stopped::Unknown,
         }
@@ -137,19 +157,31 @@ impl Stopped {
 
     /// The clause both the upstream comment and the webhook's `text` use, so
     /// the two channels never describe the same block differently.
-    fn phrase(self) -> &'static str {
+    fn phrase(&self) -> String {
         match self {
             Stopped::Asking => {
                 "the agent is waiting on an answer in its chat and will not go on until it \
                  gets one"
+                    .to_string()
             }
+            Stopped::Limited { window } => match window.as_deref() {
+                Some(w) => format!(
+                    "the run stopped on its {w} usage limit — retry it under another model or \
+                     account, or wait for the window to reset"
+                ),
+                None => "the run stopped on a usage limit — retry it under another model or \
+                         account, or wait for the window to reset"
+                    .to_string(),
+            },
             Stopped::Errored => {
                 "the run stopped with an error — the chat still holds the whole task, so it \
                  is a retry or a cancel, not a lost attempt"
+                    .to_string()
             }
             Stopped::Unknown => {
                 "the agent has stopped — either waiting on an answer or ended by an error; \
                  the chat will say which"
+                    .to_string()
             }
         }
     }
@@ -379,10 +411,22 @@ pub fn summary(task: &Task, signal: &Signal) -> String {
 /// `attempt_no` is passed rather than counted from the task: the comment is
 /// composed when the writeback is *delivered*, and a retry between queueing
 /// and delivery would otherwise renumber the attempt the comment is about.
-pub fn upstream_comment(attempt_no: u64, why: Stopped, log: &str) -> String {
+///
+/// The move it offers depends on the kind of stop. For a usage limit (gh#545)
+/// "answer in the chat" is wrong — there is no question to answer, and
+/// retrying unchanged is the one move that fails again — so the comment names
+/// the decision instead.
+pub fn upstream_comment(attempt_no: u64, why: &Stopped, log: &str) -> String {
+    let next = match why {
+        Stopped::Limited { .. } => {
+            "switch what it runs under (`comet-board retry --task <id> --model <other>` or \
+             `--account <slot>`), or wait for the window and retry as-is"
+        }
+        _ => "answer in the chat, or `comet-board cancel` it",
+    };
     format!(
         "comet-board: attempt {attempt_no} is blocked — {}. Nothing further will happen on \
-         this until someone picks it up: answer in the chat, or `comet-board cancel` it. \
+         this until someone picks it up: {next}. \
          · log: {log}",
         why.phrase(),
     )
@@ -449,9 +493,9 @@ pub fn dispatcher_message(task: &Task, attempt: &Attempt, signal: &Signal) -> St
         }
         Signal::Blocked(why) => {
             let mut s = "comet-board: work you released is blocked.\n\n".to_string();
-            s.push_str(&blocked_block(task, attempt, *why));
+            s.push_str(&blocked_block(task, attempt, why));
             s.push('\n');
-            s.push_str(unsticks(*why));
+            s.push_str(&unsticks(why));
             s
         }
     }
@@ -493,10 +537,10 @@ fn settled_block(
 }
 
 /// The identity block a block notice shares, for [`settled_block`]'s reason:
-/// which task, which attempt, which of the two ways it stopped, and the chat —
+/// which task, which attempt, which of the ways it stopped, and the chat —
 /// which for a block is not context but the address an answer has to be typed
 /// into.
-fn blocked_block(task: &Task, attempt: &Attempt, why: Stopped) -> String {
+fn blocked_block(task: &Task, attempt: &Attempt, why: &Stopped) -> String {
     let mut s = format!(
         "{}  attempt {} · blocked ({})\n",
         task_lines(task),
@@ -506,28 +550,48 @@ fn blocked_block(task: &Task, attempt: &Attempt, why: Stopped) -> String {
     if let Some(chat) = attempt.pane_id.as_deref() {
         s.push_str(&format!("  chat: {chat}\n"));
     }
+    if let Stopped::Limited { window: Some(w) } = why {
+        s.push_str(&format!("  window: {w}\n"));
+    }
     s
 }
 
 /// What actually unsticks a block, for whichever agent was told about it.
 ///
-/// Shared rather than written per audience: a dispatcher and the fallback
-/// chat have the same two moves available to them here, and a board that described
+/// Shared rather than written per audience: a dispatcher and the fallback chat
+/// have the same moves available to them here, and a board that described
 /// them differently would be teaching two contracts for one state.
-fn unsticks(why: Stopped) -> &'static str {
+fn unsticks(why: &Stopped) -> String {
     match why {
         Stopped::Asking => {
             "It is waiting on an answer and will sit there until it gets one. Read the chat \
              and answer it, or `comet-board retry --task <id>` under a different model — \
              which discards the question.\n"
+                .to_string()
+        }
+        // gh#545's whole point: this is the one stop whose offered verb must
+        // not be plain retry — the same run hits the same wall.
+        Stopped::Limited { window } => {
+            let named = window
+                .as_deref()
+                .map(|w| format!(" ({w})"))
+                .unwrap_or_default();
+            format!(
+                "It hit the subscription's usage window{named}, not a failure in the work. \
+                 Switch what it runs under now — `comet-board retry --task <id> --model \
+                 <other>` or `--account <slot>` — or wait for the window to reset and retry \
+                 as-is.\n"
+            )
         }
         Stopped::Errored => {
             "The run died; the chat still holds the whole task, so this is a retry or a \
              cancel, not a lost attempt.\n"
+                .to_string()
         }
         Stopped::Unknown => {
             "Either it is waiting on an answer or its run died — the chat will say which. \
              Nothing further happens until somebody picks it up.\n"
+                .to_string()
         }
     }
 }
@@ -608,7 +672,7 @@ pub fn fallback_message(task: &Task, attempt: &Attempt, event: &Event) -> String
             pr_url.as_deref(),
             note.as_deref(),
         )),
-        Event::Signal(Signal::Blocked(why)) => s.push_str(&blocked_block(task, attempt, *why)),
+        Event::Signal(Signal::Blocked(why)) => s.push_str(&blocked_block(task, attempt, why)),
         Event::CapWarning {
             age_secs,
             cap_secs,
@@ -634,18 +698,22 @@ pub fn fallback_message(task: &Task, attempt: &Attempt, event: &Event) -> String
         s.push_str(&format!("  released by: {by}\n"));
     }
     s.push('\n');
-    s.push_str(match event {
-        Event::Signal(Signal::Settled { .. }) => {
-            "No agent is working on it any more. `comet-board list --json` for the board's \
-             current view; review it, or carry on with whatever you were running.\n"
-        }
-        Event::Signal(Signal::Blocked(why)) => unsticks(*why),
-        Event::CapWarning { .. } => {
-            "The agent has been told to commit and open a pull request. Nothing is required \
-             of you before the grace expires; after it, the attempt closes `failed` and is \
-             yours to retry or leave.\n"
-        }
-    });
+    if let Event::Signal(Signal::Blocked(why)) = event {
+        s.push_str(&unsticks(why));
+    } else {
+        s.push_str(match event {
+            Event::Signal(Signal::Settled { .. }) => {
+                "No agent is working on it any more. `comet-board list --json` for the board's \
+                 current view; review it, or carry on with whatever you were running.\n"
+            }
+            Event::Signal(Signal::Blocked(_)) => unreachable!("handled above"),
+            Event::CapWarning { .. } => {
+                "The agent has been told to commit and open a pull request. Nothing is \
+                 required of you before the grace expires; after it, the attempt closes \
+                 `failed` and is yours to retry or leave.\n"
+            }
+        });
+    }
     s
 }
 
@@ -705,6 +773,14 @@ pub fn webhook_payload(task: &Task, attempt: &Attempt, signal: &Signal, at: &str
     match signal {
         Signal::Blocked(why) => {
             map.insert("reason".into(), json!(why.as_str()));
+            // For a usage limit, which window — present-and-null otherwise,
+            // so a receiver routing on `reason` never has to tell "no window
+            // named" from "this board predates the field" (gh#545).
+            let window = match why {
+                Stopped::Limited { window } => window.as_deref(),
+                _ => None,
+            };
+            map.insert("window".into(), json!(window));
             // Which block this is, so a receiver can tell a re-block from a
             // duplicate delivery of the first one.
             map.insert("block".into(), json!(attempt.blocked_count.max(1)));
@@ -848,17 +924,81 @@ mod tests {
         // in, and `review::is_actionable` recognises them by this prefix. A
         // blocked notice relayed back into the agent's chat as feedback would
         // be the board telling the agent it is blocked.
-        let c = upstream_comment(1, Stopped::Asking, "/tmp/board.log");
+        let c = upstream_comment(1, &Stopped::Asking, "/tmp/board.log");
         assert!(crate::review::is_the_boards_own(&c));
     }
 
     #[test]
     fn the_two_ways_of_blocking_read_differently() {
-        let asking = upstream_comment(1, Stopped::Asking, "/l");
-        let errored = upstream_comment(1, Stopped::Errored, "/l");
+        let asking = upstream_comment(1, &Stopped::Asking, "/l");
+        let errored = upstream_comment(1, &Stopped::Errored, "/l");
         assert!(asking.contains("waiting on an answer"));
         assert!(errored.contains("stopped with an error"));
         assert_ne!(asking, errored);
+    }
+
+    /// gh#545: the usage-limited comment is its own thing — it names the
+    /// window and offers the decision, never "answer in the chat", because
+    /// there is no question and plain retrying is what fails again.
+    #[test]
+    fn a_usage_limit_comment_names_the_window_and_the_decision() {
+        let c = upstream_comment(
+            2,
+            &Stopped::Limited {
+                window: Some("5-hour".into()),
+            },
+            "/l",
+        );
+        assert!(c.contains("5-hour usage limit"), "{c}");
+        assert!(c.contains("--model <other>"), "{c}");
+        assert!(c.contains("--account <slot>"), "{c}");
+        assert!(!c.contains("answer in the chat"), "{c}");
+        // And without a clocked window it still says the true thing.
+        let bare = upstream_comment(2, &Stopped::Limited { window: None }, "/l");
+        assert!(bare.contains("a usage limit"), "{bare}");
+    }
+
+    /// The webhook carries the window beside the reason — present-and-null on
+    /// every block, so a receiver routing on `reason` never has to tell "no
+    /// window named" from "this board predates the field".
+    #[test]
+    fn the_webhook_body_names_which_usage_window() {
+        let t = task();
+        let a = attempt();
+        let limited = webhook_payload(
+            &t,
+            &a,
+            &Signal::Blocked(Stopped::Limited {
+                window: Some("weekly".into()),
+            }),
+            "2026-08-06T00:00:00Z",
+        );
+        assert_eq!(limited["reason"], "limited");
+        assert_eq!(limited["window"], "weekly");
+        let errored = webhook_payload(
+            &t,
+            &a,
+            &Signal::Blocked(Stopped::Errored),
+            "2026-08-06T00:00:00Z",
+        );
+        assert_eq!(errored["window"], serde_json::Value::Null);
+    }
+
+    /// The dispatcher's copy of a limit leads with what to do about it —
+    /// `comet-board retry --model` is exactly the decision gh#545 wants the
+    /// row to offer.
+    #[test]
+    fn a_limit_reaching_the_dispatcher_offers_the_switch() {
+        let m = dispatcher_message(
+            &task(),
+            &attempt(),
+            &Signal::Blocked(Stopped::Limited {
+                window: Some("5-hour".into()),
+            }),
+        );
+        assert!(m.contains("blocked (limited)"), "{m}");
+        assert!(m.contains("usage window (5-hour)"), "{m}");
+        assert!(m.contains("--account <slot>"), "{m}");
     }
 
     #[test]
@@ -949,11 +1089,11 @@ mod tests {
         let signal = Signal::Blocked(Stopped::Unknown);
         let to_dispatcher = dispatcher_message(&t, &a, &signal);
         let to_fallback = fallback_message(&t, &a, &Event::Signal(&signal));
-        let block = blocked_block(&t, &a, Stopped::Unknown);
+        let block = blocked_block(&t, &a, &Stopped::Unknown);
         assert!(to_dispatcher.contains(&block));
         assert!(to_fallback.contains(&block));
-        assert!(to_dispatcher.contains(unsticks(Stopped::Unknown)));
-        assert!(to_fallback.contains(unsticks(Stopped::Unknown)));
+        assert!(to_dispatcher.contains(&unsticks(&Stopped::Unknown)));
+        assert!(to_fallback.contains(&unsticks(&Stopped::Unknown)));
         // ...and only the dispatcher's claims it released anything.
         assert!(to_dispatcher.contains("work you released"));
         assert!(!to_fallback.contains("work you released"));

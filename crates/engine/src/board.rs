@@ -101,6 +101,24 @@ enum Msg {
         attempt: Option<i64>,
         reply: oneshot::Sender<anyhow::Result<AttemptReview>>,
     },
+    /// One visual/runtime artifact attached to an attempt (§gh#421). On this
+    /// thread like every other write to `board.db` — and because the
+    /// fingerprint it stamps is read out of the attempt's checkout with git,
+    /// which only this thread's engine does.
+    AttachEvidence {
+        task_id: String,
+        input: comet_board::evidence::ArtifactInput,
+        bytes: Vec<u8>,
+        reply: oneshot::Sender<anyhow::Result<AttemptReview>>,
+    },
+    /// The stored bytes of one attached artifact (§gh#421), resolved by id on
+    /// this thread so the request never names a filesystem path.
+    ReadEvidence {
+        task_id: String,
+        attempt: Option<i64>,
+        artifact_id: String,
+        reply: oneshot::Sender<anyhow::Result<(String, String, Vec<u8>)>>,
+    },
     /// A verdict written in the review window (§gh#239): a GitHub post and a
     /// prompt into the authoring chat. On this thread because it is both a
     /// write to `board.db` and a use of the loop's runtime, and because the
@@ -462,6 +480,48 @@ impl BoardService {
             .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
     }
 
+    /// Attach one visual/runtime artifact to an attempt (§gh#421), answering
+    /// with the review it landed in — so the caller sees its own artifact
+    /// beside everything else the review holds, at the moment it attached.
+    pub async fn attach_evidence(
+        &self,
+        task_id: &str,
+        input: comet_board::evidence::ArtifactInput,
+        bytes: Vec<u8>,
+    ) -> anyhow::Result<AttemptReview> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::AttachEvidence {
+                task_id: task_id.to_string(),
+                input,
+                bytes,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-attach"))?
+    }
+
+    /// The stored bytes of one attached artifact (§gh#421), by id.
+    pub async fn read_evidence(
+        &self,
+        task_id: &str,
+        attempt: Option<i64>,
+        artifact_id: &str,
+    ) -> anyhow::Result<(String, String, Vec<u8>)> {
+        let (reply, rx) = oneshot::channel();
+        self.tx
+            .send(Msg::ReadEvidence {
+                task_id: task_id.to_string(),
+                attempt,
+                artifact_id: artifact_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("board loop is not running"))?;
+        rx.await
+            .map_err(|_| anyhow::anyhow!("board loop went away mid-read"))?
+    }
+
     /// Submit a verdict on an attempt's pull request (§gh#239): posted on
     /// GitHub, delivered into the chat that wrote it, with the unclaimed
     /// changes attached to both.
@@ -704,6 +764,26 @@ fn run_loop(
                 reply,
             }) => {
                 let _ = reply.send(engine.review(&task_id, attempt));
+            }
+            // The visual half of the review contract (§gh#421). The engine
+            // rides along for nothing — attaching touches no chat — but stays
+            // on this thread because the fingerprint it stamps is read out of
+            // the checkout with git and the row it lands on is this thread's.
+            Ok(Msg::AttachEvidence {
+                task_id,
+                input,
+                bytes,
+                reply,
+            }) => {
+                let _ = reply.send(engine.attach_evidence(&task_id, input, bytes));
+            }
+            Ok(Msg::ReadEvidence {
+                task_id,
+                attempt,
+                artifact_id,
+                reply,
+            }) => {
+                let _ = reply.send(engine.read_evidence_bytes(&task_id, attempt, &artifact_id));
             }
             // The outbound half (§gh#239). The runtime rides along for the
             // same reason it does on `Claims`: the delivery is a prompt into a
@@ -2525,6 +2605,118 @@ billing_guard = "{mode}"
         service.shutdown();
     }
 
+    /// gh#546's exit criterion: one human, two plans, two login addresses.
+    /// Unmapped, `require-own` refused every dispatch on the second address —
+    /// the guard read the box owner's own Codex slot as a stranger's plan.
+    /// Mapped under `[users]` with the same GitHub value as the first, the
+    /// same release walks through with no billing note anywhere.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dispatch_on_your_own_second_login_is_not_cross_billed() {
+        let paths = scratch_paths();
+        let route = r#"
+[[route]]
+match = { gh_repo = "owner/widget" }
+workspace = "widget"
+repo = "~/dev/widget"
+runtime = "mock"
+
+[defaults]
+billing_guard = "require-own"
+"#;
+        // First without the mapping: the refusal gh#546 is about, naming a
+        // payer who happens to be the dispatcher.
+        std::fs::write(paths.routing(), route).unwrap();
+        seed_task(&paths, "gh:owner/widget#545", "gh#545");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        {
+            let mut logins = runtime.logins.lock().unwrap();
+            logins.insert(
+                "slot-codex".into(),
+                "brede.bjorhovd@recognition.no".into(),
+            );
+        }
+        let brede = DispatchOrigin {
+            user: Some("brede@tally.no".into()),
+            ..DispatchOrigin::default()
+        };
+        let codex_slot = |o: &DispatchOverrides| DispatchOverrides {
+            account: Some("slot-codex".into()),
+            ..o.clone()
+        };
+        let err = service
+            .dispatch_task(
+                "gh:owner/widget#545",
+                brede.clone(),
+                codex_slot(&DispatchOverrides::default()),
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bills brede.bjorhovd@recognition.no"),
+            "{err}"
+        );
+        assert!(runtime.dispatched.lock().unwrap().is_empty());
+        service.shutdown();
+
+        // Then with both addresses mapped to one member: released, recorded,
+        // and silent about billing.
+        std::fs::write(
+            paths.routing(),
+            format!(
+                "{route}\n[users]\n\
+                 \"brede@tally.no\" = \"1+bredebjorhovd@users.noreply.github.com\"\n\
+                 \"brede.bjorhovd@recognition.no\" = \
+                 \"1+bredebjorhovd@users.noreply.github.com\"\n"
+            ),
+        )
+        .unwrap();
+        seed_task(&paths, "gh:owner/widget#546", "gh#546");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, runtime) = spawn_service(&paths, rx, vec![space("widget")]);
+        {
+            let mut logins = runtime.logins.lock().unwrap();
+            logins.insert(
+                "slot-codex".into(),
+                "brede.bjorhovd@recognition.no".into(),
+            );
+        }
+        service
+            .dispatch_task(
+                "gh:owner/widget#546",
+                brede,
+                codex_slot(&DispatchOverrides::default()),
+            )
+            .await
+            .expect("his own second login, not somebody else's plan");
+
+        let db = Db::open(&paths.db()).unwrap();
+        let task = db.get_task("gh:owner/widget#546").unwrap().unwrap();
+        let attempt = task.live_attempt().expect("released");
+        assert_eq!(
+            attempt.billed_to.as_deref(),
+            Some("brede.bjorhovd@recognition.no")
+        );
+        // And the upstream record accuses nobody: no suffix on a run that
+        // bills its own releaser, whatever address of theirs it spends.
+        let dispatch = db
+            .pending_writebacks(10)
+            .unwrap()
+            .into_iter()
+            .find(|w| w.kind == "dispatch")
+            .expect("a dispatch writeback");
+        assert!(
+            !dispatch.payload.contains("subscription"),
+            "{}",
+            dispatch.payload
+        );
+
+        service.shutdown();
+    }
+
     /// `require-own` is about *whose*, not about *which*: the owner releasing
     /// their own work walks straight through, and so does a dispatch nobody
     /// attributed — an unattributed release names no wronged party.
@@ -3211,6 +3403,77 @@ max_concurrent_per_workspace = 1
         std::fs::remove_dir_all(&checkout).ok();
     }
 
+    /// The visual half of the review contract through the service (§gh#421)
+    /// — the path `AttachBoardEvidence` and `ReadAttemptEvidence` take. One
+    /// agent run attaches one screenshot against its checkout, the board
+    /// fingerprints the tree itself, and any later read of the review carries
+    /// the artifact; the bytes come back by id alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_attached_artifact_rides_the_review_and_reads_back_by_id() {
+        let paths = scratch_paths();
+        seed_task(&paths, "gh:owner/widget#183", "gh#183");
+        seed_attempt(&paths, "gh:owner/widget#183", "chat-183");
+        let checkout = claims_checkout(&paths, "gh:owner/widget#183");
+
+        let (_tx, rx) = watch::channel(Vec::<Session>::new());
+        let (service, _runtime) = spawn_service(&paths, rx, vec![]);
+
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        png.extend_from_slice(b"pixels");
+        let input = comet_board::evidence::ArtifactInput {
+            kind: comet_board::evidence::ArtifactKind::Screenshot,
+            description: "signed-in dashboard".into(),
+            url: Some("http://localhost:5173/".into()),
+            viewport: Some("1440x900".into()),
+        };
+        let review = service
+            .attach_evidence("gh:owner/widget#183", input.clone(), png.clone())
+            .await
+            .unwrap();
+        assert_eq!(review.evidence_artifacts.len(), 1);
+        let artifact = &review.evidence_artifacts[0];
+        // The fingerprint is this box's reading of the checkout, not the
+        // agent's word about it.
+        assert!(artifact.commit_sha.is_some());
+        assert_eq!(
+            artifact.commit_sha.as_deref(),
+            Some(artifact.commit_sha.as_deref().unwrap().trim())
+        );
+
+        // A retry after a lost reply finds its own artifact already there.
+        let retried = service
+            .attach_evidence("gh:owner/widget#183", input, png.clone())
+            .await
+            .unwrap();
+        assert_eq!(retried.evidence_artifacts.len(), 1);
+
+        // The bytes read back by id — no path ever crosses the wire in.
+        let (name, mime, bytes) = service
+            .read_evidence("gh:owner/widget#183", None, &artifact.id)
+            .await
+            .unwrap();
+        assert_eq!(bytes, png);
+        assert_eq!(mime, "image/png");
+        assert_eq!(name, artifact.file);
+
+        // An unknown id has no file to find, and says so plainly.
+        let err = service
+            .read_evidence("gh:owner/widget#183", None, "screenshot-deadbeef")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no artifact"), "{err}");
+
+        // …and a fresh review of the task carries what was attached.
+        let again = service
+            .attempt_review("gh:owner/widget#183", None)
+            .await
+            .unwrap();
+        assert_eq!(again.evidence_artifacts.len(), 1);
+
+        service.shutdown();
+        std::fs::remove_dir_all(&checkout).ok();
+    }
     /// A checkout with a base commit and two changed files on top, wired onto
     /// the task's attempt exactly as a dispatch would wire it.
     fn claims_checkout(paths: &Paths, task_id: &str) -> std::path::PathBuf {

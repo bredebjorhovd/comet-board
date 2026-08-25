@@ -138,6 +138,22 @@ pub fn task_row(
         // the pickers resolve the route's default against the host's own
         // account list instead of against a guess made here.
         billed_to: live.or(last).and_then(|a| a.billed_to.clone()),
+        // Whether that payer is somebody other than the releaser — judged
+        // here with the `[users]` map beside the comparison, so a run billed
+        // to a second login of one mapped member does not wear "bills …" for
+        // its whole life (gh#546). The same comparison `check_billing` made
+        // at release; recomputed rather than stored so a mapping added later
+        // corrects the rows already on the board.
+        cross_billed: live
+            .or(last)
+            .and_then(|a| match (a.billed_to.as_deref(), a.dispatched_by_user.as_deref()) {
+                (Some(billed), Some(by)) => Some(crate::billing::cross_billed_among(
+                    Some(billed),
+                    Some(by),
+                    &crate::members::co_signins(cfg, by),
+                )),
+                _ => None,
+            }),
         // What gh#70's clock will hold this row's attempt to. Route-then-
         // defaults, resolved here because the routing config is the host's and
         // a viewport reading a relayed board has never seen it — an elapsed
@@ -154,6 +170,11 @@ pub fn task_row(
         // attempt is exactly the one whose provenance a reviewer asks about.
         automation: live.or(last).and_then(|a| a.automation.clone()),
         automation_owner: live.or(last).and_then(|a| a.automation_owner.clone()),
+        // Why the live attempt stopped, when a harness classified the stop
+        // (gh#545). Live only, on `context`'s precedent: it is a fact about a
+        // run somebody can still act on, and a closed attempt's last stop is
+        // its outcome's business, not the row's furniture.
+        stop_reason: live.and_then(|a| a.stop_reason.clone()),
     };
     // The verdict, from the row that was just built — one implementation of the
     // AND across a stack, shared with both viewports (gh#283). Every reader of
@@ -381,6 +402,95 @@ mod tests {
         let rows = board_rows(&db, &RoutingConfig::default()).unwrap();
         assert_eq!(rows[0].last_outcome.as_deref(), Some("cancelled"));
         assert_eq!(rows[0].attempts, 2);
+    }
+
+    /// gh#546: the row's cross-billing verdict is judged with the `[users]`
+    /// map beside it. A run billed to a second login of one mapped member
+    /// carries `Some(false)` — no "bills" chip in any viewport — while the
+    /// same two addresses unmapped read as accused, and a stranger's release
+    /// is accused either way.
+    #[test]
+    fn the_cross_billed_verdict_counts_what_the_map_ties_together() {
+        let mapped: RoutingConfig = toml::from_str(
+            "[users]\n\
+             \"brede@tally.no\" = \"1+bredebjorhovd@users.noreply.github.com\"\n\
+             \"brede.bjorhovd@recognition.no\" = \
+             \"1+bredebjorhovd@users.noreply.github.com\"\n",
+        )
+        .unwrap();
+        let db = Db::open_in_memory().unwrap();
+
+        // His Codex slot, released from his Claude sign-in.
+        seed(&db, "gh:o/r#3", "gh#3");
+        db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
+            stacked_on: None,
+            task_id: "gh:o/r#3".into(),
+            pane_id: None,
+            workspace: "ws".into(),
+            runtime: "codex".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            account: Some("slot-codex".into()),
+            repo_path: None,
+            dispatched_by_device: None,
+            dispatched_by_user: Some("brede@tally.no".into()),
+            dispatched_by_verified: false,
+            billed_to: Some("brede.bjorhovd@recognition.no".into()),
+        })
+        .unwrap();
+        // And ana releasing on brede's slot, for the contrast.
+        seed(&db, "gh:o/r#4", "gh#4");
+        db.insert_attempt(&NewAttempt {
+            automation: None,
+            automation_owner: None,
+            stacked_on: None,
+            task_id: "gh:o/r#4".into(),
+            pane_id: None,
+            workspace: "ws".into(),
+            runtime: "codex".into(),
+            worktree: None,
+            branch: None,
+            dispatched_by: None,
+            dispatched_by_pane: None,
+            base_sha: None,
+            account: Some("slot-codex".into()),
+            repo_path: None,
+            dispatched_by_device: None,
+            dispatched_by_user: Some("ana@example.com".into()),
+            dispatched_by_verified: true,
+            billed_to: Some("brede.bjorhovd@recognition.no".into()),
+        })
+        .unwrap();
+
+        let rows = board_rows(&db, &mapped).unwrap();
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("no row for {id}"))
+        };
+        assert_eq!(
+            by_id("gh:o/r#3").cross_billed,
+            Some(false),
+            "his own second login"
+        );
+        assert_eq!(
+            by_id("gh:o/r#4").cross_billed,
+            Some(true),
+            "somebody else on his slot"
+        );
+
+        // Unmapped, the same two addresses are strangers again — the map was
+        // the whole difference.
+        let rows = board_rows(&db, &RoutingConfig::default()).unwrap();
+        assert_eq!(
+            rows.iter().find(|r| r.id == "gh:o/r#3").unwrap().cross_billed,
+            Some(true)
+        );
     }
 
     #[test]

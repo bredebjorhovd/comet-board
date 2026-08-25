@@ -1087,7 +1087,7 @@ async fn a_sandbox_that_cannot_start_a_command_ends_the_run_instead_of_hanging()
     assert!(
         events
             .iter()
-            .any(|e| matches!(e, AgentEvent::Error { message } if message.contains("sandbox"))),
+            .any(|e| matches!(e, AgentEvent::Error { message, .. } if message.contains("sandbox"))),
         "{events:?}"
     );
 }

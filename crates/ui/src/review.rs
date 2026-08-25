@@ -96,10 +96,14 @@ use comet_board::claims::{
     Verdict, anchor_kind,
 };
 use comet_board::effects::{Chip, Ground};
+use comet_board::evidence::{ArtifactKind, EvidenceArtifact};
 use comet_board::verdict::{self, VerdictKind, VerdictReceipt};
 use comet_proto::view::board;
 use comet_rpc::methods;
 
+use crate::attachments::{
+    self, AttachmentSnapshot, PreviewImage, attachment_snapshot, store_error, store_loaded,
+};
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -127,6 +131,14 @@ const FILE_GUTTER: f32 = 10.0;
 /// couple of unclaimed lines — the shape of the payload rather than all of it,
 /// which is what the fade says.
 const PREVIEW_MAX_H: f32 = 196.0;
+
+/// A capture card (§gh#421): the thumbnail is 16:10 — the viewport shape a
+/// desktop screenshot almost always has — and the card is wide enough that its
+/// caption line (`1440x900 · a1b2c3d · 3 uncommitted`) does not truncate
+/// before it has said anything.
+const CAPTURE_THUMB_W: f32 = 132.0;
+const CAPTURE_THUMB_H: f32 = 82.0;
+const CAPTURE_CARD_W: f32 = 148.0;
 
 /// Where the preview starts fading, as the design gives it: a mask from 72% of
 /// the card's height to its bottom edge. Expressed as the band
@@ -358,6 +370,13 @@ pub struct ReviewPanel {
     /// typing, and Enter, which submits here as it does everywhere else in
     /// this app (shift-Enter is the newline).
     _edits: Subscription,
+    // -- captures (§gh#421) ---------------------------------------------------
+    /// Evidence thumbnails addressed into the shared attachment cache:
+    /// artifact id → the synthetic cache key they were stored under. Populated
+    /// as loads are kicked off, so a render pass never starts a second one.
+    artifact_keys: std::collections::HashMap<String, String>,
+    /// The open capture, full size. Any click closes.
+    capture_preview: Option<PreviewImage>,
 }
 
 impl ReviewPanel {
@@ -408,6 +427,8 @@ impl ReviewPanel {
             merge_error: None,
             merge_task: None,
             _edits: edits,
+            artifact_keys: Default::default(),
+            capture_preview: None,
         };
         panel.reload(cx);
         panel
@@ -477,6 +498,11 @@ impl ReviewPanel {
                                 Ok(review) => {
                                     panel.host = candidate;
                                     panel.review = Some(review);
+                                    // The captures ride the review; start
+                                    // their bytes moving now so a thumbnail is
+                                    // usually decoded by the time the reader
+                                    // scrolls to the band.
+                                    panel.load_artifacts(cx);
                                 }
                                 Err(err) => {
                                     panel.error = Some(format!("Unreadable review: {err}").into());
@@ -498,6 +524,77 @@ impl ReviewPanel {
                 cx.notify();
             });
         }));
+    }
+
+    /// Start fetching the bytes behind every image capture on this review
+    /// (§gh#421), into the shared attachment cache under a synthetic key —
+    /// `board-evidence/<attempt>/<artifact id>`. The cache is generic over the
+    /// key strings; only the transport differs from a chat attachment, and it
+    /// differs by addressing: id, never path. One load per artifact, claimed
+    /// through [`attachments::begin_load`] so concurrent renders cannot
+    /// double-fetch.
+    fn load_artifacts(&mut self, cx: &mut Context<Self>) {
+        let Some(review) = &self.review else {
+            return;
+        };
+        let attempt = review.attempt;
+        let artifacts: Vec<EvidenceArtifact> = review
+            .evidence_artifacts
+            .iter()
+            .filter(|a| matches!(a.kind, ArtifactKind::Screenshot))
+            .cloned()
+            .collect();
+        if artifacts.is_empty() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let device = self.host.clone().unwrap_or_default();
+        for artifact in artifacts {
+            let key = format!("board-evidence/{attempt}/{}", artifact.id);
+            if self
+                .artifact_keys
+                .insert(artifact.id.clone(), key.clone())
+                .is_some()
+                || !attachments::begin_load(&device, &key)
+            {
+                continue;
+            }
+            let engine = engine.clone();
+            let executor = cx.background_executor().clone();
+            let device = device.clone();
+            let host = self.host.clone();
+            let task_id = self.task_id.clone();
+            let artifact_id = artifact.id.clone();
+            cx.spawn(async move |this, cx| {
+                let loaded = attachments::read_evidence_image(
+                    &engine,
+                    &executor,
+                    host.as_deref(),
+                    &task_id,
+                    Some(attempt),
+                    &artifact_id,
+                )
+                .await;
+                let _ = this.update(cx, |_, cx| {
+                    match loaded {
+                        Some(image) => {
+                            store_loaded(&device, &key, SharedString::from(image.name), image.image)
+                        }
+                        None => {
+                            // A failed fetch is stated, never painted as a
+                            // clean absence: the band draws the dashed card
+                            // with its caption, which reads as "this could
+                            // not be fetched" rather than "nothing here".
+                            store_error(&device, &key)
+                        }
+                    }
+                    cx.notify();
+                });
+            })
+            .detach();
+        }
     }
 
     /// Submit the armed verdict (§gh#239): the verdict recorded, one prompt
@@ -1358,8 +1455,169 @@ impl ReviewPanel {
         )
     }
 
-    /// The remainder — the only block on this screen that is allowed to shout.
+    /// The captures (§gh#421): what the agent *showed* it tested — bounded
+    /// visual/runtime artifacts published onto the attempt, each carrying the
+    /// commit/dirty fingerprint the board read out of the checkout itself.
     ///
+    /// Beside the Evidence band rather than with the claims, for the reason
+    /// that band sits where it does: these are things the board can vouch for
+    /// having received, not things the agent said. A screenshot whose caption
+    /// reads `a1b2c3d · 3 uncommitted` pins pixels to a code state; nothing
+    /// here moves the verdict bar — additive testimony never shouts on this
+    /// screen.
+    fn render_captures(
+        &self,
+        review: &AttemptReview,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if review.evidence_artifacts.is_empty() {
+            return None;
+        }
+        let device = self.host.clone().unwrap_or_default();
+        let cards: Vec<AnyElement> = review
+            .evidence_artifacts
+            .iter()
+            .map(|artifact| {
+                let mut facts: Vec<String> = Vec::new();
+                if let Some(viewport) = &artifact.viewport {
+                    facts.push(viewport.clone());
+                }
+                match (&artifact.commit_sha, artifact.dirty_files) {
+                    (Some(sha), 0) => facts.push(sha[..8.min(sha.len())].to_string()),
+                    (Some(sha), n) => {
+                        facts.push(format!("{} · {n} uncommitted", &sha[..8.min(sha.len())]))
+                    }
+                    (None, _) => {}
+                }
+                let caption = SharedString::from(facts.join(" · "));
+                let description =
+                    SharedString::from(artifact.description.chars().take(120).collect::<String>());
+                // Image kinds get pixels; everything else gets an honest card
+                // naming what it is. A recording nobody can play here must not
+                // draw as a broken image.
+                let body: AnyElement = match artifact.kind {
+                    ArtifactKind::Screenshot => {
+                        let key = self
+                            .artifact_keys
+                            .get(&artifact.id)
+                            .cloned()
+                            .unwrap_or_else(|| format!("board-evidence-unkeyed/{}", artifact.id));
+                        let frame = div()
+                            .flex_none()
+                            .w(px(CAPTURE_THUMB_W))
+                            .h(px(CAPTURE_THUMB_H))
+                            .rounded(px(Theme::RADIUS_ROW))
+                            .overflow_hidden();
+                        match attachment_snapshot(&device, &key) {
+                            AttachmentSnapshot::Loaded(image) => {
+                                let preview = PreviewImage {
+                                    name: image.name.clone(),
+                                    image: image.image.clone(),
+                                };
+                                frame
+                                    .id(SharedString::from(format!("capture-{}", artifact.id)))
+                                    .border_1()
+                                    .border_color(theme.white_alpha(0.11))
+                                    .bg(theme.white_alpha(0.035))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(move |panel, _, _, cx| {
+                                        panel.capture_preview = Some(preview.clone());
+                                        cx.notify();
+                                    }))
+                                    .child(
+                                        gpui::img(image.image.clone())
+                                            .size_full()
+                                            .object_fit(gpui::ObjectFit::Cover),
+                                    )
+                                    .into_any_element()
+                            }
+                            AttachmentSnapshot::Error { .. } => frame
+                                .border_1()
+                                .border_dashed()
+                                .border_color(theme.white_alpha(0.14))
+                                .bg(theme.white_alpha(0.025))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .text_size(px(Theme::TEXT_CAPTION))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from("unavailable")),
+                                )
+                                .into_any_element(),
+                            AttachmentSnapshot::Loading => {
+                                let delta =
+                                    motion::pulse_delta(&motion::COMET_PULSE, cx.entity_id(), cx);
+                                frame
+                                    .border_1()
+                                    .border_color(theme.white_alpha(0.08))
+                                    .bg(theme.white_alpha(0.03 + 0.02 * delta))
+                                    .into_any_element()
+                            }
+                        }
+                    }
+                    kind => div()
+                        .flex_none()
+                        .w(px(CAPTURE_THUMB_W))
+                        .h(px(CAPTURE_THUMB_H))
+                        .rounded(px(Theme::RADIUS_ROW))
+                        .border_1()
+                        .border_dashed()
+                        .border_color(theme.white_alpha(0.14))
+                        .bg(theme.white_alpha(0.025))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .text_size(px(Theme::TEXT_CAPTION))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(kind.as_str().to_string())),
+                        )
+                        .into_any_element(),
+                };
+                div()
+                    .flex_none()
+                    .w(px(CAPTURE_CARD_W))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(body)
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_faint)
+                            .font_family(theme.font_mono.clone())
+                            .truncate()
+                            .child(caption),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(Theme::TEXT_CAPTION))
+                            .text_color(theme.text_muted)
+                            .truncate()
+                            .child(description),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        Some(Self::band(
+            theme,
+            "Captures",
+            GLYPH_NUDGE,
+            false,
+            div()
+                .flex()
+                .flex_row()
+                .gap(px(10.0))
+                .children(cards)
+                .into_any_element(),
+        ))
+    }
+
+    /// The remainder — the only block on this screen that is allowed to shout.
     /// Drawn as a bordered, tinted card in the blocked hue when it is non-empty
     /// and as a plain quiet line when it is not, because "four files nobody
     /// mentioned" and "everything is accounted for" should not be two readings
@@ -2585,14 +2843,18 @@ impl Render for ReviewPanel {
         });
 
         // The question in order — what was asked, what the branch did, what the
-        // board saw the run do, what the agent says it did, and what nobody
-        // accounted for — with the verdict pinned above the scroll so the
-        // loudest fact cannot be pushed under the fold by a long issue body.
+        // board saw the run do, what the agent showed it did, what the agent
+        // says it did, and what nobody accounted for — with the verdict pinned
+        // above the scroll so the loudest fact cannot be pushed under the fold
+        // by a long issue body.
         //
         // Evidence sits with Effects rather than after the claims (review.md
         // deviations): both are what the board read for itself, and the whole
         // argument for the effects row's position is that numbers read *before*
-        // a fluent story are what the story then has to agree with.
+        // a fluent story are what the story then has to agree with. Captures go
+        // between them and the claims (§gh#421) — the seen thing with the
+        // measured things, above the story.
+        let captures = self.render_captures(&review, &theme, cx);
         let body = div()
             .id("review-body")
             .flex_1()
@@ -2605,6 +2867,7 @@ impl Render for ReviewPanel {
             .child(brief)
             .child(effects)
             .child(evidence)
+            .children(captures)
             .child(claims)
             .child(remainder)
             // Last, and after the remainder on purpose: "here is how much moved"
@@ -2616,7 +2879,7 @@ impl Render for ReviewPanel {
         // The verdict bar is pinned under the scroll for the same reason the
         // verdict strip is pinned above it: the thing you came to do must not
         // be reachable only by scrolling past a long issue body.
-        motion::fade_quick(
+        let element = motion::fade_quick(
             SharedString::from(format!("review-in-{}", review.task_id)),
             card.child(header)
                 .child(verdict)
@@ -2630,7 +2893,26 @@ impl Render for ReviewPanel {
                 .children(bar)
                 .children(confirm),
         )
-        .into_any_element()
+        .into_any_element();
+        // A capture opened full size (§gh#421): the bare lightbox, click
+        // closes — the same viewer the transcript's thumbnails use, so one
+        // gesture means one thing everywhere in this app.
+        if let Some(preview) = self.capture_preview.clone() {
+            let weak = cx.weak_entity();
+            let overlay = attachments::lightbox(window.viewport_size(), &preview, move |_, cx| {
+                weak.update(cx, |panel, cx| {
+                    panel.capture_preview = None;
+                    cx.notify();
+                })
+                .ok();
+            });
+            return div()
+                .size_full()
+                .child(element)
+                .child(overlay)
+                .into_any_element();
+        }
+        element
     }
 }
 
@@ -2775,6 +3057,8 @@ mod tests {
             // gh#236's field, defaulted: read = false, so this fixture claims
             // nothing about effects it does not exercise.
             effects: Default::default(),
+            // §gh#421's field, defaulted: no artifact, asserted nothing about.
+            evidence_artifacts: Vec::new(),
             task_id: "gh:o/r#138".into(),
             attempt: 7,
             attempt_number: 1,

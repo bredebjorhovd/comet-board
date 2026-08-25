@@ -24,7 +24,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
      cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
      context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on, resumes, \
-     token_models, token_agents, automation, automation_owner";
+     token_models, token_agents, automation, automation_owner, stop_reason";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -119,6 +119,13 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
             .and_then(|j| serde_json::from_str(&j).ok()),
         automation: r.get(52)?,
         automation_owner: r.get(53)?,
+        // Why the run stopped, when a harness classified it (gh#545). JSON
+        // beside `token_models`' precedent; unreadable JSON reads as nothing,
+        // for the claims column's reason — one bad write must not take the
+        // board pane down over a display field.
+        stop_reason: r
+            .get::<_, Option<String>>(54)?
+            .and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
@@ -367,6 +374,14 @@ impl Db {
               -- fact and least likely to still be readable, since a resumed
               -- chat overwrites the journal's answer with its own.
               run_sandbox TEXT,
+              -- The visual/runtime artifacts this attempt published (§gh#421)
+              -- — screenshots, recordings, accessibility trees, excerpts —
+              -- each with the commit/dirty fingerprint the board read out of
+              -- the worktree at attach time. JSON and read on review like the
+              -- three above; the *bytes* live under the state dir's evidence/
+              -- with their own retention clock, so a record whose pixels have
+              -- expired is still the true provenance it always was.
+              evidence_artifacts TEXT,
               -- The attempt this one's branch was cut from, when it was
               -- dispatched onto a sibling instead of onto trunk (gh#285). An
               -- attempt id rather than the base branch name, because the branch
@@ -386,7 +401,15 @@ impl Db {
               -- (or a driving agent) released — automation provenance
               -- is the exception, and its absence is the ordinary case.
               automation TEXT,
-              automation_owner TEXT
+              automation_owner TEXT,
+              -- Why this attempt's run stopped, when its harness classified
+              -- the stop (gh#545): a usage limit with the window it named, a
+              -- billing failure, an expired login. JSON and nullable — NULL
+              -- is every run that stopped without a harness saying why,
+              -- which is what all of them were before gh#545. Cleared when a
+              -- run starts again: it describes the stop that *was*, not the
+              -- one that may come.
+              stop_reason TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -626,6 +649,10 @@ impl Db {
                 // those rows are, and which the chips say out loud rather than
                 // rendering as five clean results.
                 ("effects", "TEXT"),
+                // Visual/runtime evidence (§gh#421). NULL on every row that
+                // came before, which is what those rows are: nothing could
+                // attach a capture then, so none of them published one.
+                ("evidence_artifacts", "TEXT"),
                 // Direct Comet chats can author reviewable PRs too. Existing
                 // attempts were created by Board dispatch and remain managed.
                 ("board_managed", "INTEGER NOT NULL DEFAULT 1"),
@@ -645,6 +672,11 @@ impl Db {
                 // what they are: automation provenance marks the exception.
                 ("automation", "TEXT"),
                 ("automation_owner", "TEXT"),
+                // Why the run stopped, when a harness classified it (gh#545).
+                // NULL on every row that came before, which reads as "nothing
+                // was classified" — the truth about all of them, and exactly
+                // what the board said about every stop before this existed.
+                ("stop_reason", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -1494,6 +1526,27 @@ impl Db {
         Ok(())
     }
 
+    /// The visual/runtime artifacts this attempt published (§gh#421). Empty
+    /// for every attempt that published none — which is not the same as "the
+    /// run showed nothing", and a review must not say it was.
+    pub fn attempt_artifacts(&self, attempt_id: i64) -> Result<Vec<crate::evidence::EvidenceArtifact>> {
+        Ok(self
+            .attempt_json("evidence_artifacts", attempt_id)?
+            .unwrap_or_default())
+    }
+
+    pub fn set_attempt_artifacts(
+        &self,
+        attempt_id: i64,
+        artifacts: &[crate::evidence::EvidenceArtifact],
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE attempts SET evidence_artifacts = ?2 WHERE id = ?1",
+            params![attempt_id, serde_json::to_string(artifacts)?],
+        )?;
+        Ok(())
+    }
+
     /// What the board derived from this attempt's branch (§gh#236). `None` is
     /// "never recorded" — every row from before this existed, and every attempt
     /// whose checkout the board could not read while it was live.
@@ -1598,6 +1651,30 @@ impl Db {
             params![attempt_id],
             |r| r.get(0),
         )?)
+    }
+
+    /// Record why this attempt's run stopped, when a harness classified the
+    /// stop (gh#545); `None` takes the record back off.
+    ///
+    /// Written when the attempt enters blocked and cleared the moment a run
+    /// starts again, so the row carries the reason exactly while the decision
+    /// it enables — switch model, switch account, wait, retry, cancel — is
+    /// live. Stored as JSON beside `token_models`' precedent: one structured
+    /// value, no flat columns to invent per cause.
+    pub fn set_attempt_stop_reason(
+        &self,
+        attempt_id: i64,
+        stop: Option<&comet_proto::StopReason>,
+    ) -> Result<()> {
+        let json = match stop {
+            None => None,
+            Some(stop) => Some(serde_json::to_string(stop)?),
+        };
+        self.conn.execute(
+            "UPDATE attempts SET stop_reason = ?2 WHERE id = ?1",
+            params![attempt_id, json],
+        )?;
+        Ok(())
     }
 
     pub fn set_missing_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {

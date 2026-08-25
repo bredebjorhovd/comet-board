@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 
 use comet_board::evidence::RanCommand;
 use comet_proto::{
-    AgentEvent, AgentKind, AgentTokenUsage, ContextUsage, ModelTokenUsage, SandboxReport,
-    TokenUsage, ToolCall,
+    AgentEvent, AgentKind, AgentTokenUsage, ContextUsage, DoneStatus, ModelTokenUsage,
+    SandboxReport, StopReason, TokenUsage, ToolCall,
 };
 
 /// How much of a chat's assistant text [`RunJournal::final_text`] keeps.
@@ -566,6 +566,56 @@ impl RunJournal {
         Ok(read_lines(&path)?.into_iter().next_back())
     }
 
+    /// Why the chat's most recent run stopped, when a harness said (gh#545).
+    ///
+    /// A harness that classifies its stops emits them on [`AgentEvent::Error`]
+    /// shortly before the run's `Done`. The fold here pairs them the way the
+    /// harness emitted them: an error carrying a stop sets it aside, and the
+    /// next `Done` settles what the run that just ended stopped on — but only
+    /// if that run ended **errored**, because the question only exists when a
+    /// run died. **The last ended run wins**: a retry that got through
+    /// answers `None`, not yesterday's limit.
+    ///
+    /// `None` is "nothing was classified": no journal, no classified stop,
+    /// an unclassified cause, or a most recent run that did not end `Errored`.
+    /// Tag-filtered before parsing, like every other scan here.
+    pub fn last_stop(&self, chat_id: &str) -> Result<Option<StopReason>, JournalError> {
+        const ERROR_TAG: &str = r#""type":"error""#;
+        const DONE_TAG: &str = r#""type":"done""#;
+        let path = self.path_for(chat_id);
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut pending = None;
+        let mut verdict = None;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if !line.contains(ERROR_TAG) && !line.contains(DONE_TAG) {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<JournalLine>(&line) else {
+                continue;
+            };
+            match parsed.event {
+                AgentEvent::Error { stop: Some(stop), .. } => pending = Some(stop),
+                AgentEvent::Done { status, .. } => {
+                    verdict = if status == DoneStatus::Errored {
+                        pending.take()
+                    } else {
+                        // A clean end supersedes: whatever stopped the
+                        // previous run, this one got through.
+                        None
+                    };
+                    pending = None;
+                }
+                _ => {}
+            }
+        }
+        Ok(verdict)
+    }
+
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
@@ -1041,6 +1091,106 @@ mod tests {
         // Closing the stale journal with a Done clears the flag.
         journal.append("dead", &done()).unwrap();
         assert!(journal.stale_sessions().unwrap().is_empty());
+    }
+
+    // ---- the stop a run ended on (gh#545) ---------------------------------
+
+    fn errored() -> AgentEvent {
+        AgentEvent::Done {
+            status: DoneStatus::Errored,
+            result: None,
+            error: None,
+            session_id: None,
+        }
+    }
+
+    fn limited(window: Option<&str>) -> AgentEvent {
+        AgentEvent::Error {
+            message: "Claude usage limit reached".into(),
+            stop: Some(StopReason::UsageLimit {
+                window: window.map(str::to_string),
+            }),
+        }
+    }
+
+    /// gh#545's answer, read off the journal: the classified error beside the
+    /// run boundary names why the most recent run ended. A clean run before
+    /// it says nothing about this one.
+    #[test]
+    fn a_limited_run_answers_its_stop_and_a_clean_one_answers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        // Run one: gets through cleanly.
+        journal.append("chat-1", &started("claude-opus-5")).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+        assert_eq!(journal.last_stop("chat-1").unwrap(), None);
+        // Run two: the window closes, the turn ends on it.
+        journal
+            .append(
+                "chat-1",
+                &AgentEvent::SessionStarted {
+                    harness: comet_proto::HarnessId::ClaudeCode,
+                    model: "claude-opus-5".into(),
+                    tools: Vec::new(),
+                    cwd: "/tmp".into(),
+                    session_id: "s2".into(),
+                    assistant_message_id: "m2".into(),
+                },
+            )
+            .unwrap();
+        journal.append("chat-1", &limited(Some("5-hour"))).unwrap();
+        journal.append("chat-1", &errored()).unwrap();
+        assert_eq!(
+            journal.last_stop("chat-1").unwrap(),
+            Some(StopReason::UsageLimit {
+                window: Some("5-hour".into())
+            })
+        );
+    }
+
+    /// A retry that got through supersedes the limit: the answer is about the
+    /// most recent run, not the worst one in the file.
+    #[test]
+    fn a_clean_run_after_a_limited_one_answers_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &limited(None)).unwrap();
+        journal
+            .append(
+                "chat-1",
+                &AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            journal.last_stop("chat-1").unwrap(),
+            Some(StopReason::UsageLimit { window: None })
+        );
+        journal.append("chat-1", &done()).unwrap();
+        assert_eq!(journal.last_stop("chat-1").unwrap(), None);
+    }
+
+    /// An unclassified error is no answer: `None`, which is what every stop
+    /// said before gh#545 and what an unknown cause should still say.
+    #[test]
+    fn an_error_without_a_classification_is_not_an_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal
+            .append(
+                "chat-1",
+                &AgentEvent::Error {
+                    message: "something broke".into(),
+                    stop: None,
+                },
+            )
+            .unwrap();
+        journal.append("chat-1", &errored()).unwrap();
+        assert_eq!(journal.last_stop("chat-1").unwrap(), None);
     }
 
     #[test]

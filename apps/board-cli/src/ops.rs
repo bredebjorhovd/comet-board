@@ -533,6 +533,76 @@ pub async fn attempt_review(
     serde_json::from_value(reply).context("parsing ReadAttemptReview reply")
 }
 
+/// Attach one visual/runtime artifact to an attempt (§gh#421).
+///
+/// The file is read whole and sent once as base64; the kind is parsed here so
+/// a typo costs a local error naming the valid set instead of a round trip.
+/// Everything else — bounds, dedupe, the commit/dirty fingerprint — is the
+/// board's host's call, which is what makes it evidence rather than assertion.
+pub async fn attach_evidence(
+    board: &Board,
+    task_id: &str,
+    kind: &str,
+    description: &str,
+    url: Option<&str>,
+    viewport: Option<&str>,
+    file: &std::path::Path,
+) -> Result<AttemptReview> {
+    use base64::Engine as _;
+    let parsed = comet_board::evidence::ArtifactKind::parse(kind).ok_or_else(|| {
+        anyhow::anyhow!(
+            "{kind}: an artifact kind is `screenshot`, `recording`, `accessibility`, \
+             `console` or `log`"
+        )
+    })?;
+    let bytes = std::fs::read(file).with_context(|| format!("reading {}", file.display()))?;
+    if bytes.is_empty() {
+        anyhow::bail!("{} is empty — nothing to show", file.display());
+    }
+    if bytes.len() as u64 > parsed.max_bytes() {
+        anyhow::bail!(
+            "{} is {} bytes; the cap for {} is {}",
+            file.display(),
+            bytes.len(),
+            parsed,
+            parsed.max_bytes()
+        );
+    }
+    let mut params = serde_json::json!({
+        "taskId": task_id,
+        "kind": parsed.as_str(),
+        "description": description,
+        "dataB64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+    });
+    let object = params.as_object_mut().expect("object literal");
+    if let Some(url) = url.map(str::trim).filter(|u| !u.is_empty()) {
+        object.insert("url".into(), serde_json::json!(url));
+    }
+    if let Some(viewport) = viewport.map(str::trim).filter(|v| !v.is_empty()) {
+        object.insert("viewport".into(), serde_json::json!(viewport));
+    }
+    let reply = board
+        .client
+        .call(methods::ATTACH_BOARD_EVIDENCE, board.params(params))
+        .await?;
+    serde_json::from_value(reply).context("parsing AttachBoardEvidence reply")
+}
+
+/// What `evidence` prints back: where the artifact landed, beside everything
+/// else now on the attempt.
+pub fn print_evidence_result(review: &AttemptReview, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(review)?);
+        return Ok(());
+    }
+    println!(
+        "attached to {} attempt {} — read back with `comet-board review --task <id>`",
+        review.brief.identifier, review.attempt
+    );
+    print!("{}", render_review(review));
+    Ok(())
+}
+
 /// The whole review, printed in the order the question is asked in: what was
 /// asked, what the agent says it did, what the board saw for itself, and what
 /// nobody accounted for.
@@ -727,6 +797,7 @@ pub fn render_review(review: &AttemptReview) -> String {
     claims_section(review, &mut out);
     out.push('\n');
     evidence_section(&review.evidence, &mut out);
+    artifacts_section(review, &mut out);
     out.push('\n');
     remainder_section(review, &mut out);
     out
@@ -879,6 +950,41 @@ fn evidence_section(evidence: &RunEvidence, out: &mut String) {
     }
     if evidence.truncated {
         let _ = writeln!(out, "  (…and more; the list is capped)");
+    }
+}
+
+/// The visual/runtime captures (§gh#421): what the agent showed it tested,
+/// each with the fingerprint the board read out of the checkout itself. After
+/// the run's commands and before the remainder — a screenshot is evidence
+/// about behavior, and what nobody accounted for still closes the read.
+fn artifacts_section(review: &AttemptReview, out: &mut String) {
+    use std::fmt::Write;
+    if review.evidence_artifacts.is_empty() {
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "CAPTURES — {} artifact(s) attached to attempt {}",
+        review.evidence_artifacts.len(),
+        review.attempt
+    );
+    for artifact in &review.evidence_artifacts {
+        let mut facts: Vec<String> = vec![format!("{} bytes", artifact.bytes)];
+        if let Some(url) = &artifact.url {
+            facts.push(url.clone());
+        }
+        if let Some(viewport) = &artifact.viewport {
+            facts.push(viewport.clone());
+        }
+        match (&artifact.commit_sha, artifact.dirty_files) {
+            (Some(sha), 0) => facts.push(format!("at {}", &sha[..8.min(sha.len())])),
+            (Some(sha), n) => {
+                facts.push(format!("at {} · {n} uncommitted", &sha[..8.min(sha.len())]))
+            }
+            (None, _) => facts.push("no checkout fingerprinted".into()),
+        }
+        let _ = writeln!(out, "  · [{}] {}", artifact.kind, artifact.description);
+        let _ = writeln!(out, "      {}", facts.join(" · "));
     }
 }
 
@@ -1146,7 +1252,17 @@ pub async fn cross_billing_preflight_for_row(
             "the agent accounts do not identify a payer for {account} under runtime `{runtime}`"
         ));
     };
-    if view::cross_billed(Some(billed), Some(payer)) {
+    // What else the box's `[users]` map ties to the payer (gh#546): a Claude
+    // login and a Codex login are two addresses on one person's plans, and the
+    // literal comparison alone called every run on the second one cross-billed.
+    // Unreadable is not permission — an empty list compares literally.
+    let own_logins = read_config(board)
+        .await
+        .ok()
+        .and_then(|cfg| cfg.routing.config)
+        .map(|cfg| comet_board::members::co_signins(&cfg, payer))
+        .unwrap_or_default();
+    if comet_board::billing::cross_billed_among(Some(billed), Some(payer), &own_logins) {
         CrossBillingPreflight::DifferentPayer(view::bills_warning(billed, harness))
     } else {
         CrossBillingPreflight::SamePayer
@@ -2518,8 +2634,10 @@ mod tests {
             dispatched_by_user: None,
             dispatched_by_verified: false,
             billed_to: None,
+            cross_billed: None,
             max_duration_secs: None,
             context: None,
+            stop_reason: None,
         }
     }
 
@@ -3050,6 +3168,9 @@ mod tests {
         AttemptReview {
             automation: None,
             automation_owner: None,
+            // §gh#421's field, defaulted: this fixture attaches no artifact
+            // and asserts nothing about one.
+            evidence_artifacts: Vec::new(),
             task_id: "gh:o/r#183".into(),
             attempt: 7,
             attempt_number: 2,

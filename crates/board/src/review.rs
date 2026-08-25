@@ -321,6 +321,20 @@ pub(crate) fn is_the_boards_own(body: &str) -> bool {
         || b.contains(crate::verdict::POSTED_MARK)
 }
 
+/// The census a delivery headline can open with: how many of these items are
+/// review verdicts and how many are comments (inline or on the conversation).
+/// The split is worth keeping because a verdict speaks for a whole review pass
+/// while a comment speaks for one line of it.
+pub fn census(items: &[Feedback]) -> (usize, usize) {
+    (
+        items
+            .iter()
+            .filter(|f| f.kind == FeedbackKind::Review)
+            .count(),
+        items.iter().filter(|f| f.kind != FeedbackKind::Review).count(),
+    )
+}
+
 /// Decide what to do about one pull request, asking GitHub only if the decision
 /// needs it.
 ///
@@ -999,6 +1013,24 @@ pub(crate) mod tests {
     /// The base a pull request outside a stack keeps for its whole life, so a
     /// test that is not about retargeting never has to mention one.
     const BASE: &str = "main";
+
+    #[test]
+    fn census_splits_verdicts_from_comments() {
+        let items = vec![
+            verdict(1, "changes_requested", "Two things.", FLOOR),
+            inline(2, "crates/board/src/review.rs", 12, "typo", FLOOR),
+            feedback(FeedbackKind::Issue, 3, "also this", FLOOR),
+            verdict(4, "approved", "ship it", FLOOR),
+        ];
+        assert_eq!(census(&items), (2, 2));
+    }
+
+    #[test]
+    fn census_of_nothing_is_zeroed() {
+        assert_eq!(census(&[]), (0, 0));
+        let only_comments = vec![feedback(FeedbackKind::Issue, 1, "hi", FLOOR)];
+        assert_eq!(census(&only_comments), (0, 1));
+    }
 
     fn plan(state: &mut Delivered, updated_at: &str, items: Vec<Feedback>) -> Decision {
         plan_delivery(state, updated_at, BASE, FLOOR, || Ok(items)).unwrap()

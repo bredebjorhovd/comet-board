@@ -255,13 +255,15 @@ fn validate_release_binary(path: &Path, name: &str, expected_version: &str) -> a
         }
     }
 
-    let mut child = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("running {} --version", path.display()))?;
+    let mut command = Command::new(path);
+    let mut child = spawn_waiting_out_busy(
+        command
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .with_context(|| format!("running {} --version", path.display()))?;
     let Some(_) = child
         .wait_timeout(VERSION_PROBE_TIMEOUT)
         .with_context(|| format!("waiting for {} --version", path.display()))?
@@ -295,6 +297,66 @@ fn validate_release_binary(path: &Path, name: &str, expected_version: &str) -> a
         );
     }
     Ok(())
+}
+
+/// How long [`spawn_waiting_out_busy`] waits out an `ETXTBSY` before reporting
+/// it.
+///
+/// Generous next to what it waits for (a forked child that has not reached its
+/// `exec` yet — microseconds, or a scheduler quantum on a loaded CI box) and
+/// small next to [`VERSION_PROBE_TIMEOUT`], which bounds the probe itself. A
+/// wait that ends is the point: a permissions defect no amount of waiting fixes
+/// has to still be an error.
+const SPAWN_BUSY_BUDGET: Duration = Duration::from_secs(2);
+
+/// Spawn `command`, waiting out an `ETXTBSY` a sibling thread's `fork` put on
+/// the file, for at most [`SPAWN_BUSY_BUDGET`] (gh#604).
+///
+/// The race belongs to the *process*, not to any one call site: any thread that
+/// execs a file this process has recently written can be refused because some
+/// other thread forked while the write handle was open, and the forked child
+/// holds its inherited copy until its own `exec`. This crate writes the release
+/// it is about to probe — `stage_headless` unpacks the tarball and then asks
+/// both binaries their version — and the engine dispatching that update forks
+/// constantly. So between "written" and "exec'd" there can be a descheduled
+/// child holding the binary's inode open for writing, and Linux answers the
+/// exec with `Text file busy`; macOS does not enforce this at all, which is why
+/// the failure only ever shows up on CI (gh#604's test flaked exactly there,
+/// one caller away from the code that already knew — see `exec_waiting_out_busy`
+/// in crates/board/src/git_credentials.rs, gh#301/gh#385/gh#582).
+///
+/// What is true is that the state is *transient by construction* — it ends at
+/// the child's exec, with nothing else able to reopen the file for writing — so
+/// the answer is to wait it out, bounded, and then let a real failure through.
+/// A refused exec of a genuinely non-executable file (`EACCES`, the thing the
+/// managed-release check exists to catch) is answered immediately, because it
+/// is not transient and reporting it is what validation is for.
+fn spawn_waiting_out_busy(command: &mut Command) -> std::io::Result<std::process::Child> {
+    retrying_while_text_file_busy(SPAWN_BUSY_BUDGET, || command.spawn())
+}
+
+/// Retry `attempt` while it reports `ETXTBSY`, for at most `budget`.
+///
+/// Split from [`spawn_waiting_out_busy`] only so tests can drive the loop with
+/// a tiny budget; every attempt must be the same call, or a wait would be
+/// hiding a difference.
+fn retrying_while_text_file_busy<T>(
+    budget: Duration,
+    mut attempt: impl FnMut() -> std::io::Result<T>,
+) -> std::io::Result<T> {
+    let mut waited = Duration::ZERO;
+    let mut nap = Duration::from_millis(1);
+    loop {
+        let result = attempt();
+        match &result {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && waited < budget => {
+                std::thread::sleep(nap);
+                waited += nap;
+                nap = (nap * 2).min(Duration::from_millis(50));
+            }
+            _ => return result,
+        }
+    }
 }
 
 /// The directory an installer-managed service exposes through its `current`
@@ -1016,8 +1078,36 @@ mod tests {
         let board = tmp.path().join("comet-board");
         std::fs::set_permissions(&board, std::fs::Permissions::from_mode(0o644)).unwrap();
 
+        // Pin the setup instead of trusting ambient permissions (gh#604). The
+        // refusal below is only attributable to `comet-board` if the modes
+        // actually read back as asked — a runner whose umask, mount or
+        // filesystem quietly rewrote them must fail here, loudly, rather than
+        // send the assertion chasing a refusal that names the wrong defect.
+        let engine = symlink_mode(&tmp.path().join("comet"));
+        assert_ne!(engine & 0o111, 0, "{engine:o}: comet lost its exec bits");
+        let board_mode = symlink_mode(&board);
+        assert_eq!(
+            board_mode & 0o111,
+            0,
+            "{board_mode:o}: chmod 0644 did not clear comet-board's exec bits"
+        );
+
         let error = validate_managed_release(tmp.path(), "0.8.0").unwrap_err();
-        assert!(error.to_string().contains("not executable"), "{error:#}");
+        let message = error.to_string();
+        assert!(
+            message.contains("not executable") && message.contains("comet-board"),
+            "{error:#}"
+        );
+    }
+
+    /// The permission bits [`validate_managed_release`] actually reads back.
+    #[cfg(unix)]
+    fn symlink_mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::symlink_metadata(path)
+            .unwrap()
+            .permissions()
+            .mode()
     }
 
     /// The curl|sh path used to move `current` after checking only `comet`.
@@ -1089,5 +1179,62 @@ exit 2
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("comet-board"), "{stderr}");
         assert_eq!(std::fs::read_link(app_root.join("current")).unwrap(), old);
+    }
+
+    /// gh#604: the probe spawn waits out a transient `ETXTBSY` instead of
+    /// failing the whole release on a fork that had not exec'd yet.
+    #[test]
+    fn a_busy_spawn_is_waited_out_until_it_succeeds() {
+        use std::io::ErrorKind;
+
+        let mut attempts = 0;
+        let result = retrying_while_text_file_busy(Duration::from_secs(5), || {
+            attempts += 1;
+            if attempts < 5 {
+                Err(std::io::Error::new(ErrorKind::ExecutableFileBusy, "busy"))
+            } else {
+                Ok("spawned")
+            }
+        });
+        assert_eq!(result.unwrap(), "spawned");
+        assert_eq!(attempts, 5);
+    }
+
+    /// A genuinely refused exec — the non-executable case this module exists to
+    /// catch — is not transient and must not be waited on.
+    #[test]
+    fn a_non_busy_error_is_reported_immediately() {
+        use std::io::ErrorKind;
+
+        let mut attempts = 0;
+        let result: std::io::Result<()> =
+            retrying_while_text_file_busy(Duration::from_secs(5), || {
+                attempts += 1;
+                Err(std::io::Error::new(
+                    ErrorKind::PermissionDenied,
+                    "not executable",
+                ))
+            });
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(attempts, 1);
+    }
+
+    /// The budget bounds the wait: a busy state that never clears comes back as
+    /// the busy error it is, not as a hang.
+    #[test]
+    fn the_budget_bounds_the_wait() {
+        use std::io::ErrorKind;
+
+        let start = std::time::Instant::now();
+        let result: std::io::Result<()> =
+            retrying_while_text_file_busy(Duration::from_millis(20), || {
+                Err(std::io::Error::new(ErrorKind::ExecutableFileBusy, "busy"))
+            });
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::ExecutableFileBusy);
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "waited {:?}, budget was 20ms",
+            start.elapsed()
+        );
     }
 }

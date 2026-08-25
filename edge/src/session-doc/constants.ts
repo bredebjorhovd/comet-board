@@ -51,6 +51,21 @@ export const COMPACT_LOG_BYTES = 2 * 1024 * 1024;
  * fold early and keep cold replays trivially affordable. */
 export const COMPACT_LOG_ROWS = 400;
 
+/** One fold STEP's row budget (gh#611). The fold moves the log into a
+ * snapshot in bounded batches rather than one all-or-nothing export, so a
+ * batch that dies (CPU/memory/storage) leaves every earlier batch landed and
+ * the next attempt resumes where it stopped instead of repeating the whole
+ * doomed pass. 64 rows ≈ the small-update traffic of several minutes on a
+ * busy workspace room, and keeps one batch's import cost far under the
+ * cold-start budget {@link COMPACT_LOG_ROWS} documents. */
+export const FOLD_STEP_ROWS = 64;
+
+/** One fold STEP's byte budget — the other axis, bounding a batch of few-but-
+ * huge updates the way {@link FOLD_STEP_ROWS} bounds many tiny ones. A single
+ * update wider than this still folds whole (a chunk group is never split);
+ * the budget just gives such an update its own step. */
+export const FOLD_STEP_BYTES = 512 * 1024;
+
 /** Soft ceiling: past this much doc state the UI nudges toward a fresh
  * session. No enforcement machinery — a product stance, not a limit. */
 export const SOFT_CEILING_BYTES = 25 * 1024 * 1024;

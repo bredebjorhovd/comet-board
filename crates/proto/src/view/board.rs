@@ -537,6 +537,16 @@ pub struct TaskRow {
     /// [`cross_billed`].
     #[serde(default)]
     pub billed_to: Option<String>,
+    /// Whether that payer really is somebody other than whoever released
+    /// this, as the engine judged it — counting the `[users]` map, which ties
+    /// one person's logins together (gh#546). A row recorded before this
+    /// existed carries `None`, and a view falls back to comparing
+    /// [`billed_to`](Self::billed_to) against
+    /// [`dispatched_by_user`](Self::dispatched_by_user) literally — the
+    /// judgement that accused a second login of the same person of spending
+    /// somebody else's plan in the first place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_billed: Option<bool>,
     /// The wall-clock cap one attempt on this row gets (gh#70's `max_duration`,
     /// in seconds), resolved route-then-defaults. `None` is uncapped.
     ///
@@ -572,6 +582,19 @@ pub struct TaskRow {
     pub automation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_owner: Option<String>,
+    /// Why this row's live attempt stopped, when its harness could say
+    /// (gh#545). Set only while the attempt is stopped on it — a usage limit,
+    /// a billing failure, an expired login — and cleared the moment the run
+    /// is going again. `None` is every other row: nothing stopped, or nothing
+    /// classified the stop, which is what the board used to say about all of
+    /// them.
+    ///
+    /// On the wire so a viewport can put the *decision* in front of a person —
+    /// switch model, switch account, wait — instead of the one verb every
+    /// stopped row used to share. The chat's own last words usually quote the
+    /// error; this says which of them it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<crate::StopReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1757,12 +1780,18 @@ pub fn subscription_noun(harness: crate::HarnessId) -> &'static str {
 /// What a board row says about who it is charging, for the life of the attempt
 /// — `None` when nobody is being charged for somebody else.
 ///
-/// Derived from the row alone, which is what lets both viewports show it
-/// without asking the box anything: the attempt recorded whose subscription it
-/// spends, and it recorded who said they released it.
+/// The engine's own verdict ([`TaskRow::cross_billed`]) when the row carries
+/// one: it knows what the `[users]` map says about who signs in from where, so
+/// a run billed to a second login of the same person reads as theirs. Rows from
+/// before that verdict existed derive it from the two addresses alone, which is
+/// the best they can do and occasionally wrong (gh#546) — hence recording,
+/// not re-deriving forever.
 pub fn billing_note(row: &TaskRow) -> Option<String> {
     let billed = row.billed_to.as_deref()?;
-    cross_billed(Some(billed), row.dispatched_by_user.as_deref()).then(|| bills_label(billed))
+    let cross = row.cross_billed.unwrap_or_else(|| {
+        cross_billed(Some(billed), row.dispatched_by_user.as_deref())
+    });
+    cross.then(|| bills_label(billed))
 }
 
 // ---------------------------------------------------------------------------
@@ -2861,8 +2890,10 @@ mod tests {
             dispatched_by_user: None,
             dispatched_by_verified: false,
             billed_to: None,
+            cross_billed: None,
             max_duration_secs: None,
             context: None,
+            stop_reason: None,
             automation: None,
             automation_owner: None,
         }
@@ -4224,6 +4255,38 @@ mod tests {
 
         // And a row nothing has run on carries no verdict at all.
         assert_eq!(billing_note(&row("r", BoardState::Ready)), None);
+    }
+
+    /// gh#546: the engine's recorded verdict wins over the literal comparison.
+    /// Two addresses on one member's plans look cross-billed to the strings
+    /// alone; the engine knows they are not, and the row believes the engine.
+    /// A row from before the verdict existed falls back to the strings, which
+    /// is the best it can do and occasionally wrong — hence recording.
+    #[test]
+    fn the_recorded_verdict_decides_the_row_note_not_the_strings_alone() {
+        let mut r = row("v", BoardState::Review);
+        r.billed_to = Some("brede.bjorhovd@recognition.no".into());
+        r.dispatched_by_user = Some("brede@tally.no".into());
+
+        // Strings alone: accused. Engine's verdict (his other login): silent.
+        assert!(billing_note(&r).is_some(), "the fallback still derives");
+        r.cross_billed = Some(false);
+        assert_eq!(
+            billing_note(&r),
+            None,
+            "the same person's second plan is nobody else's business"
+        );
+
+        // And the verdict can also *accuse* where the strings happen to match
+        // nothing — it replaces the derivation, it does not AND with it.
+        let mut stranger = row("s", BoardState::Working);
+        stranger.billed_to = Some("ana@example.com".into());
+        stranger.dispatched_by_user = Some("sam@example.com".into());
+        stranger.cross_billed = Some(true);
+        assert_eq!(
+            billing_note(&stranger).as_deref(),
+            Some("bills ana@example.com")
+        );
     }
 
     #[test]

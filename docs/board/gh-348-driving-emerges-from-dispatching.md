@@ -103,6 +103,6 @@ document that stops describing a job title.
 
 Related: §gh#104 (where the pin came from), §gh#165 (dispatcher first), §gh#354
 (the protections attached to the declaration rather than the behaviour — the
-same argument, found as a bug), §gh#122 (the slot), §gh#390 (the incident line),
+same argument, found as a bug), gh#122 (the slot), §gh#390 (the incident line),
 gh#271 (the context meter), gh#340 (an agent not delegating — the same question
 from the other end).

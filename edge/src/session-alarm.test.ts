@@ -155,7 +155,16 @@ interface Harness {
   tail: () => Promise<Response>;
   stats: () => Promise<{
     backupDirty: boolean;
-    alarm: { consecutiveFailures: number; gaveUp: boolean; gaveUpAt: number | null; limit: number };
+    alarm: {
+      consecutiveFailures: number;
+      gaveUp: boolean;
+      gaveUpAt: number | null;
+      limit: number;
+      refusals: number;
+      refusalBudget: number;
+      lastAttempt: { at: number; attempts: number } | null;
+      lastError: { at: number; attempts: number; error: string } | null;
+    };
   }>;
 }
 
@@ -409,6 +418,105 @@ describe("bounded alarm chain", () => {
     const first = alarm.gaveUpAt;
     await h.fire();
     expect((await h.stats()).alarm.gaveUpAt).toBe(first);
+  });
+});
+
+// ── what the failure was (gh#611) ─────────────────────────────────────────
+//
+// The 2026-08-25 room sat at `consecutiveFailures: 8` of 24 with NOTHING
+// beside the count saying why — a count with no last-error is undiagnosable
+// from outside the isolate, which is the same observability gap gh#557 closed
+// for socket deaths. The chain now leaves two durable markers and /stats
+// reads them: an attempt stamp written BEFORE the work, and the error the
+// catch saw. The pair discriminates the two failure classes: an error beside
+// the count names the fault; a climbing count with an attempt stamp and NO
+// error names the class that has no catch block — a CPU/duration kill that
+// took the invocation mid-work.
+
+describe("alarm failure attribution", () => {
+  it("records what a failed attempt died of, and which attempt it was", async () => {
+    const h = await roomWithWork();
+    h.failBackups(true);
+    const before = Date.now();
+    await h.fire();
+
+    const { alarm } = await h.stats();
+    expect(alarm.consecutiveFailures).toBe(1);
+    expect(alarm.lastError).not.toBeNull();
+    expect(alarm.lastError!.attempts).toBe(1);
+    expect(alarm.lastError!.error).toContain("R2 unavailable");
+    expect(alarm.lastError!.at).toBeGreaterThanOrEqual(before);
+    // The attempt stamp says the same attempt number the counter spent.
+    expect(alarm.lastAttempt).toMatchObject({ attempts: 1 });
+  });
+
+  it("a success clears both markers", async () => {
+    const h = await roomWithWork();
+    h.failBackups(true);
+    await h.fire();
+    expect((await h.stats()).alarm.lastError).not.toBeNull();
+
+    h.failBackups(false);
+    await h.fire();
+    const { alarm } = await h.stats();
+    expect(alarm).toMatchObject({ consecutiveFailures: 0 });
+    expect(alarm.lastError).toBeNull();
+    expect(alarm.lastAttempt).toBeNull();
+  });
+
+  it("the last error survives into give-up — the state an operator finally reads", async () => {
+    const h = await roomWithWork();
+    h.failBackups(true);
+    for (let attempt = 1; attempt <= ALARM_FAILURE_LIMIT; attempt++) await h.fire();
+
+    const { alarm } = await h.stats();
+    expect(alarm.gaveUp).toBe(true);
+    expect(alarm.lastError).not.toBeNull();
+    expect(alarm.lastError!.attempts).toBe(ALARM_FAILURE_LIMIT);
+    expect(alarm.lastError!.error).toContain("R2 unavailable");
+  });
+
+  it("revival clears the stale incident so the fresh chain reports itself", async () => {
+    const h = await roomWithWork();
+    h.failBackups(true);
+    for (let attempt = 1; attempt <= ALARM_FAILURE_LIMIT; attempt++) await h.fire();
+    expect((await h.stats()).alarm.lastError!.attempts).toBe(ALARM_FAILURE_LIMIT);
+
+    h.failBackups(false);
+    await h.join(); // revive path
+
+    const { alarm } = await h.stats();
+    expect(alarm.gaveUp).toBe(false);
+    expect(alarm.lastError).toBeNull();
+    expect(alarm.lastAttempt).toBeNull();
+  });
+
+  // The marker that makes a catch-less death legible: the attempt stamp is
+  // synced BEFORE any work runs, so an invocation killed mid-work (CPU/duration)
+  // still leaves "attempt N started here" behind with no error beside it.
+  it("stamps the attempt durably before the work runs", async () => {
+    const h = await roomWithWork();
+    let releasePut: (() => void) | undefined;
+    h.put.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releasePut = resolve;
+        })
+    );
+    const fired = h.fire();
+    await vi.waitFor(() => expect(releasePut).toBeDefined());
+
+    // Mid-work: the counter and the stamp are already durable...
+    let stats = await h.stats();
+    expect(stats.alarm.consecutiveFailures).toBe(1);
+    expect(stats.alarm.lastAttempt).toMatchObject({ attempts: 1 });
+    expect(stats.alarm.lastError).toBeNull(); // ...and nothing has been thrown.
+    releasePut!();
+    await fired;
+
+    stats = await h.stats();
+    expect(stats.alarm.consecutiveFailures).toBe(0); // completed cleanly
+    expect(stats.alarm.lastAttempt).toBeNull();
   });
 });
 

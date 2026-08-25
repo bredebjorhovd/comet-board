@@ -3385,42 +3385,45 @@ fn agent_account_health_checks(
                 a.email.as_deref().unwrap_or(a.id.as_str()),
                 harness_name(a.harness)
             );
-            let who = a.email.as_deref().unwrap_or(a.id.as_str()).to_string();
-            let active = if a.active {
-                " · this box's live login"
-            } else {
-                ""
-            };
+            // The slot id leads because it is what a dispatch names: every
+            // billing refusal and `--account` help text points here, and an
+            // id you have to `ls ~/.comet-native/accounts` for is a fix you
+            // will not type (gh#546). The check *name* carries the human half
+            // — whose login, which harness — so the detail does not repeat it.
+            let label = format!(
+                "slot {}{}",
+                a.id,
+                if a.active {
+                    " · this box's live login"
+                } else {
+                    ""
+                }
+            );
             let Some(h) = health.iter().find(|h| h.id == a.id) else {
                 return Check {
                     name,
                     ok: true,
-                    detail: format!("{who} — not checked"),
+                    detail: format!("{label} — not checked"),
                 };
             };
             match h.state {
                 comet_proto::AgentAccountState::Ok => Check {
                     name,
                     ok: true,
-                    detail: format!("{who} ({}){active} — {}", harness_name(a.harness), h.detail),
+                    detail: format!("{label} — {}", h.detail),
                 },
                 comet_proto::AgentAccountState::Unknown => Check {
                     name,
                     ok: true,
-                    detail: format!(
-                        "{who} ({}){active} — not verified ({})",
-                        harness_name(a.harness),
-                        h.detail
-                    ),
+                    detail: format!("{label} — not verified ({})", h.detail),
                 },
                 comet_proto::AgentAccountState::Stale => Check {
                     name,
                     ok: false,
                     detail: format!(
-                        "{who} ({}){active} — STALE, {}. Re-sign it under \
+                        "{label} — STALE, {}. Re-sign it under \
                          Settings → Agents in the Comet app, or with \
                          `comet-board relogin {}` from a shell",
-                        harness_name(a.harness),
                         h.detail,
                         relogin_arg(a, accounts)
                     ),
@@ -3832,6 +3835,12 @@ fn billing_guard_check(cfg: &crate::config::RoutingConfig) -> Check {
 /// whoever pressed enter, and the fact that it is *quiet* is exactly why the
 /// question never gets asked.
 ///
+/// Answered **per harness** since gh#546, because there is no single answer: a
+/// Claude dispatch that names no account runs on the box's active Claude login
+/// and a Codex one on its active Codex login, and those are two subscriptions
+/// under two addresses. Merging them into one list read as one login and hid
+/// the exact case that fills the syncd log with warnings.
+///
 /// Never fails, for [`billing_guard_check`]'s reason: sharing one plan
 /// deliberately is a normal way to run a box, and the line exists so that
 /// choice is made rather than defaulted into.
@@ -3840,6 +3849,7 @@ fn default_account_check(
     accounts: Option<&[AgentAccount]>,
     members: Option<usize>,
 ) -> Check {
+    use comet_proto::view::board::subscription_noun;
     let name = "default account".to_string();
     let unnamed: Vec<String> = cfg
         .routes
@@ -3856,47 +3866,86 @@ fn default_account_check(
                 .into(),
         };
     }
-    // Whose login that fallback actually is, where the engine could say. The
-    // active login per harness is what a dispatch with no slot runs under.
-    let mine: Vec<String> = accounts
-        .unwrap_or_default()
-        .iter()
-        .filter(|a| a.active)
-        .filter_map(|a| a.email.clone())
-        .filter(|e| !e.trim().is_empty())
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let login = match mine.as_slice() {
+    // The active login per harness — what a dispatch with no slot runs under.
+    let mut per_harness: Vec<(comet_proto::HarnessId, String)> = Vec::new();
+    for harness in [
+        comet_proto::HarnessId::ClaudeCode,
+        comet_proto::HarnessId::Codex,
+        comet_proto::HarnessId::Cursor,
+        comet_proto::HarnessId::Opencode,
+    ] {
+        if let Some(email) = accounts
+            .unwrap_or_default()
+            .iter()
+            .find(|a| a.active && a.harness == harness)
+            .and_then(|a| a.email.clone())
+            .filter(|e| !e.trim().is_empty())
+        {
+            per_harness.push((harness, email));
+        }
+    }
+    let fallback = match per_harness.as_slice() {
         [] => "this box's own CLI login".to_string(),
-        some => format!("this box's own CLI login ({})", some.join(", ")),
+        [(harness, email)] => format!(
+            "this box's own {} login ({email})",
+            subscription_noun(*harness)
+        ),
+        many => format!(
+            "one of this box's own logins, by runtime: {}",
+            many.iter()
+                .map(|(h, e)| format!("{} → {e}", subscription_noun(*h)))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        ),
     };
     let routes = match unnamed.as_slice() {
         [one] => format!("route `{one}` names no `account`"),
         many => format!("{} routes name no `account`", many.len()),
     };
-    let detail = match members {
+    // Does the map say the active logins are all one member's? The difference
+    // between "your two plans" and a warning that fires on half of them
+    // (gh#546). Only addresses take part: a slot whose "email" is a provider
+    // label (`OpenCode CLI`) describes the fallback but is nobody's identity,
+    // and counting it as a third login would break a tie it was never in.
+    let distinct: std::collections::BTreeSet<&str> = per_harness
+        .iter()
+        .map(|(_, e)| e.trim())
+        .filter(|e| e.contains('@') && !e.is_empty())
+        .collect();
+    let tied = distinct.len() <= 1
+        || crate::members::member_groups(cfg).iter().any(|keys| {
+            distinct
+                .iter()
+                .all(|e| keys.iter().any(|k| k.eq_ignore_ascii_case(e)))
+        });
+    let ownership = match members {
         // The case this check exists for.
         Some(n) if n > 1 => format!(
-            "{routes}, so a dispatch that names none runs on {login} — and there are {n} \
-             people in this workspace. A teammate's release spends the box owner's plan \
-             unless they pass `--account <their slot>`; `[defaults] billing_guard = \
-             \"require-own\"` refuses those outright"
+            " — and there are {n} people in this workspace. A teammate's release spends \
+             the box owner's plan unless they pass `--account <their slot>`; \
+             `[defaults] billing_guard = \"require-own\"` refuses those outright"
         ),
-        Some(_) => format!(
-            "{routes}, so a dispatch that names none runs on {login} — which is yours: \
-             one person in this workspace, and the fallback is the only login there is"
-        ),
-        None => format!(
-            "{routes}, so a dispatch that names none runs on {login}. Who else could \
-             spend it was not checked — the engine could not be asked for the workspace \
-             roster"
-        ),
+        None => ". Who else could spend it was not checked — the engine could not be asked \
+                 for the workspace roster"
+            .to_string(),
+        Some(_) => match distinct.len() {
+            // One address at most among the fallbacks: nothing to tell apart.
+            0 | 1 => " — which is yours: one person in this workspace".to_string(),
+            _ if tied => " — which is yours: one person in this workspace, and `[users]` \
+                          maps every one of those logins to the same member"
+                .to_string(),
+            n => format!(
+                " — one person in this workspace, but nothing ties those {n} logins \
+                 together. If they are all yours, give `[users]` one entry per address \
+                 with the same GitHub value; until then every run on the second one says \
+                 it bills somebody else"
+            ),
+        },
     };
     Check {
         name,
         ok: true,
-        detail,
+        detail: format!("{routes}, so a dispatch that names none runs on {fallback}{ownership}"),
     }
 }
 
@@ -5232,7 +5281,9 @@ mod tests {
 
         let sam = checks.iter().find(|c| c.name.contains("sam@")).unwrap();
         assert!(sam.ok, "{}", sam.detail);
-        assert!(sam.detail.contains("claude-code"), "{}", sam.detail);
+        // The harness reads on the line — in the name, since gh#546 moved the
+        // slot id into the detail and left the human half in the name.
+        assert!(sam.name.contains("claude-code"), "{} {}", sam.name, sam.detail);
 
         let kim = checks
             .iter()
@@ -5242,9 +5293,12 @@ mod tests {
         // gh#585: the hint is the command a person would type — the harness,
         // because kim's is this device's only codex login.
         assert!(kim.detail.contains("relogin codex"), "{}", kim.detail);
+        // gh#546: and the slot id is on the line too, because `--account`
+        // takes exactly that and nowhere else in the report spells it. The
+        // email stays first — a person reads that; they copy the id.
         assert!(
-            !kim.detail.contains("bbbbbbbbbbbbbbbb"),
-            "the slot id is not something the operator keeps on hand: {}",
+            kim.detail.contains("slot bbbbbbbbbbbbbbbb"),
+            "the id a dispatch names must be on the line: {}",
             kim.detail
         );
         // And the stale one does not silently pass the report.
@@ -5383,7 +5437,7 @@ mod tests {
         let checks = doctor(&p, &engine, Some(&[]), Some(&saved), None, None, None).unwrap();
         let kim = checks
             .iter()
-            .find(|c| !c.ok && c.detail.contains("kim@example.com"))
+            .find(|c| !c.ok && c.name.contains("kim@example.com"))
             .expect("the stale line");
         assert!(
             kim.detail.contains("relogin bbbbbbbbbbbbbbbb"),
@@ -5894,6 +5948,92 @@ mod tests {
             "{}",
             settled.detail
         );
+    }
+
+    /// gh#546: there is no single "this box's own CLI login" — a Claude
+    /// dispatch falls to the Claude login and a Codex dispatch to the Codex
+    /// one. The line says which is which, and whether the map ties them to
+    /// one person or leaves them looking like two.
+    #[test]
+    fn the_default_account_line_answers_per_harness_and_says_whose_each_login_is() {
+        let shared: RoutingConfig = toml::from_str(
+            "[[route]]\nname = \"platform\"\nmatch = { label = \"team\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude-code\"\n",
+        )
+        .unwrap();
+        let claude = AgentAccount {
+            active: true,
+            ..account(
+                "slot-claude",
+                "brede@tally.no",
+                comet_proto::HarnessId::ClaudeCode,
+            )
+        };
+        let codex = AgentAccount {
+            active: true,
+            ..account(
+                "slot-codex",
+                "brede.bjorhovd@recognition.no",
+                comet_proto::HarnessId::Codex,
+            )
+        };
+
+        // Untied — the state that made every Codex dispatch warn: the line
+        // shows both logins under their runtimes and says what would tie
+        // them.
+        let untied = default_account_check(&shared, Some(&[claude.clone(), codex.clone()]), Some(1));
+        assert!(
+            untied.detail.contains("Claude → brede@tally.no"),
+            "{}",
+            untied.detail
+        );
+        assert!(
+            untied
+                .detail
+                .contains("Codex → brede.bjorhovd@recognition.no"),
+            "{}",
+            untied.detail
+        );
+        assert!(
+            untied.detail.contains("nothing ties those 2 logins"),
+            "{}",
+            untied.detail
+        );
+        assert!(
+            untied.detail.contains("same GitHub value"),
+            "the repair belongs on the line: {}",
+            untied.detail
+        );
+
+        // Mapped to one member, the same two logins read as yours.
+        let tied_cfg: RoutingConfig = toml::from_str(
+            "[[route]]\nname = \"platform\"\nmatch = { label = \"team\" }\n\
+             workspace = \"w\"\nrepo = \"/tmp\"\nruntime = \"claude-code\"\n\
+             [users]\n\
+             \"brede@tally.no\" = \"1+bredebjorhovd@users.noreply.github.com\"\n\
+             \"brede.bjorhovd@recognition.no\" = \"1+bredebjorhovd@users.noreply.github.com\"\n",
+        )
+        .unwrap();
+        let tied = default_account_check(
+            &tied_cfg,
+            Some(&[claude.clone(), codex.clone()]),
+            Some(1),
+        );
+        assert!(
+            tied.detail
+                .contains("maps every one of those logins to the same member"),
+            "{}",
+            tied.detail
+        );
+
+        // A single active login keeps its plain answer.
+        let solo = default_account_check(&shared, Some(&[claude]), Some(1));
+        assert!(
+            solo.detail.contains("own Claude login (brede@tally.no)"),
+            "{}",
+            solo.detail
+        );
+        assert!(solo.detail.contains("which is yours"), "{}", solo.detail);
     }
 
     #[test]

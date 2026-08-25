@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { CHUNK_BYTES } from "./blobs";
-import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
+import {
+  appendUpdateRow,
+  ensureUpdateLog,
+  planFoldStep,
+  readUpdateRows,
+  readUpdatesThrough
+} from "./update-log";
 
 /** Minimal SqlStorage fake covering exactly the statements update-log.ts
  * issues, including the ~2MB row cap that motivated chunking. */
@@ -38,6 +44,21 @@ class FakeSql {
     }
     if (query.startsWith("SELECT bytes, cont FROM updates")) {
       return this.rows.map((r) => ({ bytes: r.bytes, cont: r.cont }));
+    }
+    // The fold-step reader: bounded by an inclusive seq cursor.
+    if (query.startsWith("SELECT seq, bytes, cont FROM updates")) {
+      const upTo = params[0] === undefined ? Infinity : Number(params[0]);
+      return this.rows
+        .filter((r) => r.seq <= upTo)
+        .map((r) => ({ seq: r.seq, bytes: r.bytes, cont: r.cont }));
+    }
+    // The fold-step planner: lengths only.
+    if (query.startsWith("SELECT seq, cont, LENGTH(bytes) AS n FROM updates")) {
+      return this.rows.map((r) => ({
+        seq: r.seq,
+        cont: r.cont,
+        n: r.bytes.byteLength
+      }));
     }
     throw new Error(`FakeSql: unhandled query: ${query}`);
   }
@@ -124,5 +145,67 @@ describe("update log chunking", () => {
     ensureUpdateLog(asSql(sql));
     appendUpdateRow(asSql(sql), bytesOf(10, 1), 1);
     expect(readAll(sql).length).toBe(1);
+  });
+});
+
+// gh#611 — the stepped fold. The plan is the contract the room folds against:
+// whole logical updates only, bounded on both axes, oldest first, and exact
+// about which rows (and how many bytes) a step covers.
+
+describe("fold step planning", () => {
+  it("plans nothing for an empty log", () => {
+    expect(planFoldStep(asSql(new FakeSql()))).toBeNull();
+  });
+
+  it("covers the whole log when it fits one step", () => {
+    const sql = new FakeSql();
+    for (const len of [100, 200, 300]) appendUpdateRow(asSql(sql), bytesOf(len, len), 1);
+    const plan = planFoldStep(asSql(sql));
+    expect(plan).toEqual({ lastSeq: 3, bytes: 600 });
+  });
+
+  it("stops at the row budget, never mid-update", () => {
+    const sql = new FakeSql();
+    appendUpdateRow(asSql(sql), bytesOf(10, 1), 1); // seq 1
+    appendUpdateRow(asSql(sql), bytesOf(CHUNK_BYTES + 5, 2), 2); // seqs 2-3
+    appendUpdateRow(asSql(sql), bytesOf(10, 3), 3); // seq 4
+    // maxRows=2 cannot hold the chunked update (3 rows) after seq 1: the plan
+    // must stop at the last COMPLETE group that fits.
+    const plan = planFoldStep(asSql(sql), 2, Number.MAX_SAFE_INTEGER);
+    expect(plan).toEqual({ lastSeq: 1, bytes: 10 });
+    // ...and the reader through that cursor yields exactly that group.
+    const read = [...readUpdatesThrough(asSql(sql), plan!.lastSeq)];
+    expect(read.map((u) => u.lastSeq)).toEqual([1]);
+    expect(read[0]!.bytes.byteLength).toBe(10);
+  });
+
+  it("gives one oversized update its own step instead of splitting it", () => {
+    const sql = new FakeSql();
+    appendUpdateRow(asSql(sql), bytesOf(600 * 1024, 1), 1);
+    const plan = planFoldStep(asSql(sql), 64, 512 * 1024);
+    // The single update busts the byte budget but is the only thing there:
+    // deferring it forever would fold nothing, so it IS the step.
+    expect(plan).toEqual({ lastSeq: 1, bytes: 600 * 1024 });
+  });
+
+  it("walks an unbounded log in budgeted steps", () => {
+    const sql = new FakeSql();
+    for (let i = 0; i < 10; i++) appendUpdateRow(asSql(sql), bytesOf(100, i), i);
+    let seen = 0;
+    let cursor = 0;
+    for (;;) {
+      // Simulate the committed delete of every step by planning against only
+      // the rows after the last cursor.
+      const remaining = new FakeSql();
+      remaining.rows = sql.rows.filter((r) => r.seq > cursor);
+      const plan = planFoldStep(asSql(remaining), 4, Number.MAX_SAFE_INTEGER);
+      if (!plan) break;
+      expect(plan.lastSeq).toBeGreaterThan(cursor);
+      expect(plan.lastSeq - cursor).toBeLessThanOrEqual(4);
+      cursor = plan.lastSeq;
+      seen++;
+    }
+    expect(cursor).toBe(10); // everything planned
+    expect(seen).toBe(3); // 10 updates / 4-per-step → 4+4+2
   });
 });

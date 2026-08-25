@@ -2074,6 +2074,12 @@ fn forwardable(method: &str) -> bool {
             // an agent submitting claims is usually not sitting on it.
             | methods::SUBMIT_CLAIMS
             | methods::READ_ATTEMPT_REVIEW
+            // The visual half (§gh#421): the capture is taken in the agent's
+            // checkout and read wherever a review is open, both usually off
+            // the box — attach from the agent's shell, bytes fetched by any
+            // device a review is readable on, by id alone.
+            | methods::ATTACH_BOARD_EVIDENCE
+            | methods::READ_ATTEMPT_EVIDENCE
             // A verdict is written on a laptop and lands in two places that
             // are both on the box: GitHub — under the reviewer's own credential
             // when the box holds one (gh#369), else the board's — and the chat
@@ -2675,6 +2681,91 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
                 RpcReply::value(&review)
+            }
+            // The visual half of the review contract (§gh#421). The bytes
+            // arrive base64 in the params; everything the caller could have
+            // invented and the board can instead read is decided on the box.
+            methods::ATTACH_BOARD_EVIDENCE => {
+                use base64::Engine as _;
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                    kind: String,
+                    #[serde(default)]
+                    description: Option<String>,
+                    #[serde(default)]
+                    url: Option<String>,
+                    #[serde(default)]
+                    viewport: Option<String>,
+                    data_b64: String,
+                }
+                let p: P = parse_params(params)?;
+                let kind =
+                    comet_board::evidence::ArtifactKind::parse(&p.kind).ok_or_else(|| {
+                        RpcError::BadParams(format!(
+                            "{kind}: an artifact kind is `screenshot`, `recording`, \
+                             `accessibility`, `console` or `log`",
+                            kind = p.kind
+                        ))
+                    })?;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(p.data_b64.as_bytes())
+                    .map_err(|e| RpcError::BadParams(format!("dataB64 is not base64: {e}")))?;
+                let input = comet_board::evidence::ArtifactInput {
+                    kind,
+                    description: p.description.unwrap_or_default(),
+                    url: p.url,
+                    viewport: p.viewport,
+                };
+                let review = self
+                    .board()?
+                    .attach_evidence(&p.task_id, input, bytes)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&review)
+            }
+            // One artifact's bytes, by id (§gh#421). Chunked like an
+            // attachment read-back so a 24 MiB recording crosses the relay in
+            // pieces sized for it; resolved by id on the box, so the request
+            // carries no path to jail.
+            methods::READ_ATTEMPT_EVIDENCE => {
+                use base64::Engine as _;
+                const CHUNK_BYTES: usize = 45_000;
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    task_id: String,
+                    #[serde(default)]
+                    attempt: Option<i64>,
+                    id: String,
+                    #[serde(default)]
+                    offset: u64,
+                }
+                let p: P = parse_params(params)?;
+                let (name, mime_type, bytes) = self
+                    .board()?
+                    .read_evidence(&p.task_id, p.attempt, &p.id)
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                let start = (p.offset as usize).min(bytes.len());
+                let end = (start + CHUNK_BYTES).min(bytes.len());
+                #[derive(serde::Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Chunk<'a> {
+                    name: &'a str,
+                    mime_type: &'a str,
+                    data: String,
+                    next_offset: u64,
+                    done: bool,
+                }
+                RpcReply::value(&Chunk {
+                    name: &name,
+                    mime_type: &mime_type,
+                    data: base64::engine::general_purpose::STANDARD.encode(&bytes[start..end]),
+                    next_offset: end as u64,
+                    done: end >= bytes.len(),
+                })
             }
             // The outbound half (§gh#239): one review on GitHub, one prompt
             // into the checkout the agent is still in, the remainder on both.

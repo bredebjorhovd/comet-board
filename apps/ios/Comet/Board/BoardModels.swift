@@ -141,6 +141,10 @@ struct TaskRow: Decodable, Hashable, Identifiable {
     /// Null is uncapped. On the wire because the elapsed counter is worth
     /// nothing without it, and the routing config lives on the board's host.
     var maxDurationSecs: Int?
+    /// Why this row's live attempt stopped, when its harness could say
+    /// (gh#545). A usage limit is the one whose fix is a decision — switch
+    /// model, switch account, wait — rather than plain retry.
+    var stopReason: StopReason?
 
     enum CodingKeys: String, CodingKey {
         case id, identifier, title, state, source, url, labels, dispatchable, gone
@@ -158,6 +162,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         case dispatchedByUser = "dispatched_by_user"
         case billedTo = "billed_to"
         case maxDurationSecs = "max_duration_secs"
+        case stopReason = "stop_reason"
     }
 
     init(from decoder: Decoder) throws {
@@ -191,6 +196,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         dispatchedByUser = try c.decodeIfPresent(String.self, forKey: .dispatchedByUser)
         billedTo = try c.decodeIfPresent(String.self, forKey: .billedTo)
         maxDurationSecs = try c.decodeIfPresent(Int.self, forKey: .maxDurationSecs)
+        stopReason = try c.decodeIfPresent(StopReason.self, forKey: .stopReason)
     }
 
     /// Memberwise init for demo rows and tests (the decoder owns the wire).
@@ -205,7 +211,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
          attempts: Int = 0, reopened: Int = 0, updatedAt: String = "",
          startedAt: String? = nil, account: String? = nil,
          dispatchedByUser: String? = nil, billedTo: String? = nil,
-         maxDurationSecs: Int? = nil) {
+         maxDurationSecs: Int? = nil, stopReason: StopReason? = nil) {
         self.id = id
         self.identifier = identifier
         self.title = title
@@ -235,6 +241,7 @@ struct TaskRow: Decodable, Hashable, Identifiable {
         self.dispatchedByUser = dispatchedByUser
         self.billedTo = billedTo
         self.maxDurationSecs = maxDurationSecs
+        self.stopReason = stopReason
     }
 
     var boardState: BoardState { BoardState.parse(state) }
@@ -1294,10 +1301,35 @@ let needsAllClear = "Nothing needs you"
 /// What the slot says when nothing has been said there yet.
 let boardNoticesNoReports = "No reports yet"
 
+/// Why a stopped run stopped, when its harness could say (gh#545) — a port of
+/// `comet_proto::StopReason`. Only the kinds the phone renders are spelled;
+/// an unknown kind decodes as `.other` so a newer box cannot blank the inbox.
+struct StopReason: Decodable, Hashable {
+    /// Which company's window ran out, in the spelling a person reads —
+    /// derived from the runtime, as the Rust derivation does.
+    let kind: String
+    let window: String?
+
+    var isUsageLimit: Bool { kind == "usageLimit" }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try c.decodeIfPresent(String.self, forKey: .kind) ?? "other"
+        window = try c.decodeIfPresent(String.self, forKey: .window)
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind, window
+    }
+}
+
 /// Why a row is in the inbox — a port of `view::needs::NeedKind`.
 enum NeedKind {
     /// Somebody is waiting on your answer: a question, or a permission prompt.
     case question
+    /// The run stopped on a provider usage limit (gh#545): switch model,
+    /// switch account, or wait — not plain retry.
+    case limited
     /// A run died and is waiting on a retry.
     case deadRun
     /// The fallback chat finished a turn you have not seen.
@@ -1307,8 +1339,9 @@ enum NeedKind {
     var rank: Int {
         switch self {
         case .question: return 0
-        case .deadRun: return 1
-        case .report: return 2
+        case .limited: return 1
+        case .deadRun: return 2
+        case .report: return 3
         }
     }
 
@@ -1317,6 +1350,7 @@ enum NeedKind {
     var glyph: String {
         switch self {
         case .question: return "▲"
+        case .limited: return "◷"
         case .deadRun: return "✕"
         case .report: return "✓"
         }
@@ -1326,6 +1360,7 @@ enum NeedKind {
     var fallback: String {
         switch self {
         case .question: return "waiting on your answer"
+        case .limited: return "hit its usage limit — switch model, switch account, or wait"
         case .deadRun: return "its run died — open to retry"
         case .report: return "finished a turn you haven't seen"
         }
@@ -1374,6 +1409,38 @@ func needsYou(fallback: String?, rows: [TaskRow], chats: [Chat],
         let preview = singleLine(chat.lastMessagePreview)
         return preview.isEmpty ? kind.fallback : preview
     }
+    // gh#545: which company's usage window this runtime spends. None for
+    // anything unrecognised — "usage limit" alone is still true, and a wrong
+    // name would be worse than none.
+    func providerLabel(_ runtime: String?) -> String? {
+        switch runtime ?? "" {
+        case "claude-code", "claude": return "Claude"
+        case "codex", "openai-codex": return "Codex"
+        case "opencode": return "OpenCode"
+        case "cursor": return "Cursor"
+        default: return nil
+        }
+    }
+    // The one line a usage-limited row gets, built from what the board knows
+    // instead of quoting the transcript: `Claude 5-hour limit on
+    // brede@tally.no — switch model, switch account, or wait`.
+    func limitedLine(_ row: TaskRow) -> String {
+        let stop = row.stopReason.flatMap { $0.isUsageLimit ? $0 : nil }
+        let provider = providerLabel(row.runtime)
+        let window = stop.flatMap { $0.window }
+        let subject: String
+        switch (provider, window) {
+        case (.some(let p), .some(let w)): subject = "\(p) \(w) limit"
+        case (.some(let p), nil): subject = "\(p) usage limit"
+        case (nil, .some(let w)): subject = "\(w) usage limit"
+        case (nil, nil): subject = "usage limit"
+        }
+        if let billed = row.billedTo?.trimmingCharacters(in: .whitespaces),
+           !billed.isEmpty {
+            return "\(subject) on \(billed) — switch model, switch account, or wait"
+        }
+        return "\(subject) — switch model, switch account, or wait"
+    }
 
     // The fallback chat, by every door: question, dead run, unseen report.
     if let pin = fallback, let chat = chats.first(where: { $0.id == pin }) {
@@ -1402,8 +1469,8 @@ func needsYou(fallback: String?, rows: [TaskRow], chats: [Chat],
         let session = sessions[chatId]
         let kind: NeedKind
         switch agentState(row: row.boardState, session: session, now: nowMillis) {
-        case .blocked: kind = .question
-        case .errored: kind = .deadRun
+        case .blocked: kind = row.stopReason?.isUsageLimit == true ? .limited : .question
+        case .errored: kind = row.stopReason?.isUsageLimit == true ? .limited : .deadRun
         case .working: continue
         }
         // When the live session drove the verdict, its last transition is when
@@ -1412,8 +1479,9 @@ func needsYou(fallback: String?, rows: [TaskRow], chats: [Chat],
         let since: Date? = (live != nil && live != .idle)
             ? date(session?.updatedAt)
             : row.startedAtDate
+        let what = kind == .limited ? limitedLine(row) : whatLine(chat, kind)
         out.append(NeedRow(chatId: chatId, spaceId: chat.spaceId,
-                           who: row.identifier, slug: row.slug, what: whatLine(chat, kind),
+                           who: row.identifier, slug: row.slug, what: what,
                            kind: kind, since: since))
     }
 

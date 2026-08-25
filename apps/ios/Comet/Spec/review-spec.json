@@ -438,6 +438,7 @@
           "failed": 6,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
         "sandbox": null,
@@ -551,6 +552,7 @@
           "failed": 4,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": "failed",
         "pr_url": null,
         "sandbox": null,
@@ -651,6 +653,7 @@
           "failed": 0,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
         "sandbox": null,
@@ -752,6 +755,7 @@
           "failed": 0,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
         "sandbox": null,
@@ -842,6 +846,7 @@
           "failed": 0,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
         "sandbox": null,
@@ -1043,6 +1048,7 @@
           "failed": 5,
           "truncated": true
         },
+        "evidence_artifacts": [],
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
         "sandbox": null,
@@ -1146,6 +1152,7 @@
           "failed": 0,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
         "sandbox": null,
@@ -1238,6 +1245,7 @@
           "failed": 0,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": null,
         "pr_url": "https://github.com/o/r/pull/191",
         "sandbox": null,
@@ -1419,6 +1427,7 @@
           "failed": 0,
           "truncated": false
         },
+        "evidence_artifacts": [],
         "outcome": "done",
         "pr_url": "https://github.com/o/r/pull/9",
         "sandbox": null,

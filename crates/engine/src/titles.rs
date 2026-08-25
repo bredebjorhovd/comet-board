@@ -274,7 +274,7 @@ async fn collect_text(
     while let Some(event) = stream.next().await {
         match event? {
             AgentEvent::TextDelta { text: delta } => text.push_str(&delta),
-            AgentEvent::Error { message } => {
+            AgentEvent::Error { message, .. } => {
                 return Err(EngineError::Other(format!("titling run error: {message}")));
             }
             AgentEvent::Done { status, error, .. } => {

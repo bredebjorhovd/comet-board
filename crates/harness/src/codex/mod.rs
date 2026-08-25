@@ -1077,6 +1077,7 @@ async fn run_session(session: Session) {
                                 );
                                 let reported = AgentEvent::Error {
                                     message: message.clone(),
+                                    stop: None,
                                 };
                                 if !send(&event_tx, reported).await {
                                     break 'main;
@@ -1232,7 +1233,7 @@ async fn run_session(session: Session) {
                             .and_then(Value::as_str)
                             .unwrap_or("Codex error")
                             .to_owned();
-                        if !send(&event_tx, AgentEvent::Error { message }).await {
+                        if !send(&event_tx, AgentEvent::Error { message, stop: None }).await {
                             break 'main;
                         }
                     }
@@ -1443,6 +1444,7 @@ async fn steer_as_new_turn(
                 event_tx,
                 AgentEvent::Error {
                     message: format!("Steering failed: {e}"),
+                    stop: None,
                 },
             )
             .await;

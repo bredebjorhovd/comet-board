@@ -1704,6 +1704,9 @@ impl Shell {
         use needs_view::NeedKind;
         let accent = match need.kind {
             NeedKind::Question => theme.accent,
+            // gh#545: a usage limit is a decision to make, not a death —
+            // the working hue, not the danger one.
+            NeedKind::Limited => theme.warning,
             NeedKind::DeadRun => theme.danger,
             NeedKind::Report => status_dot_color(ChatIndicator::Completed, theme),
         };

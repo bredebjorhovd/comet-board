@@ -4,8 +4,8 @@
 use std::collections::{HashMap, HashSet};
 
 use comet_proto::{
-    AgentEvent, AgentKind, AgentTokenUsage, DoneStatus, HarnessId, ModelTokenUsage, TodoItem,
-    ToolCall,
+    AgentEvent, AgentKind, AgentTokenUsage, DoneStatus, HarnessId, ModelTokenUsage, StopReason,
+    TodoItem, ToolCall,
 };
 use serde_json::Value;
 
@@ -28,6 +28,28 @@ fn assistant_error_text(code: &str) -> String {
         "max_output_tokens" => "The reply hit the maximum output length.".into(),
         "unknown" => "Claude returned an unspecified error.".into(),
         other => format!("Claude error: {other}"),
+    }
+}
+
+/// Which of the CLI's assistant-level error codes is a *hard stop* (gh#545),
+/// and what the board should call it.
+///
+/// A hard-stop code means the API step produced nothing and the turn cannot
+/// go on — the class of failure whose transcript text used to be all there
+/// was, and which the board then flattened into one dead-run sentence. The
+/// classification rides the [`AgentEvent::Error`] itself so a reader can route
+/// on it without parsing that sentence. `max_output_tokens` is deliberately
+/// absent: its reply exists (up to the cap), so the turn did produce content
+/// and must keep reading as a normal end.
+fn hard_stop(code: &str) -> Option<StopReason> {
+    match code {
+        "rate_limit" => Some(StopReason::UsageLimit { window: None }),
+        "billing_error" => Some(StopReason::Billing),
+        "authentication_failed" | "oauth_org_not_allowed" => Some(StopReason::Auth),
+        "overloaded" => Some(StopReason::Overloaded),
+        "server_error" => Some(StopReason::Server),
+        "invalid_request" | "model_not_found" | "unknown" => Some(StopReason::Other),
+        _ => None,
     }
 }
 
@@ -232,6 +254,14 @@ pub(crate) struct Normalizer {
     /// assistant frames carry only the id, so the launch frame is where the
     /// human name has to be remembered.
     subagents: HashMap<String, Option<String>>,
+    /// A hard stop seen since the last real content (gh#545). The CLI's
+    /// failed turns usually end with a `result` that still says `success` —
+    /// the stream completed, the turn did not — so the stop is held here and
+    /// folded into the run's `Done`, which is what flips a usage-limited
+    /// turn from reading as a clean end to reading as the error it was.
+    /// Cleared by any later assistant content (the CLI retried and got
+    /// through) and by every `Done`.
+    pending_stop: Option<StopReason>,
 }
 
 impl Normalizer {
@@ -243,6 +273,7 @@ impl Normalizer {
             commands_seen: 0,
             usage_messages: HashSet::new(),
             subagents: HashMap::new(),
+            pending_stop: None,
         }
     }
 
@@ -293,6 +324,9 @@ impl Normalizer {
                 }
                 self.saw_init = true;
                 self.session_id = Some(f.session_id.clone());
+                // A new run: any stop a previous turn ended on says nothing
+                // about this one.
+                self.pending_stop = None;
                 vec![AgentEvent::SessionStarted {
                     harness: HarnessId::ClaudeCode,
                     model: f.model,
@@ -386,6 +420,9 @@ impl Normalizer {
                     return attributed.into_iter().chain(steps).collect();
                 }
                 let mut out: Vec<AgentEvent> = attributed.into_iter().collect();
+                // Any block — streamed text included — is the model having
+                // gotten through, which is what clears a held stop below.
+                let content = f.message.blocks().next().is_some();
                 for block in f
                     .message
                     .blocks()
@@ -400,11 +437,24 @@ impl Normalizer {
                 }
                 // A failed turn (usage limit, billing, auth, overloaded, …)
                 // carries a terse `error` code here — often with empty content
-                // and no `result` error — so surface it visibly.
-                if let Some(code) = &f.error {
-                    out.push(AgentEvent::Error {
-                        message: assistant_error_text(code),
-                    });
+                // and no `result` error — so surface it visibly, classified
+                // for the board (gh#545). The classification is also *held*:
+                // the result frame usually still says success, and it must
+                // not get the last word on how this run ended.
+                match &f.error {
+                    Some(code) => {
+                        let stop = hard_stop(code);
+                        out.push(AgentEvent::Error {
+                            message: assistant_error_text(code),
+                            stop,
+                        });
+                        self.pending_stop = hard_stop(code);
+                    }
+                    // Content after a held stop is the CLI's own retry having
+                    // gotten through — the run recovered, so the stop no
+                    // longer describes its ending.
+                    None if content => self.pending_stop = None,
+                    None => {}
                 }
                 // The enclosing assistant frame closes the streamed message
                 // item; rotate so post-boundary deltas get a fresh id.
@@ -456,17 +506,23 @@ impl Normalizer {
             }
 
             // A claude.ai plan window was hit. A hard `rejected` blocks the
-            // turn — make it visible; allowed/allowed_warning stay quiet.
+            // turn — make it visible, classified, and held for the result
+            // frame (gh#545); allowed/allowed_warning stay quiet.
             Frame::RateLimit(f) => {
                 if f.rate_limit_info.status != "rejected" {
                     return Vec::new();
                 }
                 let window =
                     rate_window_label(f.rate_limit_info.rate_limit_type.as_deref().unwrap_or(""));
+                let stop = StopReason::UsageLimit {
+                    window: Some(window.into()),
+                };
+                self.pending_stop = Some(stop.clone());
                 vec![AgentEvent::Error {
                     message: format!(
                         "Claude {window} limit reached — the turn was blocked. Try again after it resets."
                     ),
+                    stop: Some(stop),
                 }]
             }
 
@@ -489,9 +545,20 @@ impl Normalizer {
                         .collect(),
                 });
                 let done = if f.subtype == "success" {
+                    // gh#545: the result frame's `success` means the *stream*
+                    // completed. When a hard stop was held since the last
+                    // real content, the turn itself failed — the CLI just
+                    // does not say so — and the run must end the way the
+                    // board can see it: `Errored`, not a clean end that
+                    // leaves the attempt reading idle. The error text stays
+                    // off the Done; the Error event already put it in the
+                    // transcript, and a second box would say it twice.
+                    let stopped = !interrupted && self.pending_stop.take().is_some();
                     AgentEvent::Done {
                         status: if interrupted {
                             DoneStatus::Interrupted
+                        } else if stopped {
+                            DoneStatus::Errored
                         } else {
                             DoneStatus::Completed
                         },
@@ -549,6 +616,9 @@ impl Normalizer {
                         session_id: f.session_id,
                     }
                 };
+                // The turn is over either way; a held stop must not outlive
+                // it into the next one.
+                self.pending_stop = None;
                 model_usage.into_iter().chain([usage, done]).collect()
             }
 
@@ -956,6 +1026,206 @@ mod tests {
                 );
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    // ---- classified hard stops (gh#545) -----------------------------------
+
+    const RATE_LIMITED_TURN: &[&str] = &[
+        // The failed step: an assistant frame with a terse error code, no
+        // content, and — this is the trap — a `result` that still says
+        // `success` afterwards.
+        r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-5","content":[]},"error":"rate_limit"}"#,
+        r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":0}}"#,
+    ];
+
+    fn normalize_all(raws: &[&str], interrupted: bool) -> Vec<AgentEvent> {
+        let mut n = Normalizer::new();
+        let mut out = Vec::new();
+        for raw in raws {
+            let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
+            out.extend(n.normalize(frame, interrupted));
+        }
+        out
+    }
+
+    /// The shape gh#545 is about: the turn ends `success` after the error
+    /// frame. The transcript keeps its one error box (classified for the
+    /// board), and the run ends **Errored** — never a clean end that leaves
+    /// a usage-limited attempt reading idle.
+    #[test]
+    fn a_rate_limited_turn_does_not_end_clean() {
+        let events = normalize_all(RATE_LIMITED_TURN, false);
+        let error = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::Error { .. }))
+            .expect("the failure is surfaced");
+        assert!(
+            matches!(
+                error,
+                AgentEvent::Error {
+                    stop: Some(StopReason::UsageLimit { window: None }),
+                    ..
+                }
+            ),
+            "classified as a usage limit: {error:?}"
+        );
+        match events.last().expect("done") {
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            } => {}
+            other => panic!("a limited run must end errored: {other:?}"),
+        }
+    }
+
+    /// The CLI's own retry getting through clears the held stop: content
+    /// after the error means the run recovered, and it ends clean.
+    #[test]
+    fn a_recovered_step_clears_the_held_stop() {
+        let events = normalize_all(
+            &[
+                RATE_LIMITED_TURN[0],
+                r#"{"type":"assistant","message":{"id":"msg-2","model":"claude-opus-5","content":[{"type":"text","text":"back online"}]}}"#,
+                r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":1}}"#,
+            ],
+            false,
+        );
+        // (The recovered step's own content streams via deltas and usage, not
+        // as a parent TextDelta — what matters here is how the run *ended*.)
+        match events.last().expect("done") {
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            } => {}
+            other => panic!("a recovered run ends completed: {other:?}"),
+        }
+    }
+
+    /// A hard `rate_limit_event` names the window; the classification keeps
+    /// it, so the board can say *which* wall was hit.
+    #[test]
+    fn a_rejected_plan_window_is_classified_with_its_window() {
+        let events = normalize_all(
+            &[
+                r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","rateLimitType":"five_hour"}}"#,
+                r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":0}}"#,
+            ],
+            false,
+        );
+        assert!(matches!(
+            events
+                .iter()
+                .find(|e| matches!(e, AgentEvent::Error { .. }))
+                .expect("surfaced"),
+            AgentEvent::Error {
+                stop: Some(StopReason::UsageLimit {
+                    window: Some(w)
+                }),
+                ..
+            } if w == "5-hour"
+        ));
+        match events.last().expect("done") {
+            AgentEvent::Done {
+                status: DoneStatus::Errored,
+                ..
+            } => {}
+            other => panic!("a blocked window must end the run errored: {other:?}"),
+        }
+    }
+
+    /// An interrupt is still an interrupt: the human chose to stop, and the
+    /// board's Interrupted handling outranks a stop that happened to precede
+    /// it.
+    #[test]
+    fn an_interrupted_run_stays_interrupted_even_after_a_hard_stop() {
+        let events = normalize_all(RATE_LIMITED_TURN, true);
+        match events.last().expect("done") {
+            AgentEvent::Done {
+                status: DoneStatus::Interrupted,
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A reply capped at its output limit produced content — the turn worked.
+    /// It is not a hard stop, and must not flip a success end.
+    #[test]
+    fn max_output_tokens_is_not_a_hard_stop() {
+        let events = normalize_all(
+            &[
+                r#"{"type":"assistant","message":{"id":"msg-1","model":"claude-opus-5","content":[{"type":"text","text":"half a repl"}]},"error":"max_output_tokens"}"#,
+                r#"{"type":"result","subtype":"success","usage":{"input_tokens":1,"output_tokens":64}}"#,
+            ],
+            false,
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Error { .. })),
+            "still surfaced in the transcript"
+        );
+        match events.last().expect("done") {
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            } => {}
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Other recognised causes classify too, each into the kind that names
+    /// what a reader must fix.
+    #[test]
+    fn billing_and_auth_stops_classify_as_themselves() {
+        for (code, expected) in [
+            ("billing_error", StopReason::Billing),
+            ("authentication_failed", StopReason::Auth),
+            ("overloaded", StopReason::Overloaded),
+            ("server_error", StopReason::Server),
+            ("model_not_found", StopReason::Other),
+        ] {
+            let raw = format!(
+                r#"{{"type":"assistant","message":{{"id":"m","model":"claude-opus-5","content":[]}},"error":"{code}"}}"#,
+            );
+            let frame = crate::claude::wire::parse_frame(&raw).unwrap();
+            let events = Normalizer::new().normalize(frame, false);
+            // First, before the frame-closing rotation event.
+            assert_eq!(
+                events.first(),
+                Some(&AgentEvent::Error {
+                    message: assistant_error_text(code),
+                    stop: Some(expected),
+                }),
+                "{code}"
+            );
+        }
+    }
+
+    /// A later clean turn supersedes the previous one's stop: the normalizer
+    /// is per-session, not per-run, so a held stop must not leak across runs.
+    #[test]
+    fn a_held_stop_does_not_leak_into_the_next_run() {
+        let mut n = Normalizer::new();
+        let feed = |n: &mut Normalizer, raw: &str| {
+            let frame = crate::claude::wire::parse_frame(raw).unwrap();
+            n.normalize(frame, false)
+        };
+        feed(&mut n, RATE_LIMITED_TURN[0]);
+        feed(&mut n, RATE_LIMITED_TURN[1]);
+        // Next run, clean end.
+        let events = feed(
+            &mut n,
+            r#"{"type":"result","subtype":"success","session_id":"s2"}"#,
+        );
+        match events.last().expect("done") {
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                session_id: Some(s),
+                ..
+            } => assert_eq!(s, "s2"),
+            other => panic!("{other:?}"),
         }
     }
 }

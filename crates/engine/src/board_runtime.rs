@@ -673,6 +673,12 @@ impl Runtime for CometRuntime {
         })
     }
 
+    /// Why that run stopped, off the same journal (gh#545). See
+    /// [`RunJournal::last_stop`] for the fold.
+    fn last_stop(&self, chat_id: &str) -> anyhow::Result<Option<comet_proto::StopReason>> {
+        Ok(self.journal.last_stop(chat_id)?)
+    }
+
     /// The chat's tokens, off the same journal `last_run_end` reads (gh#151).
     /// The board calls this on every reconcile of a live attempt, so the scan
     /// filters lines by tag before parsing them — see [`RunJournal::tokens`].
