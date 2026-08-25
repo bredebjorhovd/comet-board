@@ -276,14 +276,15 @@ pub fn active_placements<'a>(
         .collect()
 }
 
-/// Whether the selected Space's disclosure is structurally required to stay
-/// open because it owns the visible Orchestrator row.
+/// The title of the group that holds live runs no space claims (gh#547).
 ///
-/// This is shared by rendering and the chevron action so persisted collapsed
-/// state cannot briefly move the Orchestrator outside its Space or hide it.
-pub fn space_disclosure_forced_open(selected: bool, has_orchestrator: bool) -> bool {
-    selected && has_orchestrator
-}
+/// The desktop's Spaces section is where a live run lives — its own space's
+/// disclosure when the chat names one, this group when it does not — and the
+/// group's old name, `Active`, was the whole list's name from gh#123 worn by a
+/// remainder: a header that promised "everything alive" over rows that were
+/// only the ones nothing had filed. `Unfiled` says what the rows have in
+/// common instead of what they are not missing.
+pub const UNFILED_TITLE: &str = "Unfiled";
 
 /// The live chats a space's disclosure draws, in the order Active derived them
 /// (needs-you first, then working).
@@ -304,9 +305,12 @@ pub fn space_live<'a>(space_id: &str, active: &[(&'a str, Option<&'a str>)]) -> 
 /// or [`active_placements`] normalized a dangling reference to `None` while
 /// the independent Space watch catches up.
 ///
-/// These are the only rows that still need a group of their own, and it sits
-/// BELOW the spaces tree: a live run must always have a row somewhere, and the
-/// hierarchy the tree states is not the thing that should give way for it.
+/// These are the only live rows that need a group of their own, and since
+/// gh#547 that group is the tail of the Spaces section itself (under
+/// [`UNFILED_TITLE`]) rather than a section beside it: a run with no space is
+/// the same kind of thing as a run with one, and one section owns them both.
+/// A live run must always have a row somewhere; this group is what keeps that
+/// promise when no disclosure can.
 pub fn homeless_live<'a>(active: &[(&'a str, Option<&'a str>)]) -> Vec<&'a str> {
     active
         .iter()
@@ -655,13 +659,6 @@ mod tests {
 
         assert_eq!(placements, [("dangling", None)]);
         assert_eq!(homeless_live(&placements), ["dangling"]);
-    }
-
-    #[test]
-    fn a_selected_space_with_an_orchestrator_stays_disclosed() {
-        assert!(space_disclosure_forced_open(true, true));
-        assert!(!space_disclosure_forced_open(true, false));
-        assert!(!space_disclosure_forced_open(false, true));
     }
 
     #[test]
