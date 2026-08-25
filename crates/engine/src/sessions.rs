@@ -1789,6 +1789,7 @@ async fn drive_run(
                 &chat_id,
                 &AgentEvent::Error {
                     message: message.clone(),
+                    stop: None,
                 },
             );
             inner.publish(
@@ -2123,6 +2124,7 @@ async fn drive_run(
                         // aborted-looking entry with no explanation in it.
                         let _ = engine_tx.send(AgentEvent::Error {
                             message: message.clone(),
+                            stop: None,
                         });
                         let _ = engine_tx.send(AgentEvent::Done {
                             status: DoneStatus::Errored,

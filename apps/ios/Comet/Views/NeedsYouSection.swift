@@ -90,10 +90,13 @@ struct NeedRowView: View {
     /// Said in the ramp's vocabulary rather than by naming hues (gh#173): a
     /// question wants your eyes on a healthy run, a dead run is blocked, and a
     /// report is settled. The desktop's `render_need_row` splits them the same
-    /// way and lands on the same three colours.
+    /// way and lands on the same three colours — and since gh#545 a usage
+    /// limit rides the working hue too: it is a decision on a live attempt,
+    /// not a corpse.
     private var accent: Color {
         switch need.kind {
         case .question: return Theme.status(.review)
+        case .limited: return Theme.status(.working)
         case .deadRun: return Theme.status(.blocked)
         case .report: return Theme.status(.settled)
         }

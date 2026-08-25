@@ -154,6 +154,11 @@ pub fn task_row(
         // attempt is exactly the one whose provenance a reviewer asks about.
         automation: live.or(last).and_then(|a| a.automation.clone()),
         automation_owner: live.or(last).and_then(|a| a.automation_owner.clone()),
+        // Why the live attempt stopped, when a harness classified the stop
+        // (gh#545). Live only, on `context`'s precedent: it is a fact about a
+        // run somebody can still act on, and a closed attempt's last stop is
+        // its outcome's business, not the row's furniture.
+        stop_reason: live.and_then(|a| a.stop_reason.clone()),
     };
     // The verdict, from the row that was just built — one implementation of the
     // AND across a stack, shared with both viewports (gh#283). Every reader of

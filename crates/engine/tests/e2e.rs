@@ -476,6 +476,7 @@ async fn bare_error_with_no_done_finalizes_the_segment() {
                 },
                 AgentEvent::Error {
                     message: "serve died mid-turn".into(),
+                    stop: None,
                 },
             ],
             step_delay: Duration::from_millis(5),

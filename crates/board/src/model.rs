@@ -549,6 +549,16 @@ pub struct Attempt {
     /// transition only, which is what lets the upstream notice be one comment
     /// per block rather than one per attempt or one every thirty seconds.
     pub blocked_count: i64,
+    /// Why the run stopped, when its harness classified the stop (gh#545).
+    ///
+    /// The fact gh#71's block notice used to throw away: a usage limit, a
+    /// billing failure and an expired login all arrived as the same dead-run
+    /// sentence pointing at retry — the one verb that fails again on a
+    /// limit. Set when the attempt enters blocked (with the window named,
+    /// for a usage limit the harness clocked), cleared the moment a run
+    /// starts again. `None` is nothing classified: an asking agent, an
+    /// unclassified error, and every attempt from before this existed.
+    pub stop_reason: Option<comet_proto::StopReason>,
     /// When the board told this attempt's chat it had run past its route's
     /// `max_duration` (gh#70). `None` is "not warned" — every attempt gets one
     /// warning and a grace period before the cap closes it, so this is also
@@ -806,6 +816,7 @@ pub(crate) mod tests {
             nudges: 0,
             nudged_at: None,
             blocked_count: 0,
+            stop_reason: None,
             overrun_warned_at: None,
             collectable_at: None,
             collected_at: None,

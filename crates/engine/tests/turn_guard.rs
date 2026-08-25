@@ -228,7 +228,7 @@ async fn a_looping_dispatch_is_warned_once_and_then_stopped() {
     assert!(
         events.iter().any(|(_, e)| matches!(
             e,
-            AgentEvent::Error { message }
+            AgentEvent::Error { message, .. }
                 if message.contains("`exec cargo test -p widget` has failed 6 times in a row")
         )),
         "the transcript says why it stopped"

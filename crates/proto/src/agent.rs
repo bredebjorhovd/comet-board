@@ -578,6 +578,58 @@ impl ContextUsage {
     }
 }
 
+/// Why a run stopped, when the harness could say (gh#545).
+///
+/// The transcript error text is for a person reading the chat; this is the same
+/// fact in a shape the board can route on. It rides [`AgentEvent::Error`] —
+/// the event that already names the reason in words — so a usage-limited turn
+/// can be told apart from a crashed one without anybody parsing prose. `None`
+/// on an error the harness did not classify is "a dead run of unknown cause",
+/// which is exactly what the board called all of them before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum StopReason {
+    /// A provider usage window ran out — gh#529's five-hour wall, a weekly
+    /// cap, overage. The work is intact and the fix is a *decision*: switch
+    /// model, switch account, or wait for the reset.
+    UsageLimit {
+        /// Which window, in the harness's own words (`"5-hour"`, `"weekly"`,
+        /// `"weekly (Opus)"`). `None` when the harness named no window —
+        /// still a limit, just one nobody clocked.
+        #[serde(default)]
+        window: Option<String>,
+    },
+    /// Payment: billing error, credit balance, plan problem. Retry changes
+    /// nothing until the money question is answered.
+    Billing,
+    /// Login expired or was revoked. Re-authenticate, then retry.
+    Auth,
+    /// The provider said it is overloaded — transient by its own account.
+    Overloaded,
+    /// The provider had a server error — transient by its own account.
+    Server,
+    /// Any other hard stop the harness recognised but does not classify.
+    Other,
+}
+
+impl StopReason {
+    /// Is this a provider usage-window exhaustion? The one stop whose right
+    /// answer is not "retry or cancel" (gh#545): retrying as-is fails again,
+    /// and the moves that work — another model, another account, waiting —
+    /// are the ones the board has to offer.
+    pub fn is_usage_limit(&self) -> bool {
+        matches!(self, StopReason::UsageLimit { .. })
+    }
+
+    /// Which usage window, when the harness named one.
+    pub fn window(&self) -> Option<&str> {
+        match self {
+            StopReason::UsageLimit { window } => window.as_deref(),
+            _ => None,
+        }
+    }
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors comet's `AgentEvent` tagged enum.
@@ -667,8 +719,15 @@ pub enum AgentEvent {
     /// A reader that wants it can tag-filter one line out of a journal that is
     /// otherwise megabytes of text deltas.
     Sandbox(SandboxReport),
+    /// An error the run surfaced. `message` is the human sentence the
+    /// transcript renders; `stop` is the same stop classified for the board
+    /// (gh#545) — `None` when the harness did not recognise the cause, which
+    /// is every error before gh#545 and every harness that has not learned
+    /// its codes.
     Error {
         message: String,
+        #[serde(default)]
+        stop: Option<StopReason>,
     },
     #[serde(rename_all = "camelCase")]
     InputRequested {
