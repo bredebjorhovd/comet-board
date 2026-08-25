@@ -89,7 +89,13 @@ import {
 import { AlarmArmer } from "./alarm";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { createMetaStore, type MetaStore } from "./meta";
-import { appendUpdateRow, ensureUpdateLog, readUpdateRows } from "./update-log";
+import {
+  appendUpdateRow,
+  ensureUpdateLog,
+  planFoldStep,
+  readUpdateRows,
+  readUpdatesThrough
+} from "./update-log";
 import {
   YOUNG_SOCKET_MS,
   createSocketLedger,
@@ -181,6 +187,14 @@ const DOC_IDLE_RELEASE_MS = 60_000;
  * recorded today) would have kept re-materializing their full history into
  * the pressed wasm heap for three more days of thrash. */
 const TRIM_FORCE_BYTES = 512 * 1024;
+/** Fold steps one invocation may run back to back (gh#611). The stepped fold
+ * commits each batch, so this bounds only HOW MUCH one event spends compacting
+ * — a log bigger than the bound walks down across later flushes and alarms
+ * instead of any single invocation paying for the whole backlog. 8 steps ×
+ * FOLD_STEP_BYTES is ~4MB of log movement per event, far past what a healthy
+ * room needs per flush, and bounded enough that an alarm folding a backlog
+ * still leaves budget for its own checkpoint/trim/backup work. */
+const FOLD_MAX_STEPS_PER_CALL = 8;
 /** Import penalty box (see `importPenalty`): consecutive failed %LOR imports
  * before a device's pushes are short-circuited, and for how long. */
 const IMPORT_PENALTY_STRIKES = 3;
@@ -667,6 +681,18 @@ export class SessionRoom implements DurableObject {
     string,
     { ok: number; rejected: number; lastOkAt: number; lastRejectAt: number }
   >();
+  /** Per-device JOIN outcomes (in-memory, same reasoning). gh#611: the ws4
+   * room was losing ~47 sockets an hour inside 30s while reporting healthy,
+   * with nothing saying whether those sockets had been ANSWERED — a JoinError
+   * we sent (our fault, named) and a 1005/1006 that never got one (transport
+   * or instance death) are different incidents wearing the same census row.
+   * Read beside `sockets.diedYoungLastHour`: refusals climbing with the churn
+   * means the room is ending its own sessions; a clean `ok` count beside the
+   * churn points at the wire or the runtime instead. */
+  private readonly joinOutcomes = new Map<
+    string,
+    { ok: number; refused: number; failed: number; lastOkAt: number; lastProblemAt: number }
+  >();
   /** Idle-doc release bookkeeping (see DOC_IDLE_RELEASE_MS / touchDoc). */
   private docIdleTimer: ReturnType<typeof setTimeout> | undefined;
   private lastDocUse = 0;
@@ -816,6 +842,14 @@ export class SessionRoom implements DurableObject {
           // READ — the alternative is silence, and the give-up window is
           // precisely the window with nobody connected to notice. `gaveUpAt`
           // is when it FIRST gave up; `limit` is the budget it exhausted.
+          //
+          // gh#611: `consecutiveFailures` alone could climb with nothing
+          // beside it saying WHY — the 2026-08-25 room sat at 8 of 24 with no
+          // last-error anywhere, undiagnosable from outside the isolate. Now:
+          // `lastError` is what the catch saw; `lastAttempt` is stamped
+          // BEFORE the work runs, so a failure count that climbs while
+          // `lastError` stays null names the failure class that has no catch
+          // block — a CPU/duration kill mid-replay or mid-export.
           alarm: {
             consecutiveFailures: Number(this.getMeta("alarmFailures") ?? "0"),
             gaveUp: Boolean(this.getMeta("alarmGaveUpAt")),
@@ -825,7 +859,9 @@ export class SessionRoom implements DurableObject {
             // (gh#554) — these do NOT spend the budget above, because the guard
             // is reseeding the room the alarm would otherwise give up on.
             refusals: Number(this.getMeta("alarmRefusals") ?? "0"),
-            refusalBudget: ALARM_REFUSAL_BUDGET
+            refusalBudget: ALARM_REFUSAL_BUDGET,
+            lastAttempt: this.readJsonMeta("lastAlarmAttempt"),
+            lastError: this.readJsonMeta("lastAlarmError")
           },
           // Non-zero while a cold replay is in flight or has been dying — the
           // wedge signature ensureDoc's automated reset watches for.
@@ -833,6 +869,11 @@ export class SessionRoom implements DurableObject {
           // Per-device %LOR attribution (in-memory: since this instance woke).
           importPenalty: [...this.importPenalty].map(([device, e]) => ({ device, ...e })),
           pushOutcomes: [...this.pushOutcomes].map(([device, e]) => ({ device, ...e })),
+          // Per-device join answers (gh#611) — read beside `sockets` below:
+          // refusals/failures climbing with `diedYoungLastHour` says the room
+          // is ending its own sessions and names the last answer it gave;
+          // clean oks beside the churn point at the wire or the runtime.
+          joinOutcomes: [...this.joinOutcomes].map(([device, e]) => ({ device, ...e })),
           // WHY SOCKETS DIED (gh#527). Durable, unlike everything above it that
           // is scoped to this instance — which is the point: the deaths worth
           // reading about are the ones that took an instance with them.
@@ -1125,6 +1166,9 @@ export class SessionRoom implements DurableObject {
           e.message
         );
         if (decoded.type === MessageType.JoinRequest) {
+          // Attributed (gh#611): a young-socket churn made of THESE is the
+          // room ending its own sessions, not the network.
+          this.noteJoin(state?.deviceId, "refused");
           this.send(ws, {
             type: MessageType.JoinError,
             crdt: decoded.crdt,
@@ -1149,6 +1193,9 @@ export class SessionRoom implements DurableObject {
         String(e)
       );
       if (decoded.type === MessageType.JoinRequest) {
+        // A join that died pre-answer is the young-socket shape with no
+        // explanation — record it as one (gh#611).
+        this.noteJoin(state?.deviceId, "failed");
         this.send(ws, {
           type: MessageType.JoinError,
           crdt: decoded.crdt,
@@ -1455,6 +1502,7 @@ export class SessionRoom implements DurableObject {
           permission: "write",
           version: vv.encode()
         });
+        this.noteJoin(state.deviceId, "ok");
       } finally {
         freeWasm(vv, "join-version-vv");
       }
@@ -1555,6 +1603,7 @@ export class SessionRoom implements DurableObject {
         permission: "write",
         version: new Uint8Array()
       });
+      this.noteJoin(state.deviceId, "ok");
       // Recompute BEFORE answering rather than replaying whatever the store
       // happens to still hold: the ephemeral store's 30s TTL has forgotten
       // every entry if the room has been quiet, which is now the normal state.
@@ -1606,6 +1655,29 @@ export class SessionRoom implements DurableObject {
       entry.lastRejectAt = now;
     }
     this.pushOutcomes.set(deviceId, entry);
+  }
+
+  /** Per-device join-outcome bookkeeping for /stats (see `joinOutcomes`).
+   * `outcome` is `"ok"` for a JoinResponseOk, `"refused"` for a
+   * DocLoadRefused-shaped answer, `"failed"` for a handler that died before
+   * any answer. */
+  private noteJoin(
+    deviceId: string | undefined,
+    outcome: "ok" | "refused" | "failed",
+    now = Date.now()
+  ): void {
+    if (!deviceId) return;
+    const entry =
+      this.joinOutcomes.get(deviceId) ?? { ok: 0, refused: 0, failed: 0, lastOkAt: 0, lastProblemAt: 0 };
+    if (outcome === "ok") {
+      entry.ok++;
+      entry.lastOkAt = now;
+    } else {
+      if (outcome === "refused") entry.refused++;
+      else entry.failed++;
+      entry.lastProblemAt = now;
+    }
+    this.joinOutcomes.set(deviceId, entry);
   }
 
   private async applyUpdates(
@@ -2456,15 +2528,34 @@ export class SessionRoom implements DurableObject {
    * trim when one is due — waiting for the DAILY alarm meant a heap-pressed
    * colo (2026-08-04 wasm exhaustion) kept thrash-cycling for up to a day
    * after the retention fix deployed; a high-churn room folds every ~400
-   * rows, so trimming here converges in minutes instead. Falls back to the
-   * lossless full snapshot when no trim is due (or the trim export fails).
+   * rows, so trimming here converges in minutes instead.
+   *
+   * When no trim is due, the lossless fold runs in STEPS (gh#611). The old
+   * fold was all-or-nothing: replay every row, export one full snapshot,
+   * delete everything — and if any part of that crossed the CPU/memory line
+   * on a room big enough to need it (ws4 sat at ~2.1MB of log against exactly
+   * this decision), nothing landed and the identical attempt rode every later
+   * flush forever. Now each step moves a bounded batch — import it into the
+   * live doc, export, put, delete exactly those seqs, decrement the byte
+   * count, sync — and the sync is what makes progress durable: a step that
+   * lands shrinks the room even if a later one dies mid-invocation, and the
+   * next attempt resumes at the first unfolded row instead of repeating the
+   * whole doomed export. Bounded per invocation (FOLD_MAX_STEPS_PER_CALL) so
+   * a large backlog walks down across events rather than marathon-ing one.
+   *
+   * A batch that will not IMPORT stops the fold AT it rather than deleting
+   * past it: rows are written only after a successful import, so an
+   * unimportable row is stored damage, and everything behind it may depend on
+   * it (the gh#554 hole). Deleting forward would silently drop those ops from
+   * the snapshot — worse than the visible failure, which names the blocking
+   * row and leaves the escalation to the load guard that already owns
+   * corruption.
    *
    * Never throws (gh#557). The trim above has always caught its own export —
    * "best-effort, leave the room to the caller's lossless fold" — but the fold
-   * IS that caller, and it had no catch of its own, so the fallback's fallback
-   * was whatever the flush's caller did with the exception: on the debounced
-   * timer, on socket close, on socket error and in the alarm, all four hand it
-   * to `escalateWasmPoisoning`. One room that could not export its snapshot
+   * IS that caller: on the debounced timer, on socket close, on socket error
+   * and in the alarm, all four hand an uncaught exception to
+   * `escalateWasmPoisoning`. One room that could not export its snapshot
    * therefore aborted the isolate — severing every co-located room's sockets —
    * and did it again on the next write, because a failed fold leaves the log
    * exactly as large as the threshold that triggered it. */
@@ -2477,25 +2568,61 @@ export class SessionRoom implements DurableObject {
     // Re-resolve after the await above: a concurrent trim may have replaced
     // and FREED the wrapper captured in `doc` (guarded ensureDoc returns the
     // live cached doc, or cheaply rematerializes).
-    const live = await this.ensureDoc();
-    try {
-      // Export AND put together: a put that dies partway leaves chunk rows
-      // that do not add up to a snapshot, and the log below is the only other
-      // copy of that state. Dropping the partial blob keeps the log
-      // authoritative instead of handing the next cold start a snapshot that
-      // will not import.
-      this.blobs.put("snapshot", live.export({ mode: "snapshot" }));
-    } catch (e) {
-      try {
-        this.blobs.delete("snapshot");
-      } catch {
-        /* nothing to undo, or storage is refusing everything */
+    let live = await this.ensureDoc();
+    let steps = 0;
+    while (steps < FOLD_MAX_STEPS_PER_CALL) {
+      const plan = planFoldStep(this.ctx.storage.sql);
+      if (!plan) break; // the log is fully folded
+      for (const update of readUpdatesThrough(this.ctx.storage.sql, plan.lastSeq)) {
+        try {
+          live.import(update.bytes);
+        } catch (e) {
+          // A row that will not import stops the fold AT it. Nothing has been
+          // written this step: whatever snapshot was there before is still
+          // exactly as good as it was, every row of the batch waits for the
+          // next attempt at its own seq, and the BLOCKING SEQ — not merely
+          // the batch — is named on /stats.
+          this.noteFoldFailure(e, "fold-import", update.lastSeq);
+          return;
+        }
       }
-      this.noteFoldFailure(e);
-      return;
+      let folded: Uint8Array;
+      try {
+        folded = live.export({ mode: "snapshot" });
+      } catch (e) {
+        this.noteFoldFailure(e, "fold-export");
+        return;
+      }
+      try {
+        this.blobs.put("snapshot", folded);
+      } catch (e) {
+        // Export AND put together: a put that dies partway leaves chunk rows
+        // that do not add up to a snapshot, and the log is the only other copy
+        // of that state. Dropping the partial blob keeps the log authoritative
+        // instead of handing the next cold start a snapshot that will not
+        // import.
+        try {
+          this.blobs.delete("snapshot");
+        } catch {
+          /* nothing to undo, or storage is refusing everything */
+        }
+        this.noteFoldFailure(e, "fold-put");
+        return;
+      }
+      this.ctx.storage.sql.exec("DELETE FROM updates WHERE seq <= ?", plan.lastSeq);
+      this.setMeta(
+        "updateBytes",
+        String(Math.max(Number(this.getMeta("updateBytes") ?? "0") - plan.bytes, 0))
+      );
+      // Commit the step BEFORE claiming it: this sync is what turns a kill
+      // mid-fold into progress instead of a repeat (gh#611).
+      await this.ctx.storage.sync();
+      steps++;
+      // A concurrent trim/release during the sync above can free the wrapper
+      // under us; the next step re-resolves rather than calling into a freed
+      // doc (same discipline as ensureDoc's dangling-wrapper branch).
+      if (!isLive(live)) live = await this.ensureDoc();
     }
-    this.ctx.storage.sql.exec("DELETE FROM updates");
-    this.setMeta("updateBytes", "0");
     this.noteFoldSuccess();
   }
 
@@ -2508,7 +2635,8 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  /** The log did NOT fold: back off, say so durably, and classify the fault.
+  /** The log did NOT fold (or stopped at a row it could not import): back
+   * off, say so durably, and classify the fault.
    *
    * The room keeps working — reads, writes, joins and relays never touched the
    * fold — it simply cannot compact, so its log goes on growing until either a
@@ -2516,24 +2644,39 @@ export class SessionRoom implements DurableObject {
    * `ws4` room reset yesterday becomes trimmable a day later, `dropLog` having
    * cleared its checkpoints). `MAX_DOC_LOAD_BYTES` is the backstop under all
    * of that. What must NOT happen is the room taking the isolate down over it,
-   * which is what `escalateWasmPoisoning` is now able to decline. */
-  private noteFoldFailure(e: unknown): void {
+   * which is what `escalateWasmPoisoning` is now able to decline.
+   *
+   * `site` names WHICH call of the step failed (import / export / put), the
+   * same call-site discipline gh#557 brought to `lastWasmFault`. With progress
+   * already committed behind it, an import stop is the interesting one: rows
+   * are written only after a successful import, so a row that will not import
+   * now is stored damage, everything after it is suspect by the gh#554 hole
+   * argument, and `blockedAtSeq` is the seq to look at. */
+  private noteFoldFailure(e: unknown, site: string, blockedAtSeq?: number): void {
     const failures = Number(this.getMeta("foldFailures") ?? "0") + 1;
     this.setMeta("foldFailures", String(failures));
     // Same ladder the alarm chain uses: a minute, doubling, capped at an hour.
     this.setMeta("foldRetryAt", String(Date.now() + alarmRetryDelay(failures)));
     this.setMeta(
       "lastFoldFailure",
-      JSON.stringify({ at: Date.now(), failures, error: String(e) }).slice(0, 512)
+      JSON.stringify({
+        at: Date.now(),
+        failures,
+        site,
+        ...(blockedAtSeq === undefined ? {} : { blockedAtSeq }),
+        error: String(e)
+      }).slice(0, 512)
     );
     console.error(
       "log fold failed; backing off (the room still serves, it just cannot compact)",
       `room=${this.getMeta("chatId") ?? "?"}`,
       `consecutiveFailures=${failures}`,
       `updateBytes=${this.getMeta("updateBytes") ?? "0"}`,
+      `site=${site}`,
+      ...(blockedAtSeq === undefined ? [] : [`blockedAtSeq=${blockedAtSeq}`]),
       String(e)
     );
-    this.escalateWasmPoisoning(e, "fold-export");
+    this.escalateWasmPoisoning(e, site);
   }
 
   /** HISTORY TRIM (§3.1): shallow snapshot at the newest recorded frontier
@@ -2655,6 +2798,17 @@ export class SessionRoom implements DurableObject {
       return;
     }
     this.setMeta("alarmFailures", String(failures + 1));
+    // Stamp the attempt BEFORE the work, and make it durable with the counter
+    // (gh#611). The failure class this exists for is the one that has no catch
+    // block: a CPU/duration kill mid-replay or mid-export takes the invocation
+    // and every uncommitted write with it. What survives is exactly this pair
+    // — a spent counter and an attempt stamp with no error beside it — which
+    // on /stats reads as "the work died where nothing could see it", instead
+    // of a bare count climbing toward give-up for undecipherable reasons.
+    this.setMeta(
+      "lastAlarmAttempt",
+      JSON.stringify({ at: Date.now(), attempts: failures + 1 }).slice(0, 512)
+    );
     await this.ctx.storage.sync();
     const attempts = failures + 1;
     try {
@@ -2691,6 +2845,12 @@ export class SessionRoom implements DurableObject {
         `consecutiveFailures=${attempts}`,
         String(e)
       );
+      // Leave WHAT failed behind durably (gh#611). The console line ships
+      // only while Workers Logs can be queried at all, and the next incident's
+      // first question — "eight failures at WHAT?" — has to be answerable
+      // from /stats alone, the same closing of the gap gh#557 did for socket
+      // deaths and gh#557's fold counter did for the fold.
+      this.noteAlarmFailure(attempts, e);
       if (attempts >= ALARM_FAILURE_LIMIT) {
         this.noteAlarmGaveUp(attempts);
       } else {
@@ -2713,6 +2873,22 @@ export class SessionRoom implements DurableObject {
     this.setMeta("alarmFailures", "0");
     if (this.getMeta("alarmRefusals")) this.setMeta("alarmRefusals", "0");
     if (this.getMeta("alarmGaveUpAt")) this.setMeta("alarmGaveUpAt", "");
+    if (this.getMeta("lastAlarmAttempt")) this.setMeta("lastAlarmAttempt", "");
+    if (this.getMeta("lastAlarmError")) this.setMeta("lastAlarmError", "");
+  }
+
+  /** Record what this alarm attempt died of (gh#611), beside the count the
+   * /stats surface already carried. Never throws: diagnostics on an
+   * already-failing path, same discipline as `noteWasmFault`. */
+  private noteAlarmFailure(attempts: number, e: unknown): void {
+    try {
+      this.setMeta(
+        "lastAlarmError",
+        JSON.stringify({ at: Date.now(), attempts, error: String(e) }).slice(0, 512)
+      );
+    } catch {
+      /* storage refused the marker; the console line above still says it */
+    }
   }
 
   /** Stop rescheduling and leave the state that says so. Recorded once, so
@@ -2745,6 +2921,11 @@ export class SessionRoom implements DurableObject {
     this.setMeta("alarmGaveUpAt", "");
     this.setMeta("alarmFailures", "0");
     this.setMeta("alarmRefusals", "0");
+    // A revived chain starts with a clean slate: the error that broke the old
+    // one describes the incident being recovered from, not the chain going
+    // forward (gh#611).
+    this.setMeta("lastAlarmAttempt", "");
+    this.setMeta("lastAlarmError", "");
     console.log("alarm re-armed after give-up", `room=${this.getMeta("chatId") ?? "?"}`);
     return true;
   }
