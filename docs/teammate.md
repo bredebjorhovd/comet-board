@@ -148,6 +148,27 @@ seatbelt and not a lock: the board compares the dispatching frontend's *claim*
 about who is signed in against the slot's email, and cannot verify that claim
 (gh#161). It catches the accident, not the liar.
 
+### One person, two logins
+
+A Claude plan and a Codex plan bill two different addresses. Mapped one at a
+time, that is two members as far as `[users]` knows — and every run on the
+second address warns that it bills somebody else (or, under `require-own`, is
+refused), even when both plans are yours. The fix is to map **both** sign-in
+addresses with the same GitHub value:
+
+```bash
+comet-board member add brede@tally.no --github bredebjorhovd --name "Brede"
+comet-board member add brede.bjorhovd@recognition.no --github bredebjorhovd --name "Brede"
+```
+
+Two entries resolving to one GitHub identity are one member: their slots pair
+with either login, and a run billed to one of their own addresses says nothing
+about billing (gh#546). This is also what makes `billing_guard =
+"require-own"` usable on such a box — without it, the mode refuses every
+dispatch on the second plan outright. `member list` shows each address with the
+slots it pairs with; `doctor` prints every slot's id beside its harness and
+email, which is what `--account` wants.
+
 ## 5. Cover their repos with the App
 
 If they bring work in a repo the board has never seen, the board's GitHub App

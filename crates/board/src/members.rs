@@ -157,6 +157,73 @@ pub fn named(author: GitAuthor, name: Option<&str>) -> GitAuthor {
     }
 }
 
+// ---- one member, several logins (gh#546) --------------------------------
+
+/// The `[users]` entries grouped into members: entries whose values resolve to
+/// the same git-author address are one person signing in from two places.
+///
+/// The grouping is the point of the map — its value answers "which GitHub
+/// account is this person?" — so two keys sharing one answer are two logins of
+/// one human, not two humans who happen to spell alike. This is the whole fix
+/// for gh#546: a Claude plan and a Codex plan bill two different addresses, and
+/// before this the billing guard compared those two addresses literally and
+/// concluded that one of them belonged to a stranger. Writing the second
+/// address down with the same GitHub value as the first says otherwise:
+///
+/// ```toml
+/// [users]
+/// "brede@tally.no" = "22494697+bredebjorhovd@users.noreply.github.com"
+/// "brede.bjorhovd@recognition.no" = "22494697+bredebjorhovd@users.noreply.github.com"
+/// ```
+///
+/// An entry whose value does not resolve ([`git_identity::parse_author`] is
+/// `None`) groups alone — there is nothing to tie it to anything else with.
+pub fn member_groups(cfg: &RoutingConfig) -> Vec<Vec<String>> {
+    let mut authors: Vec<String> = Vec::new();
+    let mut groups: Vec<Vec<String>> = Vec::new();
+    for (key, value) in &cfg.users {
+        let ix = match git_identity::parse_author(value).as_ref().map(|a| a.email.as_str()) {
+            Some(email) => match authors.iter().position(|a| a.eq_ignore_ascii_case(email)) {
+                Some(ix) => ix,
+                None => {
+                    authors.push(email.to_string());
+                    groups.push(Vec::new());
+                    authors.len() - 1
+                }
+            },
+            // Nothing to tie it with, so nothing to group it into but itself.
+            None => {
+                groups.push(Vec::new());
+                groups.len() - 1
+            }
+        };
+        groups[ix].push(key.clone());
+    }
+    groups
+}
+
+/// Every other sign-in address in `[users]` belonging to the same member as
+/// `email`, and empty when `email` is unmapped or maps alone.
+///
+/// This is the billing guard's second chance to be right: a run billed to one
+/// of these is spending the dispatcher's own plan, however unlike their sign-in
+/// address the login looks.
+pub fn co_signins(cfg: &RoutingConfig, email: &str) -> Vec<String> {
+    let needle = email.trim();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    member_groups(cfg)
+        .into_iter()
+        .find(|keys| keys.iter().any(|k| k.eq_ignore_ascii_case(needle)))
+        .map(|keys| {
+            keys.into_iter()
+                .filter(|k| !k.eq_ignore_ascii_case(needle))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---- the roster ---------------------------------------------------------
 
 /// One saved CLI login on the box, as `member list` names it.
@@ -186,12 +253,6 @@ impl Slot {
                 .map(str::to_string),
             active: a.active,
         }
-    }
-
-    fn is(&self, email: &str) -> bool {
-        self.email
-            .as_deref()
-            .is_some_and(|e| e.eq_ignore_ascii_case(email))
     }
 }
 
@@ -248,8 +309,24 @@ pub struct Roster {
 /// ([`comet_proto::view::board::cross_billed`]). Anything cleverer would pair
 /// differently from the thing that decides who pays, and two rules for one
 /// question is how a surface ends up confidently wrong.
+///
+/// Since gh#546 "the billing guard's comparison" includes what the map says
+/// about who is who: a slot pairs with every entry in its member group, so the
+/// Codex login mapped beside a Claude login counts as an account of that
+/// person's rather than as nobody's. A slot whose email matches a key outright
+/// still pairs when its value does not resolve — equality needs no author.
 pub fn roster(cfg: &RoutingConfig, accounts: Option<&[AgentAccount]>) -> Roster {
     let slots: Vec<Slot> = accounts.unwrap_or(&[]).iter().map(Slot::of).collect();
+    let groups = member_groups(cfg);
+    // Are these two addresses one member's? Same string, or two keys of one
+    // group. The map is tiny; a scan per question costs nothing worth caching.
+    let same_member = |a: &str, b: &str| {
+        a.eq_ignore_ascii_case(b.trim())
+            || groups.iter().any(|keys| {
+                keys.iter().any(|k| k.eq_ignore_ascii_case(a))
+                    && keys.iter().any(|k| k.eq_ignore_ascii_case(b.trim()))
+            })
+    };
     let members: Vec<MemberRow> = cfg
         .users
         .iter()
@@ -259,7 +336,11 @@ pub fn roster(cfg: &RoutingConfig, accounts: Option<&[AgentAccount]>) -> Roster 
                 noreply: author
                     .as_ref()
                     .is_some_and(|a| git_identity::is_github_noreply(&a.email)),
-                accounts: slots.iter().filter(|s| s.is(user)).cloned().collect(),
+                accounts: slots
+                    .iter()
+                    .filter(|s| s.email.as_deref().is_some_and(|e| same_member(e, user)))
+                    .cloned()
+                    .collect(),
                 user: user.clone(),
                 value: value.clone(),
                 author,
@@ -268,7 +349,11 @@ pub fn roster(cfg: &RoutingConfig, accounts: Option<&[AgentAccount]>) -> Roster 
         .collect();
     let unmapped = slots
         .into_iter()
-        .filter(|s| !members.iter().any(|m| s.is(&m.user)))
+        .filter(|s| {
+            !cfg.users
+                .keys()
+                .any(|u| s.email.as_deref().is_some_and(|e| same_member(e, u)))
+        })
         .collect();
     Roster {
         members,
@@ -452,5 +537,84 @@ mod tests {
         let none = roster(&cfg, Some(&[]));
         assert!(none.accounts_known);
         assert!(none.members[0].needs_account());
+    }
+
+    /// gh#546: one human, two subscriptions, two addresses. Mapping the second
+    /// address with the same GitHub value as the first makes the pairing — and
+    /// therefore every surface built on it — read them as one person.
+    #[test]
+    fn two_logins_with_one_github_value_are_one_member() {
+        let author = "22494697+bredebjorhovd@users.noreply.github.com";
+        let cfg: RoutingConfig = toml::from_str(&format!(
+            "[users]\n\
+             \"brede@tally.no\" = \"{author}\"\n\
+             \"brede.bjorhovd@recognition.no\" = \"{author}\"\n\
+             \"ana@example.com\" = \"1+ana@users.noreply.github.com\"\n"
+        ))
+        .unwrap();
+
+        // The grouping: Ana alone, Brede's two sign-ins together. `[users]`
+        // is a `BTreeMap`, so the pairs read alphabetically.
+        assert_eq!(
+            member_groups(&cfg),
+            vec![
+                vec!["ana@example.com".to_string()],
+                vec![
+                    "brede.bjorhovd@recognition.no".to_string(),
+                    "brede@tally.no".to_string()
+                ],
+            ]
+        );
+        assert_eq!(
+            co_signins(&cfg, "brede@tally.no"),
+            ["brede.bjorhovd@recognition.no"]
+        );
+        // Case-insensitive on the way in, like every other email comparison.
+        assert_eq!(
+            co_signins(&cfg, "BREDE@Tally.No"),
+            ["brede.bjorhovd@recognition.no"]
+        );
+        // Unmapped, empty, and a member of nobody.
+        assert!(co_signins(&cfg, "sam@example.com").is_empty());
+        assert!(co_signins(&cfg, "  ").is_empty());
+
+        // And the roster pairs each login's slot with both entries: either row
+        // answers "does this person have an account of their own".
+        let accounts = [
+            account("slot-claude", Some("brede@tally.no"), ClaudeCode),
+            account(
+                "slot-codex",
+                Some("brede.bjorhovd@recognition.no"),
+                Codex,
+            ),
+            account("slot-ana", Some("ana@example.com"), ClaudeCode),
+        ];
+        let r = roster(&cfg, Some(&accounts));
+        for m in &r.members {
+            if m.user.starts_with("brede") {
+                assert_eq!(m.accounts.len(), 2, "{} sees both logins", m.user);
+                assert!(!m.needs_account());
+            }
+        }
+        assert!(r.unmapped.is_empty(), "{:?}", r.unmapped);
+    }
+
+    /// The grouping never merges two people: same name spelling is not the
+    /// same as same address, and an entry that resolves to nothing groups
+    /// alone rather than with everything.
+    #[test]
+    fn grouping_is_by_resolved_address_and_nothing_looser() {
+        let cfg: RoutingConfig = toml::from_str(
+            "[users]\n\
+             \"ana@work.example\" = \"Ana Ruiz <1+ana@users.noreply.github.com>\"\n\
+             \"ana@home.example\" = \"2+ana@users.noreply.github.com\"\n\
+             \"broken@example.com\" = \"not an address\"\n",
+        )
+        .unwrap();
+        // Two different GitHub ids are two different accounts, whatever the
+        // display names say.
+        assert_eq!(co_signins(&cfg, "ana@work.example"), Vec::<String>::new());
+        // An unresolvable value has no group to belong to.
+        assert!(member_groups(&cfg)[2].len() == 1);
     }
 }

@@ -4580,6 +4580,7 @@ mod tests {
             dispatched_by_user: None,
             dispatched_by_verified: false,
             billed_to: None,
+            cross_billed: None,
             max_duration_secs: None,
             context: None,
             stop_reason: None,

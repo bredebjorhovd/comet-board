@@ -33,7 +33,7 @@
 //! made it is already the person the box runs as.
 
 use comet_proto::HarnessId;
-use comet_proto::view::board::{REQUIRE_OWN_REFUSAL, bills_warning, cross_billed};
+use comet_proto::view::board::{REQUIRE_OWN_REFUSAL, bills_warning};
 
 /// What the board does about a dispatch that spends somebody else's
 /// subscription — `[defaults] billing_guard`, overridable per route.
@@ -170,6 +170,12 @@ pub struct Billing {
     pub billed_to: Option<String>,
     /// Who released it, at whatever strength the transport allowed.
     pub dispatcher: Attribution,
+    /// The other sign-in addresses the box's `[users]` map ties to whoever
+    /// released this (gh#546): one person's Claude plan and Codex plan bill two
+    /// different addresses, and the literal comparison read every run on the
+    /// second one as spending a stranger's plan. Empty is the honest default —
+    /// a board that cannot say two logins are one person warns.
+    pub own_logins: Vec<String>,
     /// The harness the run spends it on — a Claude slot and a Codex slot are
     /// different subscriptions, and the warning names which.
     pub harness: HarnessId,
@@ -185,10 +191,41 @@ pub struct Billing {
     pub is_owner: bool,
 }
 
+/// Is this run spending somebody else's subscription? The guard's comparison,
+/// with what the `[users]` map says about who signs in from where beside it
+/// (gh#546).
+///
+/// Three ways to be cross-billed into one: the slot login matches neither the
+/// dispatcher's address nor any other address mapped to them. Either side
+/// missing is *not* cross-billed — an unattributed dispatch names nobody to
+/// have wronged, and a subscription the box cannot name accuses nobody.
+pub fn cross_billed_among(
+    billed_to: Option<&str>,
+    dispatcher_email: Option<&str>,
+    own_logins: &[String],
+) -> bool {
+    let (Some(billed), Some(by)) = (
+        billed_to.map(str::trim).filter(|b| !b.is_empty()),
+        dispatcher_email.map(str::trim).filter(|b| !b.is_empty()),
+    ) else {
+        return false;
+    };
+    if by.eq_ignore_ascii_case(billed) {
+        return false;
+    }
+    !own_logins
+        .iter()
+        .any(|l| l.trim().eq_ignore_ascii_case(billed))
+}
+
 impl Billing {
     /// Is this run spending somebody else's subscription?
     pub fn cross_billed(&self) -> bool {
-        cross_billed(self.billed_to.as_deref(), self.dispatcher.email())
+        cross_billed_among(
+            self.billed_to.as_deref(),
+            self.dispatcher.email(),
+            &self.own_logins,
+        )
     }
 
     /// The one line every surface leads with, or `None` when there is nothing
@@ -352,6 +389,7 @@ mod tests {
             dispatcher: by
                 .map(|b| Attribution::Claimed(b.to_string()))
                 .unwrap_or_default(),
+            own_logins: Vec::new(),
             harness: HarnessId::ClaudeCode,
             named_slot: true,
             is_owner: true,
@@ -364,6 +402,7 @@ mod tests {
         Billing {
             billed_to: billed.map(str::to_string),
             dispatcher: by,
+            own_logins: Vec::new(),
             harness: HarnessId::ClaudeCode,
             named_slot: false,
             is_owner: false,
@@ -574,5 +613,83 @@ mod tests {
     fn bill_tells_a_slot_id_from_an_email() {
         assert!(bill_names_a_slot("8f2c1d0a7b6e4539"));
         assert!(!bill_names_a_slot("brede@tally.no"));
+    }
+
+    /// gh#546: one human, a Claude plan and a Codex plan, two login addresses.
+    /// Before the map could say they were one person, every run on the second
+    /// address warned that it bills somebody else — and `require-own` refused
+    /// it outright, naming a `--account` fix that did not exist. With the
+    /// second address mapped to the same member, the same dispatch is theirs
+    /// and nothing is said.
+    #[test]
+    fn a_second_login_of_the_same_person_is_not_cross_billing() {
+        let codex = Billing {
+            billed_to: Some("brede.bjorhovd@recognition.no".into()),
+            dispatcher: Attribution::Claimed("brede@tally.no".into()),
+            harness: HarnessId::Codex,
+            ..billing(Some(""), None)
+        };
+
+        // Without the mapping: the literal comparison, warning as it always
+        // did — and under require-own, refusing.
+        assert!(codex.cross_billed());
+        assert_eq!(
+            codex.warning().as_deref(),
+            Some("this run bills brede.bjorhovd@recognition.no's Codex — pass --account <your slot>")
+        );
+        assert!(guard(GuardMode::RequireOwn, &codex, false).is_err());
+
+        // With it: their own plan, on both surfaces, in both modes.
+        let mapped = Billing {
+            own_logins: vec!["brede.bjorhovd@recognition.no".into()],
+            ..codex.clone()
+        };
+        assert!(!mapped.cross_billed());
+        assert_eq!(mapped.warning(), None);
+        assert_eq!(mapped.comment_suffix(), "");
+        assert!(guard(GuardMode::RequireOwn, &mapped, false).is_ok());
+
+        // The tie is case-insensitive, like every other email comparison here,
+        // and a stranger's address gains nothing from an empty or unrelated
+        // list.
+        let lax = Billing {
+            own_logins: vec!["  ".into(), "BREDE.BJORHOVD@RECOGNITION.NO".into()],
+            ..codex
+        };
+        assert!(!lax.cross_billed());
+    }
+
+    /// `cross_billed_among` is the shared half of the comparison — the CLI
+    /// preflight asks it with a freshly-read `[users]` rather than carrying a
+    /// `Billing` it has no harness for.
+    #[test]
+    fn cross_billed_among_answers_for_the_map_and_for_nobody() {
+        // The alias list is what turns Brede's two logins into one person's.
+        assert!(!cross_billed_among(
+            Some("brede.bjorhovd@recognition.no"),
+            Some("brede@tally.no"),
+            &["brede.bjorhovd@recognition.no".into()]
+        ));
+        // Their own address never needed the list.
+        assert!(!cross_billed_among(
+            Some("BREDE@TALLY.NO"),
+            Some("brede@tally.no"),
+            &[],
+        ));
+        // Without the list, the second login is still a stranger's.
+        assert!(cross_billed_among(
+            Some("brede.bjorhovd@recognition.no"),
+            Some("brede@tally.no"),
+            &[],
+        ));
+        // No dispatcher at all accuses nobody, whatever the logins say; so do
+        // an unnamed subscription and an empty one.
+        assert!(!cross_billed_among(
+            Some("ana@example.com"),
+            None,
+            &["ana@example.com".into()]
+        ));
+        assert!(!cross_billed_among(None, Some("ana@example.com"), &[]));
+        assert!(!cross_billed_among(Some("  "), Some("ana@example.com"), &[]));
     }
 }
