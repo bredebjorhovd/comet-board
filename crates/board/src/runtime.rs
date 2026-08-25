@@ -646,6 +646,21 @@ pub trait Runtime {
     /// carry this.
     fn last_run_end(&self, chat_id: &str) -> anyhow::Result<Option<RunEnd>>;
 
+    /// Why the chat's most recent run stopped, when its harness classified
+    /// the stop (gh#545) — off the same journal [`Runtime::last_run_end`]
+    /// reads.
+    ///
+    /// This is what tells a usage-limited run apart from a crashed one inside
+    /// the one `Blocked` status: the board's phrases, its Needs-you kind and
+    /// the decision it puts in front of a person all hang off it. `None` is
+    /// "nothing was classified" — a runtime that cannot read a journal, an
+    /// older journal, or a stop no harness named — and lands exactly where
+    /// every stop landed before gh#545.
+    fn last_stop(&self, chat_id: &str) -> anyhow::Result<Option<comet_proto::StopReason>> {
+        let _ = chat_id;
+        Ok(None)
+    }
+
     /// What the chat has spent so far, summed off the same run journal
     /// (gh#151). `None` is "nothing reported" — the board leaves the attempt's
     /// token columns NULL for it, and the stats page renders a blank.

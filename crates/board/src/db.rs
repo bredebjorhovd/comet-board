@@ -24,7 +24,7 @@ const ATTEMPT_COLUMNS: &str = "id, task_id, pane_id, workspace, runtime, worktre
      input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, model, \
      cache_sweepable_at, cache_swept_at, claims, claims_at, claims_error, board_managed, \
      context_used_tokens, context_max_tokens, context_compact_at_tokens, stacked_on, resumes, \
-     token_models, token_agents, automation, automation_owner";
+     token_models, token_agents, automation, automation_owner, stop_reason";
 
 /// Build an [`Attempt`] from a row selected with [`ATTEMPT_COLUMNS`].
 fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
@@ -119,6 +119,13 @@ fn read_attempt(r: &rusqlite::Row<'_>) -> rusqlite::Result<Attempt> {
             .and_then(|j| serde_json::from_str(&j).ok()),
         automation: r.get(52)?,
         automation_owner: r.get(53)?,
+        // Why the run stopped, when a harness classified it (gh#545). JSON
+        // beside `token_models`' precedent; unreadable JSON reads as nothing,
+        // for the claims column's reason — one bad write must not take the
+        // board pane down over a display field.
+        stop_reason: r
+            .get::<_, Option<String>>(54)?
+            .and_then(|j| serde_json::from_str(&j).ok()),
     })
 }
 
@@ -386,7 +393,15 @@ impl Db {
               -- (or an orchestrating agent) released — automation provenance
               -- is the exception, and its absence is the ordinary case.
               automation TEXT,
-              automation_owner TEXT
+              automation_owner TEXT,
+              -- Why this attempt's run stopped, when its harness classified
+              -- the stop (gh#545): a usage limit with the window it named, a
+              -- billing failure, an expired login. JSON and nullable — NULL
+              -- is every run that stopped without a harness saying why,
+              -- which is what all of them were before gh#545. Cleared when a
+              -- run starts again: it describes the stop that *was*, not the
+              -- one that may come.
+              stop_reason TEXT
             );
 
             -- Impl spec §7: the duplicate-dispatch guard. A second concurrent
@@ -645,6 +660,11 @@ impl Db {
                 // what they are: automation provenance marks the exception.
                 ("automation", "TEXT"),
                 ("automation_owner", "TEXT"),
+                // Why the run stopped, when a harness classified it (gh#545).
+                // NULL on every row that came before, which reads as "nothing
+                // was classified" — the truth about all of them, and exactly
+                // what the board said about every stop before this existed.
+                ("stop_reason", "TEXT"),
             ],
         )?;
         self.add_missing_columns(
@@ -1598,6 +1618,30 @@ impl Db {
             params![attempt_id],
             |r| r.get(0),
         )?)
+    }
+
+    /// Record why this attempt's run stopped, when a harness classified the
+    /// stop (gh#545); `None` takes the record back off.
+    ///
+    /// Written when the attempt enters blocked and cleared the moment a run
+    /// starts again, so the row carries the reason exactly while the decision
+    /// it enables — switch model, switch account, wait, retry, cancel — is
+    /// live. Stored as JSON beside `token_models`' precedent: one structured
+    /// value, no flat columns to invent per cause.
+    pub fn set_attempt_stop_reason(
+        &self,
+        attempt_id: i64,
+        stop: Option<&comet_proto::StopReason>,
+    ) -> Result<()> {
+        let json = match stop {
+            None => None,
+            Some(stop) => Some(serde_json::to_string(stop)?),
+        };
+        self.conn.execute(
+            "UPDATE attempts SET stop_reason = ?2 WHERE id = ?1",
+            params![attempt_id, json],
+        )?;
+        Ok(())
     }
 
     pub fn set_missing_ticks(&self, attempt_id: i64, ticks: i64) -> Result<()> {

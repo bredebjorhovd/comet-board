@@ -1426,6 +1426,12 @@ impl SyncEngine {
             if attempt.agent_status != Some(status) {
                 self.db.set_attempt_status(attempt.id, status)?;
             }
+            // Back to work: whatever stopped the previous run says nothing
+            // about this one, so its reason comes off the row (gh#545).
+            // Transition-only, like every other write this pass makes.
+            if status == AgentStatus::Working && attempt.stop_reason.is_some() {
+                self.db.set_attempt_stop_reason(attempt.id, None)?;
+            }
             // Latch that the agent actually got going, so a settled status can
             // be told apart from one that never started.
             if status == AgentStatus::Working && !attempt.saw_working {
@@ -4335,18 +4341,43 @@ impl SyncEngine {
     ) -> Result<()> {
         // Which kind of block, straight off the journal — the same read
         // `run_end` makes, and the only thing that tells a question apart from
-        // a dead run inside the one `Blocked` status.
-        let why = match runtime.map(|r| r.last_run_end(chat_id)) {
-            Some(Ok(Some(RunEnd::Errored))) => Stopped::Errored,
+        // a dead run inside the one `Blocked` status. Since gh#545 the journal
+        // can also say *why* a run died when its harness classified the stop:
+        // a usage limit is not a dead run's retry-or-cancel decision, it is
+        // its own decision, and it gets its own kind.
+        let end = runtime.map(|r| r.last_run_end(chat_id));
+        let stop = match runtime.map(|r| r.last_stop(chat_id)) {
+            Some(Ok(stop)) => stop,
+            Some(Err(e)) => {
+                self.log.warn(format!(
+                    "{}: reading chat {chat_id}'s journal for the stop reason: {e}",
+                    task.identifier
+                ));
+                None
+            }
+            None => None,
+        };
+        let why = match end {
+            Some(Ok(Some(RunEnd::Errored))) => match stop.clone() {
+                Some(reason) => Stopped::from(reason),
+                None => Stopped::Errored,
+            },
             Some(Ok(_)) => Stopped::Asking,
             Some(Err(_)) | None => Stopped::Unknown,
         };
+        // The record the row shows while it sits blocked (gh#545). Written on
+        // every block — including an unclassified one, which clears whatever
+        // the previous block said, because this one superseded it.
+        if attempt.stop_reason != stop {
+            self.db.set_attempt_stop_reason(attempt.id, stop.as_ref())?;
+        }
         let block = self.db.bump_blocked_count(attempt.id)?;
         let queued = self.db.enqueue_writeback(&NewWriteback {
             task_id: task.id.clone(),
             kind: "blocked".into(),
             payload: json!({
                 "reason": why.as_str(),
+                "window": why_window(&why),
                 "block": block,
                 "attempt": task.attempt_count(),
                 "log": self.paths.logfile().to_string_lossy(),
@@ -4544,6 +4575,12 @@ impl SyncEngine {
             let entered_blocked = self.entered_blocked(&attempt, status);
             if transitioned {
                 self.db.set_attempt_status(attempt.id, status)?;
+                changed = true;
+            }
+            // Back to work on the event path too: the reason a previous run
+            // stopped must not outlive it onto this one (gh#545).
+            if status == AgentStatus::Working && attempt.stop_reason.is_some() {
+                self.db.set_attempt_stop_reason(attempt.id, None)?;
                 changed = true;
             }
             // Monotonic, so safe from the fast path — and a working phase
@@ -5030,11 +5067,31 @@ pub fn derivation_for(
 /// *facts* come out of the payload, because they were true when the block
 /// happened and the task row has moved on since.
 fn blocked_comment(payload: &Value) -> String {
+    let mut why = Stopped::parse(payload["reason"].as_str().unwrap_or(""));
+    if why.as_str() == "limited"
+        && let Some(window) = payload["window"].as_str()
+    {
+        // The window rode beside the reason because `parse` round-trips only
+        // the kind; without this the delivered comment would un-name the very
+        // fact ("5-hour") that tells a reader how long waiting costs.
+        why = Stopped::Limited {
+            window: Some(window.to_string()),
+        };
+    }
     notify::upstream_comment(
         payload["attempt"].as_u64().unwrap_or(1),
-        Stopped::parse(payload["reason"].as_str().unwrap_or("")),
+        &why,
         payload["log"].as_str().unwrap_or("(none)"),
     )
+}
+
+/// Which usage window a block names, for the queued payload — `None` for
+/// every stop but a classified limit, and for a limit nobody clocked.
+fn why_window(why: &Stopped) -> Option<&str> {
+    match why {
+        Stopped::Limited { window } => window.as_deref(),
+        _ => None,
+    }
 }
 
 /// The gh#233 notice, composed at delivery like every other comment.
@@ -6187,6 +6244,8 @@ mod tests {
     #[derive(Default)]
     struct JournalFact {
         end: Option<RunEnd>,
+        /// The classified stop the harness left beside the run (gh#545).
+        stop: Option<comet_proto::StopReason>,
         queued: std::sync::Mutex<Vec<(String, String)>>,
         /// Chats that have been archived since — the ordinary shape of a
         /// dispatcher that did not survive its child (gh#165).
@@ -6203,10 +6262,20 @@ mod tests {
         fn ending(end: Option<RunEnd>) -> JournalFact {
             JournalFact {
                 end,
+                stop: None,
                 queued: Default::default(),
                 gone: Vec::new(),
                 blind: false,
                 revivals: Some(0),
+            }
+        }
+        /// An errored end with a usage limit classified beside it (gh#545).
+        fn limited(window: Option<&str>) -> JournalFact {
+            JournalFact {
+                stop: Some(comet_proto::StopReason::UsageLimit {
+                    window: window.map(str::to_string),
+                }),
+                ..JournalFact::ending(Some(RunEnd::Errored))
             }
         }
         /// The same, on a box whose engine has already revived these runs
@@ -6275,6 +6344,12 @@ mod tests {
         }
         fn last_run_end(&self, _: &str) -> anyhow::Result<Option<RunEnd>> {
             Ok(self.end)
+        }
+        fn last_stop(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<Option<comet_proto::StopReason>> {
+            Ok(self.stop.clone())
         }
     }
 
@@ -7039,6 +7114,77 @@ mod tests {
         let body = blocked_comment(&queued[0]);
         assert!(body.contains("stopped with an error"), "{body}");
         assert!(body.starts_with("comet-board:"), "{body}");
+    }
+
+    /// gh#545's headline: a usage limit is not a dead run. The comment names
+    /// the window and offers the decision — switch model or account, or
+    /// wait — instead of pointing at the chat as if there were a question to
+    /// answer; the attempt row carries the classified stop so the board can
+    /// show it.
+    #[test]
+    fn a_usage_limit_is_its_own_block_not_a_dead_run() {
+        let e = engine();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::limited(Some("5-hour"));
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["reason"], "limited");
+        assert_eq!(queued[0]["window"], "5-hour");
+        let body = blocked_comment(&queued[0]);
+        assert!(body.contains("usage limit"), "{body}");
+        assert!(body.contains("--model <other>"), "{body}");
+        assert!(
+            !body.contains("answer in the chat"),
+            "there is no question to answer: {body}"
+        );
+        // And the row can say which stop it was sitting on.
+        assert_eq!(
+            live(&e).stop_reason,
+            Some(comet_proto::StopReason::UsageLimit {
+                window: Some("5-hour".into())
+            })
+        );
+    }
+
+    /// A limit without a named window is still its own kind — "wait for the
+    /// window" survives even when nobody clocked which one.
+    #[test]
+    fn a_usage_limit_without_a_window_still_names_itself() {
+        let e = engine();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::limited(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+
+        let queued = blocked_writebacks(&e);
+        assert_eq!(queued[0]["reason"], "limited");
+        assert_eq!(queued[0]["window"], serde_json::Value::Null);
+        assert!(blocked_comment(&queued[0]).contains("a usage limit"));
+    }
+
+    /// Back to work takes the old stop off the row: the reason describes the
+    /// stop that *was*, and must not brand a retry that got going again.
+    #[test]
+    fn working_again_clears_the_recorded_stop_reason() {
+        let e = engine();
+        seed(&e, "linear:LIN-142", "LIN-142", UpstreamState::Started);
+        dispatch(&e, "linear:LIN-142", "chat-9");
+        let rt = JournalFact::limited(None);
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Blocked)]), Some(&rt))
+            .unwrap();
+        assert!(live(&e).stop_reason.is_some());
+
+        e.reconcile_sessions_with(&statuses(&[("chat-9", AgentStatus::Working)]), Some(&rt))
+            .unwrap();
+        assert_eq!(live(&e).stop_reason, None);
     }
 
     /// The board must not say two contradictory things about one event. An

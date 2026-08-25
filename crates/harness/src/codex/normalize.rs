@@ -335,6 +335,7 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
         }
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
+            stop: None,
         }],
         // userMessage / reasoning / agentMessage flow through delta channels.
         _ => Vec::new(),

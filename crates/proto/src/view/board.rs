@@ -570,6 +570,19 @@ pub struct TaskRow {
     pub automation: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_owner: Option<String>,
+    /// Why this row's live attempt stopped, when its harness could say
+    /// (gh#545). Set only while the attempt is stopped on it — a usage limit,
+    /// a billing failure, an expired login — and cleared the moment the run
+    /// is going again. `None` is every other row: nothing stopped, or nothing
+    /// classified the stop, which is what the board used to say about all of
+    /// them.
+    ///
+    /// On the wire so a viewport can put the *decision* in front of a person —
+    /// switch model, switch account, wait — instead of the one verb every
+    /// stopped row used to share. The chat's own last words usually quote the
+    /// error; this says which of them it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<crate::StopReason>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2861,6 +2874,7 @@ mod tests {
             billed_to: None,
             max_duration_secs: None,
             context: None,
+            stop_reason: None,
             automation: None,
             automation_owner: None,
         }

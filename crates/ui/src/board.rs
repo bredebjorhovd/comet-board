@@ -4582,6 +4582,7 @@ mod tests {
             billed_to: None,
             max_duration_secs: None,
             context: None,
+            stop_reason: None,
         }
     }
 

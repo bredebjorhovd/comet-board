@@ -47,11 +47,15 @@ pub const ALL_CLEAR: &str = "Nothing needs you";
 /// notice will arrive before one ever has.
 pub const NO_REPORTS: &str = "No reports yet";
 
-/// Why a row is in the inbox — three ways a human ends up owed something.
+/// Why a row is in the inbox — the ways a human ends up owed something.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeedKind {
     /// Somebody is waiting on your answer: a question, or a permission prompt.
     Question,
+    /// The run stopped on a provider usage limit (gh#545). Not a corpse: the
+    /// work is intact and the move that works is a decision — switch model,
+    /// switch account, wait for the reset — which is why it outranks one.
+    Limited,
     /// A run died and is waiting on a retry.
     DeadRun,
     /// The orchestrator finished a turn you have not seen.
@@ -60,30 +64,36 @@ pub enum NeedKind {
 
 impl NeedKind {
     /// Inbox order — lower first. The same judgement [`AgentState::rank`]
-    /// encodes: a question outranks a corpse, and both outrank news.
+    /// encodes: a question outranks a limit, a limit outranks a corpse
+    /// (gh#545 — it is the stop with an actual decision to make), and all of
+    /// them outrank news.
     pub fn rank(self) -> u8 {
         match self {
             NeedKind::Question => 0,
-            NeedKind::DeadRun => 1,
-            NeedKind::Report => 2,
+            NeedKind::Limited => 1,
+            NeedKind::DeadRun => 2,
+            NeedKind::Report => 3,
         }
     }
 
     /// The board's own shape families (`view::board::BoardState::glyph`), so a
     /// row means the same thing here as one section down: pointed is stuck,
-    /// crossed is dead, checked is done-and-for-you.
+    /// clocked is a window you are waiting out, crossed is dead, checked is
+    /// done-and-for-you.
     pub fn glyph(self) -> &'static str {
         match self {
             NeedKind::Question => "▲",
+            NeedKind::Limited => "◷",
             NeedKind::DeadRun => "✕",
             NeedKind::Report => "✓",
         }
     }
 
-    /// What the row says when the chat has no last words to quote.
+    /// What the row says when there is nothing richer to build the line from.
     pub fn fallback(self) -> &'static str {
         match self {
             NeedKind::Question => "waiting on your answer",
+            NeedKind::Limited => "hit its usage limit — switch model, switch account, or wait",
             NeedKind::DeadRun => "its run died — open to retry",
             NeedKind::Report => "finished a turn you haven't seen",
         }
@@ -201,7 +211,14 @@ pub fn needs_you(
             continue;
         };
         let session = session_for(chat_id);
+        // A classified stop outranks the generic kinds (gh#545): a usage
+        // limit arrives with the session reading errored, and without this
+        // it would render as a dead run — "open to retry" — which is
+        // precisely the wrong verb for a wall that plain retrying hits again.
+        let limited = row.stop_reason.as_ref().is_some_and(|s| s.is_usage_limit());
         let kind = match agent_state(row.state(), session, now) {
+            AgentState::Blocked if limited => NeedKind::Limited,
+            AgentState::Errored if limited => NeedKind::Limited,
             AgentState::Blocked => NeedKind::Question,
             AgentState::Errored => NeedKind::DeadRun,
             AgentState::Working => continue,
@@ -223,7 +240,14 @@ pub fn needs_you(
             space_id: chat.space_id.clone(),
             who: row.identifier.clone(),
             slug: row.slug(),
-            what: what_line(chat, kind),
+            // A limit's line is built from what the board knows — provider,
+            // window, whose subscription — rather than quoting the chat: the
+            // transcript says the limit happened, and this line is the part
+            // that says what to do about it.
+            what: match kind {
+                NeedKind::Limited => limited_line(row),
+                _ => what_line(chat, kind),
+            },
             kind,
             since,
         });
@@ -284,6 +308,40 @@ fn what_line(chat: &Chat, kind: NeedKind) -> String {
         .map(single_line)
         .filter(|preview| !preview.is_empty())
         .unwrap_or_else(|| kind.fallback().to_string())
+}
+
+/// The one line a usage-limited row gets (gh#545), built from what the board
+/// knows instead of quoting the transcript: which provider, which window,
+/// whose subscription paid for the wall. The example it is written for reads
+/// `Claude 5-hour limit on brede@tally.no — switch model, switch account, or
+/// wait`.
+fn limited_line(row: &TaskRow) -> String {
+    let provider = provider_label(row.runtime.as_deref());
+    let window = row.stop_reason.as_ref().and_then(|s| s.window());
+    let subject = match (provider, window) {
+        (Some(p), Some(w)) => format!("{p} {w} limit"),
+        (Some(p), None) => format!("{p} usage limit"),
+        (None, Some(w)) => format!("{w} usage limit"),
+        (None, None) => "usage limit".to_string(),
+    };
+    let billed = match row.billed_to.as_deref() {
+        Some(email) if !email.trim().is_empty() => format!(" on {}", email.trim()),
+        _ => String::new(),
+    };
+    format!("{subject}{billed} — switch model, switch account, or wait")
+}
+
+/// Which company's usage window this runtime spends, in the spelling a person
+/// reads. `None` for anything unrecognised — "usage limit" alone is still
+/// true, and a wrong name would be worse than none.
+fn provider_label(runtime: Option<&str>) -> Option<&'static str> {
+    match runtime? {
+        "claude-code" | "claude" => Some("Claude"),
+        "codex" | "openai-codex" => Some("Codex"),
+        "opencode" => Some("OpenCode"),
+        "cursor" => Some("Cursor"),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -433,6 +491,7 @@ mod tests {
             billed_to: None,
             max_duration_secs: None,
             context: None,
+            stop_reason: None,
         }
     }
 
@@ -542,6 +601,49 @@ mod tests {
         // No last words to quote: the kind speaks.
         assert_eq!(needs[0].what, NeedKind::Question.fallback());
         assert_eq!(needs[1].what, NeedKind::DeadRun.fallback());
+    }
+
+    /// gh#545's headline, in the inbox: an agent stopped on a usage limit is
+    /// not a dead run. Its row says which provider hit which window on whose
+    /// subscription, and offers the decision instead of "open to retry" —
+    /// even when the chat's own last words quote the error, because quoting
+    /// says what happened and this line is the part that says what to do.
+    #[test]
+    fn a_usage_limited_agent_is_its_own_kind_with_its_own_line() {
+        let chats = vec![chat(
+            "c1",
+            None,
+            Some("Claude usage limit reached — try again after the limit resets."),
+        )];
+        let mut limited = attempt("529", "c1", BoardState::Blocked);
+        limited.runtime = Some("claude-code".into());
+        limited.billed_to = Some("brede@tally.no".into());
+        limited.stop_reason = Some(crate::StopReason::UsageLimit {
+            window: Some("5-hour".into()),
+        });
+        let sessions = vec![session("c1", SessionStatus::Errored, 0)];
+
+        let needs = needs_you(None, &[limited], &chats, &sessions, now());
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].kind, NeedKind::Limited);
+        assert_eq!(needs[0].kind.glyph(), "◷");
+        assert_eq!(
+            needs[0].what,
+            "Claude 5-hour limit on brede@tally.no — switch model, switch account, or wait"
+        );
+    }
+
+    /// The same without the frills the board could not resolve: no window
+    /// clocked, unknown runtime, nothing billed. Still its own kind, still
+    /// the decision.
+    #[test]
+    fn a_usage_limit_with_nothing_else_known_still_says_the_decision() {
+        let mut limited = attempt("529", "c1", BoardState::Blocked);
+        limited.stop_reason = Some(crate::StopReason::UsageLimit { window: None });
+        let needs = needs_you(None, &[limited], &[chat("c1", None, None)], &[], now());
+        assert_eq!(needs.len(), 1);
+        assert_eq!(needs[0].kind, NeedKind::Limited);
+        assert_eq!(needs[0].what, "usage limit — switch model, switch account, or wait");
     }
 
     /// One chat, one row: the orchestrator's row wins over its attempt row,

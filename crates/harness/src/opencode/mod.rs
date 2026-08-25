@@ -849,6 +849,7 @@ async fn run_session(session: Session) {
                         &event_tx,
                         AgentEvent::Error {
                             message: format!("opencode failed to start the run: {create_err}"),
+                            stop: None,
                         },
                     )
                     .await;
@@ -875,6 +876,7 @@ async fn run_session(session: Session) {
                 &event_tx,
                 AgentEvent::Error {
                     message: format!("opencode failed to start the run: {e2}"),
+                    stop: None,
                 },
             )
             .await;
@@ -1096,7 +1098,7 @@ async fn run_session(session: Session) {
                         interrupted = true;
                     } else {
                         turn_error = Some(message.clone());
-                        if !send(&event_tx, AgentEvent::Error { message }).await {
+                        if !send(&event_tx, AgentEvent::Error { message, stop: None }).await {
                             break 'main;
                         }
                     }
@@ -1147,6 +1149,7 @@ async fn run_session(session: Session) {
                                 &event_tx,
                                 AgentEvent::Error {
                                     message: format!("Steering failed: {e}"),
+                                    stop: None,
                                 },
                             )
                             .await
