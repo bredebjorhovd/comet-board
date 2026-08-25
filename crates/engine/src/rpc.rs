@@ -2064,7 +2064,7 @@ fn forwardable(method: &str) -> bool {
             // was per-USER until then, which is what kept a second teammate
             // out), exactly as for every other forwardable call.
             | methods::WATCH_BOARD
-            | methods::WATCH_BOARD_ORCHESTRATOR
+            | methods::WATCH_BOARD_FALLBACK
             | methods::DISPATCH_TASK
             | methods::CANCEL_TASK
             | methods::READ_BOARD_TASK
@@ -2124,7 +2124,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::UPDATE_STATUS
             | methods::WATCH_BOARD
-            | methods::WATCH_BOARD_ORCHESTRATOR
+            | methods::WATCH_BOARD_FALLBACK
     )
 }
 
@@ -2540,8 +2540,8 @@ impl RpcService for EngineRpc {
             // Board surface (comet-board fork, §runtime-impl). Served off
             // the board service's loop; absent when the board is disabled.
             methods::WATCH_BOARD => Ok(RpcReply::Stream(watch_stream(self.board()?.watch_rows()))),
-            methods::WATCH_BOARD_ORCHESTRATOR => Ok(RpcReply::Stream(watch_stream(
-                self.board()?.watch_orchestrator(),
+            methods::WATCH_BOARD_FALLBACK => Ok(RpcReply::Stream(watch_stream(
+                self.board()?.watch_fallback(),
             ))),
             // The runtimes a dispatch can be pointed at, and whether each could
             // actually start *here* (gh#187) — the board core's names, stamped

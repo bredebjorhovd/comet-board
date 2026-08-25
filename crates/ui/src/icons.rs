@@ -59,7 +59,7 @@ icon_assets![
     // Hand-drawn git-branch glyph in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
-    // Hand-drawn pin in the same style — the pinned-orchestrator affordance
+    // Hand-drawn pin in the same style — the fallback-chat affordance
     // (gh#104); the set here has no pin either.
     (PIN, "pin"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),

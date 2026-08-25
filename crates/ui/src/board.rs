@@ -1129,7 +1129,7 @@ impl BoardPanel {
             &self.model.rows,
             &state.chats,
             &state.sessions,
-            state.orchestrator.as_deref(),
+            state.fallback_chat.as_deref(),
             now,
         )
     }
@@ -1142,7 +1142,7 @@ impl BoardPanel {
     pub fn needs(&self, cx: &App, now: chrono::DateTime<Utc>) -> Vec<needs_view::NeedRow> {
         let state = self.state.read(cx);
         needs_view::needs_you(
-            state.orchestrator.as_deref(),
+            state.fallback_chat.as_deref(),
             &self.model.rows,
             &state.chats,
             &state.sessions,

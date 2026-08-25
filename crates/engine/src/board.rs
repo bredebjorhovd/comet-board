@@ -45,7 +45,7 @@ use comet_board::sources::github::{HttpRest, PushCapabilities};
 use comet_board::stats::Stats as BoardStats;
 use comet_board::sync::{SessionStatuses, SyncEngine};
 use comet_board::verdict::{VerdictKind, VerdictReceipt};
-use comet_proto::view::board::OrchestratorPin;
+use comet_proto::view::board::FallbackPin;
 use comet_proto::view::stats::StatsMergeBasis;
 use comet_proto::{Session, Space};
 use tokio::sync::{oneshot, watch};
@@ -143,14 +143,14 @@ pub struct BoardService {
     thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
     watch_task: tokio::task::JoinHandle<()>,
     rows: watch::Receiver<Vec<TaskRow>>,
-    /// The pinned orchestrator (gh#104). Held as the *sender* so two writers
+    /// Where stray notices go (gh#104). Held as the *sender* so two writers
     /// can reach it: the loop, which republishes whenever it rereads
     /// `routing.toml` (an `$EDITOR` over ssh), and
     /// [`BoardService::note_config`], which republishes the instant a
     /// `WriteBoardConfig` lands — pinning a chat from the app is a direct
     /// action, and a glyph that appeared up to a sync interval later would read
     /// as the click not having worked.
-    orchestrator: Arc<watch::Sender<OrchestratorPin>>,
+    fallback: Arc<watch::Sender<FallbackPin>>,
     /// Where this board's `routing.toml`, `.env` and store live. Kept here so
     /// the config RPCs (gh#75) resolve them off the running service rather than
     /// re-deriving them from the data dir — two answers to "which routing.toml"
@@ -213,7 +213,7 @@ impl BoardService {
         drop(db);
         let (tx, rx) = mpsc::channel::<Msg>();
         let (rows_tx, rows_rx) = watch::channel(Vec::<TaskRow>::new());
-        let pin_tx = Arc::new(watch::Sender::new(OrchestratorPin::default()));
+        let pin_tx = Arc::new(watch::Sender::new(FallbackPin::default()));
         let loop_pin = pin_tx.clone();
 
         // Forward every watch snapshot (current value first — the loop must
@@ -253,7 +253,7 @@ impl BoardService {
             thread: std::sync::Mutex::new(Some(thread)),
             watch_task,
             rows: rows_rx,
-            orchestrator: pin_tx,
+            fallback: pin_tx,
             paths,
             board_id,
         })
@@ -278,10 +278,10 @@ impl BoardService {
         self.rows.clone()
     }
 
-    /// The pinned orchestrator, current value first — what
-    /// `WatchBoardOrchestrator` streams (gh#104).
-    pub fn watch_orchestrator(&self) -> watch::Receiver<OrchestratorPin> {
-        self.orchestrator.subscribe()
+    /// The board's fallback chat, current value first — what
+    /// [`methods::WATCH_BOARD_FALLBACK`] streams (gh#104).
+    pub fn watch_fallback(&self) -> watch::Receiver<FallbackPin> {
+        self.fallback.subscribe()
     }
 
     /// A `routing.toml` write just landed: republish anything derived from it
@@ -297,7 +297,7 @@ impl BoardService {
         let Some(cfg) = view.config.as_ref() else {
             return;
         };
-        publish_pin(&self.orchestrator, cfg.defaults.orchestrator());
+        publish_pin(&self.fallback, cfg.defaults.fallback());
     }
 
     /// Release a task: resolve its route, cut the checkout, create the chat,
@@ -552,11 +552,11 @@ impl Drop for BoardService {
 }
 
 /// What the loop publishes out to subscribers: the board's rows
-/// (`WatchBoard`) and its pinned orchestrator (`WatchBoardOrchestrator`). One
+/// (`WatchBoard`) and its fallback chat ([`methods::WATCH_BOARD_FALLBACK`]). One
 /// struct because they are the loop's outputs and travel as a set.
 struct Feeds {
     rows: watch::Sender<Vec<TaskRow>>,
-    pin: Arc<watch::Sender<OrchestratorPin>>,
+    pin: Arc<watch::Sender<FallbackPin>>,
 }
 
 fn run_loop(
@@ -585,7 +585,7 @@ fn run_loop(
     // Before the first cycle: a frontend that connects to a box whose board is
     // mid-poll should see the pin it already has, not "unpinned" for a whole
     // interval and then a glyph appearing under the cursor.
-    publish_pin(&feeds.pin, engine.cfg.defaults.orchestrator());
+    publish_pin(&feeds.pin, engine.cfg.defaults.fallback());
     loop {
         if Instant::now() >= next_sync {
             // Credentials and routes are read at startup, but the engine
@@ -596,7 +596,7 @@ fn run_loop(
                 // The reload is the only moment the pin can have moved: it is a
                 // `routing.toml` key, so `WriteBoardConfig` from a laptop and an
                 // `$EDITOR` over ssh both land here and nowhere else.
-                publish_pin(&feeds.pin, engine.cfg.defaults.orchestrator());
+                publish_pin(&feeds.pin, engine.cfg.defaults.fallback());
             }
             match engine.sync_once_with(statuses.as_ref(), Some(runtime.as_ref())) {
                 // Review delivery rides the cycle's own PR poll, and runs
@@ -835,11 +835,11 @@ fn run_auto_pick(
     dispatched
 }
 
-/// Publish the pinned orchestrator to `WatchBoardOrchestrator` subscribers
+/// Publish the board's fallback chat to [`methods::WATCH_BOARD_FALLBACK`] subscribers
 /// (gh#104) — only when it actually changed, so the sidebars are not woken by
 /// every cycle that read the same config back.
-fn publish_pin(pin: &watch::Sender<OrchestratorPin>, chat_id: Option<&str>) {
-    let fresh = OrchestratorPin {
+fn publish_pin(pin: &watch::Sender<FallbackPin>, chat_id: Option<&str>) {
+    let fresh = FallbackPin {
         chat_id: chat_id.map(str::to_string),
     };
     pin.send_if_modified(|current| {
@@ -893,7 +893,7 @@ fn handle_dispatch(
     overrides: &DispatchOverrides,
     replace: bool,
     // The auto-pick rule releasing this, and its human owner (gh#490).
-    // `None` on every dispatch a person or an orchestrating agent asked for.
+    // `None` on every dispatch a person or a driving agent asked for.
     // A parameter rather than a field on `DispatchOrigin` because no RPC
     // caller may claim it: automation provenance exists only on the path the
     // board's own evaluator drives.
@@ -1208,7 +1208,7 @@ fn handle_dispatch(
             // neither — see `dispatcher_name` for why that order and not the
             // one gh#232 found. Plain, without gh#161's strength marker: this
             // one is a public issue comment, and the audience for "the box
-            // checked this" is the operator and the orchestrator, not the repo.
+            // checked this" is the operator and whoever drives the board, not the repo.
             let by = match automation {
                 // An automated release names the rule and its human owner —
                 // the comment is the surface a repo reader sees, and "who
@@ -2552,7 +2552,7 @@ billing_guard = "{mode}"
             .expect("the owner's own subscription");
 
         // No `viaUser` at all — `comet-board` from a shell nobody signed into,
-        // or an orchestrating agent. Nothing to compare, so nothing refused.
+        // or a driving agent. Nothing to compare, so nothing refused.
         service
             .dispatch_task(
                 "gh:owner/widget#105",
@@ -2757,7 +2757,7 @@ max_concurrent_per_workspace = 1
     }
 
     /// gh#232: a `via` chat the board never dispatched resolves to no
-    /// identifier — the long-lived orchestrator case — and its id is a UUID.
+    /// identifier — the long-lived driving chat — and its id is a UUID.
     /// The attempt row keeps it (it is the address a settle notice goes to),
     /// and the public comment names the person instead.
     #[tokio::test(flavor = "multi_thread")]

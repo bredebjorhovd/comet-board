@@ -690,7 +690,7 @@ impl DispatchOrigin {
 /// - a live attempt owning that chat is a board-dispatched agent, and names
 ///   its **task** as the parent — the chain keeps the richer `via LIN-138`
 ///   label rather than dropping to a chat id;
-/// - a chat the board never dispatched (the usual long-lived orchestrator, the
+/// - a chat the board never dispatched (the usual long-lived driving chat, the
 ///   case AGE-24 existed for) is still an agent, recorded by its chat alone —
 ///   `chat_alive` is comet's answer to "does the pane hold an agent";
 /// - a chat that is archived or gone is not claimed as an agent: recording it
@@ -893,7 +893,7 @@ pub struct RanOn<'a> {
 }
 
 /// Per-dispatch deviations from the route's defaults — what the operator (or an
-/// orchestrating agent) chooses at release time over what `routing.toml` says.
+/// driving agent) chooses at release time over what `routing.toml` says.
 ///
 /// `runtime` is validated against the same [`harness_for_runtime`] mapping as
 /// the route's own `runtime` key; the pickers surface exactly the canonical
@@ -2341,7 +2341,7 @@ mod tests {
         );
     }
 
-    /// The usual case (AGE-24): a long-lived orchestrator chat the board never
+    /// The usual case (AGE-24): a long-lived driving chat the board never
     /// dispatched. Still an agent, recorded by its chat alone.
     #[test]
     fn a_live_chat_without_an_attempt_is_an_agent_by_chat() {
@@ -2352,7 +2352,7 @@ mod tests {
         assert_eq!(dispatcher_name(&db, &d, None).as_deref(), Some("chat-orch"));
     }
 
-    /// gh#232: an orchestrator chat the board never dispatched resolves to no
+    /// gh#232: a driving chat the board never dispatched resolves to no
     /// identifier, and the chat id is a UUID on a public comment. The human the
     /// board already recorded beats it; the id survives only when there is
     /// nobody to name, and a blank claim is nobody.
@@ -2389,7 +2389,7 @@ mod tests {
     }
 
     /// A parent whose attempt has ended is no longer named by its task, but
-    /// its chat can still be an agent (an orchestrator waiting on children).
+    /// its chat can still be an agent (a dispatcher waiting on children).
     #[test]
     fn a_finished_parents_chat_is_still_an_agent_while_alive() {
         let db = Db::open_in_memory().unwrap();

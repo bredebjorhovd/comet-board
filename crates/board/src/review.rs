@@ -1,7 +1,7 @@
 //! Deliver pull-request review comments back into the chat that wrote the PR
 //! (§review-delivery; herdr-board gh#13).
 //!
-//! An orchestrator reviews a task and writes its feedback on the pull request.
+//! A reviewer reads a task and writes its feedback on the pull request.
 //! The agent that wrote the PR never sees it: it is sitting in a live chat with
 //! the entire task in context, and the review is a notification it has no way
 //! to receive. A task in `review` keeps its chat — nothing disposes of a chat
@@ -11,7 +11,7 @@
 //!
 //! ## The loop, and what closes it here
 //!
-//! The orchestrator and the agent act as the same GitHub identity — both are
+//! The reviewer and the agent act as the same GitHub identity — both are
 //! the operator's token — so "skip my own comments" has nothing to key on. A
 //! naive implementation delivers a comment, the agent replies on the PR, the
 //! board sees a new comment and delivers it back, forever.
@@ -1054,7 +1054,7 @@ pub(crate) mod tests {
     #[test]
     fn an_agents_own_reply_is_relayed_once_and_never_twice() {
         let mut state = seen("2026-07-28T11:00:00Z");
-        // The orchestrator asks for changes.
+        // The reviewer asks for changes.
         let d = plan(
             &mut state,
             "2026-07-28T11:30:00Z",
@@ -1068,7 +1068,7 @@ pub(crate) mod tests {
         assert!(matches!(d, Decision::Deliver(_)));
 
         // The agent replies on the pull request. Same GitHub identity as the
-        // orchestrator, so nothing about the comment says who wrote it — it is
+        // reviewer, so nothing about the comment says who wrote it — it is
         // relayed back into the chat, which is the accepted cost of dropping
         // the latch.
         let reply = feedback(

@@ -382,32 +382,32 @@ final class AppModel {
         let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
         let chats = demo?.chats ?? workspace?.chats ?? []
         return activeRows(rows: boardRows, chats: chats, sessions: sessions,
-                          orchestrator: orchestratorChatId)
+                          fallback: fallbackChatId)
     }
 
-    /// Which chat the board has pinned as its orchestrator (gh#104), off the
+    /// Which chat takes this board's stray notices (gh#104, gh#348), off the
     /// host the board sweep settled on.
-    var orchestratorChatId: String? {
-        demo != nil ? demo?.orchestratorChatId : board?.orchestratorChatId
+    var fallbackChatId: String? {
+        demo != nil ? demo?.fallbackChatId : board?.fallbackChatId
     }
 
-    /// What to call the pinned chat when a *different* chat is about to take
-    /// the pin from it (gh#166) — the pin is one key, so saying yes moves it.
+    /// What to call the chat a *different* chat is about to take the address
+    /// from (gh#166) — it is one key, so saying yes moves it.
     ///
-    /// A pin whose chat has not synced to this phone still has to be nameable:
-    /// the operator is being told what they are about to displace, and "nothing
-    /// is pinned" would be the one wrong answer.
-    var pinnedOrchestratorName: String? {
-        guard let pin = orchestratorChatId else { return nil }
-        return chat(id: pin)?.displayTitle ?? orchestratorName
+    /// An address whose chat has not synced to this phone still has to be
+    /// nameable: the operator is being told what they are about to displace,
+    /// and "nothing is set" would be the one wrong answer.
+    var fallbackChatName: String? {
+        guard let address = fallbackChatId else { return nil }
+        return chat(id: address)?.displayTitle ?? boardNoticesName
     }
 
     /// Whether the board dispatched this chat — an attempt of its own.
     ///
-    /// The one thing `comet-board doctor` says can be wrong with a pin: an
-    /// attempt holds a workspace slot and is exempted from its own time cap by
-    /// being pinned. Rows the board never released answer false, which includes
-    /// every chat on a phone attached to no board at all.
+    /// The one thing `comet-board doctor` says can be wrong here: the board's
+    /// own events landing in a chat that is in the middle of a task of its own.
+    /// Rows the board never released answer false, which includes every chat on
+    /// a phone attached to no board at all.
     func boardDispatched(chatId: String) -> Bool {
         boardRows.contains { $0.chatId == chatId }
     }
@@ -417,15 +417,15 @@ final class AppModel {
     var needsYouRows: [NeedRow] {
         let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
         let chats = demo?.chats ?? workspace?.chats ?? []
-        return needsYou(orchestrator: orchestratorChatId, rows: boardRows,
+        return needsYou(fallback: fallbackChatId, rows: boardRows,
                         chats: chats, sessions: sessions)
     }
 
-    /// The orchestrator's pinned slot (gh#122), or `nil` when none is pinned.
-    var orchestratorSlotRow: OrchestratorSlot? {
+    /// The board-notices slot (gh#122), or `nil` when no chat takes them.
+    var boardNoticesSlotRow: BoardNoticesSlot? {
         let sessions = demo?.sessions ?? workspace?.sessions ?? [:]
         let chats = demo?.chats ?? workspace?.chats ?? []
-        return orchestratorSlot(orchestrator: orchestratorChatId,
+        return boardNoticesSlot(fallback: fallbackChatId,
                                 chats: chats, sessions: sessions)
     }
 
@@ -542,18 +542,18 @@ final class AppModel {
         return await board.stats(sinceDays: sinceDays)
     }
 
-    /// Pin a chat as the board's orchestrator, or unpin whatever is (gh#144).
+    /// Send the board's stray notices to a chat, or stop (gh#144, gh#348).
     ///
-    /// The phone's only route to `comet-board routes defaults orchestrator_chat
-    /// --unset`: the slot is often the ONLY row a pinned chat has, since its
+    /// The phone's only route to `comet-board routes defaults fallback_chat
+    /// --unset`: the slot is often the ONLY row that chat has, since its
     /// session ends and its space shelf may never have listed it.
-    func setOrchestrator(chatId: String?) async -> String? {
+    func setFallbackChat(chatId: String?) async -> String? {
         if let demo {
-            demo.orchestratorChatId = chatId
+            demo.fallbackChatId = chatId
             return nil
         }
         guard let board else { return "Not connected to a board" }
-        return await board.setOrchestrator(chatId: chatId)
+        return await board.setFallbackChat(chatId: chatId)
     }
 
     func cancelBoardTask(taskId: String) async -> String? {

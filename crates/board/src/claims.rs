@@ -331,7 +331,7 @@ pub struct Brief {
 /// nobody accounted for.
 ///
 /// Serialized `snake_case` throughout, like [`crate::rows::TaskRow`] and unlike
-/// the RPC *params* around it: the same orchestrating agents read `list --json`
+/// the RPC *params* around it: the same driving agents read `list --json`
 /// and this, and one object changing case halfway through a CLI is a papercut
 /// nobody should have to remember.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -433,7 +433,7 @@ pub struct AttemptReview {
     #[serde(default)]
     pub effects: crate::effects::Effects,
     /// The auto-pick rule that released this attempt, and its human owner
-    /// (gh#490). Both `None` on every attempt a person or an orchestrating
+    /// (gh#490). Both `None` on every attempt a person or a driving
     /// agent dispatched. On the review because that is where an autonomous
     /// attempt meets its human: the reviewer is entitled to know nobody
     /// pressed dispatch, and who answers for the rule that did.
@@ -2013,7 +2013,7 @@ mod tests {
     }
 
     /// The published shape (`comet-board review --json`, `ReadAttemptReview`).
-    /// Pinned because orchestrating agents read it beside `list --json`, and a
+    /// Pinned because driving agents read it beside `list --json`, and a
     /// key that quietly changes case is a key that quietly stops being read.
     #[test]
     fn the_json_is_snake_case_and_flattens_the_remainder_into_the_review() {

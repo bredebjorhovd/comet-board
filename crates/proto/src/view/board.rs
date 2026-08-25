@@ -228,31 +228,33 @@ impl RuntimeUnavailable {
     }
 }
 
-/// The mark a pinned orchestrator's session row carries, on both viewports.
+/// The mark the board's fallback chat carries on its session row, on both
+/// viewports.
 ///
 /// Shape-distinct from every [`BoardState::glyph`] and from the session dot, on
 /// the same rule those follow: it has to survive colour being stripped, because
 /// one row in the list meaning something different from all the others is the
 /// whole point of drawing it.
-pub const ORCHESTRATOR_GLYPH: &str = "◆";
+pub const FALLBACK_GLYPH: &str = "◆";
 
-/// Which chat, if any, is pinned as this board's orchestrator (gh#104).
+/// Which chat, if any, takes this board's stray notices (gh#104, renamed in
+/// gh#348).
 ///
 /// A frame of its own rather than a field on [`TaskRow`], and a *stream* rather
-/// than a read, for the same reason: the pin is a property of the board and not
-/// of any task on it, and every surface that renders it — the sidebar, on both
-/// viewports — needs it before a board panel has ever been opened. Reading it
-/// off `ReadBoardConfig` would work and would cost a git probe per space every
-/// time, which is the wrong price for a glyph.
+/// than a read, for the same reason: the address is a property of the board and
+/// not of any task on it, and every surface that renders it — the sidebar, on
+/// both viewports — needs it before a board panel has ever been opened. Reading
+/// it off `ReadBoardConfig` would work and would cost a git probe per space
+/// every time, which is the wrong price for a glyph.
 ///
-/// A struct rather than a bare `Option<String>` because this is the frame a
-/// pinned-chat feature grows in: `null` today means unpinned, and a field added
-/// beside it later does not change what an old client already parses.
+/// A struct rather than a bare `Option<String>` because this is the frame the
+/// feature grows in: `null` today means no address, and a field added beside it
+/// later does not change what an old client already parses.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct OrchestratorPin {
-    /// The pinned chat's id. `None` = this board has no orchestrator, which is
-    /// the default and a legitimate way to run one.
+pub struct FallbackPin {
+    /// The chat's id. `None` = this board sends its stray notices nowhere,
+    /// which is the default and a legitimate way to run one.
     #[serde(default)]
     pub chat_id: Option<String>,
 }
@@ -368,7 +370,7 @@ impl RowStack {
 ///
 /// This shape is a published contract, consumed three ways: `WatchBoard`
 /// streams it, the `comet-board` CLI prints it (§board-cli, verbatim), and the
-/// agent conventions text teaches orchestrating agents to poll it. Field
+/// agent conventions text teaches driving agents to poll it. Field
 /// renames from herdr-board are exactly the two the port dictates — `pane_id`
 /// → `chat_id`, `dispatched_by_pane` → `dispatched_by_chat` — because the
 /// values *are* chat ids now, and a contract that lies about what its ids
@@ -399,7 +401,7 @@ pub struct TaskRow {
     /// is review context, not a live agent consuming a concurrency slot.
     #[serde(default)]
     pub review_chat_id: Option<String>,
-    /// Set on `review` rows, which is how a PR reaches an orchestrator.
+    /// Set on `review` rows, which is how a PR reaches a reviewer.
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
     /// The branch the pull request merges *into* (gh#282). Trunk for a
@@ -452,7 +454,7 @@ pub struct TaskRow {
     pub stack: Option<RowStack>,
     pub branch: Option<String>,
     /// Parent task id when the board dispatched the releasing agent too. Null
-    /// on its own does **not** mean the operator: an orchestrating chat has no
+    /// on its own does **not** mean the operator: an driving chat has no
     /// attempt and so no task id — read `dispatched_by_chat` as well.
     pub dispatched_by: Option<String>,
     /// The chat the dispatch ran from, when an agent was in it (herdr-board's
@@ -562,7 +564,7 @@ pub struct TaskRow {
     pub context: Option<crate::ContextUsage>,
     /// The auto-pick rule that released this row's attempt (gh#490), and the
     /// human who owns that rule. Both absent on every row a person or an
-    /// orchestrating agent dispatched — automation provenance marks the
+    /// driving agent dispatched — automation provenance marks the
     /// exception, and [`automation_line`] is the sentence both viewports
     /// render from it. Defaulted on the wire so a row from an older box
     /// simply reads as nobody's automation.
@@ -1676,7 +1678,7 @@ pub fn billed_email<'a>(
 /// claim, over the relay it is the identity the edge verified, and this
 /// comparison is the same either way. Two unknowns read as "not cross-billed"
 /// rather than as an accusation — an unattributed dispatch (the bare CLI, an
-/// orchestrating agent) names nobody to have wronged.
+/// driving agent) names nobody to have wronged.
 pub fn cross_billed(billed_to: Option<&str>, dispatcher: Option<&str>) -> bool {
     let (Some(billed), Some(by)) = (email(billed_to), email(dispatcher)) else {
         return false;
@@ -2469,12 +2471,12 @@ pub(crate) fn agent_state(
 // ---------------------------------------------------------------------------
 //
 // [`agent_rows`] answers "what has the board released", which is a smaller
-// question than "what is working on this box". An orchestrator that raised
+// question than "what is working on this box". A chat that raised
 // in-chat subagents instead of dispatching, an ad-hoc chat somebody started by
 // hand: all of them are real runs holding a real checkout, and none of them
 // has an attempt row, so the Agents section shows nothing and the only honest
 // answer to "are they even alive" was `pgrep` over ssh. This is the other half
-// of the list. (The pinned orchestrator, which used to lead this group, now
+// of the list. (The board's fallback chat, which used to lead this group, now
 // has a fixed slot of its own — gh#122 — and is subtracted here.)
 //
 // The join is the same one gh#103 does, minus the board row — which is exactly
@@ -2508,7 +2510,7 @@ pub struct RunningRow {
     /// indicator, and an errored run is not a working one.
     pub state: AgentState,
     /// When the *run* started, off the session mirror — not when the chat was
-    /// created, which for a long-lived orchestrator is days ago and says
+    /// created, which for a long-lived chat is days ago and says
     /// nothing about the work in front of it. `None` where the mirror carries
     /// no start (an engine that predates the field).
     ///
@@ -2559,7 +2561,7 @@ impl RunningRow {
 /// - **Archived is not a reason to hide a run.** Archiving is a decision about
 ///   a *finished* chat; one that is working anyway is the exact invisible run
 ///   this group exists to surface.
-/// - **The pinned orchestrator is subtracted too** (gh#122): it has a fixed
+/// - **The board's fallback chat is subtracted too** (gh#122): it has a fixed
 ///   slot of its own above Spaces, which carries its live state — a second
 ///   row here would report the same run twice.
 ///
@@ -2570,7 +2572,7 @@ pub fn running_rows(
     rows: &[TaskRow],
     chats: &[crate::Chat],
     sessions: &[crate::Session],
-    orchestrator: Option<&str>,
+    fallback: Option<&str>,
     now: DateTime<Utc>,
 ) -> Vec<RunningRow> {
     let dispatched: Vec<&str> = rows
@@ -2581,7 +2583,7 @@ pub fn running_rows(
     let mut out: Vec<RunningRow> = chats
         .iter()
         .filter(|chat| !dispatched.contains(&chat.id.as_str()))
-        .filter(|chat| orchestrator != Some(chat.id.as_str()))
+        .filter(|chat| fallback != Some(chat.id.as_str()))
         .filter_map(|chat| {
             let session = sessions.iter().find(|s| s.chat_id == chat.id);
             let state = match crate::view::effective_indicator(session, now) {
@@ -2632,7 +2634,7 @@ pub fn running_rows(
 // ---------------------------------------------------------------------------
 //
 // [`agent_rows`] and [`running_rows`] split the live list by how a run started
-// — the board released it, or somebody (or some orchestrator) just started it.
+// — the board released it, or somebody (or some other agent) just started it.
 // That is a mechanism distinction, and the reader's question does not contain
 // it: "what is working, and which of it wants me" has one answer, not two. So
 // one group, needs-you first, then working, origin-blind in the order and
@@ -2649,7 +2651,7 @@ pub fn running_rows(
 pub enum ActiveRow {
     /// The board released this: it has an issue, a branch, a cap and a bill.
     Agent(AgentRow),
-    /// A run the board never heard of: the orchestrator, an ad-hoc chat,
+    /// A run the board never heard of: a chat driving the board, an ad-hoc one,
     /// anything started by hand.
     Unmanaged(RunningRow),
 }
@@ -2700,18 +2702,18 @@ pub fn active_rows(
     rows: &[TaskRow],
     chats: &[crate::Chat],
     sessions: &[crate::Session],
-    orchestrator: Option<&str>,
+    fallback: Option<&str>,
     now: DateTime<Utc>,
 ) -> Vec<ActiveRow> {
     let mut out: Vec<ActiveRow> = agent_rows(rows, chats, sessions, now)
         .into_iter()
         .map(ActiveRow::Agent)
         .chain(
-            // The pinned orchestrator is subtracted with the rest of the
+            // The board's fallback chat is subtracted with the rest of the
             // unmanaged membership rules (gh#122): its slot above Spaces
             // carries its live state, and a second row here would report
             // the same run twice.
-            running_rows(rows, chats, sessions, orchestrator, now)
+            running_rows(rows, chats, sessions, fallback, now)
                 .into_iter()
                 .map(ActiveRow::Unmanaged),
         )
@@ -3900,13 +3902,13 @@ mod tests {
     #[test]
     fn a_working_chat_with_no_attempt_is_a_running_row() {
         let chats = vec![
-            chat("orchestrator", None),
+            chat("notices", None),
             chat("adhoc", None),
             chat("idle", None),
         ];
         let sessions = vec![
             started(
-                "orchestrator",
+                "notices",
                 crate::SessionStatus::Working,
                 "2026-08-01T11:30:00Z",
             ),
@@ -3923,7 +3925,7 @@ mod tests {
                 .map(|r| r.chat_id.as_str())
                 .collect::<Vec<_>>(),
             // Blocked floats; the idle chat is not a run at all.
-            vec!["adhoc", "orchestrator"]
+            vec!["adhoc", "notices"]
         );
         assert_eq!(running[0].state, AgentState::Blocked);
         assert_eq!(running[1].elapsed_label(now()).as_deref(), Some("30m00s"));
@@ -4046,10 +4048,10 @@ mod tests {
         assert_eq!(running_rows(&[], &chats, &sessions, None, now()).len(), 1);
     }
 
-    /// The pinned orchestrator has a slot of its own (gh#122) — a working
-    /// orchestrator is the slot's news, not a Running row.
+    /// The fallback chat has a slot of its own (gh#122) — when it is working
+    /// that is the slot's news, not a Running row.
     #[test]
-    fn the_pinned_orchestrator_is_the_slots_not_runnings() {
+    fn the_fallback_chat_is_the_slots_not_runnings() {
         let chats = vec![chat("orch", None), chat("adhoc", None)];
         let sessions = vec![
             session("orch", crate::SessionStatus::Working, 0),

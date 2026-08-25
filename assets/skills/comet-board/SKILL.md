@@ -121,8 +121,8 @@ comet-board wait --timeout 3600 --json [--blocked-is-settled]
 ```
 
 `wait` with no --task watches everything in flight when called; it does NOT
-return on blocked unless you pass `--blocked-is-settled` — an orchestrator that
-skips that flag hangs on a child's question forever.
+return on blocked unless you pass `--blocked-is-settled` — skip that flag and
+you hang on a child's question forever.
 
 Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
 
@@ -162,7 +162,7 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
 - After releasing work, wait for it or say plainly you're leaving it running.
   Your chat is prompted when it settles or blocks (`notify_dispatcher`, on by
   default) — and is the first addressee, so what reaches you does not also
-  reach the board's orchestrator. The board keeps your chat off the shelf
+  reach the board's fallback chat. The board keeps your chat off the shelf
   until the work you released has left the board — settling is not enough, so
   the whole merge window is yours. Never promise
   you'll be woken: the setting is invisible from here, and a chat somebody
@@ -182,7 +182,46 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
   `raw.githubusercontent.com/<owner>/<repo>/<branch>/…` URL is broken on a
   private repo and dies with the branch on merge — silently, both times.
 
-The pinned orchestrator's fuller brief: docs/orchestrator.md.
+## Driving the board
+
+Nothing appoints you to this and nothing has to be configured for it. **A chat
+that dispatches is already the parent of what it dispatched**: the dispatch
+records your chat id, its settles and blocks come back to you as prompts, and
+the board keeps your chat off the shelf while the work you released is still
+owed. If you are the chat somebody is releasing work from, you are the driver,
+and the verbs above are the whole of the job. What that job is, beyond them:
+
+- **The board is the state — re-read, don't remember.** `comet-board list
+  --json` knows what is ready, working, blocked and in review, and it is still
+  true after a compaction, a restart, or somebody else's dispatch. A driver
+  that re-reads has nothing to lose by forgetting.
+- **Dispatch only what a human asked for.** Releasing work starts a real agent
+  in a real repo that commits and opens pull requests. Never a gap in the
+  queue, never "this looked ready", never a plan you made yourself. If you
+  think something should go out and nobody has said so, say so and wait.
+- **Review what comes back, on the pull request.** A task in `review` keeps its
+  chat and comments are delivered into it, so the agent that wrote the diff is
+  still sitting there with the whole task in context. Do not describe the
+  problem to a human to relay.
+- **A block is yours to unstick.** An agent waiting on an answer sits there
+  until it gets one. Read its chat and answer it, or say why you cannot.
+- **Retry judiciously.** `comet-board retry --task <id>` — not cancel then
+  dispatch, which leaves the row `ready` in between for a cap or another agent
+  to take. A different model is the usual reason to retry at all. Retrying a
+  blocked row discards the question its agent was waiting on.
+- **Accounts are the operator's choice.** Do not pass `--account` unless you
+  were told which to use; `routing.toml` decides whose subscription a route's
+  work bills. When `dispatch` prints that a release charges somebody other than
+  whoever it is attributed to, repeat that line rather than swallowing it.
+- **Report cheaply.** When a batch settles, one summary: what landed, what
+  needs a human, what you are still waiting on. That summary is the product.
+
+One chat on a board may be named as its **fallback** (`[defaults]
+fallback_chat`): the address for notices no dispatcher can be given — work
+released from the panel or the phone, work whose dispatching chat is gone, cap
+warnings. It is an address, not a role, and if this chat is it you are told so
+by the notices arriving, not by anything you have to look up.
+docs/fallback-chat.md.
 
 ## Every verb
 
@@ -191,7 +230,7 @@ Global flags, on every verb: `--port`, `--data-dir`, `--device`.
 
 | verb | flags | what it is for |
 | --- | --- | --- |
-| `list` | `--state`, `--source`, `--label`, `--json` | List what is on the board. `--json` for orchestrating agents |
+| `list` | `--state`, `--source`, `--label`, `--json` | List what is on the board. `--json` for agents driving it |
 | `dispatch` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--decompose`, `--onto`, `--base` | Release a task into a coding-agent chat |
 | `retry` | `--task`, `--via`, `--runtime`, `--model`, `--account`, `--bill`, `--stack`, `--decompose`, `--onto`, `--base` | Release a task again — the desktop panel's Retry, from a shell |
 | `cancel` | `--task` | Cancel a task's live attempt. The issue stays open |

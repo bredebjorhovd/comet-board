@@ -692,7 +692,7 @@ pub struct Attempt {
     pub claims_error: Option<String>,
     /// The auto-pick rule that released this attempt (gh#490), and the human
     /// who owns that rule. Both `None` on every attempt a person or an
-    /// orchestrating agent dispatched — which is what makes the provenance
+    /// driving agent dispatched — which is what makes the provenance
     /// legible: an automation's work always says whose automation it is.
     pub automation: Option<String>,
     pub automation_owner: Option<String>,
@@ -709,7 +709,7 @@ impl Attempt {
 ///
 /// The board dispatches *into* fresh panes, but the pane that does the
 /// dispatching is usually not one of them: the common topology is one
-/// long-lived orchestrator pane the operator started and keeps around, which
+/// long-lived driving chat the operator started and keeps around, which
 /// releases many children. That pane is a session, not an attempt — so asking
 /// "does a live attempt own this pane" answers `None` for exactly the case
 /// provenance most needs to see, and every dispatch gets recorded as the
@@ -727,7 +727,7 @@ pub enum Dispatcher {
     Operator,
     Agent {
         /// The agent's own task, when the board dispatched it. Absent for an
-        /// orchestrator pane, which is the usual case.
+        /// driving chat, which is the usual case.
         task: Option<String>,
         /// The pane it ran from — a delivery address, and the only identifier
         /// that is always available.

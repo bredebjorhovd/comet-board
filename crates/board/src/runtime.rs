@@ -445,7 +445,7 @@ pub trait Runtime {
     fn dispatch(&self, spec: &DispatchSpec) -> anyhow::Result<DispatchHandle>;
 
     /// Deliver text into a live chat — review comments, settle notices to a
-    /// dispatching orchestrator. Queued as a steer if a run is live, a send
+    /// dispatching chat. Queued as a steer if a run is live, a send
     /// otherwise; the command ledger's supersede rules apply.
     fn prompt(&self, chat_id: &str, text: &str) -> anyhow::Result<()>;
 

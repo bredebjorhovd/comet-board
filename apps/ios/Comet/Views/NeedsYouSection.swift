@@ -1,17 +1,17 @@
-// The "Needs you" inbox and the orchestrator's pinned slot — gh#122, on the
+// The "Needs you" inbox and the board-notices slot — gh#122, on the
 // phone, where they matter most: the desktop critique's 8px dot vocabularies
 // do not exist at arm's length at all. Every row here is words — WHO wants
 // you, and one line of WHAT — and the empty state is words too.
 //
-// Pure presentation over `needsYou` / `orchestratorSlot` (BoardModels.swift,
+// Pure presentation over `needsYou` / `boardNoticesSlot` (BoardModels.swift,
 // ports of `comet_proto::view::needs`). A tap opens the chat, which is where
 // answering, retrying and reading all happen — and what marks the thread seen,
 // the synced marker that clears the badge on every device.
 //
-// The one thing a row here writes is the orchestrator pin, on long-press
-// (`OrchestratorPin.swift`, gh#166): both halves of it, in the words the
-// desktop and the TUI use, since the slot below is only the pinned case of the
-// same item.
+// The one thing a row here writes is where the board's notices go, on
+// long-press (`BoardNotices.swift`, gh#166): both halves of it, in the words
+// the desktop uses, since the slot below is only the set case of the same
+// item.
 
 import SwiftUI
 
@@ -46,10 +46,10 @@ struct NeedsYouSection: View {
                 }
                 .buttonStyle(SelectRowButtonStyle())
                 // A chat asking you something is a chat you are looking at, so
-                // the pin is offered here too (gh#166) — an orchestrator is
-                // usually pinned in the middle of the work that made you want
-                // one, not from a settings page afterwards.
-                .orchestratorPinMenu(chatId: need.chatId)
+                // the item is offered here too (gh#166) — the address is
+                // usually set in the middle of the work that made you want it,
+                // not from a settings page afterwards.
+                .boardNoticesMenu(chatId: need.chatId)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
@@ -138,36 +138,35 @@ struct NeedRowView: View {
     }
 }
 
-/// The orchestrator's fixed slot, above Spaces: a pinned thread — ◆ identity,
-/// the name, an unread badge, the latest report's preview. Rendered even
-/// before it has ever spoken, so the place to look exists before the first
-/// notice arrives. Absent only when no orchestrator is pinned.
-struct OrchestratorSlotSection: View {
+/// The board-notices slot, above Spaces: a pinned thread — ◆ identity, the
+/// name, an unread badge, the latest report's preview. Rendered even before
+/// anything has been said there, so the place to look exists before the first
+/// notice arrives. Absent only when the board has no fallback chat.
+struct BoardNoticesSlotSection: View {
     @Environment(AppModel.self) private var model
     @Binding var path: [Route]
 
     var body: some View {
-        if let slot = model.orchestratorSlotRow {
+        if let slot = model.boardNoticesSlotRow {
             Section {
                 Button {
                     path.append(.chat(slot.chatId))
                 } label: {
-                    OrchestratorSlotView(slot: slot)
+                    BoardNoticesSlotView(slot: slot)
                 }
                 .buttonStyle(SelectRowButtonStyle())
                 // The kill switch, and on the phone the ONLY one (gh#144).
-                // This slot is often the only row a pinned chat has — its
-                // session ends and its space shelf may never have listed it —
-                // so without a menu here an operator who reopens the
-                // orchestrator cannot unpin it from this device at all. The
-                // desktop and the TUI grew this menu for exactly that; the
-                // phone has no `comet-board routes defaults orchestrator_chat
-                // --unset` to fall back to.
+                // This slot is often the only row that chat has — its session
+                // ends and its space shelf may never have listed it — so
+                // without a menu here an operator who reopens it cannot stop
+                // the notices from this device at all. The desktop grew this
+                // menu for exactly that; the phone has no `comet-board routes
+                // defaults fallback_chat --unset` to fall back to.
                 //
                 // The item, its words and its refusal are the same ones every
                 // other chat's menu carries (gh#166) — this row is only the
-                // pinned case of them.
-                .orchestratorPinMenu(chatId: slot.chatId)
+                // set case of them.
+                .boardNoticesMenu(chatId: slot.chatId)
                 .listRowBackground(Color.clear)
                 .listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 12, bottom: 1, trailing: 12))
@@ -176,8 +175,8 @@ struct OrchestratorSlotSection: View {
     }
 }
 
-struct OrchestratorSlotView: View {
-    let slot: OrchestratorSlot
+struct BoardNoticesSlotView: View {
+    let slot: BoardNoticesSlot
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -195,12 +194,12 @@ struct OrchestratorSlotView: View {
             }
             .frame(width: 10, height: 16)
             VStack(alignment: .leading, spacing: 2) {
-                Text(orchestratorName)
+                Text(boardNoticesName)
                     .font(Theme.sans(Theme.textBody, weight: .medium))
                     .foregroundStyle(Theme.text)
                     .lineLimit(1)
                 // The latest report is the payload: brighter while unread.
-                Text(slot.preview ?? orchestratorNoReports)
+                Text(slot.preview ?? boardNoticesNoReports)
                     .font(Theme.sans(Theme.textCaption))
                     .foregroundStyle(slot.unseen
                         ? Theme.text

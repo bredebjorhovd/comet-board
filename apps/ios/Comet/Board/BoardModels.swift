@@ -1140,7 +1140,7 @@ struct RunningRow: Identifiable, Hashable {
     /// indicator, and an errored run is not a working one.
     var state: AgentState
     /// When the RUN started, off the session mirror — not when the chat was
-    /// created, which for a long-lived orchestrator is days ago.
+    /// created, which for a long-lived chat is days ago.
     var startedAt: Date?
 
     var id: String { chatId }
@@ -1156,9 +1156,9 @@ struct RunningRow: Identifiable, Hashable {
 /// port of `view::board::running_rows`.
 ///
 /// `agentRows` answers "what has the board released", which is a smaller
-/// question than "what is working". An orchestrator that raised in-chat
-/// subagents instead of dispatching, an ad-hoc chat somebody started by hand,
-/// the orchestrator itself: real runs with no attempt row, and so nothing in
+/// question than "what is working". A chat that raised in-chat subagents
+/// instead of dispatching, an ad-hoc chat somebody started by hand, the chat
+/// driving the board itself: real runs with no attempt row, and so nothing in
 /// the Agents section at all.
 ///
 /// - Membership is the session mirror and nothing else: `working` or
@@ -1174,15 +1174,15 @@ struct RunningRow: Identifiable, Hashable {
 /// No board is required — `rows` empty (no board in the org, the sweep still
 /// running, a phone that has not attached) subtracts nothing.
 func runningRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
-                 orchestrator: String? = nil, now: Date = Date()) -> [RunningRow] {
+                 fallback: String? = nil, now: Date = Date()) -> [RunningRow] {
     let nowMillis = Int64(now.timeIntervalSince1970 * 1000)
     let dispatched = Set(rows.filter { $0.boardState.holdsPane }.compactMap(\.chatId))
     var out: [RunningRow] = chats.compactMap { chat in
         guard !dispatched.contains(chat.id) else { return nil }
-        // The pinned orchestrator has a fixed slot of its own (gh#122), which
-        // carries its live state — a second row here would report the same run
-        // twice.
-        guard chat.id != orchestrator else { return nil }
+        // The board's fallback chat has a fixed slot of its own (gh#122),
+        // which carries its live state — a second row here would report the
+        // same run twice.
+        guard chat.id != fallback else { return nil }
         let session = sessions[chat.id]
         let state: AgentState
         switch effectiveStatus(session, now: nowMillis) {
@@ -1223,8 +1223,8 @@ func runningRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
 enum ActiveRow: Identifiable, Hashable {
     /// The board released this: it has an issue, a branch, a cap and a bill.
     case agent(AgentRow)
-    /// A run the board never heard of: the orchestrator, an ad-hoc chat,
-    /// anything started by hand.
+    /// A run the board never heard of: a chat driving the board, an ad-hoc
+    /// one, anything started by hand.
     case unmanaged(RunningRow)
 
     /// Where the tap goes, and the row's identity — unique across both cases,
@@ -1262,11 +1262,11 @@ enum ActiveRow: Identifiable, Hashable {
 /// urgency, then longest-running, then the chat id, which every row carries
 /// and no two rows share.
 func activeRows(rows: [TaskRow], chats: [Chat], sessions: [String: SessionRow],
-                orchestrator: String? = nil, now: Date = Date()) -> [ActiveRow] {
+                fallback: String? = nil, now: Date = Date()) -> [ActiveRow] {
     var out = agentRows(rows: rows, chats: chats, sessions: sessions, now: now)
         .map(ActiveRow.agent)
         + runningRows(rows: rows, chats: chats, sessions: sessions,
-                      orchestrator: orchestrator, now: now)
+                      fallback: fallback, now: now)
         .map(ActiveRow.unmanaged)
     out.sort { a, b in
         if a.state.rank != b.state.rank { return a.state.rank < b.state.rank }
@@ -1283,16 +1283,16 @@ func activeNeedingAttention(_ rows: [ActiveRow]) -> Int {
     rows.filter { $0.state.needsAttention }.count
 }
 
-// MARK: - "Needs you" and the orchestrator's slot (gh#122)
+// MARK: - "Needs you" and the board-notices slot (gh#122)
 
 /// One spelling everywhere, ports of `view::needs`'s constants: the product's
 /// voice with three names is three voices.
-let orchestratorName = "Orchestrator"
+let boardNoticesName = "Board notices"
 let needsYouTitle = "Needs you"
 /// The inbox's empty state, in words — a quiet check, never an omitted section.
 let needsAllClear = "Nothing needs you"
-/// What the slot says when the pinned orchestrator has never spoken.
-let orchestratorNoReports = "No reports yet"
+/// What the slot says when nothing has been said there yet.
+let boardNoticesNoReports = "No reports yet"
 
 /// Why a row is in the inbox — a port of `view::needs::NeedKind`.
 enum NeedKind {
@@ -1300,7 +1300,7 @@ enum NeedKind {
     case question
     /// A run died and is waiting on a retry.
     case deadRun
-    /// The orchestrator finished a turn you have not seen.
+    /// The fallback chat finished a turn you have not seen.
     case report
 
     /// Inbox order — a question outranks a corpse, and both outrank news.
@@ -1338,10 +1338,10 @@ struct NeedRow: Identifiable, Hashable {
     /// Where the tap goes. Always a chat that exists here.
     var chatId: String
     var spaceId: String?
-    /// `orchestratorName`, an issue identifier (`gh#503`), or the chat's title.
+    /// `boardNoticesName`, an issue identifier (`gh#503`), or the chat's title.
     var who: String
     /// A slug of the task's title, after an identifier WHO (gh#364). Never set
-    /// on the orchestrator's row or an ad-hoc chat's — those are named in words
+    /// on the notices row or an ad-hoc chat's — those are named in words
     /// already, and a slug of a title beside the title says one thing twice.
     var slug: String?
     /// The chat's last words, or the kind's own words.
@@ -1360,9 +1360,9 @@ private func singleLine(_ text: String?) -> String {
 
 /// Everything waiting on a human, most owed first — a port of
 /// `view::needs::needs_you`; membership and order are documented there. The
-/// inputs are the four standing streams the app already holds: the pin,
-/// `WatchBoard` rows, the chat rows, the session mirror.
-func needsYou(orchestrator: String?, rows: [TaskRow], chats: [Chat],
+/// inputs are the four standing streams the app already holds: the fallback
+/// address, `WatchBoard` rows, the chat rows, the session mirror.
+func needsYou(fallback: String?, rows: [TaskRow], chats: [Chat],
               sessions: [String: SessionRow], now: Date = Date()) -> [NeedRow] {
     let nowMillis = Int64(now.timeIntervalSince1970 * 1000)
     var out: [NeedRow] = []
@@ -1375,8 +1375,8 @@ func needsYou(orchestrator: String?, rows: [TaskRow], chats: [Chat],
         return preview.isEmpty ? kind.fallback : preview
     }
 
-    // The orchestrator, by every door: question, dead run, unseen report.
-    if let pin = orchestrator, let chat = chats.first(where: { $0.id == pin }) {
+    // The fallback chat, by every door: question, dead run, unseen report.
+    if let pin = fallback, let chat = chats.first(where: { $0.id == pin }) {
         let session = sessions[pin]
         let kind: NeedKind?
         switch chatIndicator(chat: chat, live: effectiveStatus(session, now: nowMillis)) {
@@ -1390,14 +1390,14 @@ func needsYou(orchestrator: String?, rows: [TaskRow], chats: [Chat],
                 ? chat.lastMessageAt
                 : (session.map(\.updatedAt) ?? chat.lastMessageAt)
             out.append(NeedRow(chatId: chat.id, spaceId: chat.spaceId,
-                               who: orchestratorName, slug: nil, what: whatLine(chat, kind),
+                               who: boardNoticesName, slug: nil, what: whatLine(chat, kind),
                                kind: kind, since: date(since)))
         }
     }
 
     // Live board attempts whose agent wants a human, named by their issue.
     for row in rows where row.boardState.holdsPane {
-        guard let chatId = row.chatId, chatId != orchestrator,
+        guard let chatId = row.chatId, chatId != fallback,
               let chat = chats.first(where: { $0.id == chatId }) else { continue }
         let session = sessions[chatId]
         let kind: NeedKind
@@ -1420,7 +1420,7 @@ func needsYou(orchestrator: String?, rows: [TaskRow], chats: [Chat],
     // Everything else that is asking. Archived is not a reason to hide a
     // question — the rule the Running group already keeps.
     let claimed = Set(rows.filter { $0.boardState.holdsPane }.compactMap(\.chatId))
-    for chat in chats where chat.id != orchestrator && !claimed.contains(chat.id) {
+    for chat in chats where chat.id != fallback && !claimed.contains(chat.id) {
         let session = sessions[chat.id]
         guard effectiveStatus(session, now: nowMillis) == .awaitingInput else { continue }
         out.append(NeedRow(chatId: chat.id, spaceId: chat.spaceId,
@@ -1438,15 +1438,15 @@ func needsYou(orchestrator: String?, rows: [TaskRow], chats: [Chat],
     return out
 }
 
-/// The orchestrator as a pinned thread — a port of
-/// `view::needs::OrchestratorSlot`.
-struct OrchestratorSlot: Hashable {
-    /// The pinned chat. Opening it marks it seen — the synced marker that
-    /// clears `unseen` on every device.
+/// The board's fallback chat as a pinned thread — a port of
+/// `view::needs::FallbackSlot`.
+struct BoardNoticesSlot: Hashable {
+    /// That chat. Opening it marks it seen — the synced marker that clears
+    /// `unseen` on every device.
     var chatId: String
     var spaceId: String?
     /// The latest report, one line. `nil` = never spoke, and the slot says
-    /// `orchestratorNoReports` instead of vanishing.
+    /// `boardNoticesNoReports` instead of vanishing.
     var preview: String?
     var unseen: Bool
     /// Live status, so a turn running now can never be mistaken for an
@@ -1456,18 +1456,18 @@ struct OrchestratorSlot: Hashable {
     var lastAt: Int64?
 }
 
-/// The slot, or `nil` when no orchestrator is pinned or its chat has not
-/// synced here. A pinned-but-silent orchestrator is NOT `nil`: that is the
-/// empty fixture, and it renders.
-func orchestratorSlot(orchestrator: String?, chats: [Chat],
+/// The slot, or `nil` when the board has no fallback chat or that chat has not
+/// synced here. A set-but-silent chat is NOT `nil`: that is the empty fixture,
+/// and it renders.
+func boardNoticesSlot(fallback: String?, chats: [Chat],
                       sessions: [String: SessionRow],
-                      now: Date = Date()) -> OrchestratorSlot? {
-    guard let pin = orchestrator, let chat = chats.first(where: { $0.id == pin }) else {
+                      now: Date = Date()) -> BoardNoticesSlot? {
+    guard let pin = fallback, let chat = chats.first(where: { $0.id == pin }) else {
         return nil
     }
     let nowMillis = Int64(now.timeIntervalSince1970 * 1000)
     let preview = singleLine(chat.lastMessagePreview)
-    return OrchestratorSlot(
+    return BoardNoticesSlot(
         chatId: chat.id,
         spaceId: chat.spaceId,
         preview: preview.isEmpty ? nil : preview,
@@ -1479,7 +1479,7 @@ func orchestratorSlot(orchestrator: String?, chats: [Chat],
 
 // MARK: - Which device hosts the board (gh#55)
 
-/// The devices to try, in order, when the operator has pinned none.
+/// The devices to try, in order, when the operator has named none.
 ///
 /// The desktop's `host_candidates` leads with `None` — itself, because a local
 /// board must win over a remote one. The phone has no engine and therefore no

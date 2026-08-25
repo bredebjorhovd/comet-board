@@ -52,7 +52,8 @@ already streams a status for every chat.
   would mean a new streamed field through harness → engine → doc → three
   frontends. Left out rather than faked.
 
-**The brief teaches tickets-first.** `docs/orchestrator.md` said never dispatch
+**The brief teaches tickets-first.** The brief (`docs/orchestrator.md`, now
+`docs/fallback-chat.md` — §gh#348) said never dispatch
 speculatively and never said the inverse, so an orchestrator obeying it to the
 letter could still bypass the board entirely. It now names the rule (work you
 delegate goes through a ticket; `comet-board new "title" --dispatch` is one

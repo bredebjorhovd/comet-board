@@ -861,7 +861,7 @@ mod tests {
     }
 
     /// `by` is a parent task id, `pane` the pane the dispatch came from —
-    /// either one makes it an agent's, and an orchestrator only ever has the
+    /// either one makes it an agent's, and a driving chat only ever has the
     /// second.
     fn attempt_by(
         minutes_ago: i64,
@@ -990,9 +990,9 @@ mod tests {
 
     /// The number used to be structurally 0: it counted only agents the board
     /// had dispatched, and those are not the ones that dispatch. An
-    /// orchestrator has a pane and no task, and it still counts (AGE-24).
+    /// driving chat has a pane and no task, and it still counts (AGE-24).
     #[test]
-    fn an_orchestrators_releases_are_counted_too() {
+    fn a_driving_chats_releases_are_counted_too() {
         let t = task(
             "a",
             vec![

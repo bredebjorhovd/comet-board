@@ -3,7 +3,7 @@
 //!
 //! This shape is a published contract, consumed three ways: `WatchBoard`
 //! streams it, the `comet-board` CLI prints it (§board-cli, verbatim), and the
-//! agent conventions text teaches orchestrating agents to poll it. Field
+//! agent conventions text teaches driving agents to poll it. Field
 //! renames from herdr-board are exactly the two the port dictates — `pane_id`
 //! → `chat_id`, `dispatched_by_pane` → `dispatched_by_chat` — because the
 //! values *are* chat ids now, and a contract that lies about what its ids

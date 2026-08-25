@@ -1959,18 +1959,22 @@ impl Shell {
         cx.notify();
     }
 
-    /// Pin a chat as the board's orchestrator, or unpin whatever is (gh#104).
+    /// Send this board's stray notices to a chat, or stop (gh#104, gh#348).
     ///
-    /// `[defaults] orchestrator_chat` on the board's `routing.toml`, written
+    /// `[defaults] fallback_chat` on the board's `routing.toml`, written
     /// through `WriteBoardConfig` — the same validated, backed-up path the
     /// routing settings page uses, rather than a second way to edit that file.
-    /// `None` removes the key: the notices stop and the chat goes back to being
-    /// an ordinary chat, which is the whole of the kill switch.
+    /// `None` removes the key: the notices stop and nothing else about the chat
+    /// changes, which is the whole of the kill switch.
     ///
-    /// Nothing is applied optimistically. The board republishes the pin as the
-    /// write lands, so the glyph appearing *is* the box agreeing; a refusal
+    /// It appoints nobody to anything. What it decides is where a notice with
+    /// no dispatcher to go to lands; driving the board is what a chat that
+    /// dispatches is already doing (gh#348).
+    ///
+    /// Nothing is applied optimistically. The board republishes the address as
+    /// the write lands, so the glyph appearing *is* the box agreeing; a refusal
     /// leaves the list as it was and says why.
-    fn set_orchestrator(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
+    fn set_fallback_chat(&mut self, chat_id: Option<String>, cx: &mut Context<Self>) {
         self.chat_menu = None;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.sidebar_notice = Some("Engine not connected".into());
@@ -1989,7 +1993,7 @@ impl Shell {
             let mut last: Option<String> = None;
             for candidate in candidates {
                 let mut params = serde_json::json!({
-                    "op": "default", "key": "orchestrator_chat"
+                    "op": "default", "key": "fallback_chat"
                 });
                 if let Some(object) = params.as_object_mut() {
                     if let Some(id) = &chat_id {
@@ -2632,13 +2636,13 @@ impl Shell {
     ///
     /// gh#258 put the hierarchy back. Active used to be a group of its own
     /// between the inbox and the tree, holding the full row of every live run
-    /// and leaving the tree to enumerate what was left; the orchestrator had a
+    /// and leaving the tree to enumerate what was left; the fallback chat had a
     /// pinned slot above that. Three groups deep, the reader had to know which
     /// surface a chat was on this frame before they could look for it, and the
     /// thing the window is actually organised by — the spaces — started a
     /// third of the way down the column. Now the tree owns every row: a live
     /// run's row is drawn inside its own space's disclosure, above that
-    /// space's idle sessions, and the orchestrator is the first row under the
+    /// space's idle sessions, and the notices slot is the first row under the
     /// selected space. What is left of Active is a fallback group BELOW the
     /// tree for runs whose chat names no space at all — the one case a
     /// disclosure cannot draw.
@@ -3057,7 +3061,7 @@ impl Shell {
             // Unpinning is the same item on the row that is pinned: whoever
             // wants the notices to stop reaches for the session they pinned,
             // not for a settings page.
-            let pinned = self.state.read(cx).is_orchestrator(&chat_id);
+            let pinned = self.state.read(cx).is_fallback_chat(&chat_id);
             let pin_target = (!pinned).then(|| chat_id.clone());
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
@@ -3094,7 +3098,7 @@ impl Shell {
                     popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
                         .id("chat-menu-pin")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_orchestrator(pin_target.clone(), cx)
+                            this.set_fallback_chat(pin_target.clone(), cx)
                         }))
                         .child(icon(icons::PIN).size(px(16.0)).text_color(if pinned {
                             theme.accent
@@ -3102,9 +3106,9 @@ impl Shell {
                             theme.text_muted
                         }))
                         .child(SharedString::from(if pinned {
-                            "Unpin as orchestrator"
+                            "Stop sending board notices here"
                         } else {
-                            "Pin as orchestrator"
+                            "Send board notices here"
                         })),
                 )
                 .child(popover::menu_separator(&theme))

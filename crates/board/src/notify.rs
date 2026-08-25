@@ -1,5 +1,5 @@
 //! Who gets told what, when a dispatched attempt blocks or settles (gh#71),
-//! plus the one chat that hears about all of it (gh#104).
+//! plus the one chat that hears what nobody else can be told (gh#104).
 //!
 //! Four audiences, and they are genuinely different people:
 //!
@@ -9,7 +9,7 @@
 //!    comment belongs to the task. Composed here ([`upstream_comment`]),
 //!    delivered by the writeback queue, keyed so a block that lasts three
 //!    hours is still one comment (`Attempt::blocked_count`).
-//! 2. **The agent that released the work.** An orchestrator cannot be woken —
+//! 2. **The agent that released the work.** A chat cannot wake itself —
 //!    it only gets a turn when something prompts it — so a settle or a block it
 //!    is waiting on has to arrive as a prompt into its own chat
 //!    ([`dispatcher_message`]). This is herdr-board's AGE-25 dispatcher wake;
@@ -20,18 +20,23 @@
 //!    vanished, a cancel somebody pressed, a duration cap that bit — because
 //!    what this reader is waiting on is the step being over, not the step
 //!    going well.
-//! 3. **The pinned orchestrator.** The agent whose job is the *board*, not one
-//!    task on it ([`orchestrator_message`]). It is the **addressee of last
-//!    resort**, and that is the whole of its job: work no agent released (the
-//!    board panel, the phone, a bare `comet-board dispatch`), work whose
-//!    dispatcher did not survive it — attempts cap at 2h and chats archive as
-//!    their task settles, so a long child routinely outlives its parent — and
-//!    the events that belong to no attempt at all, which is the duration cap's
-//!    warning ([`Event`]). One chat, named by `[defaults] orchestrator_chat`.
+//! 3. **The board's fallback chat.** The **addressee of last resort**
+//!    ([`fallback_message`]), and that is the whole of it: work no agent
+//!    released (the board panel, the phone, a bare `comet-board dispatch`),
+//!    work whose dispatcher did not survive it — attempts cap at 2h and chats
+//!    archive as their task settles, so a long child routinely outlives its
+//!    parent — and the events that belong to no attempt at all, which is the
+//!    duration cap's warning ([`Event`]). One chat, named by
+//!    `[defaults] fallback_chat`.
 //!
-//!    What audience 2 was told is *not* repeated here. That is what makes a
-//!    pinned orchestrator survivable on a busy board: its context fills with
-//!    the things that would otherwise vanish, not with a copy of every child's
+//!    An address and not a role (gh#348): it decides where a stray notice
+//!    goes, not who is running the board. Whoever is running the board is
+//!    audience 2 — a chat that dispatched — and needs nothing configured to
+//!    become one.
+//!
+//!    What audience 2 was told is *not* repeated here. That is what keeps this
+//!    address survivable on a busy board: the chat's context fills with the
+//!    things that would otherwise vanish, not with a copy of every child's
 //!    settle. Before gh#165 both channels fired and the notice audience 2 could
 //!    not be given was dropped — the two halves of one wrong shape.
 //! 4. **The operator, out of band.** None of the above reaches a human who is
@@ -236,10 +241,10 @@ pub enum Fate {
 /// was an engine restart; the notices were about six tasks; nobody could see
 /// the first from the second.
 ///
-/// Addressed to the orchestrator and to the operator's webhook rather than to
+/// Addressed to the fallback chat and to the operator's webhook rather than to
 /// any dispatcher, for the cap warning's reason ([`Event::CapWarning`]): a
 /// resumed attempt has not ended, so there is nothing for an agent waiting on
-/// that step to do — while an agent whose job is the board wants to know that
+/// that step to do — while whoever is watching the board wants to know that
 /// the box just dropped every run on it.
 pub fn interrupted_message(runs: &[Interrupted]) -> String {
     let mut s = format!("comet-board: {}.\n\n", interrupted_headline(runs));
@@ -411,12 +416,12 @@ pub fn credential_comment(
 /// The prompt queued into the chat of the agent that released this work.
 ///
 /// Addressed to an agent, so it says what changed and what is actionable, and
-/// nothing else — an orchestrator that gets this is spending a turn on it.
+/// nothing else — an agent that gets this is spending a turn on it.
 ///
 /// Both [`Signal`]s, not only the settle: a block is the state where *nothing*
 /// happens until somebody acts, and the party who was waiting on that step is
-/// the one who can act on it soonest. The body is the same one the orchestrator
-/// would have got for the same event, because it is the same event; only the
+/// the one who can act on it soonest. The body is the same one the fallback
+/// chat would have got for the same event, because it is the same event; only the
 /// lead line differs, and it differs because this reader did release the work.
 pub fn dispatcher_message(task: &Task, attempt: &Attempt, signal: &Signal) -> String {
     match signal {
@@ -456,7 +461,7 @@ pub fn dispatcher_message(task: &Task, attempt: &Attempt, signal: &Signal) -> St
 /// how it ended, and the two artifacts a reader immediately wants.
 ///
 /// One builder rather than one per audience, because the moment the dispatcher
-/// and the orchestrator describe the same settle differently, the wording in
+/// and the fallback chat describe the same settle differently, the wording in
 /// `docs/agent-conventions.md` stops being the contract for either of them.
 fn settled_block(
     task: &Task,
@@ -506,8 +511,8 @@ fn blocked_block(task: &Task, attempt: &Attempt, why: Stopped) -> String {
 
 /// What actually unsticks a block, for whichever agent was told about it.
 ///
-/// Shared rather than written per audience: a dispatcher and an orchestrator
-/// have the same two moves available to them here, and a board that described
+/// Shared rather than written per audience: a dispatcher and the fallback
+/// chat have the same two moves available to them here, and a board that described
 /// them differently would be teaching two contracts for one state.
 fn unsticks(why: Stopped) -> &'static str {
     match why {
@@ -543,7 +548,7 @@ fn task_lines(task: &Task) -> String {
     format!("  {} · {}\n  {}\n", task.identifier, task.title, task.url)
 }
 
-/// Everything the pinned orchestrator can be told about, which is [`Signal`]
+/// Everything the fallback chat can be told about, which is [`Signal`]
 /// plus the one event no attempt's dispatcher could act on.
 ///
 /// The duration cap's warning is here and not on `Signal` because the two are
@@ -566,20 +571,20 @@ pub enum Event<'a> {
     },
 }
 
-/// The prompt queued into the pinned orchestrator's chat (gh#104).
+/// The prompt queued into the board's fallback chat (gh#104).
 ///
 /// Same body as the notice audience 2 gets — deliberately, so the one
 /// description in `docs/agent-conventions.md` covers both — with two
-/// differences that come from the orchestrator not being the party that
-/// released the work:
+/// differences that come from this reader not being the party that released
+/// the work:
 ///
 /// - The lead line does not claim it released anything. Everything that
-///   reaches the orchestrator since gh#165 was released by an operator, or by a
-///   chat that is no longer there to be told.
+///   reaches here since gh#165 was released by an operator, or by a chat that
+///   is no longer there to be told.
 /// - It names who *did* release it, when the board recorded anyone. That is the
-///   fact an orchestrator acts on: a settle here with a `released by` line is
-///   one whose dispatcher never heard about it, and picking that up is the job.
-pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> String {
+///   fact this reader acts on: a settle here with a `released by` line is one
+///   whose dispatcher never heard about it, and picking that up is the point.
+pub fn fallback_message(task: &Task, attempt: &Attempt, event: &Event) -> String {
     let mut s = match event {
         Event::Signal(Signal::Settled { .. }) => {
             "comet-board: work on the board has finished.\n\n".to_string()
@@ -644,7 +649,7 @@ pub fn orchestrator_message(task: &Task, attempt: &Attempt, event: &Event) -> St
     s
 }
 
-/// Who released this attempt, as a line the orchestrator can read.
+/// Who released this attempt, as a line the fallback chat's reader can use.
 ///
 /// The task the releasing agent was itself running is the richest answer, its
 /// chat the one that is always recorded, and the human's name attribution
@@ -935,7 +940,7 @@ mod tests {
         assert!(died.contains("The run died"), "{died}");
     }
 
-    /// The block's body and its advice are shared with the orchestrator's copy
+    /// The block's body and its advice are shared with the fallback chat's copy
     /// for [`settled_block`]'s reason: two audiences describing one state two
     /// ways is two contracts for it.
     #[test]
@@ -943,22 +948,22 @@ mod tests {
         let (t, a) = (task(), attempt());
         let signal = Signal::Blocked(Stopped::Unknown);
         let to_dispatcher = dispatcher_message(&t, &a, &signal);
-        let to_orchestrator = orchestrator_message(&t, &a, &Event::Signal(&signal));
+        let to_fallback = fallback_message(&t, &a, &Event::Signal(&signal));
         let block = blocked_block(&t, &a, Stopped::Unknown);
         assert!(to_dispatcher.contains(&block));
-        assert!(to_orchestrator.contains(&block));
+        assert!(to_fallback.contains(&block));
         assert!(to_dispatcher.contains(unsticks(Stopped::Unknown)));
-        assert!(to_orchestrator.contains(unsticks(Stopped::Unknown)));
+        assert!(to_fallback.contains(unsticks(Stopped::Unknown)));
         // ...and only the dispatcher's claims it released anything.
         assert!(to_dispatcher.contains("work you released"));
-        assert!(!to_orchestrator.contains("work you released"));
+        assert!(!to_fallback.contains("work you released"));
     }
 
     /// The point of sharing [`settled_block`]: whatever else the two notices
     /// say, they describe the settle itself identically — which is what lets
     /// `docs/agent-conventions.md` document it once.
     #[test]
-    fn the_orchestrator_and_the_dispatcher_describe_a_settle_the_same_way() {
+    fn the_fallback_chat_and_the_dispatcher_describe_a_settle_the_same_way() {
         let (t, a) = (task(), attempt());
         let signal = Signal::Settled {
             outcome: Outcome::Done,
@@ -967,7 +972,7 @@ mod tests {
             note: None,
         };
         let to_dispatcher = dispatcher_message(&t, &a, &signal);
-        let to_orchestrator = orchestrator_message(&t, &a, &Event::Signal(&signal));
+        let to_fallback = fallback_message(&t, &a, &Event::Signal(&signal));
         let block = settled_block(
             &t,
             &a,
@@ -977,10 +982,10 @@ mod tests {
             None,
         );
         assert!(to_dispatcher.contains(&block));
-        assert!(to_orchestrator.contains(&block));
-        // ...and only the orchestrator's is careful not to claim it released it.
+        assert!(to_fallback.contains(&block));
+        // ...and only the fallback copy is careful not to claim it released it.
         assert!(to_dispatcher.contains("work you released"));
-        assert!(!to_orchestrator.contains("work you released"));
+        assert!(!to_fallback.contains("work you released"));
     }
 
     // ---- the print that tells a repeat from a second settle (gh#356) -----
@@ -1054,34 +1059,32 @@ mod tests {
         );
     }
 
-    /// Most of what reaches the orchestrator is somebody else's dispatch, and
+    /// Most of what reaches the fallback chat is somebody else's dispatch, and
     /// which somebody is the difference between "a step in my own plan landed"
     /// and "I have just been handed something".
     #[test]
-    fn the_orchestrator_is_told_who_released_the_work() {
+    fn the_fallback_chat_is_told_who_released_the_work() {
         let mut a = attempt();
         a.dispatched_by = Some("linear:LIN-9".into());
         a.dispatched_by_user = Some("brede@tally.no".into());
         let signal = Signal::Blocked(Stopped::Asking);
-        let m = orchestrator_message(&task(), &a, &Event::Signal(&signal));
+        let m = fallback_message(&task(), &a, &Event::Signal(&signal));
         assert!(m.contains("released by: linear:LIN-9 · chat chat-parent · for brede@tally.no"));
         // An operator's dispatch records nobody, and a line saying so would be
         // noise on the common case.
         let mut bare = attempt();
         bare.dispatched_by_pane = None;
-        assert!(
-            !orchestrator_message(&task(), &bare, &Event::Signal(&signal)).contains("released by")
-        );
+        assert!(!fallback_message(&task(), &bare, &Event::Signal(&signal)).contains("released by"));
     }
 
-    /// A block reaching the orchestrator has to say what unsticks it — it is
+    /// A block reaching the fallback chat has to say what unsticks it — it is
     /// the one event where nothing at all happens until somebody acts.
     #[test]
-    fn a_block_tells_the_orchestrator_what_to_do_about_it() {
+    fn a_block_tells_the_fallback_chat_what_to_do_about_it() {
         let asking = Signal::Blocked(Stopped::Asking);
         let errored = Signal::Blocked(Stopped::Errored);
-        let a = orchestrator_message(&task(), &attempt(), &Event::Signal(&asking));
-        let e = orchestrator_message(&task(), &attempt(), &Event::Signal(&errored));
+        let a = fallback_message(&task(), &attempt(), &Event::Signal(&asking));
+        let e = fallback_message(&task(), &attempt(), &Event::Signal(&errored));
         assert!(a.contains("waiting on an answer"));
         assert!(a.contains("comet-board retry"));
         assert!(e.contains("The run died"));
@@ -1093,7 +1096,7 @@ mod tests {
     /// has to say how long is left and that nothing is required of the reader.
     #[test]
     fn a_cap_warning_names_the_remaining_grace() {
-        let m = orchestrator_message(
+        let m = fallback_message(
             &task(),
             &attempt(),
             &Event::CapWarning {
