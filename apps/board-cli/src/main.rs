@@ -156,9 +156,12 @@ enum Command {
         ///
         /// Off unless asked for. Layer 1 is the attempt's own branch and the
         /// ones above it are that name with `-2`, `-3` on the end, which is how
-        /// the board tells they are one attempt's work. Needs the `gh-stack`
-        /// extension on the dispatching box; the brief tells the agent how to
-        /// install it if it is missing.
+        /// the board tells they are one attempt's work. Ask for it on what the
+        /// ticket's text names — several separable, dependent concerns — never
+        /// on size alone: a large change can be indivisible and a small one
+        /// two clean layers (gh#336). Needs the `gh-stack` extension on the
+        /// dispatching box; the brief tells the agent how to install it if it
+        /// is missing.
         #[arg(long)]
         stack: bool,
         /// Ask for a decomposition: have the agent split the task into tickets

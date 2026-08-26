@@ -174,10 +174,11 @@ Rules (canonical text: docs/agent-conventions.md in the comet-board repo):
   pull requests (`gh stack`), one dependent concern per layer, reviewed in
   parallel instead of as one wall of diff. Off unless asked for, and *ask* is
   the word: five pull requests where one was expected is a surprise, so pass it
-  when the work is plainly several stacked concerns and the person who wrote
-  the ticket would recognise the layers. Nothing else changes — layer 1 is the
-  attempt's own branch, and the layers above it are that name with `-2`, `-3`
-  on the end, which is how the board knows they are one attempt's work.
+  when the ticket's text itself names several separable, dependent concerns —
+  the spec is the signal, size is not: a large change can be indivisible and a
+  small one hold two clean layers (gh#336). Nothing else changes — layer 1 is
+  the attempt's own branch, and the layers above it are that name with `-2`,
+  `-3` on the end, which is how the board knows they are one attempt's work.
 - **`--decompose`** asks the agent to split its task into tickets and release
   each to an agent of its own (`comet-board new --dispatch`), keeping for
   itself the part that needed the whole picture (gh#340). This is the explicit

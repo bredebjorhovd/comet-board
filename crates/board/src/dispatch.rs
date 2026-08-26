@@ -941,8 +941,10 @@ pub struct DispatchOverrides {
     /// deciding on its own to open five pull requests where one was expected is
     /// a surprise worth opting into, and because how many concerns a task holds
     /// is a property of the *work* rather than of the class of work a route
-    /// describes. A size threshold could come later; it would need a board that
-    /// has watched this work first.
+    /// describes. The board does not infer the ask (gh#336): spec — concerns
+    /// the ticket itself names — is the signal worth inferring from one day,
+    /// size is not, and until real stacks have landed there is no predicate to
+    /// infer from at all.
     pub stack: bool,
     /// `--decompose`: split this task into tickets and release each to an
     /// agent of its own (gh#340). All it does is add [`decompose_brief`] to
