@@ -30,8 +30,9 @@
 //! moves a chat: a need answered and the row is gone, while the row it
 //! pointed at stays exactly where it lives. The slot sits between the inbox
 //! and Spaces (the phone drew it there from the start; the desktop caught up
-//! in gh#547) because the orchestrator is not a chat inside a folder — it is
-//! the one conversation you talk TO rather than check on, and a fixture that
+//! in gh#547) because a fallback chat (gh#348: an address, not a role) is not
+//! a chat inside a folder — it is the one conversation you talk TO rather
+//! than check on, and a fixture that
 //! vanished whenever another space was selected was a hidden one, not a
 //! pinned one.
 

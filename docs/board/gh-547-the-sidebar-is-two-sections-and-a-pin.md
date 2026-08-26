@@ -28,30 +28,36 @@ regular — which is not a new decision but an old drift corrected: the canvas
 claims C1.1/C2.2 said 11px/**600** from the start. No new token, no size
 change; #171 owns the scale and this pass only assigns the levels to it.
 
-### 3. The orchestrator comes out of Spaces
+### 3. The pin comes out of Spaces
 
 The pin used to be the first child of the selected space's disclosure,
 following canvas claim C2.3 as drawn: it belongs to the space whose board it
-orchestrates. The reasoning was fine and the nesting was still wrong — the
-orchestrator is the board's voice for *every* space, and housing it inside one
+serves. The reasoning was fine and the nesting was still wrong — it is one
+address for stray notices about *every* space, and housing it inside one
 disclosure meant it vanished whenever another space was selected. A pinned
-conversation that hides is a hidden one. It now draws as its own fixture
-between Needs you and Spaces, with the section hairline under it:
+conversation that hides is a hidden one. It now draws as its own slot between
+Needs you and Spaces, with the section hairline under it:
 
 - The phone drew the slot there from the start (`HomeView.swift`); the
-  derivation's own contract always said "above Spaces"; the desktop caught up.
-- Its chat is held out of every disclosure — live and idle — so one
-  Orchestrator appears once per sidebar, wherever its chat's space happens to
-  be. The old scoping (held only in the selected space, ◆-marked rows
-  elsewhere) existed to patch housing a global fixture inside one branch.
+  derivation's own contract (`view::needs::fallback_slot`) always said "above
+  Spaces"; the desktop caught up.
+- Its chat is held out of every disclosure — live and idle — so the pin
+  appears once per sidebar, wherever its chat's space happens to be. The old
+  scoping (held only in the selected space, ◆-marked rows elsewhere) existed
+  to patch housing a global fixture inside one branch.
 - The forced-open machinery died with the placement:
   `space_disclosure_forced_open` existed so a collapsed disclosure could not
   hide the slot; with no slot in any disclosure there is nothing to force.
-- Selection got *better*: the fixture now fills when its chat is the selected
+- Selection got *better*: the slot now fills when its chat is the selected
   one, which it could not do while the parent space owned the fill.
 
-`window.md` C2.3/C2.8/C2.9 are amended under a deviations note, the same way
-D6's size deviation is recorded.
+Naming follows gh#348, which landed while this pass was in review and
+dissolved the orchestrator *role* this ticket had inherited: the thing is an
+address for stray notices — `[defaults] fallback_chat` — and nothing more.
+That sharpened the placement decision rather than reversing it: an address
+that is nobody's chair has even less business living inside one space's
+branch. `window.md` C2.3/C2.8/C2.9 are amended under a deviations note, the
+same way D6's size deviation is recorded.
 
 ### 4. Loose Active joined Spaces, and the board pane says what it is
 
