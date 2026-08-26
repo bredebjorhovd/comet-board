@@ -7,13 +7,13 @@ come in, a dispatch releases a task into a comet chat with a coding agent,
 and session state reconciles back to the board and the tracker.
 Agents read the board and dispatch from it themselves.
 
-A settle or a block goes to the chat that released the work. Pin one chat as
-the board's **orchestrator** and it receives everything no other agent can be
-told about — work you released from the panel or the phone, work whose
-dispatching chat is gone, and every cap warning — so one long-lived agent can
-dispatch, review, retry and report while your job reduces to reading its
-summaries. [docs/orchestrator.md](docs/orchestrator.md) is the brief to open
-that chat with.
+A settle or a block goes to the chat that released the work — which is what
+makes a chat that dispatches into one that can review, retry and report, with
+nothing configured. Name one chat as the board's **fallback** and it takes what
+no dispatcher can be told: work you released from the panel or the phone, work
+whose dispatching chat is gone, and every cap warning.
+[docs/fallback-chat.md](docs/fallback-chat.md) is where stray notices go, and
+why driving the board is not a role anybody is appointed to.
 
 A second person on the box is five steps — invite, they join, `comet-board
 member add`, their agent-account slot, the App on their repos — and every one

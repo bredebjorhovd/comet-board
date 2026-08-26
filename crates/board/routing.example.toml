@@ -90,7 +90,7 @@ runtime = "codex"
 # turn that never fails and never finishes.
 #
 # A stopped run is a *block*, not a lost attempt: the chat keeps the whole task,
-# the dispatching agent and the orchestrator are told as they are about any
+# the dispatching agent (or the fallback chat) is told as it is about any
 # other block, and retry-or-cancel is yours.
 #
 # Per route because what counts as a normal number of failures is a property of
@@ -191,10 +191,10 @@ base = "origin/HEAD"
 #                gets a prompt when it settles or blocks. On by default, and
 #                tried first: it is the precise channel, prompting the one agent
 #                whose plan that task was a step in.
-#   the board's  `orchestrator_chat`, below — one pinned chat, and the addressee
-#   orchestrator of last resort: work no chat released, work whose dispatching
-#                chat is gone, and the cap warning. What the dispatcher was told
-#                is never repeated to it.
+#   the board's  `fallback_chat`, below — one chat, and the addressee of last
+#   fallback     resort: work no chat released, work whose dispatching chat is
+#                gone, and the cap warning. What the dispatcher was told is
+#                never repeated to it.
 #   you          `notify` + `notify_webhook`, here. The only channel that
 #                reaches somebody looking at neither the board nor the tracker.
 #
@@ -214,26 +214,25 @@ base = "origin/HEAD"
 # in, and a chat told about the two or three things it released is nothing like
 # a chat told about the whole board. Turn it off where you dispatch from chats
 # that are you at a prompt rather than agents; `notify_webhook` above is the
-# channel for that reader, and every settle then falls to the pin below.
+# channel for that reader, and every settle then falls to the address below.
 # notify_dispatcher = true
-# The pinned orchestrator: one chat that drives the board and hears what nobody
-# else can be told — work you released from the panel or the phone (which
-# records no chat), work whose dispatching chat has been archived since, and the
-# cap warning, which is about a run that is still going. What the dispatcher was
-# told is never repeated here; that is what keeps a pin usable on a busy board.
+# The fallback chat: where the board's *stray* notices go — work you released
+# from the panel or the phone (which records no chat), work whose dispatching
+# chat has been archived since, and the cap warning, which is about a run that
+# is still going. What the dispatcher was told is never repeated here; that is
+# what keeps this address usable on a busy board.
 #
-# It is an ordinary chat: no workspace slot (the board did not dispatch it),
-# though everything it releases counts against the caps like anyone's, and it
-# bills whatever account its chat config names. It is exempt from
-# `max_duration`, because it is meant to outlive every attempt on the board — so
-# the thing to watch is notice volume, and the board sends exactly one prompt
-# per event and never polls. Unset it and the notices stop; the chat carries on
-# as an ordinary chat.
+# An address, not a role. It is an ordinary chat and stays one: it is owed no
+# brief, it is not appointed to drive the board, and it is exempt from nothing
+# (before gh#348 it was exempt from `max_duration`, which only ever mattered in
+# the misconfiguration `doctor` refuses). A chat that drives the board is a chat
+# that dispatched — that needs no key in this file. The one thing to watch here
+# is notice volume, and the board sends exactly one prompt per event and never
+# polls. Unset it and the notices stop; the chat carries on as an ordinary chat.
 #
-# Easier set from the app than from here: "Pin as orchestrator" on a session in
-# the desktop app or the TUI writes this key for you. `docs/orchestrator.md` is
-# the brief to open it with.
-# orchestrator_chat = "chat_01J8Z…"
+# Easier set from the app than from here: "Send board notices here" on a session
+# writes this key for you. `docs/fallback-chat.md` is the whole of it.
+# fallback_chat = "chat_01J8Z…"
 # Which tracker `comet-board new` writes to. "github" is the only supported
 # value.
 # new_source = "github"

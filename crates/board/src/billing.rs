@@ -96,7 +96,7 @@ pub fn parse_guard_mode(s: &str) -> Result<GuardMode, String> {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum Attribution {
     /// Nobody said and nothing was stamped: `comet-board` from a shell nobody
-    /// signed into, an orchestrating agent, every attempt from before the
+    /// signed into, a driving agent, every attempt from before the
     /// frontends sent `viaUser` at all. Names nobody to have been wronged, so
     /// it is never refused.
     #[default]

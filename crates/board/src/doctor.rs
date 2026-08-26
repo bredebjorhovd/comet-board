@@ -383,7 +383,7 @@ pub fn doctor(
             // it is another answer to the same question — who hears about a
             // settle — and because an unpinned board is the one state where
             // nobody hears about work an operator released by hand.
-            checks.push(orchestrator_check(&cfg.defaults, db_ok.as_ref().ok()));
+            checks.push(fallback_check(&cfg.defaults, db_ok.as_ref().ok()));
 
             // Whose name a teammate's dispatch commits under (gh#107). Beside
             // the box's own identity below, and always printed for the same
@@ -3442,24 +3442,25 @@ fn agent_account_health_checks(
 /// is why it belongs in `doctor` next to the other two.
 ///
 /// Since gh#165 the two agent channels are one chain, so this line answers
-/// "who takes this event" rather than reporting a switch. It reads the pin as
-/// well as the switch for exactly that reason: `notify_dispatcher = false` on a
-/// board with an orchestrator is a routing choice, and on a board without one
-/// it is silence — two facts one boolean cannot tell apart.
+/// "who takes this event" rather than reporting a switch. It reads the fallback
+/// address as well as the switch for exactly that reason:
+/// `notify_dispatcher = false` on a board with a fallback chat is a routing
+/// choice, and on a board without one it is silence — two facts one boolean
+/// cannot tell apart.
 fn settle_notice_detail(defaults: &crate::config::Defaults) -> String {
-    match (defaults.notify_dispatcher, defaults.orchestrator()) {
+    match (defaults.notify_dispatcher, defaults.fallback()) {
         (true, Some(chat)) => format!(
             "on — a settle or a block goes to the chat that released the work; when nothing \
-             did, or that chat is gone, the orchestrator ({chat}) takes it instead"
+             did, or that chat is gone, the fallback chat ({chat}) takes it instead"
         ),
         (true, None) => "on — a settle or a block goes to the chat that released the work. \
                          Work released from the panel or the phone released it from no chat, \
-                         and with nothing pinned that reaches no agent at all (see \
-                         `orchestrator`)"
+                         and with no fallback that reaches no agent at all (see \
+                         `fallback`)"
             .into(),
         (false, Some(chat)) => format!(
             "off — the chat that released work is never told; every settle and block goes to \
-             the orchestrator ({chat}), including a copy of every child it released itself \
+             the fallback chat ({chat}), including a copy of every child it released itself \
              (`[defaults] notify_dispatcher = true` routes them to the dispatcher first)"
         ),
         // Deliberately not "only you are notified": until gh#71 that was what
@@ -3473,39 +3474,42 @@ fn settle_notice_detail(defaults: &crate::config::Defaults) -> String {
     }
 }
 
-/// Whether one agent is running this board, and whether the chat named as that
-/// agent can actually be one (gh#104).
+/// Where this board's stray notices go, and whether that chat can take them
+/// (gh#104, renamed in gh#348).
 ///
-/// Unpinned is a preference, not a fault: a board driven by a human at the panel
-/// wants no orchestrator, and a `doctor` that exited non-zero over that would
-/// stop meaning anything. What the line has to do is say what an unpinned board
+/// Unset is a preference, not a fault: a board driven by a human at the panel
+/// may want nothing here, and a `doctor` that exited non-zero over that would
+/// stop meaning anything. What the line has to do is say what an unset board
 /// costs — the three cases that reach nobody — so that "nobody picked this up"
 /// is legible as a setting rather than as a bug.
 ///
-/// The fault it does catch is the one misconfiguration the pin allows: pinning
-/// a chat the board itself dispatched. That chat is an attempt — it holds a
-/// workspace slot, it has a task of its own, and the exemption from
-/// `max_duration` now keeps it alive past every cap. None of that is what
-/// somebody meant by "run the board", and unpinned it would simply have
-/// finished.
-fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Check {
-    let name = "orchestrator".to_string();
-    let Some(chat) = defaults.orchestrator() else {
+/// The fault it does catch is the one misconfiguration this setting allows:
+/// naming a chat the board itself dispatched. That chat is an attempt — it has
+/// a task of its own and a context spent on it — and stray notices about the
+/// rest of the board arriving in it are events delivered to the one reader with
+/// no room for them. Left alone it would simply have finished.
+///
+/// Deliberately *not* a check about whether anybody is driving the board. That
+/// is not a configured fact and cannot be read off a config file: a chat
+/// becomes a driver by dispatching (gh#348).
+fn fallback_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Check {
+    let name = "fallback".to_string();
+    let Some(chat) = defaults.fallback() else {
         return Check {
             name,
             ok: true,
-            detail: "not pinned — nothing takes what no dispatcher can be told. Work you \
+            detail: "unset — nothing takes what no dispatcher can be told. Work you \
                      release from the panel or the phone, a settle whose dispatching chat \
                      has been archived, and every cap warning reach no agent: they are a row \
                      colour and a comment on the issue, and the log says so once per event \
-                     (pin a session in the app, or `[defaults] orchestrator_chat = \
+                     (name a session in the app, or `[defaults] fallback_chat = \
                      \"<chat-id>\"`)"
                 .into(),
         };
     };
-    // A live attempt on the pinned chat is the real misconfiguration. A closed
-    // one is history — the chat outlived its attempt and somebody pinned it
-    // afterwards, which is odd but harmless — so only the live case is a fault.
+    // A live attempt on this chat is the real misconfiguration. A closed one is
+    // history — the chat outlived its attempt and somebody named it afterwards,
+    // which is odd but harmless — so only the live case is a fault.
     let dispatched = db
         .and_then(|db| db.live_attempts().ok())
         .map(|attempts| {
@@ -3519,9 +3523,10 @@ fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Ch
             name,
             ok: false,
             detail: format!(
-                "chat {chat} is pinned, but the board dispatched it — it is the live \
-                 attempt on {}, so it holds a workspace slot and is now exempt from its \
-                 own time cap. Pin a chat you opened yourself",
+                "chat {chat} takes the stray notices, but the board dispatched it — it is \
+                 the live attempt on {}, so the board's own events land in an agent's \
+                 chat mid-task and go wherever that task's context goes. Name a chat you \
+                 opened yourself",
                 attempt.task_id
             ),
         },
@@ -3529,7 +3534,7 @@ fn orchestrator_check(defaults: &crate::config::Defaults, db: Option<&Db>) -> Ch
             name,
             ok: true,
             detail: format!(
-                "chat {chat} — {}, one message per event. Unpin to stop them",
+                "chat {chat} — {}, one message per event. Clear it to stop them",
                 if defaults.notify_dispatcher {
                     "the addressee of last resort: work no chat released, work whose \
                      dispatching chat is gone, and every cap warning. A settle its \
@@ -5769,7 +5774,7 @@ mod tests {
 
         // Dispatcher-first with the fallback behind it: the whole chain, in
         // order, in one line.
-        d.orchestrator_chat = Some("chat-boss".into());
+        d.fallback_chat = Some("chat-boss".into());
         let chained = settle_notice_detail(&d);
         assert!(chained.contains("that chat is gone"), "{chained}");
         assert!(chained.contains("chat-boss"), "{chained}");
@@ -5783,7 +5788,7 @@ mod tests {
         assert!(routed.contains("notify_dispatcher"), "{routed}");
 
         // Off with nothing pinned is the one silent state.
-        d.orchestrator_chat = None;
+        d.fallback_chat = None;
         let silent = settle_notice_detail(&d);
         assert!(silent.contains("no agent is told"), "{silent}");
         assert!(
@@ -6174,33 +6179,33 @@ mod tests {
         assert!(c.detail.starts_with("on —"), "{:?}", c.detail);
     }
 
-    /// An unpinned board is a legitimate preference, so the line has to be
-    /// `ok` — and it still has to say what is *not* happening, because "nobody
-    /// picked this up" reads as a bug until you know no agent was told.
+    /// A board with no fallback address is a legitimate preference, so the line
+    /// has to be `ok` — and it still has to say what is *not* happening, because
+    /// "nobody picked this up" reads as a bug until you know no agent was told.
     #[test]
-    fn doctor_says_when_no_agent_is_running_the_board() {
+    fn doctor_says_when_stray_notices_reach_nobody() {
         let (_d, p) = tmp();
         std::fs::write(p.routing(), "[github]\nrepos = []\n").unwrap();
         let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
         let c = checks
             .iter()
-            .find(|c| c.name == "orchestrator")
-            .expect("doctor is silent about the pin");
-        assert!(c.ok, "not pinning anything is not a fault");
-        assert!(c.detail.starts_with("not pinned"), "{}", c.detail);
-        assert!(c.detail.contains("orchestrator_chat"), "{}", c.detail);
+            .find(|c| c.name == "fallback")
+            .expect("doctor is silent about the fallback address");
+        assert!(c.ok, "naming no fallback chat is not a fault");
+        assert!(c.detail.starts_with("unset"), "{}", c.detail);
+        assert!(c.detail.contains("fallback_chat"), "{}", c.detail);
     }
 
     #[test]
-    fn doctor_names_the_pinned_chat() {
+    fn doctor_names_the_fallback_chat() {
         let (_d, p) = tmp();
         std::fs::write(
             p.routing(),
-            "[defaults]\norchestrator_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
+            "[defaults]\nfallback_chat = \"chat-boss\"\n\n[github]\nrepos = []\n",
         )
         .unwrap();
         let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
-        let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
+        let c = checks.iter().find(|c| c.name == "fallback").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("chat-boss"), "{}", c.detail);
         // gh#165: what it receives is the question, and on a default board the
@@ -6209,33 +6214,33 @@ mod tests {
         assert!(c.detail.contains("is not repeated here"), "{}", c.detail);
     }
 
-    /// With the dispatcher wake off, the pin really is the whole board again —
-    /// and an operator who turned it off should read that here rather than
-    /// discover it as volume in the pinned chat.
+    /// With the dispatcher wake off, the fallback really is the whole board
+    /// again — and an operator who turned it off should read that here rather
+    /// than discover it as volume in that chat.
     #[test]
-    fn the_pin_says_when_it_is_taking_the_whole_board() {
+    fn the_fallback_says_when_it_is_taking_the_whole_board() {
         let (_d, p) = tmp();
         std::fs::write(
             p.routing(),
-            "[defaults]\norchestrator_chat = \"chat-boss\"\nnotify_dispatcher = false\n\n\
+            "[defaults]\nfallback_chat = \"chat-boss\"\nnotify_dispatcher = false\n\n\
              [github]\nrepos = []\n",
         )
         .unwrap();
         let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
-        let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
+        let c = checks.iter().find(|c| c.name == "fallback").unwrap();
         assert!(c.ok);
         assert!(c.detail.contains("gets the whole board"), "{}", c.detail);
     }
 
-    /// The one misconfiguration the pin allows, and it is a quiet one: a
-    /// board-dispatched chat pinned as the orchestrator holds a workspace slot
-    /// and — since gh#104 — never hits its own time cap either.
+    /// The one misconfiguration this setting allows, and it is a quiet one: the
+    /// board's own events land in a chat that is in the middle of a task of its
+    /// own.
     #[test]
-    fn doctor_refuses_a_pin_on_a_chat_the_board_dispatched() {
+    fn doctor_refuses_a_fallback_on_a_chat_the_board_dispatched() {
         let (_d, p) = tmp();
         std::fs::write(
             p.routing(),
-            "[defaults]\norchestrator_chat = \"chat-9\"\n\n[github]\nrepos = []\n",
+            "[defaults]\nfallback_chat = \"chat-9\"\n\n[github]\nrepos = []\n",
         )
         .unwrap();
         let db = Db::open(&p.db()).unwrap();
@@ -6279,7 +6284,7 @@ mod tests {
         drop(db);
 
         let checks = doctor(&p, &engine_up(), Some(&[]), Some(&[]), None, None, None).unwrap();
-        let c = checks.iter().find(|c| c.name == "orchestrator").unwrap();
+        let c = checks.iter().find(|c| c.name == "fallback").unwrap();
         assert!(!c.ok, "{}", c.detail);
         assert!(c.detail.contains("linear:LIN-142"), "{}", c.detail);
     }

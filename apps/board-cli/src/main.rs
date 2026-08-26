@@ -95,7 +95,7 @@ enum Command {
     /// ordinary CLI verbs.
     #[command(hide = true)]
     Mcp,
-    /// List what is on the board. `--json` for orchestrating agents.
+    /// List what is on the board. `--json` for agents driving it.
     List {
         /// Only this state: blocked, working, ready, review, failed, done.
         #[arg(long)]
@@ -400,7 +400,7 @@ enum Command {
         /// The task whose pull request to merge.
         #[arg(long)]
         task: String,
-        /// Skip the confirmation — for orchestrating agents. Without a
+        /// Skip the confirmation — for agents driving the board. Without a
         /// terminal to ask on, this flag is required rather than assumed.
         #[arg(long)]
         yes: bool,
@@ -536,7 +536,7 @@ enum Command {
         /// is a real setup.
         #[arg(long)]
         force: bool,
-        /// The whole result as JSON — every step's outcome, for an orchestrating
+        /// The whole result as JSON — every step's outcome, for a driving
         /// agent that has to decide what to do next.
         #[arg(long)]
         json: bool,
@@ -711,7 +711,7 @@ enum RoutesCommand {
     /// Set one key under `[defaults]`: `routes defaults max_duration 4h`.
     Defaults {
         /// One of: max_concurrent_per_workspace, branch_template, base,
-        /// notify, notify_dispatcher, orchestrator_chat, new_source,
+        /// notify, notify_dispatcher, fallback_chat, new_source,
         /// max_duration, max_tool_failures, max_tool_calls, retain_worktrees,
         /// retain_build_output, archive_chats, billing_guard,
         /// agent_instructions.
@@ -767,7 +767,7 @@ fn main() -> Result<()> {
         None => Paths::discover()?,
     };
     // Which device's board the verbs drive. The environment carries it so an
-    // orchestrator points its whole shell at the box once, instead of
+    // driver points its whole shell at the box once, instead of
     // threading the flag through every call it makes.
     let device = cli
         .device

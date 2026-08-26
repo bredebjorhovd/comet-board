@@ -770,8 +770,8 @@ pub struct Defaults {
     pub base: String,
     /// Surface a notification, out of band, when work blocks or settles.
     ///
-    /// A conversational orchestrator cannot be woken — it only gets a turn when
-    /// something prompts it — so the operator is the one who has to notice, and
+    /// A chat cannot wake itself — it only gets a turn when something prompts
+    /// it — so the operator is the one who has to notice, and
     /// an agent that stops to ask at 02:00 is invisible until somebody looks at
     /// the board. This is the switch for the channel that reaches them anyway;
     /// [`notify_webhook`](Self::notify_webhook) is where it goes. On with
@@ -799,23 +799,27 @@ pub struct Defaults {
     ///
     /// **On by default since gh#165**, and first in the chain: this is the
     /// precise channel, prompting the one agent whose plan that task was a step
-    /// in. It was off for a release on the grounds that "an orchestrator woken
-    /// by every child it released cannot hold a train of thought" — true, and a
+    /// in. It was off for a release on the grounds that "an agent woken by
+    /// every child it released cannot hold a train of thought" — true, and a
     /// description of the *other* channel, which delivers the whole board into
     /// one chat. A chat told about the two or three things it released is not
     /// the same volume as a chat told about everything.
     ///
+    /// It is also the channel that makes a driver of a chat: what comes back
+    /// here is what a chat that dispatched needs in order to review, retry and
+    /// report, and it arrives without anything having been configured (gh#348).
+    ///
     /// Turn it off for a board dispatched from chats that are you at a prompt
     /// rather than agents — [`notify`](Self::notify) is the channel for that
     /// reader — and every settle then falls to
-    /// [`orchestrator_chat`](Self::orchestrator_chat), or to nobody.
+    /// [`fallback_chat`](Self::fallback_chat), or to nobody.
     ///
     /// Independent of `notify`, because they are different audiences: this one
     /// never fires for operator-released work, which has no dispatcher.
     #[serde(default = "default_true")]
     pub notify_dispatcher: bool,
-    /// The chat pinned as this board's orchestrator (gh#104): the one agent
-    /// that hears what **nobody else can be told**.
+    /// The chat that takes the board's **stray notices** (gh#104, renamed in
+    /// gh#348): the events **nobody else can be told about**.
     ///
     /// [`notify_dispatcher`](Self::notify_dispatcher) wakes the chat that
     /// released each task, which is the right audience whenever there is one.
@@ -834,16 +838,34 @@ pub struct Defaults {
     ///   a step that finished.
     ///
     /// What the dispatcher was told is not repeated here, and that is what
-    /// makes a pin survivable on a busy board. Delivery is the same
+    /// keeps this address survivable on a busy board. Delivery is the same
     /// [`crate::runtime::Runtime`] path review delivery uses. One per board —
-    /// re-pinning moves it — and unset (the default) is a board where those
+    /// naming another moves it — and unset (the default) is a board where those
     /// three cases reach nobody, which `doctor` says out loud.
+    ///
+    /// **An address, not a role.** It says where a stray notice goes and
+    /// nothing else: the chat is not appointed to drive the board, is not
+    /// exempt from anything, and is owed no brief. A chat that drives the board
+    /// is a chat that dispatched — see `docs/fallback-chat.md`.
     ///
     /// The value is a comet chat id. Nothing here can check that it names a
     /// live chat: the board core has no runtime at parse time, so a stale id is
     /// caught at delivery (the chat is gone; the log says so once) and named by
     /// `doctor`. Empty string reads as unset rather than as a chat called ""
-    /// — see [`Defaults::orchestrator`].
+    /// — see [`Defaults::fallback`].
+    #[serde(default)]
+    pub fallback_chat: Option<String>,
+    /// What [`fallback_chat`](Self::fallback_chat) was called before gh#348.
+    ///
+    /// Still read, because a board on disk today spells it this way and a
+    /// rename is not a reason to break somebody's routing.toml — and still
+    /// *writable*, because a frontend built before the rename (an installed
+    /// phone) sends this key. Its own field rather than a `serde(alias)`: a
+    /// file carrying both spellings is a duplicate field to an alias and a
+    /// parse error for the whole config, which is a worse outcome than one
+    /// stale key being ignored. [`Defaults::fallback`] prefers the new
+    /// spelling; [`crate::routes`] rewrites this one on the way in, so a board
+    /// edited from any surface converges on `fallback_chat`.
     #[serde(default)]
     pub orchestrator_chat: Option<String>,
     /// Which tracker `comet-board new` writes to. `github` is the only
@@ -1093,17 +1115,23 @@ fn default_billing_guard() -> String {
 }
 
 impl Defaults {
-    /// The pinned orchestrator's chat id, if there is one.
+    /// Where a stray notice goes, if anywhere.
     ///
     /// Trimmed, and an empty value is `None`. A settings surface that clears a
-    /// text field writes `orchestrator_chat = ""` at least as often as it
-    /// removes the key, and a board that then tried to prompt a chat named ""
-    /// would log a delivery failure every settle for as long as nobody noticed.
-    pub fn orchestrator(&self) -> Option<&str> {
-        self.orchestrator_chat
-            .as_deref()
+    /// text field writes `fallback_chat = ""` at least as often as it removes
+    /// the key, and a board that then tried to prompt a chat named "" would log
+    /// a delivery failure every settle for as long as nobody noticed.
+    ///
+    /// The new spelling wins over
+    /// [`orchestrator_chat`](Defaults::orchestrator_chat) when a file carries
+    /// both — the legacy key is what an un-updated frontend writes, and the
+    /// board's own surfaces write the current one.
+    pub fn fallback(&self) -> Option<&str> {
+        [&self.fallback_chat, &self.orchestrator_chat]
+            .into_iter()
+            .filter_map(|c| c.as_deref())
             .map(str::trim)
-            .filter(|c| !c.is_empty())
+            .find(|c| !c.is_empty())
     }
 }
 
@@ -1177,6 +1205,7 @@ impl Default for Defaults {
             notify: true,
             notify_webhook: None,
             notify_dispatcher: true,
+            fallback_chat: None,
             orchestrator_chat: None,
             new_source: default_new_source(),
             max_duration: default_max_duration(),
@@ -2321,6 +2350,39 @@ branch_template = "board/{identifier_lower}"
         let c: RoutingConfig = toml::from_str(SAMPLE).unwrap();
         c.validate().unwrap();
         c
+    }
+
+    /// gh#348 renamed the key. A board on disk today still spells it the old
+    /// way, and a rename that stopped reading it would silently send every
+    /// stray notice to nobody — the failure mode this address exists to close.
+    #[test]
+    fn the_pre_rename_spelling_still_names_the_fallback_chat() {
+        let c: RoutingConfig =
+            toml::from_str("[defaults]\norchestrator_chat = \"chat-boss\"\n").unwrap();
+        assert_eq!(c.defaults.fallback(), Some("chat-boss"));
+    }
+
+    /// Both spellings in one file is not a parse error — that is why the legacy
+    /// key is a field of its own and not a `serde(alias)` — and the current
+    /// spelling is the one that counts.
+    #[test]
+    fn the_current_spelling_wins_over_the_legacy_one() {
+        let c: RoutingConfig = toml::from_str(
+            "[defaults]\nfallback_chat = \"chat-new\"\norchestrator_chat = \"chat-old\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.defaults.fallback(), Some("chat-new"));
+    }
+
+    /// An empty string is a cleared text field, not a chat called "" — under
+    /// either spelling, since a frontend that clears the old key writes `""`
+    /// into it exactly as often as it removes it.
+    #[test]
+    fn a_cleared_field_reads_as_no_fallback_chat() {
+        let c: RoutingConfig =
+            toml::from_str("[defaults]\nfallback_chat = \"\"\norchestrator_chat = \"  \"\n")
+                .unwrap();
+        assert_eq!(c.defaults.fallback(), None);
     }
 
     #[test]

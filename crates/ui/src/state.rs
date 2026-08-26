@@ -30,7 +30,7 @@ use serde::de::DeserializeOwned;
 
 use comet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use comet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use comet_proto::view::board::{self as board_view, OrchestratorPin};
+use comet_proto::view::board::{self as board_view, FallbackPin};
 use comet_proto::view::needs::{self as needs_view};
 use comet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
 use comet_rpc::{
@@ -443,11 +443,11 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
-    /// The chat the board has pinned as its orchestrator (gh#104). `None` = no
-    /// pin, or no board this app can reach. Held on the app state rather than
-    /// on the board panel because it marks a row in the session list, which is
-    /// on screen whether or not the board is open.
-    pub orchestrator: Option<String>,
+    /// The chat this board sends its stray notices to (gh#104, gh#348).
+    /// `None` = no address, or no board this app can reach. Held on the app
+    /// state rather than on the board panel because it marks a row in the
+    /// session list, which is on screen whether or not the board is open.
+    pub fallback_chat: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<comet_update::UpdateStatus>,
     /// This engine's own edge census, polled every 15s (gh#126). What lets the
@@ -484,7 +484,7 @@ impl AppState {
             transcript: Vec::new(),
             echoes: HashMap::new(),
             local_device_id: None,
-            orchestrator: None,
+            fallback_chat: None,
             update: None,
             edge_health: None,
             data_dir: None,
@@ -727,20 +727,20 @@ impl AppState {
     // under their space's disclosed row, and [`Self::chats_in_space`] is the
     // per-space enumeration both the sidebar and the tab strip read.)
 
-    /// The orchestrator's fixed slot (gh#122), or `None` when no orchestrator
-    /// is pinned or its chat has not synced here.
-    pub fn orchestrator_slot(&self, now: DateTime<Utc>) -> Option<needs_view::OrchestratorSlot> {
-        needs_view::orchestrator_slot(
-            self.orchestrator.as_deref(),
+    /// The board-notices slot (gh#122), or `None` when the board has no
+    /// fallback chat or its chat has not synced here.
+    pub fn fallback_slot(&self, now: DateTime<Utc>) -> Option<needs_view::FallbackSlot> {
+        needs_view::fallback_slot(
+            self.fallback_chat.as_deref(),
             &self.chats,
             &self.sessions,
             now,
         )
     }
 
-    /// Is this the chat the board has pinned as its orchestrator?
-    pub fn is_orchestrator(&self, chat_id: &str) -> bool {
-        self.orchestrator.as_deref() == Some(chat_id)
+    /// Is this the chat the board sends its stray notices to?
+    pub fn is_fallback_chat(&self, chat_id: &str) -> bool {
+        self.fallback_chat.as_deref() == Some(chat_id)
     }
 
     pub fn session_for(&self, chat_id: &str) -> Option<&Session> {
@@ -846,7 +846,7 @@ impl AppState {
                 methods::UPDATE_STATUS,
                 AppState::apply_update,
             ),
-            spawn_orchestrator_watch(cx, handle.clone()),
+            spawn_fallback_watch(cx, handle.clone()),
             spawn_local_device_probe(cx, handle.clone()),
             spawn_edge_health_poll(cx, handle.clone()),
         ];
@@ -1020,9 +1020,9 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
 /// How long before a device that hosts no board is asked again for its pin.
 /// The same 2s the board panel's sweep uses: a device with no board costs one
 /// refused subscribe, and a box still booting is picked up while you look.
-const ORCHESTRATOR_RETRY: Duration = Duration::from_secs(2);
+const FALLBACK_RETRY: Duration = Duration::from_secs(2);
 
-/// Watch which chat the board has pinned as its orchestrator (gh#104), sweeping
+/// Watch which chat takes the board's stray notices (gh#104), sweeping
 /// devices the way the board panel does until one answers.
 ///
 /// Its own sweep rather than the board panel's, because the audiences differ:
@@ -1034,7 +1034,7 @@ const ORCHESTRATOR_RETRY: Duration = Duration::from_secs(2);
 /// which is the answer; an engine too old to serve the method looks the same;
 /// and either way the list simply has no pinned row, which is also what an
 /// unpinned board looks like.
-fn spawn_orchestrator_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+fn spawn_fallback_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
         let mut host: Option<String> = None;
         loop {
@@ -1045,12 +1045,12 @@ fn spawn_orchestrator_watch(cx: &mut Context<AppState>, handle: EngineHandle) ->
             let mut delivered = false;
             if let Ok(mut rx) = handle
                 .client()
-                .subscribe(methods::WATCH_BOARD_ORCHESTRATOR, params)
+                .subscribe(methods::WATCH_BOARD_FALLBACK, params)
                 .await
             {
                 while let Some(value) = rx.recv().await {
                     delivered = true;
-                    let pin: OrchestratorPin = match serde_json::from_value(value) {
+                    let pin: FallbackPin = match serde_json::from_value(value) {
                         Ok(pin) => pin,
                         Err(err) => {
                             tracing::warn!(error = %err, "dropping malformed pin frame");
@@ -1059,7 +1059,7 @@ fn spawn_orchestrator_watch(cx: &mut Context<AppState>, handle: EngineHandle) ->
                     };
                     if this
                         .update(cx, |state, cx| {
-                            state.orchestrator = pin.chat_id;
+                            state.fallback_chat = pin.chat_id;
                             cx.notify();
                         })
                         .is_err()
@@ -1072,7 +1072,7 @@ fn spawn_orchestrator_watch(cx: &mut Context<AppState>, handle: EngineHandle) ->
             // it beats leaving a glyph on a row nothing is delivered to.
             if this
                 .update(cx, |state, cx| {
-                    if state.orchestrator.take().is_some() {
+                    if state.fallback_chat.take().is_some() {
                         cx.notify();
                     }
                 })
@@ -1104,7 +1104,7 @@ fn spawn_orchestrator_watch(cx: &mut Context<AppState>, handle: EngineHandle) ->
                     None => host = None,
                 }
             }
-            cx.background_executor().timer(ORCHESTRATOR_RETRY).await;
+            cx.background_executor().timer(FALLBACK_RETRY).await;
         }
     })
 }
@@ -1689,9 +1689,9 @@ mod tests {
         assert_eq!(ids, ["old", "new"]);
     }
 
-    /// gh#122: the pin's place is the fixed slot above Spaces, not a float in
-    /// the sessions list — which stays pure recency for everyone, the
-    /// orchestrator included.
+    /// gh#122: that chat's place is the fixed slot above Spaces, not a float
+    /// in the sessions list — which stays pure recency for everyone, the
+    /// fallback chat included.
     #[test]
     fn the_pin_is_a_slot_not_a_float() {
         let mut state = AppState::new();
@@ -1712,22 +1712,22 @@ mod tests {
                 .collect()
         };
         assert_eq!(ids(&state), ["boss", "recent"]);
-        assert!(state.orchestrator_slot(now).is_none());
+        assert!(state.fallback_slot(now).is_none());
 
-        state.orchestrator = Some("boss".into());
+        state.fallback_chat = Some("boss".into());
         // The per-space enumeration is untouched — the slot is where the pin
         // shows (and the disclosed row just wears the ◆ mark).
         assert_eq!(ids(&state), ["boss", "recent"]);
-        assert!(state.is_orchestrator("boss"));
-        let slot = state.orchestrator_slot(now).expect("pinned and synced");
+        assert!(state.is_fallback_chat("boss"));
+        let slot = state.fallback_slot(now).expect("pinned and synced");
         assert_eq!(slot.chat_id, "boss");
         assert_eq!(slot.preview.as_deref(), Some("PR 576 green"));
         assert!(slot.unseen);
 
         // A stale pin — the chat was archived away, or the id in
         // `routing.toml` is from a chat that is gone — invents nothing.
-        state.orchestrator = Some("nobody".into());
-        assert!(state.orchestrator_slot(now).is_none());
+        state.fallback_chat = Some("nobody".into());
+        assert!(state.fallback_slot(now).is_none());
     }
 
     #[test]

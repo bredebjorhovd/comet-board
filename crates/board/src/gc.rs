@@ -239,22 +239,23 @@ impl Dispatchers {
 /// archived chat reads as gone), an issue still owed holds, and only a task
 /// that has left the board is spent. What is added here:
 ///
-/// - **The pinned orchestrator is never archived.** It is the board's own
-///   standing agent ([`crate::config::Defaults::orchestrator_chat`]) — the
-///   address every event that can reach no other agent goes to, so it is
-///   *always* somebody's, whatever the attempt it was once dispatched as.
-///   `Held`, not a skip, so a mark left from before it was pinned is cleared.
+/// - **The board's fallback chat is never archived.** It is the address every
+///   event that can reach no other agent goes to
+///   ([`crate::config::Defaults::fallback_chat`]), so more is always coming to
+///   it, whatever the attempt it was once dispatched as. `Held`, not a skip, so
+///   a mark left from before it was named is cleared.
 /// - **Nor is a chat that has released work the board is not finished with**
 ///   (gh#354). This is the same protection, attached to the behaviour instead
-///   of the pin: the orchestrator is spared because it is waiting on the board,
-///   and a chat with two agents out is waiting on exactly the same thing at a
-///   smaller scale. Until gh#354 the sweep could only see the declaration, so
-///   the pane somebody dispatched from was, once its own task merged, a
-///   finished attempt like any other — and it was archived out from under them
-///   mid-use. A dispatcher outlives what it dispatched: see [`Dispatchers`] for
-///   why that is the child's [`standing`] and not the child's outcome. `Live`
-///   rather than `Held`, because unlike a pin this says something about *right
-///   now*: somebody is in there waiting for an answer.
+///   of the setting: the fallback chat is spared because the board still has
+///   things to tell it, and a chat with two agents out is waiting on exactly
+///   the same thing at a smaller scale. Until gh#354 the sweep could only see
+///   the declaration, so the pane somebody dispatched from was, once its own
+///   task merged, a finished attempt like any other — and it was archived out
+///   from under them mid-use. A dispatcher outlives what it dispatched: see
+///   [`Dispatchers`] for why that is the child's [`standing`] and not the
+///   child's outcome. `Live` rather than `Held`, because unlike a config key
+///   this says something about *right now*: somebody is in there waiting for an
+///   answer.
 /// - **A chatless attempt has nothing to archive.** A dispatch whose chat
 ///   never got recorded is `Held` for want of anything to do.
 ///
@@ -268,14 +269,14 @@ impl Dispatchers {
 pub fn chat_standing(
     task: &Task,
     attempt: &Attempt,
-    orchestrator: Option<&str>,
+    fallback: Option<&str>,
     dispatchers: &Dispatchers,
     dependents: &Dependents,
 ) -> Standing {
     let Some(chat) = attempt.pane_id.as_deref() else {
         return Standing::Held;
     };
-    if orchestrator.is_some_and(|pinned| pinned == chat) {
+    if fallback.is_some_and(|address| address == chat) {
         return Standing::Held;
     }
     if dispatchers.holds(chat) {
@@ -877,11 +878,11 @@ mod tests {
         );
     }
 
-    /// The pinned orchestrator hears about every settle on the board, so it is
-    /// never finished — whatever the attempt it was once dispatched as. `Held`
-    /// rather than skipped, so a clock started before it was pinned stops.
+    /// The fallback chat hears about everything nobody else can be told, so it
+    /// is never finished — whatever the attempt it was once dispatched as.
+    /// `Held` rather than skipped, so a clock started before it was named stops.
     #[test]
-    fn the_pinned_orchestrator_is_never_archived() {
+    fn the_fallback_chat_is_never_archived() {
         let mut t = task(UpstreamState::Terminal);
         t.attempts = vec![attempt(1, Some(Outcome::Done))];
         assert_eq!(
@@ -894,7 +895,7 @@ mod tests {
             ),
             Standing::Held
         );
-        // Somebody else's pin leaves this chat exactly as spent as it was.
+        // Another chat's address leaves this one exactly as spent as it was.
         assert_eq!(
             chat_standing(
                 &t,

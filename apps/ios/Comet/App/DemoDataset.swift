@@ -17,10 +17,10 @@ final class DemoDataset {
     /// Agents section and the board rows agree with each other and tapping a
     /// row opens a transcript that exists.
     var boardRows: [TaskRow] = []
-    /// The board's pinned orchestrator (gh#122) — the demo pins its long-lived
-    /// driver chat, so the slot above Spaces and the Needs-you inbox are
-    /// explorable with no infrastructure.
-    var orchestratorChatId: String? = "chat-orchestrator"
+    /// Where the board's stray notices go (gh#122) — the demo points them at
+    /// its long-lived driving chat, so the slot above Spaces and the Needs-you
+    /// inbox are explorable with no infrastructure.
+    var fallbackChatId: String? = "chat-notices"
     private var stores: [String: SessionStore] = [:]
     private var streamTask: Task<Void, Never>?
 
@@ -77,10 +77,10 @@ final class DemoDataset {
                  config: claude, lastMessagePreview: "Which device owns the catalog?",
                  lastMessageAt: now - 120_000, createdAt: now - 7_200_000,
                  spaceId: comet.id, lastSeenAt: now - 130_000),
-            // The pinned orchestrator (gh#122): working right now, with a
+            // The board's fallback chat (gh#122): working right now, with a
             // report you have not opened — the slot shows the spinner AND the
             // unread badge, which is the demo's whole pitch for it.
-            Chat(id: "chat-orchestrator", deviceId: "dev-mac", title: "Board orchestrator",
+            Chat(id: "chat-notices", deviceId: "dev-mac", title: "Driving the board",
                  archived: false, cwd: comet.path, branch: "main", checkoutId: nil,
                  config: claude, lastMessagePreview: "Two agents up in the tally space…",
                  lastMessageAt: now - 20_000, createdAt: now - 86_400_000 * 3,
@@ -102,13 +102,13 @@ final class DemoDataset {
             "chat-picker": SessionRow(chatId: "chat-picker", deviceId: "dev-mac",
                                       status: .awaitingInput, startedAt: now - 400_000,
                                       updatedAt: now - 10_000),
-            // No board row points here; being the pinned orchestrator, its
+            // No board row points here; it takes the board's notices, so its
             // live state shows on the slot above Spaces (gh#122).
             // No board row points here, so it is an unmanaged Active row
             // (gh#117) — bare title, no chip.
-            "chat-orchestrator": SessionRow(chatId: "chat-orchestrator", deviceId: "dev-mac",
-                                            status: .working, startedAt: now - 6_600_000,
-                                            updatedAt: now - 2_000),
+            "chat-notices": SessionRow(chatId: "chat-notices", deviceId: "dev-mac",
+                                       status: .working, startedAt: now - 6_600_000,
+                                       updatedAt: now - 2_000),
         ]
         let dataset = DemoDataset(devices: [mac, vps], spaces: [comet, cometWorktree, edge],
                                   chats: chats, sessions: sessions)
@@ -418,7 +418,7 @@ final class DemoDataset {
                     runtime: "claude-code", branch: "deploy-hygiene",
                     lastOutcome: "failed", attempts: 2, updatedAt: stamp(86_400_000)),
             TaskRow(id: "gh:comet#110", identifier: "gh#110",
-                    title: "Pin one chat as the orchestrator",
+                    title: "Send the board's notices to one chat",
                     state: .done, route: "comet-native", workspace: "comet-native",
                     runtime: "claude-code", lastOutcome: "done", attempts: 1,
                     updatedAt: stamp(5_400_000)),

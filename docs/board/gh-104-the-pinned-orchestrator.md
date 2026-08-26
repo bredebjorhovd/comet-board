@@ -3,7 +3,8 @@
 Landed as `[defaults] orchestrator_chat` plus `notify::orchestrator_message` /
 `SyncEngine::wake_orchestrator`, a `WatchBoardOrchestrator` stream, and a "Pin
 as orchestrator" item on the session context menu of both viewports.
-`docs/orchestrator.md` is the brief to open the pinned chat with.
+`docs/fallback-chat.md` is what this became: §gh#348 kept the mechanism,
+renamed the key to `fallback_chat`, and retired the role.
 
 This is herdr-board's AGE-24 topology, made a product concept instead of
 something a human wires by hand every time. It is also how this fork was
