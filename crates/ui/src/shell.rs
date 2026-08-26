@@ -2630,9 +2630,10 @@ impl Shell {
         (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
-    /// Chat-mode sidebar: the Needs-you inbox, then **Spaces** — the primary
-    /// group, each space disclosing its own sessions inline — then the notice
-    /// strip and the account footer (gh#230).
+    /// Chat-mode sidebar: the Needs-you inbox, the board-notices slot, then
+    /// **Spaces** — each space disclosing its own sessions inline, with the
+    /// Unfiled tail for runs no space names — then the notice strip and the
+    /// account footer (gh#230, gh#547).
     ///
     /// gh#258 put the hierarchy back. Active used to be a group of its own
     /// between the inbox and the tree, holding the full row of every live run
@@ -2640,12 +2641,16 @@ impl Shell {
     /// pinned slot above that. Three groups deep, the reader had to know which
     /// surface a chat was on this frame before they could look for it, and the
     /// thing the window is actually organised by — the spaces — started a
-    /// third of the way down the column. Now the tree owns every row: a live
-    /// run's row is drawn inside its own space's disclosure, above that
-    /// space's idle sessions, and the notices slot is the first row under the
-    /// selected space. What is left of Active is a fallback group BELOW the
-    /// tree for runs whose chat names no space at all — the one case a
-    /// disclosure cannot draw.
+    /// third of the way down the column. So the tree came to own every row: a
+    /// live run's row is drawn inside its own space's disclosure, above that
+    /// space's idle sessions. gh#547 finished the job: the fallback chat is an
+    /// address for stray notices about every space (gh#348) and not a chat in
+    /// a folder, so it left the selected space's disclosure for its own slot
+    /// between the inbox and Spaces — where the derivation's contract and the
+    /// phone always had it — and what was left of Active — live runs whose
+    /// chat names no space at all, the one case a disclosure cannot draw —
+    /// moved INSIDE Spaces as its Unfiled tail instead of masquerading as a
+    /// section beside it. Two sections and a pin.
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
@@ -2661,11 +2666,18 @@ impl Shell {
 
         let account_footer = self.render_account_footer(theme, cx);
 
-        // First, the inbox (gh#122): does anything want me — in words, and it
-        // cannot miss. Then the spaces tree, which owns every other row.
+        // The sidebar is two sections and a pin (gh#547). First, the inbox
+        // (gh#122): does anything want me — in words, and it cannot miss; it
+        // is a projection over what follows, not a fourth place things live.
+        // Then the board-notices slot — one address for stray notices about
+        // every space (gh#348), which belongs to no space and so sits outside
+        // the tree. Then Spaces, which owns where everything else lives:
+        // each space's disclosure, and the Unfiled tail for live runs no
+        // space claims.
         let needs_section = self.render_needs_section(theme, cx);
-        // Everything alive (gh#103/gh#117), derived ONCE here, because the tree
-        // below is defined by it: each space's disclosure draws the live rows
+        let fallback_fixture = self.render_fallback_fixture(theme, cx);
+        // Everything alive (gh#103/gh#117), derived ONCE here, because the
+        // tree below is defined by it: each space's disclosure draws the live rows
         // that belong to it and then its idle ones. One derivation, so the two
         // halves of a space's list can never disagree about which chats are
         // running this frame.
@@ -2679,10 +2691,6 @@ impl Shell {
                 .collect()
         };
         let spaces_section = self.render_spaces_section(&active, &placements, theme, cx);
-        // The remainder: live runs whose chat names no space, which no
-        // disclosure can hold. Below the tree, not above it.
-        let loose_section =
-            self.render_loose_active_section(&active, &placements, active_now, theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2712,8 +2720,14 @@ impl Shell {
                             .flex()
                             .flex_col()
                             .child(needs_section)
+                            .children(fallback_fixture)
+                            // The section divider the canvas draws above the
+                            // Spaces header (`docs/design/window.md` C2.1) —
+                            // the one hairline that says "everything above
+                            // this line wants you; everything below it just
+                            // lives somewhere".
+                            .child(Self::render_sidebar_rule(theme))
                             .child(spaces_section)
-                            .children(loose_section)
                             .child(div().pb(px(Theme::SPACE_SM))),
                     )
                     .when(lists_fade_top && !glass, |el| {

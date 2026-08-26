@@ -22,6 +22,19 @@
 //!   nothing has been said there yet the slot says so ([`NO_REPORTS`])
 //!   instead of vanishing, teaching where to look before the first notice
 //!   arrives.
+//!
+//! The inbox is a **projection**, not a fourth place things live (gh#547):
+//! its rows are pointers at rows that also exist below it — in a space's
+//! list, or on the board — drawn here because "does anything want me" is the
+//! question a person opening the app actually has. Nothing about membership
+//! moves a chat: a need answered and the row is gone, while the row it
+//! pointed at stays exactly where it lives. The slot sits between the inbox
+//! and Spaces (the phone drew it there from the start; the desktop caught up
+//! in gh#547) because a fallback chat (gh#348: an address, not a role) is not
+//! a chat inside a folder — it is the one conversation you talk TO rather
+//! than check on, and a fixture that
+//! vanished whenever another space was selected was a hidden one, not a
+//! pinned one.
 
 use chrono::{DateTime, Utc};
 

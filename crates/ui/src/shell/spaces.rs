@@ -5,22 +5,27 @@
 //! between them and surfacing which sessions want attention. Child module of
 //! `shell` so it renders straight off `Shell`'s private state.
 //!
-//! ## One session surface (gh#124)
+//! ## Two sections and a pin (gh#547)
+//!
+//! The sidebar reads as exactly two sections — **Needs you**, the projection
+//! that answers "does anything want me", and **Spaces**, which owns where
+//! everything lives — with the board-notices slot between them (gh#547),
+//! outside both: it is an address, not a role (gh#348), and not a chat in a
+//! folder either, so a pin that vanished whenever another space was selected
+//! would be a hidden one. A live run's row draws under the space its chat
+//! names; when no space names it, the same section keeps it visible as the
+//! [`spaces_view::UNFILED_TITLE`] tail, because a run with no space is the
+//! same kind of thing as a run with one. That tail matters because Chat and
+//! Space watches settle independently; a dangling `space_id` must stay
+//! visible while the Space side catches up.
+//!
+//! ## One full row per chat (gh#124, gh#138)
 //!
 //! The sidebar is the authoritative enumeration of sessions: each space row
 //! contains its sessions, disclosed inline under the row (click activates and
-//! disclosing follows; the chevron toggles without activating). The old global
-//! "Sessions" flat list is retired — it was a second session switcher
-//! competing with the tab strip, and neither was authoritative. The tab strip
-//! stays as in-space navigation with the titlebar duties.
-//!
-//! ## One full row per chat (gh#138, gh#258)
-//!
-//! Spaces is the primary hierarchy: a disclosure draws its board-notices slot first,
-//! then live sessions, then idle sessions. Active is only the fallback for a
-//! live row whose current placement resolves to no known Space. That fallback
-//! matters because Chat and Space watches settle independently; a dangling
-//! `space_id` must stay visible while the Space side catches up.
+//! disclosing follows; the chevron toggles without activating). A disclosure
+//! draws its live sessions first, then idle ones. The fallback chat draws
+//! nowhere in the tree — it has the slot above the tree and only that.
 //!
 //! A space row is named repo-first: `owner/repo` where a host has supplied the
 //! gh#118 link ([`Shell::refresh_space_slugs`]), the folder basename otherwise.
@@ -94,13 +99,12 @@ const RAIL_OFFSET: f32 = 9.0;
 /// See [`RAIL_OFFSET`].
 const RAIL_INSET: f32 = 14.0;
 
-/// The hairline between that slot and the chats under it — margin 3/9/4,
-/// per claim C2.9, and drawn INSIDE the rail rather than across the sidebar.
-const FALLBACK_RULE_TOP: f32 = 3.0;
-/// See [`FALLBACK_RULE_TOP`].
-const FALLBACK_RULE_SIDE: f32 = 9.0;
-/// See [`FALLBACK_RULE_TOP`].
-const FALLBACK_RULE_BOTTOM: f32 = 4.0;
+/// The sidebar's section hairline — under the board-notices slot, above the
+/// Spaces header (gh#547): 3px of air above, 4 below. Full width: it divides
+/// two sections, so it is not drawn inside one rail.
+const SIDEBAR_RULE_TOP: f32 = 3.0;
+/// See [`SIDEBAR_RULE_TOP`].
+const SIDEBAR_RULE_BOTTOM: f32 = 4.0;
 
 /// How much of a space row the disambiguating tail may claim (gh#138). It wins
 /// the width fight against the repo name — that is the whole point — but not
@@ -452,17 +456,6 @@ impl Shell {
     /// The chevron's toggle — collapse if disclosed, disclose if not. Does not
     /// activate the space; that is the row's job.
     fn toggle_space_disclosure(&mut self, space_id: &str, cx: &mut Context<Self>) {
-        let forced_open = {
-            let state = self.state.read(cx);
-            spaces_view::space_disclosure_forced_open(
-                state.selected_space.as_deref() == Some(space_id),
-                state.fallback_slot(Utc::now()).is_some(),
-            )
-        };
-        if forced_open {
-            self.expand_space(space_id, cx);
-            return;
-        }
         if let Some(ix) = self
             .settings
             .expanded_spaces
@@ -544,16 +537,16 @@ impl Shell {
 
     // ---- sidebar sections ----
 
-    /// The "Spaces" section: tracked header + add button, then the spaces
-    /// grouped by device — the device named ONCE per group — with each space's
-    /// sessions disclosed inline under its row (gh#124).
+    /// The "Spaces" section (gh#547 shape): tracked header + add button, then
+    /// the spaces grouped by device — the device named ONCE per group — with
+    /// each space's sessions disclosed inline under its row (gh#124), and the
+    /// [`spaces_view::UNFILED_TITLE`] tail for live runs no space claims.
     ///
     /// `live` is everything the board says is running this frame and `active`
     /// is [`spaces_view::active_placements`] for it — which chat lives where.
-    /// Since gh#258 the tree DRAWS those rows rather than deferring them to a
-    /// group above it: a space's disclosure holds its live rows and then its
-    /// idle ones, and the space row's `N running` count still says how many of
-    /// the first kind a collapsed row is hiding.
+    /// A space's disclosure holds its live rows and then its idle ones, and
+    /// the space row's `N running` count still says how many of the first kind
+    /// a collapsed row is hiding.
     pub(super) fn render_spaces_section(
         &mut self,
         live: &[comet_proto::view::board::ActiveRow],
@@ -579,7 +572,6 @@ impl Shell {
             animating,
             slugs,
             local_device,
-            has_fallback,
         ) = {
             let now = Utc::now();
             let state = self.state.read(cx);
@@ -647,7 +639,6 @@ impl Shell {
                 animating,
                 state.space_slugs.clone(),
                 state.local_device_id.clone(),
-                state.fallback_slot(now).is_some(),
             )
         };
         // Manual (drag) order overrides the synced creation order — device-
@@ -668,10 +659,13 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .pt(px(8.0))
             .pb(px(4.0))
+            // A top-level section's header carries 600 (`window.md` C2.2) —
+            // one step above the group headers under it, so depth survives
+            // the indent being invisible (gh#547).
             .child(
                 div()
                     .text_size(px(Theme::TEXT_CAPTION))
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from("Spaces")),
             )
@@ -791,9 +785,7 @@ impl Shell {
                     // while collapsed (gh#229) — owner-stamped, so it costs no
                     // RPC and is true on a phone that will never see the disk.
                     let branch = spaces_view::space_branch(&space).map(str::to_string);
-                    let expanded = (self.space_expanded(&space.id)
-                        || spaces_view::space_disclosure_forced_open(is_selected, has_fallback))
-                        && !drag_active;
+                    let expanded = self.space_expanded(&space.id) && !drag_active;
                     // What Active holds for this space — the count the row
                     // wears, and the rows the shelf therefore skips.
                     let order = self.tab_ids(&id, cx);
@@ -843,9 +835,10 @@ impl Shell {
                         _ => row.into_any_element(),
                     });
                     // The disclosure: everything that lives in this space,
-                    // inline under its row (gh#124's containment) — the
-                    // notices slot when this is the selected space, then the
-                    // live rows, then the idle ones (gh#258).
+                    // inline under its row (gh#124's containment) — the live
+                    // rows first, then the idle ones (gh#258). The pinned
+                    // chat is held out by the disclosure itself; it has the
+                    // slot above the tree (gh#547).
                     if expanded {
                         let held: Vec<&comet_proto::view::board::ActiveRow> =
                             spaces_view::space_live(&id, &borrowed_active)
@@ -904,6 +897,45 @@ impl Shell {
                         .children(rows),
                 );
             }
+        }
+        // The Unfiled tail (gh#547): live runs whose chat names no space,
+        // which no disclosure above can draw. Inside Spaces, not beside it —
+        // a run with no space is the same kind of thing as a run with one,
+        // and this section owns where things live. `None` whenever every run
+        // has a home, which is the ordinary case; a live run must always have
+        // a row somewhere, and that guarantee is all this group is for.
+        let borrowed: Vec<(&str, Option<&str>)> = active
+            .iter()
+            .map(|(chat, space)| (chat.as_str(), space.as_deref()))
+            .collect();
+        let homeless: Vec<&comet_proto::view::board::ActiveRow> =
+            spaces_view::homeless_live(&borrowed)
+                .into_iter()
+                .filter_map(|chat| live.iter().find(|row| row.chat_id() == chat))
+                .collect();
+        if !homeless.is_empty() {
+            let owned: Vec<comet_proto::view::board::ActiveRow> =
+                homeless.iter().map(|row| (*row).clone()).collect();
+            let blocked = comet_proto::view::board::active_needing_attention(&owned);
+            // The rows are chats; selection is the chat's, not the space's.
+            let selected_chat = self.state.read(cx).selected_chat.clone();
+            let now = Utc::now();
+            let rows: Vec<AnyElement> = homeless
+                .into_iter()
+                .map(|row| {
+                    let is_selected = selected_chat.as_deref() == Some(row.chat_id());
+                    match row {
+                        comet_proto::view::board::ActiveRow::Agent(agent) => {
+                            self.render_agent_row(agent, is_selected, now, theme, cx)
+                        }
+                        comet_proto::view::board::ActiveRow::Unmanaged(run) => {
+                            self.render_running_row(run, is_selected, now, theme, cx)
+                        }
+                    }
+                })
+                .collect();
+            column = column.child(Self::render_unfiled_header(blocked, theme));
+            column = column.child(div().flex().flex_col().gap(px(2.0)).children(rows));
         }
         column.into_any_element()
     }
@@ -1262,19 +1294,17 @@ impl Shell {
     /// repeated on any row, because the row is IN the space.
     ///
     /// The rail is claim C2.7 and it is the point: `padding-left:14` at
-    /// `margin-left:9` with one `--line` hairline down the left. Three things
-    /// stack inside it, in this order (gh#258, claims C2.3/C2.8/C2.9):
+    /// `margin-left:9` with one `--line` hairline down the left. Two things
+    /// stack inside it (gh#258):
     ///
-    /// 1. **The board-notices slot**, on the SELECTED space only, followed by its
-    ///    hairline. It is the row you talk TO rather than check on, it outlives
-    ///    every attempt in the list under it, and it belongs to the space whose
-    ///    board it is driving — which is what putting it here says.
-    ///    Because it is drawn here, the pinned chat is dropped from the lists
-    ///    below: one notices slot per rail.
-    /// 2. **The live rows** — board attempts and the runs the board never
+    /// 1. **The live rows** — board attempts and the runs the board never
     ///    released — in Active's own order, needs-you first.
-    /// 3. **The idle sessions**, in the tab strip's order (creation + manual
+    /// 2. **The idle sessions**, in the tab strip's order (creation + manual
     ///    drag), so the shelf and the tabs agree.
+    ///
+    /// The fallback chat draws in NEITHER list: since gh#547 it has the slot
+    /// above the tree, so `held-out` here is unconditional — one pinned row per
+    /// sidebar, wherever its chat's space happens to be.
     ///
     /// Expanding a space must always answer with something true about what
     /// lives here, so an empty one says so rather than disclosing into a gap.
@@ -1282,32 +1312,17 @@ impl Shell {
         &mut self,
         shelf: &spaces_view::SpaceShelf<'_>,
         live: &[&comet_proto::view::board::ActiveRow],
-        fallback: bool,
+        space_selected: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use comet_proto::view::board::ActiveRow;
         let now = Utc::now();
-        // The chat the slot above is already drawing, when it drew one. The
-        // canvas has exactly one notices slot in the tree (claim C2.8) and the
-        // pinned chat is an ordinary member of its space, so without this it
-        // appeared twice inside one rail — once as the first child and again,
-        // four rows down, among the chats it is supposed to be separated from
-        // by the hairline. `held` is scoped to THIS disclosure: a pinned chat
-        // living in some other space still draws its own row there, wearing
-        // the ◆ that says which one it is.
-        let held: Option<String> = if fallback {
-            self.state.read(cx).fallback_slot(now).map(|s| s.chat_id)
-        } else {
-            None
-        };
-        let head: Vec<AnyElement> = if fallback {
-            self.render_fallback_slot(theme, cx)
-                .map(|slot| vec![slot, Self::render_fallback_rule(theme)])
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        // The pinned chat is drawn once, by the slot above the tree. It is
+        // held out of every disclosure — live or idle — whatever space its
+        // chat names, because a row that also appears four rows down among the
+        // chats it is supposed to sit apart from is the same task twice.
+        let held: Option<String> = self.state.read(cx).fallback_chat.clone();
         let live_rows: Vec<AnyElement> = {
             let selected = self.state.read(cx).selected_chat.clone();
             live.iter()
@@ -1318,7 +1333,7 @@ impl Shell {
                     // white plates in light; the reference leaves children on
                     // the disclosed bed.
                     let is_selected = disclosed_child_selected(
-                        fallback,
+                        space_selected,
                         selected.as_deref() == Some(row.chat_id()),
                     );
                     match row {
@@ -1334,10 +1349,7 @@ impl Shell {
         };
         let order = &shelf.idle;
         let rows: Vec<AnyElement> = {
-            let (selected, pinned) = {
-                let state = self.state.read(cx);
-                (state.selected_chat.clone(), state.fallback_chat.clone())
-            };
+            let selected = self.state.read(cx).selected_chat.clone();
             order
                 .iter()
                 .filter(|chat_id| held.as_deref() != Some(**chat_id))
@@ -1351,8 +1363,10 @@ impl Shell {
                     Some(self.render_space_session_row(
                         &chat,
                         status,
-                        disclosed_child_selected(fallback, selected.as_deref() == Some(*chat_id)),
-                        pinned.as_deref() == Some(*chat_id),
+                        disclosed_child_selected(
+                            space_selected,
+                            selected.as_deref() == Some(*chat_id),
+                        ),
                         now,
                         theme,
                         cx,
@@ -1360,10 +1374,8 @@ impl Shell {
                 })
                 .collect()
         };
-        let body: AnyElement = if rows.is_empty() && live_rows.is_empty() && head.is_empty() {
+        let body: AnyElement = if rows.is_empty() && live_rows.is_empty() {
             // Nothing lives here at all — the one honest gap, and it says so.
-            // With the slot drawn there IS something here, and the note would
-            // be denying the row directly above it.
             div()
                 .px(px(Theme::SPACE_SM))
                 .py(px(4.0))
@@ -1393,7 +1405,6 @@ impl Shell {
             .border_color(theme.border)
             .flex()
             .flex_col()
-            .children(head)
             .child(body)
             .into_any_element()
     }
@@ -1421,7 +1432,6 @@ impl Shell {
         chat: &comet_proto::Chat,
         status: ChatIndicator,
         selected: bool,
-        fallback: bool,
         now: DateTime<Utc>,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -1509,18 +1519,6 @@ impl Shell {
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
                     .child(status_rail)
-                    .when(fallback, |el| {
-                        el.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(Theme::TEXT_CAPTION))
-                                .line_height(px(14.0))
-                                .text_color(theme.accent)
-                                .child(SharedString::from(
-                                    comet_proto::view::board::FALLBACK_GLYPH,
-                                )),
-                        )
-                    })
                     // The chip wears the Active list's attempt-chip clothes —
                     // the same wash fill, the same radius — because it is the
                     // same fact about the same chat, one section apart. Mono,
@@ -1624,10 +1622,13 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .pt(px(12.0))
             .pb(px(4.0))
+            // A top-level section's header carries 600 (`window.md` C1.1) —
+            // one step above the group headers below it, so depth survives
+            // the indent being invisible (gh#547).
             .child(
                 div()
                     .text_size(px(Theme::TEXT_CAPTION))
-                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
                     .text_color(theme.text_subtle)
                     .child(SharedString::from(needs_view::NEEDS_YOU_TITLE)),
             )
@@ -1783,30 +1784,35 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The board-notices row — the FIRST child of the selected space's
-    /// disclosure (claims C2.3, C2.8), inside the rail and above the hairline.
-    /// `None` only when the board has no fallback chat (or its chat has not
-    /// synced here).
+    /// The board-notices slot — the pinned chat's own row between "Needs you"
+    /// and Spaces, outside the tree (gh#547). `None` only when the board has
+    /// no fallback chat (or its chat has not synced here).
     ///
-    /// One line, exactly as the canvas draws it: a 5px status dot, the ◆ in
-    /// `--review`, the name 13/18/500 in `--text`, and how long ago it last
-    /// spoke at 12px `--subtle`. It used to carry two more things — a green
-    /// "new" badge and a preview of the latest report — and both said what
-    /// "Needs you" says four rows above in words ("Board notices · finished a
-    /// turn you haven't seen"). The inbox is where an unread report is
-    /// supposed to catch you (claim C1.3); repeating it here made the tree's
-    /// first child two lines tall so it could restate its own inbox entry.
+    /// It used to be the first child of the selected space's disclosure
+    /// (`window.md` C2.3 as drawn), on the reasoning that it belongs to the
+    /// space whose board it serves. The nesting was the problem: it is one
+    /// address for stray notices about every space (gh#348), not a chat in a
+    /// folder, and housing it inside one disclosure made it vanish whenever
+    /// another space was selected — a pinned conversation that hides is a
+    /// hidden one. The phone drew this slot above Spaces from the start; the
+    /// derivation's own contract ([`needs_view::fallback_slot`]) always said
+    /// "above Spaces"; the desktop caught up.
     ///
-    /// That disclosure is forced open while this row exists, so the ownership
-    /// stays visible even if the saved disclosure state says collapsed.
-    pub(super) fn render_fallback_slot(
+    /// One line: a 5px status dot, the ◆ in `--review`, the name 13/18/500 in
+    /// `--text`, and how long ago it last spoke at 12px `--subtle`. No badge
+    /// and no report preview — both said what "Needs you" says a few rows up
+    /// in words ("Board notices · finished a turn you haven't seen"), and the
+    /// inbox is where an unread report is supposed to catch you (claim C1.3).
+    pub(super) fn render_fallback_fixture(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let now = Utc::now();
         let slot = self.state.read(cx).fallback_slot(now)?;
-        let fade_key = format!("orch-slot-{}", slot.chat_id);
+        let selected_chat = self.state.read(cx).selected_chat.clone();
+        let is_selected = selected_chat.as_deref() == Some(slot.chat_id.as_str());
+        let fade_key = format!("fallback-slot-{}", slot.chat_id);
         let chat_id = slot.chat_id.clone();
         let menu_id = slot.chat_id.clone();
         // The dot is state, in the same 5px slot every sibling chat row uses —
@@ -1837,6 +1843,7 @@ impl Shell {
                     "board-notices-{}",
                     slot.chat_id
                 )))
+                .mt(px(4.0))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -1844,10 +1851,9 @@ impl Shell {
                 .rounded(px(Theme::RADIUS_ROW))
                 .px(px(Theme::SPACE_SM))
                 .py(px(6.0))
-                // The selected Space row owns the hierarchy's selection fill;
-                // its board-notices child remains unfilled like every other
-                // disclosed child in the reference.
-                .list_row(theme, Bed::Shell, false, fade_key)
+                // A fixture that is also a chat row: when the chat is the one
+                // you are looking at, the fixture says so like any other row.
+                .list_row(theme, Bed::Shell, is_selected, fade_key)
                 .cursor_pointer()
                 // Opening it opens the thread — and marks it seen, the synced
                 // marker that clears the inbox entry on every device.
@@ -1904,102 +1910,43 @@ impl Shell {
         )
     }
 
-    /// The hairline under the board-notices slot (gh#229).
+    /// The hairline under the board-notices slot, and the section divider
+    /// above the Spaces header (`window.md` C2.1) — one hairline between
+    /// them, since the slot sits directly over the section (gh#547).
     ///
     /// The slot is a chat row like any other and it is not one of the chats:
-    /// it is pinned, it outlives every attempt, and it is the only row above
-    /// that the reader is expected to talk TO rather than check on. Order
+    /// it is pinned, it outlives every attempt, and it is the only row up
+    /// there the reader is expected to talk TO rather than check on. Order
     /// alone said that faintly — the rule says it in a way you do not have to
     /// have been told.
-    pub(super) fn render_fallback_rule(theme: &Theme) -> AnyElement {
+    pub(super) fn render_sidebar_rule(theme: &Theme) -> AnyElement {
         div()
-            .mt(px(FALLBACK_RULE_TOP))
-            .mx(px(FALLBACK_RULE_SIDE))
-            .mb(px(FALLBACK_RULE_BOTTOM))
+            .mt(px(SIDEBAR_RULE_TOP))
+            .mb(px(SIDEBAR_RULE_BOTTOM))
             .h(px(1.0))
             .flex_none()
             .bg(theme.border)
             .into_any_element()
     }
 
-    /// What is left of the "Active" group (gh#123, cut back by gh#258): the
-    /// live runs no space can hold — a working chat whose placement is unset
-    /// or dangling, which no disclosure in the tree above can draw yet.
-    ///
-    /// It sits BELOW the tree, not above it, and it is `None` whenever every
-    /// run has a home — which is the ordinary case. A live run must always
-    /// have a row somewhere; that guarantee is what this group is for, and
-    /// nothing else. Rows that DO belong to a space are drawn there
-    /// ([`Self::render_space_disclosure`]) from the same derivation on the same
-    /// frame, so the two can never draw one chat twice.
-    pub(super) fn render_loose_active_section(
-        &mut self,
-        live: &[comet_proto::view::board::ActiveRow],
-        active: &[(String, Option<String>)],
-        now: DateTime<Utc>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        use comet_proto::view::board::ActiveRow;
-        let borrowed: Vec<(&str, Option<&str>)> = active
-            .iter()
-            .map(|(chat, space)| (chat.as_str(), space.as_deref()))
-            .collect();
-        let loose: Vec<&ActiveRow> = spaces_view::homeless_live(&borrowed)
-            .into_iter()
-            .filter_map(|chat| live.iter().find(|row| row.chat_id() == chat))
-            .collect();
-        if loose.is_empty() {
-            return None;
-        }
-        let owned: Vec<ActiveRow> = loose.iter().map(|row| (*row).clone()).collect();
-        let blocked = comet_proto::view::board::active_needing_attention(&owned);
-        let selected = self.state.read(cx).selected_chat.clone();
-
-        let header = Self::render_active_header(blocked, theme);
-
-        let rows: Vec<AnyElement> = loose
-            .into_iter()
-            .map(|row| {
-                let is_selected = selected.as_deref() == Some(row.chat_id());
-                match row {
-                    ActiveRow::Agent(agent) => {
-                        self.render_agent_row(agent, is_selected, now, theme, cx)
-                    }
-                    ActiveRow::Unmanaged(run) => {
-                        self.render_running_row(run, is_selected, now, theme, cx)
-                    }
-                }
-            })
-            .collect();
-
-        Some(
-            div()
-                .flex()
-                .flex_col()
-                .child(header)
-                .child(div().flex().flex_col().gap(px(2.0)).children(rows))
-                .into_any_element(),
-        )
-    }
-
-    /// The Active header: one label over the whole live list, and the count of
-    /// rows under it that want a human.
-    fn render_active_header(blocked: usize, theme: &Theme) -> AnyElement {
+    /// The Unfiled group's header: [`spaces_view::UNFILED_TITLE`] in the
+    /// group-header voice — quieter than a section header, because it divides
+    /// a group rather than announcing one — and the count of rows under it
+    /// that want a human.
+    fn render_unfiled_header(blocked: usize, theme: &Theme) -> AnyElement {
         div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
             .px(px(Theme::SPACE_SM))
-            .pt(px(12.0))
-            .pb(px(4.0))
+            .pt(px(6.0))
+            .pb(px(2.0))
             .child(
                 div()
                     .text_size(px(Theme::TEXT_CAPTION))
-                    .font_weight(gpui::FontWeight::MEDIUM)
                     .text_color(theme.text_subtle)
-                    .child(SharedString::from("Active")),
+                    .child(SharedString::from(spaces_view::UNFILED_TITLE)),
             )
             // The count is what you look for first: three running, one of them
             // stuck on a question you have not answered.

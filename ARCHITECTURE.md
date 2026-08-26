@@ -28,9 +28,11 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC
   whether the engine is in-process or a separate daemon. Organized around **spaces** — synced
-  (device, folder) pairs: the sidebar lists spaces plus a global attention-sorted Active list;
-  the main area shows the selected space's sessions as horizontal tabs (closing a tab archives);
-  new sessions are minted onto the space's device via relay-forwardable RPCs.
+  (device, folder) pairs: the sidebar is two sections and a pin (gh#547) — "Needs you" (the inbox
+  projecting what wants a human), the board-notices slot, and Spaces, whose rows disclose
+  their sessions inline; the main area shows the selected space's sessions as horizontal tabs
+  (closing a tab archives); new sessions are minted onto the space's device via relay-forwardable
+  RPCs.
 - **Edge (TypeScript, ported from comet `apps/edge`)**: Worker + SessionRoom DO (per chat) +
   DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth. Absorbs the old `apps/server`
   responsibilities (WorkOS code exchange/refresh, orgs) so **Postgres, the Hono server, and

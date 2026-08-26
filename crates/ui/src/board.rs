@@ -2464,6 +2464,34 @@ impl BoardPanel {
     /// "Filter" control (the route chip IS the filter, and says what it is
     /// filtered to rather than that filtering exists), and a close ✕ (the
     /// titlebar's board toggle is the dock's switch, and `esc` still shuts it).
+    /// The header's right cluster leads with what this pane owes the sidebar
+    /// (gh#547): six state sections are the ALL-ROWS organisation of one
+    /// queue, and the sidebar is the "what wants me" one — so when rows here
+    /// want a human, the header says how many in the inbox's own words, and
+    /// "N need you" means the same thing at both ends of one window. Quiet
+    /// when nothing does; a fact, not a control — the inbox itself lives in
+    /// the sidebar, always on screen.
+    fn render_needs_count(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let count = self.needs(cx, Utc::now()).len();
+        if count == 0 {
+            return None;
+        }
+        let theme = Theme::of(cx);
+        Some(
+            div()
+                .flex_none()
+                .text_size(px(Theme::TEXT_CAPTION))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.accent)
+                .child(SharedString::from(if count == 1 {
+                    "1 needs you".to_string()
+                } else {
+                    format!("{count} need you")
+                }))
+                .into_any_element(),
+        )
+    }
+
     fn render_header(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let typing = self.model.typing;
@@ -2497,7 +2525,10 @@ impl BoardPanel {
             // box produced them, and a header that is silent about it on the
             // ordinary install is silent exactly where the habit forms.
             .child(self.render_host_title(&theme, cx))
-            .child(div().flex_1());
+            .child(div().flex_1())
+            // The tie to the inbox (gh#547), before the filter chips so the
+            // rightmost pair stays filter-then-find.
+            .children(self.render_needs_count(cx));
 
         if typing {
             // The `/` field: the query input inline, then a close chip.

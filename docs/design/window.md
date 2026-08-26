@@ -58,8 +58,8 @@ token means the field in `Theme`, never a literal at the call site.
 
 - **C2.1** A 1px `--line` divider sits above the Spaces header, margin 12/8/0.
 - **C2.2** Header: "Spaces" 11px/600 `--subtle`, and a 20px "+" button right.
-- **C2.3** **Spaces is the primary group and the board-notices slot lives
-  inside the selected space** — not as a sibling group, and not displaced by Active.
+- **C2.3** Spaces is the primary group. *(Amended by gh#547: the board-notices
+  slot no longer lives inside the selected space — see C deviations below.)*
 - **C2.4** A space row is radius 10, padding 6×9, gap 8: a 15px source icon,
   the name 13/18/500, the branch 12px `--subtle`, a spacer, a running count
   ("3 running") led by a 5px dot, then a 16px chevron.
@@ -69,10 +69,13 @@ token means the field in `Theme`, never a literal at the call site.
 - **C2.7** **The children hang off a rail**: the child list is inset
   `padding-left:14` at `margin-left:9` with a 1px `--line` left border. This is
   what makes them read as inside the space rather than under it.
-- **C2.8** The board-notices slot is the first child: a 5px `--settled` dot, a `--review`
-  diamond, the name 13/18/500 `--text`, and an elapsed time 12px `--subtle`.
-- **C2.9** A 1px `--line` divider separates that slot from the chats below
-  it, margin 3/9/4 — inside the rail, not across the sidebar.
+- **C2.8** The board-notices slot is its own fixture between Needs-you and
+  Spaces: a 5px status dot, a `--review` diamond, the name 13/18/500 `--text`,
+  and an elapsed time 12px `--subtle`. *(gh#547 moved it out of the disclosure;
+  the shape is the canvas's, and gh#348 named it: an address for stray notices,
+  not a chair.)*
+- **C2.9** A 1px `--line` divider runs under that fixture and above the Spaces
+  header, margin 3/8/4 — across the sidebar, as C2.1's.
 - **C2.10** A chat row with an agent shows a subline indented 13px: the Claude
   mark at 10px in `--claude`, then the branch at 11/15.
 - **C2.11** An agent row carries its issue id as a chip — `--chip` bed, mono
@@ -80,6 +83,9 @@ token means the field in `Theme`, never a literal at the call site.
 - **C2.12** A collapsed space is the same row shape with `--muted` name and a
   right-pointing chevron, and no children.
 - **C2.13** A non-git space (`scratch`) uses the folder icon, not the source icon.
+- **C2.14** Live runs whose chat names no space draw as the tail of Spaces
+  under a group header (`Unfiled`) in the device-header voice, only when such
+  rows exist (gh#547).
 
 ### C3 Account footer
 
@@ -88,6 +94,30 @@ token means the field in `Theme`, never a literal at the call site.
 - **C3.2** The row is padding 8×9, margin 8/0, gap 10: a 26px circle filled
   `--text` with the initial in `--card` at 12px/600, then the name 13/18/500
   `--text` over "Alpha" at 11/15 `--subtle`.
+
+### C deviations
+
+Three, from gh#547 — the hierarchy pass, not a visual one: what contains what.
+
+- **C2.3 amended — the board-notices slot is not inside the selected space.**
+  The canvas housed it as the disclosure's first child on the reasoning that
+  it belongs to the space whose board it serves. The nesting was the problem:
+  it is one address for stray notices (gh#348) about every space, and housing
+  it inside one disclosure made it vanish whenever another space was selected
+  — a pinned conversation that hides is a hidden one. It now draws between
+  Needs-you and Spaces (C2.8), where the phone had it all along and where the
+  derivation's contract always said it lived. Its chat is held out of every
+  disclosure, so it appears once per sidebar.
+- **The loose Active group joined Spaces as its Unfiled tail (C2.14).** The
+  group below the tree kept gh#123's name long after gh#258 split the live
+  list into disclosures; a header saying "Active" over only the rows no space
+  claimed was a promise the rows did not keep. Live runs with no space are the
+  same kind of thing as live runs with one, so both belong to the section that
+  owns where things live.
+- **Headers are typed to their level.** Section headers ("Needs you", "Spaces")
+  carry 600 — which is what C1.1/C2.2 said all along; the code had drifted to
+  500. Group headers (`@ device`, `Unfiled`) stay regular-weight, so depth has
+  a second carrier when indentation is truncated away.
 
 ## D. Conversation panel
 
@@ -167,6 +197,17 @@ Two, both from gh#297.
   `--subtle`, and the agent that did it sits in the time column in `--faint`.
 - **E14** Footer 28px, `--line` top border, padding 0×14, 12px `--subtle`:
   "↵ dispatch · space peek · / find".
+
+### E deviations
+
+One, from gh#547:
+
+- **E2 gains one phrase**: when rows on the board want a human, the header
+  says "N need you" in the accent, in the inbox's own words. Six sections and
+  a tree are two organisations of one queue; this is the pane saying openly
+  that it is the all-rows one, and naming how many of its rows the sidebar's
+  first section projects. A fact, not a control — the inbox itself lives in
+  the sidebar, always on screen.
 
 ## F. Both themes
 
