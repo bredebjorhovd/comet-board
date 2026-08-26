@@ -881,8 +881,23 @@ fn in_path(name: &str, skip: Option<&Path>) -> Option<PathBuf> {
 }
 
 /// The PATH walk itself, over an explicit list of directories.
+///
+/// Everything under `{state_dir}/bin` is passed over, not just one caller-named
+/// directory: those directories hold only wrappers this code wrote (`git`,
+/// `gh`, `comet-askpass`), so a lookup landing there resolves *our own guard*
+/// as the real tool — a guard wrapping a guard, minting against whichever
+/// board the ambient environment names. Found the hard way by the wide pass
+/// (§gh#386): running the workspace suite from inside a dispatched chat made
+/// `resolve_git(None)` answer with the live chat's `git` shim, and two test
+/// binaries then measured the box's shell instead of this code. Nothing else
+/// reads the environment here, and when `COMET_BOARD_STATE_DIR` is unset — a
+/// daemon, CI, an ordinary shell — the walk is exactly what it was.
 fn scan(dirs: impl Iterator<Item = PathBuf>, name: &str, skip: Option<&Path>) -> Option<PathBuf> {
+    let shim_root = std::env::var_os(crate::config::STATE_DIR_ENV)
+        .map(PathBuf::from)
+        .map(|state| state.join("bin"));
     dirs.filter(|dir| !dir.as_os_str().is_empty() && Some(dir.as_path()) != skip)
+        .filter(|dir| !shim_root.as_ref().is_some_and(|root| dir.starts_with(root)))
         .map(|dir| dir.join(name))
         .find(|p| p.exists())
 }

@@ -661,7 +661,10 @@ struct Capture {
 /// Run git capturing stdout under a hard byte ceiling — the child is killed once
 /// the cap is hit, so an arbitrarily large repository diff never buffers fully.
 async fn capture_git(cwd: &Path, args: &[&str], max_bytes: usize) -> Result<Capture, EngineError> {
-    let mut cmd = tokio::process::Command::new("git");
+    // Resolved past the board's shim directories, for the same reason as
+    // `repos::the_git` (§gh#386): PATH's first `git` inside a dispatched chat
+    // is the guard wrapper, not git.
+    let mut cmd = tokio::process::Command::new(crate::repos::the_git()?);
     cmd.arg("-C").arg(cwd).args(args);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
