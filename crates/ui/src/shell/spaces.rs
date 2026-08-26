@@ -11,14 +11,13 @@
 //! that answers "does anything want me", and **Spaces**, which owns where
 //! everything lives — with the board-notices slot between them (gh#547),
 //! outside both: it is an address, not a role (gh#348), and not a chat in a
-//! folder either, so a pin
-//! that vanished whenever another space was selected would be a hidden one. A live
-//! run's row draws under the space its chat names; when no space names it,
-//! the same section keeps it visible as the [`spaces_view::UNFILED_TITLE`]
-//! tail, because a run with no space is the same kind of thing as a run with
-//! one. The fallback matters because Chat and Space watches settle
-//! independently; a dangling `space_id` must stay visible while the Space
-//! side catches up.
+//! folder either, so a pin that vanished whenever another space was selected
+//! would be a hidden one. A live run's row draws under the space its chat
+//! names; when no space names it, the same section keeps it visible as the
+//! [`spaces_view::UNFILED_TITLE`] tail, because a run with no space is the
+//! same kind of thing as a run with one. That tail matters because Chat and
+//! Space watches settle independently; a dangling `space_id` must stay
+//! visible while the Space side catches up.
 //!
 //! ## One full row per chat (gh#124, gh#138)
 //!
