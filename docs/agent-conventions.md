@@ -51,8 +51,8 @@ running at all. Subagents are for reading (research, a sweep across files, a
 question to answer before deciding); anything that lands a commit is a ticket.
 
 **Releasing work and waiting for it.** `wait` blocks until the work settles, so
-an orchestrator does not have to poll or, worse, go quiet until a human prods
-it:
+a chat that released work does not have to poll or, worse, go quiet until a
+human prods it:
 
 ```bash
 comet-board dispatch --task gh:owner/repo#14
@@ -177,8 +177,10 @@ is this board's `review`.
   `gh stack` — one dependent concern per layer, foundations at the bottom —
   and each layer is reviewed on its own instead of as one wall of diff. Off
   unless asked for, on purpose: an agent opening five pull requests where one
-  was expected is a surprise, so pass it when the work is plainly several
-  stacked concerns and not on the chance that it might be. It changes the
+  was expected is a surprise, so pass it when the ticket's own text names
+  several separable, dependent concerns — the spec is the signal — and never
+  on size alone, which correlates without implying: a large change can be
+  indivisible and a small one hold two clean layers (gh#336). It changes the
   brief and nothing else. The layers are the attempt's own branch and that
   name with `-2`, `-3` on the end — that naming is how the board tells they
   are one attempt's work rather than pull requests belonging to nobody — and
@@ -257,15 +259,15 @@ is this board's `review`.
   plainly that you are leaving it running. A board with `notify_dispatcher`
   on — the default — prompts you in this chat when work you released settles
   or blocks, and it is the first addressee: what reaches you does not also
-  reach the board's orchestrator. *Every* ending arrives, not only the happy
+  reach the board's fallback chat. *Every* ending arrives, not only the happy
   one: an attempt someone cancelled, and one the duration cap killed, come
   through the same channel with a line saying which. An ending you have already
   been told about is not repeated: an attempt can close, re-open and close again
   without anything you could act on having moved, and you are woken for the
   second close only when something did — a new commit on the branch, a new pull
   request, a different ending. What you will *not* be told about is work
-  you did not release; that is the orchestrator's, and only when this chat
-  could not be told. You cannot see either setting from here, and a chat that
+  you did not release; that goes to the board's fallback chat, and only when
+  this chat could not be told. You cannot see either setting from here, and a chat that
   is archived before its child finishes is told nothing at all, so never
   promise that you will be woken. Note also that `wait` does **not** return on
   `blocked` by default: an agent that stops to ask a question holds its
@@ -278,22 +280,33 @@ is this board's `review`.
   instruction — releases tasks. Reading the board is always safe; dispatching
   is not.
 
-**One chat may be pinned as the board's orchestrator.** If this one is, you
-receive a `comet-board:` prompt for everything on the board that no other agent
-could be told about — work a human released from the panel or the phone, work
-whose dispatching chat is gone, and every cap warning — one message per event,
-never a stream. Work a live dispatcher was told about does not reach you, and
-that is deliberate: your context is for the events that would otherwise vanish,
-not for a copy of every child's settle. A notice that names who released it is
-one whose dispatcher never heard, which is the thing to pick up. Everything else
-about you is unchanged: you hold no
-workspace slot, everything you release counts against the caps like anyone's,
-and you bill whatever account your chat names. You are exempt from
-`max_duration` and from `archive_chats` alike, because you are meant to outlive
-every attempt — the shelf sweep never files the pinned chat away. That makes
-restraint your responsibility rather than the clock's: never poll the board in
-a loop, and never dispatch because a queue looked empty. Being told about work
-is not being told to release any. `docs/orchestrator.md` is the brief.
+**Driving the board is not a role you are given.** A chat that dispatches is
+already the parent of what it dispatched: the dispatch records this chat, its
+children's settles and blocks come back here, and the shelf sweep will not file
+this chat away while the work it released is still owed (§gh#354). Nothing has
+to be configured for that, and nothing declares it. If you are driving, the
+verbs above are the whole of the job.
+
+**The board is the state.** `comet-board list --json` knows what is ready,
+working, blocked and in review, and it is still true after a compaction, a
+restart, or somebody else's dispatch. Re-read it rather than trusting what you
+remember; a driver that re-reads has no context problem to solve.
+
+**One chat may be named as the board's fallback.** If this one is, you receive a
+`comet-board:` prompt for everything on the board that no other agent could be
+told about — work a human released from the panel or the phone, work whose
+dispatching chat is gone, and every cap warning — one message per event, never a
+stream. Work a live dispatcher was told about does not reach you, and that is
+deliberate: your context is for the events that would otherwise vanish, not for
+a copy of every child's settle. A notice that names who released it is one whose
+dispatcher never heard, which is the thing to pick up. It is an address and not
+an appointment: nothing else about you changes, you hold no workspace slot,
+everything you release counts against the caps like anyone's, you bill whatever
+account your chat names, and you are exempt from nothing (the shelf sweep does
+leave the chat alone, because more notices are always coming to it). Restraint
+is yours rather than the clock's: never poll the board in a loop, and never
+dispatch because a queue looked empty. Being told about work is not being told
+to release any. `docs/fallback-chat.md` is the whole of it.
 
 **Reviewing a pull request is how you reach the agent that wrote it.** The board
 delivers new comments on an open PR back into the chat that produced it — the

@@ -84,9 +84,9 @@ this row spends it.
 - **B2.5** [manual] The row under a finger paints `--sel` with the `--sellift`
   ring, at the row's own radius. No other row has a fill.
 
-### B3 Orchestrator
+### B3 Board notices
 
-- **B3.1** A 1px `--line` divider sits above the orchestrator row, margin
+- **B3.1** A 1px `--line` divider sits above the board-notices row, margin
   10/4/0.
 - **B3.2** The row is radius `radiusCard`, padding 7×9, gap 8: a 10px-wide
   `--review` ◆, the name 13/500 `--text`, the latest report at 11/16 beneath,
@@ -319,7 +319,7 @@ system three surfaces share.
   makes concentric curves possible, and a 12 between the two steps breaks it
   wherever it nests. Each of these is a number the canvas drew once; none is
   worth a fourth step in a system three surfaces share.
-- **The orchestrator preview's `opacity:.72`** becomes `--text` when unread and
+- **The notices preview's `opacity:.72`** becomes `--text` when unread and
   `--subtle` when seen. A text tone multiplied by an alpha is precisely what
   gh#172 retired, and `ios_theme.rs` fails the build on a new one; the canvas's
   .72 grey is not one of the four and is not contrast-checked.

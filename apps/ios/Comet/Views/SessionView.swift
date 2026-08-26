@@ -15,11 +15,11 @@ struct SessionView: View {
     @State private var refs: [RepoRef] = []
     @State private var catalogs: [String: [ModelInfo]] = [:]
 
-    /// The orchestrator pin, asked for and refused (gh#166) — the chat's own
+    /// The notices address, asked for and refused (gh#166) — the chat's own
     /// menu is where a person is standing when they decide this chat is the one
     /// the board should talk to.
-    @State private var pinRequest: OrchestratorPinRequest?
-    @State private var pinFailure: OrchestratorPinFailure?
+    @State private var pinRequest: BoardNoticesRequest?
+    @State private var pinFailure: BoardNoticesFailure?
 
     /// Width the nav bar's own controls need either side of the title — the
     /// back button leading, breathing room trailing.
@@ -103,12 +103,12 @@ struct SessionView: View {
                     }
                     .buttonStyle(.plain)
                 }
-                // The chat's own menu: whole-transcript copy/share, and the pin
-                // when it is offered. The pin is here because it has nowhere
-                // else to be for a chat that is not running — an idle
-                // orchestrator has no Active row, and before it is pinned it
+                // The chat's own menu: whole-transcript copy/share, and the
+                // notices item when it is offered. It is here because it has
+                // nowhere else to be for a chat that is not running — an idle
+                // chat has no Active row, and before it takes the notices it
                 // has no slot either; it is absent when the board dispatched
-                // this chat, which is the one chat that must not be pinned.
+                // this chat, which is the one chat that must not take them.
                 //
                 // The export is here because a session is the unit a person
                 // wants OUT of the phone: during the 2026-08-19 incident the
@@ -117,9 +117,9 @@ struct SessionView: View {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
                         transcriptExportItems(chat: chat)
-                        if orchestratorPinOffered(chatId: chatId, model: model) {
+                        if boardNoticesOffered(chatId: chatId, model: model) {
                             Divider()
-                            orchestratorPinItem(chatId: chatId, model: model,
+                            boardNoticesItem(chatId: chatId, model: model,
                                                 request: $pinRequest,
                                                 failure: $pinFailure)
                         }
@@ -130,7 +130,7 @@ struct SessionView: View {
                 }
             }
         }
-        .orchestratorPinPrompts(request: $pinRequest, failure: $pinFailure)
+        .boardNoticesPrompts(request: $pinRequest, failure: $pinFailure)
         .sheet(isPresented: $showConfig) {
             if let chat {
                 let harness = chat.config?.harness ?? "claude-code"

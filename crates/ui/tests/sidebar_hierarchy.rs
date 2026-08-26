@@ -3,17 +3,18 @@
 //!
 //! The strangeness the ticket named was not any one element — it was that
 //! nothing on screen said what contains what. Needs you, Spaces and the loose
-//! Active group all rendered the same header; the orchestrator lived inside a
-//! disclosure it does not belong to; and one blocked attempt could appear as
-//! three unrelated-looking rows. The fix is composition, and composition is
-//! the kind of thing that drifts back one reasonable-looking edit at a time,
-//! so like `sidebar_seam.rs` this test reads the source and checks the shape:
+//! Active group all rendered the same header; the board-notices slot lived
+//! inside a disclosure it does not belong to; and one blocked attempt could
+//! appear as three unrelated-looking rows. The fix is composition, and
+//! composition is the kind of thing that drifts back one reasonable-looking
+//! edit at a time, so like `sidebar_seam.rs` this test reads the source and
+//! checks the shape:
 //!
-//! - **Order**: Needs you (the projection), then the orchestrator's fixture,
+//! - **Order**: Needs you (the projection), then the board-notices slot,
 //!   then the section hairline, then Spaces (which owns where things live).
 //! - **The pin is global**: its chat is held out of every disclosure
-//!   unconditionally — one Orchestrator per sidebar.
-//! - **No forced-open coupling survives**: nothing re-hides the fixture by
+//!   unconditionally — one pinned row per sidebar.
+//! - **No forced-open coupling survives**: nothing re-hides the slot by
 //!   collapsing a space, because no disclosure holds it.
 //! - **No fourth section**: the homeless live runs draw under Spaces' Unfiled
 //!   header, and nothing renders an `"Active"` list beside the tree.
@@ -32,7 +33,7 @@ fn two_sections_and_a_pin_compose_in_that_order() {
     let body = fn_body(&shell_rs(), COMPOSITION).expect("render_chat_sidebar");
     let order = [
         ".child(needs_section)",
-        ".children(orchestrator_fixture)",
+        ".children(fallback_fixture)",
         "Self::render_sidebar_rule(theme)",
         ".child(spaces_section)",
     ];
@@ -46,7 +47,7 @@ fn two_sections_and_a_pin_compose_in_that_order() {
         assert!(
             line > last,
             "`{marker}` composes out of order (line {line}): the sidebar is \
-             Needs you → orchestrator fixture → section hairline → Spaces \
+             Needs you → board-notices slot → section hairline → Spaces \
              (gh#547)"
         );
         last = line;
@@ -59,15 +60,15 @@ fn the_pinned_chat_is_held_out_of_every_disclosure_unconditionally() {
     let body = fn_body(&spaces_rs, DISCLOSURE).expect("render_space_disclosure");
     assert!(
         body.iter()
-            .any(|(_, l)| l.contains("self.state.read(cx).orchestrator.clone()")),
+            .any(|(_, l)| l.contains("self.state.read(cx).fallback_chat.clone()")),
         "the disclosure no longer holds the pinned chat out unconditionally — \
-         without that, the fixture above the tree and the chat row in its \
+         without that, the slot above the tree and the chat row in its \
          space are the same task twice"
     );
     // And nothing scopes it to the selected space again: the whole point of
-    // moving the fixture out was that it shows from every space.
+    // moving the slot out was that it shows from every space.
     assert!(
-        !body.iter().any(|(_, l)| l.contains("orchestrator_slot(")),
+        !body.iter().any(|(_, l)| l.contains("fallback_slot(")),
         "the disclosure consults the slot per-space again; the hold must be \
          unconditional (gh#547)"
     );

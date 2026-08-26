@@ -1552,7 +1552,7 @@ pub async fn merge(board: &Board, task_id: &str) -> Result<String> {
 /// The default trio is "finished, one way or another": work to look at, work
 /// that broke, or work whose ticket closed under it. `blocked` is deliberately
 /// not among them — an agent pausing for an approval mid-run is not a result,
-/// and an orchestrator that waited on it would be woken by every permission
+/// and a chat that waited on it would be woken by every permission
 /// prompt.
 ///
 /// But a child that asks a question and is never answered never settles either,
@@ -1579,7 +1579,7 @@ pub fn settle_states(explicit: &[String], blocked_is_settled: bool) -> Vec<Strin
 }
 
 /// Block until watched work settles — the counterpart to `dispatch`, so an
-/// orchestrator can release work and be told, instead of polling or falling
+/// driving chat can release work and be told, instead of polling or falling
 /// silent until a human prods it.
 ///
 /// herdr-board's `wait` was a poll loop that reconciled as it went; here it is
@@ -3017,7 +3017,7 @@ mod tests {
     #[test]
     fn blocked_is_settled_adds_to_the_states_rather_than_replacing_them() {
         assert_eq!(settle_states(&[], false), ["review", "failed", "done"]);
-        // The orchestrator wants to hear about a question AND about the finish.
+        // A driver wants to hear about a question AND about the finish.
         assert_eq!(
             settle_states(&[], true),
             ["review", "failed", "done", "blocked"]

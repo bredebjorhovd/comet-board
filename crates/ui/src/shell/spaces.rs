@@ -9,9 +9,10 @@
 //!
 //! The sidebar reads as exactly two sections — **Needs you**, the projection
 //! that answers "does anything want me", and **Spaces**, which owns where
-//! everything lives — with the orchestrator's pinned fixture between them,
-//! outside both: it is the board's voice, not a chat in a folder, and a pin
-//! that vanished whenever another space was selected was a hidden one. A live
+//! everything lives — with the board-notices slot between them (gh#547),
+//! outside both: it is an address, not a role (gh#348), and not a chat in a
+//! folder either, so a pin
+//! that vanished whenever another space was selected would be a hidden one. A live
 //! run's row draws under the space its chat names; when no space names it,
 //! the same section keeps it visible as the [`spaces_view::UNFILED_TITLE`]
 //! tail, because a run with no space is the same kind of thing as a run with
@@ -24,9 +25,8 @@
 //! The sidebar is the authoritative enumeration of sessions: each space row
 //! contains its sessions, disclosed inline under the row (click activates and
 //! disclosing follows; the chevron toggles without activating). A disclosure
-//! draws its live sessions first, then idle ones. The pinned orchestrator's
-//! chat draws nowhere in the tree — it has the fixture above the tree and
-//! only that.
+//! draws its live sessions first, then idle ones. The fallback chat draws
+//! nowhere in the tree — it has the slot above the tree and only that.
 //!
 //! A space row is named repo-first: `owner/repo` where a host has supplied the
 //! gh#118 link ([`Shell::refresh_space_slugs`]), the folder basename otherwise.
@@ -100,11 +100,12 @@ const RAIL_OFFSET: f32 = 9.0;
 /// See [`RAIL_OFFSET`].
 const RAIL_INSET: f32 = 14.0;
 
-/// The sidebar's section hairline — under the orchestrator's fixture, above
-/// the Spaces header (gh#547): 3px of air above, 4 below.
-const ORCHESTRATOR_RULE_TOP: f32 = 3.0;
-/// See [`ORCHESTRATOR_RULE_TOP`].
-const ORCHESTRATOR_RULE_BOTTOM: f32 = 4.0;
+/// The sidebar's section hairline — under the board-notices slot, above the
+/// Spaces header (gh#547): 3px of air above, 4 below. Full width: it divides
+/// two sections, so it is not drawn inside one rail.
+const SIDEBAR_RULE_TOP: f32 = 3.0;
+/// See [`SIDEBAR_RULE_TOP`].
+const SIDEBAR_RULE_BOTTOM: f32 = 4.0;
 
 /// How much of a space row the disambiguating tail may claim (gh#138). It wins
 /// the width fight against the repo name — that is the whole point — but not
@@ -837,8 +838,8 @@ impl Shell {
                     // The disclosure: everything that lives in this space,
                     // inline under its row (gh#124's containment) — the live
                     // rows first, then the idle ones (gh#258). The pinned
-                    // orchestrator is held out by the disclosure itself; it
-                    // has the fixture above the tree (gh#547).
+                    // chat is held out by the disclosure itself; it has the
+                    // slot above the tree (gh#547).
                     if expanded {
                         let held: Vec<&comet_proto::view::board::ActiveRow> =
                             spaces_view::space_live(&id, &borrowed_active)
@@ -1302,9 +1303,9 @@ impl Shell {
     /// 2. **The idle sessions**, in the tab strip's order (creation + manual
     ///    drag), so the shelf and the tabs agree.
     ///
-    /// The pinned orchestrator draws in NEITHER list: since gh#547 it has the
-    /// fixture above the tree, so `held-out` here is unconditional — one
-    /// Orchestrator per sidebar, wherever its chat's space happens to be.
+    /// The fallback chat draws in NEITHER list: since gh#547 it has the slot
+    /// above the tree, so `held-out` here is unconditional — one pinned row per
+    /// sidebar, wherever its chat's space happens to be.
     ///
     /// Expanding a space must always answer with something true about what
     /// lives here, so an empty one says so rather than disclosing into a gap.
@@ -1318,11 +1319,11 @@ impl Shell {
     ) -> AnyElement {
         use comet_proto::view::board::ActiveRow;
         let now = Utc::now();
-        // The pinned chat is drawn once, by the fixture above the tree. It is
+        // The pinned chat is drawn once, by the slot above the tree. It is
         // held out of every disclosure — live or idle — whatever space its
         // chat names, because a row that also appears four rows down among the
         // chats it is supposed to sit apart from is the same task twice.
-        let held: Option<String> = self.state.read(cx).orchestrator.clone();
+        let held: Option<String> = self.state.read(cx).fallback_chat.clone();
         let live_rows: Vec<AnyElement> = {
             let selected = self.state.read(cx).selected_chat.clone();
             live.iter()
@@ -1508,7 +1509,7 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: status dot, ◆ for the orchestrator's chat, then either
+            // Line 1: status dot, ◆ for the board's fallback chat, then either
             // `<chip> <branch>` (a dispatched attempt) or the chat's title,
             // then the time.
             .child(
@@ -1784,35 +1785,35 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The orchestrator's pinned fixture — its own row between "Needs you"
-    /// and Spaces, outside the tree (gh#547). `None` only when no orchestrator
-    /// is pinned (or its chat has not synced here).
+    /// The board-notices slot — the pinned chat's own row between "Needs you"
+    /// and Spaces, outside the tree (gh#547). `None` only when the board has
+    /// no fallback chat (or its chat has not synced here).
     ///
     /// It used to be the first child of the selected space's disclosure
     /// (`window.md` C2.3 as drawn), on the reasoning that it belongs to the
-    /// space whose board it is orchestrating. The nesting was the problem: the
-    /// orchestrator is not a chat in a folder, it is the board's voice for all
-    /// of them, and housing it inside one disclosure made it vanish whenever
+    /// space whose board it serves. The nesting was the problem: it is one
+    /// address for stray notices about every space (gh#348), not a chat in a
+    /// folder, and housing it inside one disclosure made it vanish whenever
     /// another space was selected — a pinned conversation that hides is a
     /// hidden one. The phone drew this slot above Spaces from the start; the
-    /// derivation's own contract ([`needs_view::orchestrator_slot`]) always
-    /// said "above Spaces"; the desktop caught up.
+    /// derivation's own contract ([`needs_view::fallback_slot`]) always said
+    /// "above Spaces"; the desktop caught up.
     ///
     /// One line: a 5px status dot, the ◆ in `--review`, the name 13/18/500 in
     /// `--text`, and how long ago it last spoke at 12px `--subtle`. No badge
     /// and no report preview — both said what "Needs you" says a few rows up
-    /// in words ("Orchestrator · finished a turn you haven't seen"), and the
+    /// in words ("Board notices · finished a turn you haven't seen"), and the
     /// inbox is where an unread report is supposed to catch you (claim C1.3).
-    pub(super) fn render_orchestrator_fixture(
+    pub(super) fn render_fallback_fixture(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let now = Utc::now();
-        let slot = self.state.read(cx).orchestrator_slot(now)?;
+        let slot = self.state.read(cx).fallback_slot(now)?;
         let selected_chat = self.state.read(cx).selected_chat.clone();
         let is_selected = selected_chat.as_deref() == Some(slot.chat_id.as_str());
-        let fade_key = format!("orch-slot-{}", slot.chat_id);
+        let fade_key = format!("fallback-slot-{}", slot.chat_id);
         let chat_id = slot.chat_id.clone();
         let menu_id = slot.chat_id.clone();
         // The dot is state, in the same 5px slot every sibling chat row uses —
@@ -1839,7 +1840,10 @@ impl Shell {
 
         Some(
             div()
-                .id(SharedString::from(format!("orchestrator-{}", slot.chat_id)))
+                .id(SharedString::from(format!(
+                    "board-notices-{}",
+                    slot.chat_id
+                )))
                 .mt(px(4.0))
                 .flex()
                 .flex_row()
@@ -1879,9 +1883,7 @@ impl Shell {
                         .flex_none()
                         .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.accent)
-                        .child(SharedString::from(
-                            comet_proto::view::board::ORCHESTRATOR_GLYPH,
-                        )),
+                        .child(SharedString::from(comet_proto::view::board::FALLBACK_GLYPH)),
                 )
                 .child(
                     div()
@@ -1892,7 +1894,7 @@ impl Shell {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .line_height(px(SPACE_ROW_LINE))
                         .text_color(theme.text)
-                        .child(SharedString::from(needs_view::ORCHESTRATOR_NAME)),
+                        .child(SharedString::from(needs_view::FALLBACK_NAME)),
                 )
                 .child(
                     div()
@@ -1909,19 +1911,19 @@ impl Shell {
         )
     }
 
-    /// The hairline under the orchestrator's fixture, and the section divider
+    /// The hairline under the board-notices slot, and the section divider
     /// above the Spaces header (`window.md` C2.1) — one hairline between
-    /// them, since the fixture sits directly over the section (gh#547).
+    /// them, since the slot sits directly over the section (gh#547).
     ///
-    /// The fixture is a chat row like any other and it is not one of the
-    /// chats: it is pinned, it outlives every attempt, and it is the only row
-    /// up there the reader is expected to talk TO rather than check on. Order
+    /// The slot is a chat row like any other and it is not one of the chats:
+    /// it is pinned, it outlives every attempt, and it is the only row up
+    /// there the reader is expected to talk TO rather than check on. Order
     /// alone said that faintly — the rule says it in a way you do not have to
     /// have been told.
     pub(super) fn render_sidebar_rule(theme: &Theme) -> AnyElement {
         div()
-            .mt(px(ORCHESTRATOR_RULE_TOP))
-            .mb(px(ORCHESTRATOR_RULE_BOTTOM))
+            .mt(px(SIDEBAR_RULE_TOP))
+            .mb(px(SIDEBAR_RULE_BOTTOM))
             .h(px(1.0))
             .flex_none()
             .bg(theme.border)

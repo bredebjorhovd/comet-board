@@ -322,10 +322,10 @@ const DEFAULT_KEYS: &[(&str, Kind)] = &[
     ("base", Kind::Str),
     ("notify", Kind::Bool),
     ("notify_dispatcher", Kind::Bool),
-    // The pin (gh#104). Here rather than only in the frontends' hands because
-    // this is how it is *unset*: a settings surface can clear a key it wrote,
-    // and a board reached over ssh can too.
-    ("orchestrator_chat", Kind::Str),
+    // Where stray notices go (gh#104, renamed in gh#348). Here rather than only
+    // in the frontends' hands because this is how it is *unset*: a settings
+    // surface can clear a key it wrote, and a board reached over ssh can too.
+    ("fallback_chat", Kind::Str),
     ("new_source", Kind::Str),
     ("max_duration", Kind::Str),
     ("max_tool_failures", Kind::Str),
@@ -453,6 +453,30 @@ fn trim_zeros(amount: f64) -> String {
     }
 }
 
+/// `[defaults]` keys that have been renamed, oldest spelling first.
+///
+/// One pair today (gh#348). A list rather than a special case because the
+/// question — "what did this key used to be called" — is asked by both
+/// directions of the same edit, and a rename with no entry here is a setting a
+/// frontend silently stops writing.
+const LEGACY_KEYS: &[(&str, &str)] = &[("orchestrator_chat", "fallback_chat")];
+
+/// What a caller's key is called now.
+fn current_key(key: &str) -> &str {
+    LEGACY_KEYS
+        .iter()
+        .find(|(old, _)| *old == key)
+        .map_or(key, |(_, new)| *new)
+}
+
+/// What a key used to be called, if it was ever called anything else.
+fn legacy_of(key: &str) -> Option<&'static str> {
+    LEGACY_KEYS
+        .iter()
+        .find(|(_, new)| *new == key)
+        .map(|(old, _)| *old)
+}
+
 fn kind_of(keys: &[(&str, Kind)], key: &str, table: &str) -> Result<Kind> {
     match keys.iter().find(|(k, _)| *k == key) {
         Some((_, kind)) => Ok(*kind),
@@ -500,9 +524,22 @@ pub fn edit(paths: &Paths, edit: &Edit) -> Result<RoutingView> {
             set_in_route(&before, *route, key, rendered(kind, value.as_deref())?)?
         }
         Edit::Default { key, value } => {
+            // A renamed key is written under its current spelling whichever one
+            // the caller sent, and the old one is cleared in the same edit.
+            // Leaving both would let a file say two things about one setting,
+            // and the reader that prefers the new spelling would make the write
+            // somebody just made from an old phone look like it did nothing.
+            // Mapped before the schema lookup so the legacy spelling is
+            // accepted without being *offered*: it is not in `DEFAULT_KEYS`, so
+            // the "try one of" list names only keys worth writing today.
+            let key = current_key(key);
             let kind = kind_of(DEFAULT_KEYS, key, "[defaults]")?;
+            let cleared = match legacy_of(key) {
+                Some(old) => set_in_table(&before, "[defaults]", old, None),
+                None => before.clone(),
+            };
             set_in_table(
-                &before,
+                &cleared,
                 "[defaults]",
                 key,
                 rendered(kind, value.as_deref())?,
@@ -1153,6 +1190,73 @@ max_duration = "banana"
         .unwrap();
         assert!(view.config.as_ref().unwrap().routes[1].account.is_none());
         assert!(!view.text.contains("old-slot"));
+    }
+
+    /// gh#348: a frontend built before the rename — an installed phone — sends
+    /// the key it knows. The write still lands, under the current spelling, and
+    /// the file is left saying one thing about one setting rather than two.
+    #[test]
+    fn the_legacy_spelling_is_written_as_the_current_one() {
+        let (_dir, paths) = paths_with("[defaults]\norchestrator_chat = \"chat-old\"\n");
+        let view = edit(
+            &paths,
+            &Edit::Default {
+                key: "orchestrator_chat".into(),
+                value: Some("chat-new".into()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            view.config.as_ref().unwrap().defaults.fallback(),
+            Some("chat-new")
+        );
+        assert!(
+            view.text.contains("fallback_chat = \"chat-new\""),
+            "written under the current spelling:\n{}",
+            view.text
+        );
+        assert!(
+            !view.text.contains("orchestrator_chat"),
+            "and the old line is gone, so the two cannot disagree:\n{}",
+            view.text
+        );
+    }
+
+    /// The same convergence from the other direction: a current-spelling write
+    /// clears a legacy line the file was already carrying.
+    #[test]
+    fn writing_the_current_key_clears_the_legacy_line() {
+        let (_dir, paths) = paths_with("[defaults]\norchestrator_chat = \"chat-old\"\n");
+        let view = edit(
+            &paths,
+            &Edit::Default {
+                key: "fallback_chat".into(),
+                value: Some("chat-new".into()),
+            },
+        )
+        .unwrap();
+        assert!(!view.text.contains("chat-old"), "{}", view.text);
+        assert_eq!(
+            view.config.as_ref().unwrap().defaults.fallback(),
+            Some("chat-new")
+        );
+    }
+
+    /// Clearing it from an old surface clears it for real — both lines go, so
+    /// the board does not carry on prompting a chat somebody just unset.
+    #[test]
+    fn clearing_from_the_legacy_spelling_clears_both() {
+        let (_dir, paths) = paths_with("[defaults]\norchestrator_chat = \"chat-old\"\n");
+        let view = edit(
+            &paths,
+            &Edit::Default {
+                key: "orchestrator_chat".into(),
+                value: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(view.config.as_ref().unwrap().defaults.fallback(), None);
+        assert!(!view.text.contains("chat-old"), "{}", view.text);
     }
 
     #[test]

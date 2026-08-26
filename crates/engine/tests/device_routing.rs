@@ -1392,15 +1392,15 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
     );
 
     // gh#104: the pin is a `routing.toml` key like any other, so A can set it
-    // on B's board — and B's `WatchBoardOrchestrator` says so at once rather
+    // on B's board — and B's fallback-chat stream says so at once rather
     // than on its next reread, because pinning is a click and not a poll.
     let mut pinned = client
         .subscribe(
-            methods::WATCH_BOARD_ORCHESTRATOR,
+            methods::WATCH_BOARD_FALLBACK,
             serde_json::json!({ "targetDeviceId": "device-b" }),
         )
         .await
-        .expect("remote WatchBoardOrchestrator");
+        .expect("remote fallback-chat stream");
     let first = pinned.recv().await.expect("the current value first");
     assert!(
         first["chatId"].is_null(),
@@ -1411,7 +1411,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
         .call(
             methods::WRITE_BOARD_CONFIG,
             serde_json::json!({
-                "op": "default", "key": "orchestrator_chat", "value": "chat-boss",
+                "op": "default", "key": "fallback_chat", "value": "chat-boss",
                 "targetDeviceId": "device-b"
             }),
         )
@@ -1428,7 +1428,7 @@ async fn board_rpcs_forward_to_the_device_hosting_the_board() {
         .call(
             methods::WRITE_BOARD_CONFIG,
             serde_json::json!({
-                "op": "default", "key": "orchestrator_chat",
+                "op": "default", "key": "fallback_chat",
                 "targetDeviceId": "device-b"
             }),
         )

@@ -227,7 +227,7 @@ impl Db {
               reopened     INTEGER NOT NULL DEFAULT 0,
               -- Task id of the parent that released this one, when the board
               -- dispatched that parent too. NULL on its own does not mean
-              -- "you": an orchestrator pane has no attempt and so no task id.
+              -- "you": a driving chat has no attempt and so no task id.
               dispatched_by TEXT,
               -- The pane the dispatch ran from, when an agent was in it. Both
               -- NULL is what "you" means; this one is set for every agent,
@@ -398,7 +398,7 @@ impl Db {
               resumes INTEGER NOT NULL DEFAULT 0,
               -- The auto-pick rule that released this attempt, and the human
               -- who owns that rule (gh#490). NULL on every attempt a person
-              -- (or an orchestrating agent) released — automation provenance
+              -- (or a driving agent) released — automation provenance
               -- is the exception, and its absence is the ordinary case.
               automation TEXT,
               automation_owner TEXT,
@@ -1828,7 +1828,7 @@ impl Db {
     /// The live attempt that owns a pane, if any.
     ///
     /// This names a *board-dispatched* agent by its task. It is not how an
-    /// agent is recognised — an orchestrator pane owns no attempt and would
+    /// agent is recognised — a driving chat owns no attempt and would
     /// answer `None` here — only how one that has a task on the board gets the
     /// richer label. See `dispatch::dispatcher_from`.
     pub fn live_attempt_for_pane(&self, pane_id: &str) -> Result<Option<Attempt>> {
@@ -2179,7 +2179,7 @@ pub struct NewAttempt {
     /// what it was cut from.
     pub stacked_on: Option<i64>,
     /// The auto-pick rule releasing this attempt, and that rule's human owner
-    /// (gh#490). Both `None` on every dispatch a person or an orchestrating
+    /// (gh#490). Both `None` on every dispatch a person or a driving
     /// agent made — automation provenance marks the exception. Written with
     /// the insert, like `stacked_on`: the rule is decided before anything is
     /// created, and a crash must not leave an autonomous attempt unattributed.

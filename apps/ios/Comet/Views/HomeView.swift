@@ -24,11 +24,10 @@ struct HomeView: View {
         NavigationStack(path: $path) {
             List {
                 // First, the inbox (gh#122): does anything want me — in
-                // words, and it cannot miss. Then the orchestrator's pinned
-                // slot, above Spaces, exactly where both desktop sidebars put
-                // them.
+                // words, and it cannot miss. Then the board-notices slot,
+                // above Spaces, exactly where both desktop sidebars put them.
                 NeedsYouSection(path: $path)
-                OrchestratorSlotSection(path: $path)
+                BoardNoticesSlotSection(path: $path)
                 spacesSection
                 // Between Spaces and the sessions, exactly where both desktop
                 // sidebars put it: everything alive in one Active group

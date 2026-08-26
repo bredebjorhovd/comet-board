@@ -23,11 +23,11 @@ import Observation
 final class BoardStore {
     /// The board's rows, newest frame wins. Empty until a host answers.
     private(set) var rows: [TaskRow] = []
-    /// Which chat the board has pinned as its orchestrator (gh#104/gh#122) —
-    /// the `WatchBoardOrchestrator` stream, ridden on the same host the board
-    /// sweep settled on. `nil` is a board with no orchestrator, which is a
+    /// Which chat takes this board's stray notices (gh#104/gh#122, gh#348) —
+    /// the fallback-chat stream, ridden on the same host the board sweep
+    /// settled on. `nil` is a board that sends them nowhere, which is a
     /// legitimate way to run one.
-    private(set) var orchestratorChatId: String?
+    private(set) var fallbackChatId: String?
     /// The device currently serving this board, once the sweep has settled.
     private(set) var hostDeviceId: String?
     /// True once any host has ever delivered a frame — the difference between
@@ -170,8 +170,8 @@ final class BoardStore {
                     // The pickers' data belongs to the host that will run the
                     // dispatch — reload it whenever the host changes.
                     Task { [weak self] in await self?.loadPickerCatalogs(host: deviceId) }
-                    // The pin rides the same host: it answers a question about
-                    // this board, and the sidebar's orchestrator slot needs it
+                    // It rides the same host: it answers a question about
+                    // this board, and the sidebar's notices slot needs it
                     // before any board screen has been opened (gh#122).
                     pinTask?.cancel()
                     pinTask = watchPin(deviceId: deviceId)
@@ -190,9 +190,13 @@ final class BoardStore {
         return delivered ? .settled : .notMe
     }
 
-    /// The `WatchBoardOrchestrator` stream (gh#104): the current pin first,
-    /// then every change. A frame that will not decode is schema skew — keep
-    /// the last good value, the same discipline the row stream keeps.
+    /// The fallback-chat stream (gh#104): the current address first, then
+    /// every change. A frame that will not decode is schema skew — keep the
+    /// last good value, the same discipline the row stream keeps.
+    ///
+    /// The method name is the pre-gh#348 spelling and stays that way: it is a
+    /// wire identifier, and an engine that renamed it would go dark on every
+    /// phone already installed.
     private func watchPin(deviceId: String) -> Task<Void, Never> {
         Task { [weak self] in
             guard let self else { return }
@@ -203,7 +207,7 @@ final class BoardStore {
                 for try await item in stream {
                     guard !Task.isCancelled else { return }
                     if let pin = try? JSONDecoder().decode(Pin.self, from: item) {
-                        self.orchestratorChatId = pin.chatId
+                        self.fallbackChatId = pin.chatId
                     }
                 }
             } catch {
@@ -487,25 +491,25 @@ final class BoardStore {
         return .failed(last ?? "No device in this org is hosting a board")
     }
 
-    // MARK: The orchestrator pin (gh#104, gh#144)
+    // MARK: Where the board's notices go (gh#104, gh#144, gh#348)
 
-    /// Pin a chat as the board's orchestrator, or unpin whatever is.
+    /// Send the board's stray notices to a chat, or stop.
     ///
     /// One `[defaults]` key on the board's `routing.toml`, written through the
     /// same validated path a settings page uses. `nil` removes it, which is the
-    /// kill switch: the notices stop and the chat is an ordinary chat again.
+    /// kill switch: the notices stop and nothing else about the chat changes.
     ///
-    /// Nothing is applied optimistically — the board republishes the pin on the
-    /// watch stream as the write lands, so the slot disappearing IS the box
+    /// Nothing is applied optimistically — the board republishes the address on
+    /// the watch stream as the write lands, so the slot disappearing IS the box
     /// agreeing. Returns an error to say, or nil.
-    func setOrchestrator(chatId: String?) async -> String? {
+    func setFallbackChat(chatId: String?) async -> String? {
         var candidates = boardHostCandidates(devices())
         if let host = hostDeviceId {
             candidates.removeAll { $0 == host }
             candidates.insert(host, at: 0)
         }
         guard !candidates.isEmpty else { return "No board host" }
-        var params: [String: Any] = ["op": "default", "key": "orchestrator_chat"]
+        var params: [String: Any] = ["op": "default", "key": "fallback_chat"]
         if let chatId { params["value"] = chatId }
         // The host replies with the board's whole config view; nothing here
         // reads it — the pin comes back on the watch stream — so this decodes

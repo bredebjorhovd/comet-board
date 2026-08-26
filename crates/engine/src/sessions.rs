@@ -2098,7 +2098,7 @@ async fn drive_run(
                 // `Errored`, not `Interrupted`: this is a run that stopped
                 // badly, and the board's reconcile reads that off the journal as
                 // a *block* — the attempt keeps its chat, its context and its
-                // slot, the dispatching agent and the orchestrator are told, and
+                // slot, the dispatching agent (or the fallback chat) is told, and
                 // retry-or-cancel is the operator's call. Which is the whole
                 // point of stopping it early rather than at the wall clock.
                 comet_board::spin::Rung::Stop => {

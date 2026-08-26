@@ -1,4 +1,4 @@
-//! The "Needs you" inbox and the orchestrator's pinned slot (gh#122).
+//! The "Needs you" inbox and the board-notices slot (gh#122).
 //!
 //! Every other sidebar section answers "which subsystem produced this row" —
 //! space aggregates, session rails, the Agents badge, the finished-unseen
@@ -11,15 +11,15 @@
 //! between surfaces is a real bug.
 //!
 //! - [`needs_you`] — the inbox. Everything waiting on a human, as rows that
-//!   say WHO and WHAT in words ("Orchestrator · PR 576 green, nothing needs
+//!   say WHO and WHAT in words ("Board notices · PR 576 green, nothing needs
 //!   you" / "gh#503 · agent asks about auth semantics"). First section on
 //!   every surface. When it is empty the surface says so in words
 //!   ([`ALL_CLEAR`]) — the empty state is the reward, not a gap, and it is
 //!   what licenses everything below it to stay calm forever.
-//! - [`orchestrator_slot`] — the board's voice as a pinned thread above
+//! - [`fallback_slot`] — the board's voice as a pinned thread above
 //!   Spaces: name, unseen badge, latest-report preview. A fixture like a
 //!   messaging app's pinned conversation, not a decorated session row; when
-//!   the orchestrator has never spoken the slot says so ([`NO_REPORTS`])
+//!   nothing has been said there yet the slot says so ([`NO_REPORTS`])
 //!   instead of vanishing, teaching where to look before the first notice
 //!   arrives.
 //!
@@ -41,10 +41,14 @@ use crate::view::board::{AgentState, TaskRow, agent_state};
 use crate::view::{Indicator, display_status, effective_indicator, single_line};
 use crate::{Chat, ChatIndicator, Session};
 
-/// What every surface calls the pinned orchestrator when it speaks for
+/// What every surface calls the board's fallback chat when it speaks for
 /// itself — the inbox row's WHO and the slot's name. One spelling, everywhere:
 /// this is the product's voice, and a voice with three names is three voices.
-pub const ORCHESTRATOR_NAME: &str = "Orchestrator";
+///
+/// It names the *board*, not a role somebody was appointed to (gh#348): what
+/// lands in that chat is the board's own news — a settle nobody else could be
+/// told about, a cap warning — and whoever reads it is reading the board.
+pub const FALLBACK_NAME: &str = "Board notices";
 
 /// The section's title, pinned so no surface invents its own.
 pub const NEEDS_YOU_TITLE: &str = "Needs you";
@@ -54,8 +58,7 @@ pub const NEEDS_YOU_TITLE: &str = "Needs you";
 /// anything if its silence is spelled out too.
 pub const ALL_CLEAR: &str = "Nothing needs you";
 
-/// What the slot says under the name when the pinned orchestrator has never
-/// spoken. An empty fixture, deliberately rendered: it teaches where the first
+/// What the slot says under the name when nothing has been said there yet. An empty fixture, deliberately rendered: it teaches where the first
 /// notice will arrive before one ever has.
 pub const NO_REPORTS: &str = "No reports yet";
 
@@ -70,7 +73,7 @@ pub enum NeedKind {
     Limited,
     /// A run died and is waiting on a retry.
     DeadRun,
-    /// The orchestrator finished a turn you have not seen.
+    /// The fallback chat finished a turn you have not seen.
     Report,
 }
 
@@ -122,7 +125,7 @@ pub struct NeedRow {
     pub chat_id: String,
     /// The space to land in, as the chat records it.
     pub space_id: Option<String>,
-    /// WHO wants you: [`ORCHESTRATOR_NAME`], an issue identifier (`gh#503`),
+    /// WHO wants you: [`FALLBACK_NAME`], an issue identifier (`gh#503`),
     /// or the chat's own title.
     pub who: String,
     /// A short slug of the task's title (gh#364), drawn after
@@ -130,7 +133,7 @@ pub struct NeedRow {
     /// review-page-loads`.
     ///
     /// Only ever set on the rows whose `who` is an identifier: the
-    /// orchestrator's row and an ad-hoc chat's are already named in words, and
+    /// fallback chat's row and an ad-hoc chat's are already named in words, and
     /// a slug of the chat title beside the chat title says one thing twice.
     /// Decoration on the key, so a narrow surface drops it and keeps the
     /// identifier — see [`crate::view::board::AgentRow::slug`].
@@ -148,22 +151,23 @@ pub struct NeedRow {
 /// Everything waiting on a human, most owed first.
 ///
 /// The inputs are the four standing streams every viewport already holds: the
-/// orchestrator pin, `WatchBoard` rows, the chat rows, the session watch.
+/// fallback address, `WatchBoard` rows, the chat rows, the session watch.
 /// Membership, exactly:
 ///
-/// - **The orchestrator**, when its turn finished unseen ([`NeedKind::Report`])
-///   — the one chat whose *news* is worth a row, because its news is the
-///   board's. Its questions and dead runs qualify like anyone else's.
+/// - **The fallback chat**, when its turn finished unseen
+///   ([`NeedKind::Report`]) — the one chat whose *news* is worth a row,
+///   because its news is the board's. Its questions and dead runs qualify like
+///   anyone else's.
 /// - **Live board attempts** whose agent is blocked or dead, state read
 ///   session-first exactly as the Agents section reads it. WHO is the issue
 ///   identifier — what the agent is *for*.
 /// - **Any other chat that is asking** (`AwaitingInput`, staleness-gated).
 ///   A finished ad-hoc session's green dot stays the sessions list's news,
 ///   and a dead ad-hoc run stays at the recency it earned — only the
-///   orchestrator's news interrupts, or the section becomes a second
+///   fallback chat's news interrupts, or the section becomes a second
 ///   sessions list and stops meaning "you are needed".
 ///
-/// Each chat appears at most once: the orchestrator's row wins over its
+/// Each chat appears at most once: the fallback chat's row wins over its
 /// attempt row (if a board ever dispatched it), and an attempt's chat is
 /// never re-listed as a plain asking chat.
 ///
@@ -171,7 +175,7 @@ pub struct NeedRow {
 /// been owed the longest is the most owed — with `since`-less rows last and
 /// the chat id breaking the final tie so the sort is total.
 pub fn needs_you(
-    orchestrator: Option<&str>,
+    fallback: Option<&str>,
     rows: &[TaskRow],
     chats: &[Chat],
     sessions: &[Session],
@@ -180,8 +184,8 @@ pub fn needs_you(
     let session_for = |id: &str| sessions.iter().find(|s| s.chat_id == id);
     let mut out: Vec<NeedRow> = Vec::new();
 
-    // The orchestrator, by every door: question, dead run, unseen report.
-    if let Some(pin) = orchestrator
+    // The fallback chat, by every door: question, dead run, unseen report.
+    if let Some(pin) = fallback
         && let Some(chat) = chats.iter().find(|c| c.id == pin)
     {
         let session = session_for(pin);
@@ -195,7 +199,7 @@ pub fn needs_you(
             out.push(NeedRow {
                 chat_id: chat.id.clone(),
                 space_id: chat.space_id.clone(),
-                who: ORCHESTRATOR_NAME.to_string(),
+                who: FALLBACK_NAME.to_string(),
                 // A name already, and not a task's — nothing to decorate.
                 slug: None,
                 what: what_line(chat, kind),
@@ -216,7 +220,7 @@ pub fn needs_you(
         let Some(chat_id) = row.chat_id.as_deref() else {
             continue;
         };
-        if orchestrator == Some(chat_id) {
+        if fallback == Some(chat_id) {
             continue;
         }
         let Some(chat) = chats.iter().find(|c| c.id == chat_id) else {
@@ -273,7 +277,7 @@ pub fn needs_you(
         .filter_map(|row| row.chat_id.as_deref())
         .collect();
     for chat in chats {
-        if orchestrator == Some(chat.id.as_str()) || claimed.contains(&chat.id.as_str()) {
+        if fallback == Some(chat.id.as_str()) || claimed.contains(&chat.id.as_str()) {
             continue;
         }
         let session = session_for(&chat.id);
@@ -357,48 +361,48 @@ fn provider_label(runtime: Option<&str>) -> Option<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
-// The orchestrator's pinned slot
+// The board-notices slot
 // ---------------------------------------------------------------------------
 
-/// The orchestrator as a pinned thread: what the fixed slot above Spaces
+/// The board's fallback chat as a pinned thread: what the fixed slot above Spaces
 /// renders on every surface.
 #[derive(Debug, Clone, PartialEq)]
-pub struct OrchestratorSlot {
+pub struct FallbackSlot {
     /// The pinned chat — where opening the slot goes. Opening marks the chat
     /// seen (the synced LWW marker), which is what clears [`unseen`]
     /// everywhere.
     ///
-    /// [`unseen`]: OrchestratorSlot::unseen
+    /// [`unseen`]: FallbackSlot::unseen
     pub chat_id: String,
     pub space_id: Option<String>,
-    /// The latest report's one-line preview. `None` = the orchestrator has
-    /// never spoken, and the slot says [`NO_REPORTS`] instead of vanishing.
+    /// The latest report's one-line preview. `None` = nothing has
+    /// ever been spoken, and the slot says [`NO_REPORTS`] instead of vanishing.
     pub preview: Option<String>,
     /// Unread activity — the slot's badge. A word or a count on the surface,
     /// never only a color.
     pub unseen: bool,
     /// Live status, so the slot can say "working" while a turn runs — in the
-    /// screenshots an 8h-old orchestrator row was indistinguishable from an
+    /// screenshots an 8h-old notices row was indistinguishable from an
     /// idle one, and this is the field that fixes it.
     pub indicator: ChatIndicator,
     /// When it last spoke, for the slot's time column.
     pub last_at: Option<DateTime<Utc>>,
 }
 
-/// The slot, or `None` when this board has no orchestrator pinned (or its
+/// The slot, or `None` when this board has no fallback chat set (or its
 /// chat has not synced here — a slot that cannot be opened teaches nothing).
-/// A pinned-but-silent orchestrator is NOT `None`: that is the empty fixture,
+/// A set-but-silent fallback chat is NOT `None`: that is the empty fixture,
 /// and it renders.
-pub fn orchestrator_slot(
-    orchestrator: Option<&str>,
+pub fn fallback_slot(
+    fallback: Option<&str>,
     chats: &[Chat],
     sessions: &[Session],
     now: DateTime<Utc>,
-) -> Option<OrchestratorSlot> {
-    let pin = orchestrator?;
+) -> Option<FallbackSlot> {
+    let pin = fallback?;
     let chat = chats.iter().find(|c| c.id == pin)?;
     let session = sessions.iter().find(|s| s.chat_id == pin);
-    Some(OrchestratorSlot {
+    Some(FallbackSlot {
         chat_id: chat.id.clone(),
         space_id: chat.space_id.clone(),
         preview: chat
@@ -508,14 +512,14 @@ mod tests {
         }
     }
 
-    /// The exit criterion, literally: the orchestrator has reported and one
+    /// The exit criterion, literally: the fallback chat has reported and one
     /// agent is blocked — two rows, each saying who and what in words, the
     /// question first.
     #[test]
     fn a_report_and_a_blocked_agent_are_two_rows_that_name_themselves() {
-        let orchestrator = chat(
+        let fallback = chat(
             "orch",
-            Some("Board orchestrator"),
+            Some("Board notices"),
             Some("PR 576 green, nothing needs you"),
         );
         let agent_chat = chat("c503", None, Some("agent asks about auth semantics"));
@@ -525,7 +529,7 @@ mod tests {
         let needs = needs_you(
             Some("orch"),
             &rows,
-            &[orchestrator, agent_chat],
+            &[fallback, agent_chat],
             &sessions,
             now(),
         );
@@ -533,7 +537,7 @@ mod tests {
         assert_eq!(needs[0].who, "gh#503");
         assert_eq!(needs[0].what, "agent asks about auth semantics");
         assert_eq!(needs[0].kind, NeedKind::Question);
-        assert_eq!(needs[1].who, ORCHESTRATOR_NAME);
+        assert_eq!(needs[1].who, FALLBACK_NAME);
         assert_eq!(needs[1].what, "PR 576 green, nothing needs you");
         assert_eq!(needs[1].kind, NeedKind::Report);
     }
@@ -552,7 +556,7 @@ mod tests {
     /// Completed and errored ad-hoc sessions stay the sessions list's news;
     /// stale questions are dead backends, not questions.
     #[test]
-    fn only_the_orchestrators_news_interrupts() {
+    fn only_the_fallback_chats_news_interrupts() {
         let asking = chat("ask", Some("ad-hoc run"), Some("which env?"));
         let finished = chat("done", Some("finished thing"), Some("all done"));
         let mut errored = chat("err", Some("crashed thing"), None);
@@ -659,16 +663,16 @@ mod tests {
         assert_eq!(needs[0].what, "usage limit — switch model, switch account, or wait");
     }
 
-    /// One chat, one row: the orchestrator's row wins over its attempt row,
+    /// One chat, one row: the fallback chat's row wins over its attempt row,
     /// and an attempt's chat is never re-listed as a plain asking chat.
     #[test]
     fn each_chat_appears_at_most_once() {
-        let chats = vec![chat("orch", Some("orchestrator"), Some("hello"))];
+        let chats = vec![chat("orch", Some("notices"), Some("hello"))];
         let rows = vec![attempt("x", "orch", BoardState::Blocked)];
         let sessions = vec![session("orch", SessionStatus::AwaitingInput, 0)];
         let needs = needs_you(Some("orch"), &rows, &chats, &sessions, now());
         assert_eq!(needs.len(), 1);
-        assert_eq!(needs[0].who, ORCHESTRATOR_NAME);
+        assert_eq!(needs[0].who, FALLBACK_NAME);
     }
 
     /// A blocked attempt whose chat has not synced here cannot be opened, so
@@ -686,7 +690,7 @@ mod tests {
         let chats = vec![
             chat("q-new", Some("new question"), None),
             chat("q-old", Some("old question"), None),
-            chat("orch", Some("orchestrator"), Some("report")),
+            chat("orch", Some("notices"), Some("report")),
         ];
         let sessions = vec![
             session("q-new", SessionStatus::AwaitingInput, 1_000),
@@ -709,7 +713,7 @@ mod tests {
             Some("PR 576 green"),
         );
         let sessions = vec![session("orch", SessionStatus::Working, 0)];
-        let slot = orchestrator_slot(Some("orch"), std::slice::from_ref(&orch), &sessions, now())
+        let slot = fallback_slot(Some("orch"), std::slice::from_ref(&orch), &sessions, now())
             .expect("pinned and synced");
         assert_eq!(slot.chat_id, "orch");
         assert_eq!(slot.preview.as_deref(), Some("PR 576 green"));
@@ -723,15 +727,15 @@ mod tests {
     fn opening_clears_the_badge() {
         let mut orch = chat("orch", None, Some("PR 576 green"));
         orch.last_seen_at = Some(at("2026-08-07T11:30:00Z"));
-        let slot = orchestrator_slot(Some("orch"), &[orch], &[], now()).unwrap();
+        let slot = fallback_slot(Some("orch"), &[orch], &[], now()).unwrap();
         assert!(!slot.unseen);
     }
 
     /// Never spoken: the slot still renders, as the empty fixture.
     #[test]
-    fn a_silent_orchestrator_is_a_slot_with_no_preview_not_no_slot() {
+    fn a_silent_fallback_chat_is_a_slot_with_no_preview_not_no_slot() {
         let orch = chat("orch", None, None);
-        let slot = orchestrator_slot(Some("orch"), &[orch], &[], now()).unwrap();
+        let slot = fallback_slot(Some("orch"), &[orch], &[], now()).unwrap();
         assert_eq!(slot.preview, None);
         assert!(!slot.unseen);
         assert_eq!(slot.indicator, ChatIndicator::Idle);
@@ -740,8 +744,8 @@ mod tests {
     /// No pin, or a pin whose chat has not synced here: no slot.
     #[test]
     fn no_pin_or_no_chat_is_no_slot() {
-        assert!(orchestrator_slot(None, &[chat("c", None, None)], &[], now()).is_none());
-        assert!(orchestrator_slot(Some("gone"), &[chat("c", None, None)], &[], now()).is_none());
+        assert!(fallback_slot(None, &[chat("c", None, None)], &[], now()).is_none());
+        assert!(fallback_slot(Some("gone"), &[chat("c", None, None)], &[], now()).is_none());
     }
 
     /// A multi-line preview collapses onto the slot's one line — same rule as
@@ -749,7 +753,7 @@ mod tests {
     #[test]
     fn previews_are_single_lines() {
         let orch = chat("orch", None, Some("line one\nline two"));
-        let slot = orchestrator_slot(Some("orch"), &[orch.clone()], &[], now()).unwrap();
+        let slot = fallback_slot(Some("orch"), &[orch.clone()], &[], now()).unwrap();
         assert_eq!(slot.preview.as_deref(), Some("line one line two"));
         let needs = needs_you(Some("orch"), &[], &[orch], &[], now());
         assert_eq!(needs[0].what, "line one line two");
