@@ -148,7 +148,7 @@ retain_worktrees = "7d"
 retain_build_output = "on-settle"
 # And when its *chat* leaves the space's shelf. `on-settle` is no window at all:
 # the same guards hold it — never while an attempt is live or blocked, never
-# while a pull request is in review, never the pinned orchestrator, never a chat
+# while a pull request is in review, never the board's fallback chat, never a chat
 # still waiting on work it released, never a chat you made yourself — and once
 # none of them do, the task has merged or closed and its row has nothing left to
 # say. Write a duration (`2d`, `1w`) for a grace
@@ -160,8 +160,8 @@ archive_chats = "on-settle"
 # When an agent releases work through the board, prompt it in its own chat as
 # that work settles or blocks. On, and tried first: it is the precise channel —
 # the reader is the one agent whose plan that task was a step in. Turn it off if
-# you dispatch by hand rather than from orchestrators, and every settle falls to
-# the pin below instead.
+# you dispatch by hand rather than from agents, and every settle falls to the
+# fallback chat below instead.
 # notify_dispatcher = true
 # Where the board tells *you* — one URL, POSTed a small JSON body when a
 # dispatched attempt blocks or settles (`{{"event": "on_blocked", …}}`). This is
@@ -170,14 +170,15 @@ archive_chats = "on-settle"
 # on its issue and a coloured row, and nothing else. `notify` switches it off
 # without deleting the URL. `doctor` reports which of the two is missing.
 # notify_webhook = "https://hooks.example.com/comet-board"
-# One chat pinned as this board's orchestrator: it hears what nobody else can be
-# told — work you released from the panel or the phone, work whose dispatching
-# chat has been archived since, and every cap warning — and can drive the board
-# with the ordinary `comet-board` verbs. Set it from the desktop app or the TUI
-# ("Pin as orchestrator" on a session) rather than by hand — they know the chat
-# id. Unset, those three reach no agent at all and the log says so once per
-# event. `docs/orchestrator.md` is the brief to open that chat with.
-# orchestrator_chat = "chat_01J8Z…"
+# One chat to take the board's stray notices: what nobody else can be told —
+# work you released from the panel or the phone, work whose dispatching chat has
+# been archived since, and every cap warning. An address, not a role: it is not
+# appointed to drive the board, and a chat that drives the board is simply one
+# that dispatched. Set it from the app ("Send board notices here" on a session)
+# rather than by hand — it knows the chat id. Unset, those three reach no agent
+# at all and the log says so once per event. `docs/fallback-chat.md` is the
+# whole of it.
+# fallback_chat = "chat_01J8Z…"
 # Whether a dispatch writes the board's conventions into the instruction file
 # its runtime reads on its own — `CLAUDE.md` in the Claude config dir,
 # `AGENTS.md` in `CODEX_HOME`. On, because a Codex agent has no skill mechanism

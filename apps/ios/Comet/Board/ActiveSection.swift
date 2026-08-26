@@ -13,7 +13,7 @@
 // Pure presentation: everything drawn was already streamed, and a tap opens
 // the chat and nothing else — retry and cancel live on the board, which is
 // the deep view and has the confirmations. The one write a row here offers is
-// the orchestrator pin on long-press (`OrchestratorPin.swift`, gh#166), and it
+// where the board's notices go, on long-press (`BoardNotices.swift`, gh#166), and it
 // carries its own confirmation for the same reason.
 
 import SwiftUI
@@ -43,15 +43,15 @@ struct ActiveSection: View {
                         }
                     }
                     .buttonStyle(PressWashButtonStyle())
-                    // Long-press to pin this chat as the board's orchestrator
-                    // (gh#166). An orchestrator is a long-lived chat you opened
-                    // yourself, which is exactly what an `.unmanaged` row is —
-                    // so more often than not it is already running, and this is
-                    // the row it has. The item declines to appear on an
-                    // `.agent` row: the board dispatched that one, and pinning
-                    // an attempt is the one thing `comet-board doctor` says can
-                    // be wrong with a pin.
-                    .orchestratorPinMenu(chatId: row.chatId)
+                    // Long-press to send the board's notices here (gh#166).
+                    // That chat is a long-lived one you opened yourself, which
+                    // is exactly what an `.unmanaged` row is — so more often
+                    // than not it is already running, and this is the row it
+                    // has. The item declines to appear on an `.agent` row: the
+                    // board dispatched that one, and putting the board's own
+                    // events into an attempt's chat is the one thing
+                    // `comet-board doctor` says can be wrong here.
+                    .boardNoticesMenu(chatId: row.chatId)
                     .listRowBackground(Color.clear)
                     .listRowSeparator(.hidden)
                     .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))

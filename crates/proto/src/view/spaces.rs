@@ -277,12 +277,12 @@ pub fn active_placements<'a>(
 }
 
 /// Whether the selected Space's disclosure is structurally required to stay
-/// open because it owns the visible Orchestrator row.
+/// open because it owns the visible board-notices row.
 ///
 /// This is shared by rendering and the chevron action so persisted collapsed
-/// state cannot briefly move the Orchestrator outside its Space or hide it.
-pub fn space_disclosure_forced_open(selected: bool, has_orchestrator: bool) -> bool {
-    selected && has_orchestrator
+/// state cannot briefly move that row outside its Space or hide it.
+pub fn space_disclosure_forced_open(selected: bool, has_fallback: bool) -> bool {
+    selected && has_fallback
 }
 
 /// The live chats a space's disclosure draws, in the order Active derived them
@@ -658,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn a_selected_space_with_an_orchestrator_stays_disclosed() {
+    fn a_selected_space_with_a_fallback_chat_stays_disclosed() {
         assert!(space_disclosure_forced_open(true, true));
         assert!(!space_disclosure_forced_open(true, false));
         assert!(!space_disclosure_forced_open(false, true));

@@ -172,7 +172,14 @@ fn fake_board(dir: &Path) -> PathBuf {
 }
 
 async fn git(cwd: &Path, args: &[&str]) {
-    let output = tokio::process::Command::new("git")
+    // Resolved past the board's own shim directories: run from inside a
+    // dispatched chat — where the suite gets run (§gh#561) — PATH's first
+    // `git` is the gh#488 guard, which re-stamps the live credential at its
+    // exec boundary and decides this test from the shell it was raised in.
+    let Some(git) = comet_board::git_credentials::resolve_git(None) else {
+        panic!("no real git on this box")
+    };
+    let output = tokio::process::Command::new(git)
         .args(args)
         .current_dir(cwd)
         .env("GIT_AUTHOR_NAME", "test")

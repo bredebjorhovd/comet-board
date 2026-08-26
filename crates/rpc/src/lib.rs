@@ -229,15 +229,23 @@ pub mod methods {
     /// collector and performs one concurrent, five-second-bounded read per
     /// non-iOS device. No background polling or edge persistence is involved.
     pub const AGGREGATE_BOARD_STATS: &str = "AggregateBoardStats";
-    /// Stream: which chat is pinned as this board's orchestrator (gh#104),
-    /// current value first, then every change. Params: `{}` → `{chatId}`.
+    /// Stream: which chat takes this board's stray notices (gh#104, renamed in
+    /// gh#348), current value first, then every change. Params: `{}` →
+    /// `{chatId}`.
     ///
     /// Separate from [`WATCH_BOARD`] because it answers a question about the
     /// board rather than about the work on it, and every surface that renders
-    /// the pin — the session list, on both viewports — needs it whether or not
+    /// the mark — the session list, on both viewports — needs it whether or not
     /// a board panel is open. Written through [`WRITE_BOARD_CONFIG`], like
     /// every other `routing.toml` key: one writer discipline, not two.
-    pub const WATCH_BOARD_ORCHESTRATOR: &str = "WatchBoardOrchestrator";
+    ///
+    /// **The wire name is frozen at the pre-gh#348 spelling.** A method name is
+    /// an identifier, not a description: a phone installed before the rename
+    /// subscribes by this exact string, and renaming it would take the ◆ off
+    /// that phone's session list until somebody shipped it a new build — a real
+    /// cost for no gain to any reader. The vocabulary the rename is about lives
+    /// in the config key, the `doctor` line and every word a person sees.
+    pub const WATCH_BOARD_FALLBACK: &str = "WatchBoardOrchestrator";
     /// End a task's live attempt (interrupt + archive the chat). The issue
     /// stays open: cancel ends attempts, never tasks. Params: `{taskId}`.
     pub const CANCEL_TASK: &str = "CancelTask";

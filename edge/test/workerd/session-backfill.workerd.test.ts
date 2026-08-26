@@ -144,7 +144,11 @@ const applyBackfill = (
 };
 
 describe("SessionRoom backfill on real workerd", () => {
-  it("bounds one causally complex workspace join and converges over continuations", async () => {
+  // Six Loro docs in causal rounds against real workerd: ~4s of test time on
+  // an idle box, past vitest's 5s default the moment anything else runs (the
+  // wide pass, gh#386, watched it flake under a parallel cargo build). The
+  // margin was the bug; the budget below is room for a loaded machine.
+  it("bounds one causally complex workspace join and converges over continuations", { timeout: 30_000 }, async () => {
     const source = causallyComplexWorkspace();
     expect(source.peers).toBe(6);
     const stub = env.TEST_SESSION.get(env.TEST_SESSION.idFromName("complex-backfill"));

@@ -23,7 +23,7 @@
 //!   for the same reason: a run the board is about to end gets told first.
 //! - **Then stop.** The hard rung ends the run with an error, which is the
 //!   *existing* block path: the attempt keeps its chat and its context, the
-//!   board's reconcile reads `Errored` off the journal, and the orchestrator
+//!   board's reconcile reads `Errored` off the journal, and whoever is driving the board
 //!   (or the dispatching agent) is told exactly as it is told about any other
 //!   block. Nothing new had to be invented for anybody to hear about this.
 //!

@@ -123,7 +123,7 @@ fn main() -> Result<()> {
             runtime: seed.runtime.into(),
             worktree: None,
             branch: Some(format!("seed/{index}")),
-            dispatched_by: seed.by_agent.then(|| "seed-orchestrator".to_string()),
+            dispatched_by: seed.by_agent.then(|| "seed-driver".to_string()),
             dispatched_by_pane: None,
             base_sha: None,
             account: seed.account.map(str::to_string),

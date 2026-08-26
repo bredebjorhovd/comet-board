@@ -16,7 +16,7 @@
 //!
 //! ## One full row per chat (gh#138, gh#258)
 //!
-//! Spaces is the primary hierarchy: a disclosure draws its Orchestrator first,
+//! Spaces is the primary hierarchy: a disclosure draws its board-notices slot first,
 //! then live sessions, then idle sessions. Active is only the fallback for a
 //! live row whose current placement resolves to no known Space. That fallback
 //! matters because Chat and Space watches settle independently; a dangling
@@ -94,13 +94,13 @@ const RAIL_OFFSET: f32 = 9.0;
 /// See [`RAIL_OFFSET`].
 const RAIL_INSET: f32 = 14.0;
 
-/// The hairline between Orchestrator and the chats under it — margin 3/9/4,
+/// The hairline between that slot and the chats under it — margin 3/9/4,
 /// per claim C2.9, and drawn INSIDE the rail rather than across the sidebar.
-const ORCHESTRATOR_RULE_TOP: f32 = 3.0;
-/// See [`ORCHESTRATOR_RULE_TOP`].
-const ORCHESTRATOR_RULE_SIDE: f32 = 9.0;
-/// See [`ORCHESTRATOR_RULE_TOP`].
-const ORCHESTRATOR_RULE_BOTTOM: f32 = 4.0;
+const FALLBACK_RULE_TOP: f32 = 3.0;
+/// See [`FALLBACK_RULE_TOP`].
+const FALLBACK_RULE_SIDE: f32 = 9.0;
+/// See [`FALLBACK_RULE_TOP`].
+const FALLBACK_RULE_BOTTOM: f32 = 4.0;
 
 /// How much of a space row the disambiguating tail may claim (gh#138). It wins
 /// the width fight against the repo name — that is the whole point — but not
@@ -456,7 +456,7 @@ impl Shell {
             let state = self.state.read(cx);
             spaces_view::space_disclosure_forced_open(
                 state.selected_space.as_deref() == Some(space_id),
-                state.orchestrator_slot(Utc::now()).is_some(),
+                state.fallback_slot(Utc::now()).is_some(),
             )
         };
         if forced_open {
@@ -579,7 +579,7 @@ impl Shell {
             animating,
             slugs,
             local_device,
-            has_orchestrator,
+            has_fallback,
         ) = {
             let now = Utc::now();
             let state = self.state.read(cx);
@@ -647,7 +647,7 @@ impl Shell {
                 animating,
                 state.space_slugs.clone(),
                 state.local_device_id.clone(),
-                state.orchestrator_slot(now).is_some(),
+                state.fallback_slot(now).is_some(),
             )
         };
         // Manual (drag) order overrides the synced creation order — device-
@@ -792,10 +792,7 @@ impl Shell {
                     // RPC and is true on a phone that will never see the disk.
                     let branch = spaces_view::space_branch(&space).map(str::to_string);
                     let expanded = (self.space_expanded(&space.id)
-                        || spaces_view::space_disclosure_forced_open(
-                            is_selected,
-                            has_orchestrator,
-                        ))
+                        || spaces_view::space_disclosure_forced_open(is_selected, has_fallback))
                         && !drag_active;
                     // What Active holds for this space — the count the row
                     // wears, and the rows the shelf therefore skips.
@@ -847,7 +844,7 @@ impl Shell {
                     });
                     // The disclosure: everything that lives in this space,
                     // inline under its row (gh#124's containment) — the
-                    // orchestrator when this is the selected space, then the
+                    // notices slot when this is the selected space, then the
                     // live rows, then the idle ones (gh#258).
                     if expanded {
                         let held: Vec<&comet_proto::view::board::ActiveRow> =
@@ -1268,12 +1265,12 @@ impl Shell {
     /// `margin-left:9` with one `--line` hairline down the left. Three things
     /// stack inside it, in this order (gh#258, claims C2.3/C2.8/C2.9):
     ///
-    /// 1. **The orchestrator**, on the SELECTED space only, followed by its
+    /// 1. **The board-notices slot**, on the SELECTED space only, followed by its
     ///    hairline. It is the row you talk TO rather than check on, it outlives
     ///    every attempt in the list under it, and it belongs to the space whose
-    ///    board it is orchestrating — which is what putting it here says.
+    ///    board it is driving — which is what putting it here says.
     ///    Because it is drawn here, the pinned chat is dropped from the lists
-    ///    below: one Orchestrator per rail.
+    ///    below: one notices slot per rail.
     /// 2. **The live rows** — board attempts and the runs the board never
     ///    released — in Active's own order, needs-you first.
     /// 3. **The idle sessions**, in the tab strip's order (creation + manual
@@ -1285,28 +1282,28 @@ impl Shell {
         &mut self,
         shelf: &spaces_view::SpaceShelf<'_>,
         live: &[&comet_proto::view::board::ActiveRow],
-        orchestrator: bool,
+        fallback: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use comet_proto::view::board::ActiveRow;
         let now = Utc::now();
         // The chat the slot above is already drawing, when it drew one. The
-        // canvas has exactly one Orchestrator in the tree (claim C2.8) and the
+        // canvas has exactly one notices slot in the tree (claim C2.8) and the
         // pinned chat is an ordinary member of its space, so without this it
         // appeared twice inside one rail — once as the first child and again,
         // four rows down, among the chats it is supposed to be separated from
         // by the hairline. `held` is scoped to THIS disclosure: a pinned chat
         // living in some other space still draws its own row there, wearing
         // the ◆ that says which one it is.
-        let held: Option<String> = if orchestrator {
-            self.state.read(cx).orchestrator_slot(now).map(|s| s.chat_id)
+        let held: Option<String> = if fallback {
+            self.state.read(cx).fallback_slot(now).map(|s| s.chat_id)
         } else {
             None
         };
-        let head: Vec<AnyElement> = if orchestrator {
-            self.render_orchestrator_slot(theme, cx)
-                .map(|slot| vec![slot, Self::render_orchestrator_rule(theme)])
+        let head: Vec<AnyElement> = if fallback {
+            self.render_fallback_slot(theme, cx)
+                .map(|slot| vec![slot, Self::render_fallback_rule(theme)])
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -1321,7 +1318,7 @@ impl Shell {
                     // white plates in light; the reference leaves children on
                     // the disclosed bed.
                     let is_selected = disclosed_child_selected(
-                        orchestrator,
+                        fallback,
                         selected.as_deref() == Some(row.chat_id()),
                     );
                     match row {
@@ -1339,7 +1336,7 @@ impl Shell {
         let rows: Vec<AnyElement> = {
             let (selected, pinned) = {
                 let state = self.state.read(cx);
-                (state.selected_chat.clone(), state.orchestrator.clone())
+                (state.selected_chat.clone(), state.fallback_chat.clone())
             };
             order
                 .iter()
@@ -1354,10 +1351,7 @@ impl Shell {
                     Some(self.render_space_session_row(
                         &chat,
                         status,
-                        disclosed_child_selected(
-                            orchestrator,
-                            selected.as_deref() == Some(*chat_id),
-                        ),
+                        disclosed_child_selected(fallback, selected.as_deref() == Some(*chat_id)),
                         pinned.as_deref() == Some(*chat_id),
                         now,
                         theme,
@@ -1427,7 +1421,7 @@ impl Shell {
         chat: &comet_proto::Chat,
         status: ChatIndicator,
         selected: bool,
-        orchestrator: bool,
+        fallback: bool,
         now: DateTime<Utc>,
         theme: &Theme,
         cx: &mut Context<Self>,
@@ -1504,7 +1498,7 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: status dot, ◆ for the orchestrator's chat, then either
+            // Line 1: status dot, ◆ for the board's fallback chat, then either
             // `<chip> <branch>` (a dispatched attempt) or the chat's title,
             // then the time.
             .child(
@@ -1515,7 +1509,7 @@ impl Shell {
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
                     .child(status_rail)
-                    .when(orchestrator, |el| {
+                    .when(fallback, |el| {
                         el.child(
                             div()
                                 .flex_none()
@@ -1523,7 +1517,7 @@ impl Shell {
                                 .line_height(px(14.0))
                                 .text_color(theme.accent)
                                 .child(SharedString::from(
-                                    comet_proto::view::board::ORCHESTRATOR_GLYPH,
+                                    comet_proto::view::board::FALLBACK_GLYPH,
                                 )),
                         )
                     })
@@ -1789,29 +1783,29 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The orchestrator's pinned row — the FIRST child of the selected space's
+    /// The board-notices row — the FIRST child of the selected space's
     /// disclosure (claims C2.3, C2.8), inside the rail and above the hairline.
-    /// `None` only when no orchestrator is pinned (or its chat has not synced
-    /// here).
+    /// `None` only when the board has no fallback chat (or its chat has not
+    /// synced here).
     ///
     /// One line, exactly as the canvas draws it: a 5px status dot, the ◆ in
     /// `--review`, the name 13/18/500 in `--text`, and how long ago it last
     /// spoke at 12px `--subtle`. It used to carry two more things — a green
     /// "new" badge and a preview of the latest report — and both said what
-    /// "Needs you" says four rows above in words ("Orchestrator · finished a
+    /// "Needs you" says four rows above in words ("Board notices · finished a
     /// turn you haven't seen"). The inbox is where an unread report is
     /// supposed to catch you (claim C1.3); repeating it here made the tree's
     /// first child two lines tall so it could restate its own inbox entry.
     ///
     /// That disclosure is forced open while this row exists, so the ownership
     /// stays visible even if the saved disclosure state says collapsed.
-    pub(super) fn render_orchestrator_slot(
+    pub(super) fn render_fallback_slot(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let now = Utc::now();
-        let slot = self.state.read(cx).orchestrator_slot(now)?;
+        let slot = self.state.read(cx).fallback_slot(now)?;
         let fade_key = format!("orch-slot-{}", slot.chat_id);
         let chat_id = slot.chat_id.clone();
         let menu_id = slot.chat_id.clone();
@@ -1839,7 +1833,10 @@ impl Shell {
 
         Some(
             div()
-                .id(SharedString::from(format!("orchestrator-{}", slot.chat_id)))
+                .id(SharedString::from(format!(
+                    "board-notices-{}",
+                    slot.chat_id
+                )))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -1848,7 +1845,7 @@ impl Shell {
                 .px(px(Theme::SPACE_SM))
                 .py(px(6.0))
                 // The selected Space row owns the hierarchy's selection fill;
-                // its Orchestrator child remains unfilled like every other
+                // its board-notices child remains unfilled like every other
                 // disclosed child in the reference.
                 .list_row(theme, Bed::Shell, false, fade_key)
                 .cursor_pointer()
@@ -1879,9 +1876,7 @@ impl Shell {
                         .flex_none()
                         .text_size(px(Theme::TEXT_CAPTION))
                         .text_color(theme.accent)
-                        .child(SharedString::from(
-                            comet_proto::view::board::ORCHESTRATOR_GLYPH,
-                        )),
+                        .child(SharedString::from(comet_proto::view::board::FALLBACK_GLYPH)),
                 )
                 .child(
                     div()
@@ -1892,7 +1887,7 @@ impl Shell {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .line_height(px(SPACE_ROW_LINE))
                         .text_color(theme.text)
-                        .child(SharedString::from(needs_view::ORCHESTRATOR_NAME)),
+                        .child(SharedString::from(needs_view::FALLBACK_NAME)),
                 )
                 .child(
                     div()
@@ -1909,18 +1904,18 @@ impl Shell {
         )
     }
 
-    /// The hairline under the orchestrator's slot (gh#229).
+    /// The hairline under the board-notices slot (gh#229).
     ///
     /// The slot is a chat row like any other and it is not one of the chats:
     /// it is pinned, it outlives every attempt, and it is the only row above
     /// that the reader is expected to talk TO rather than check on. Order
     /// alone said that faintly — the rule says it in a way you do not have to
     /// have been told.
-    pub(super) fn render_orchestrator_rule(theme: &Theme) -> AnyElement {
+    pub(super) fn render_fallback_rule(theme: &Theme) -> AnyElement {
         div()
-            .mt(px(ORCHESTRATOR_RULE_TOP))
-            .mx(px(ORCHESTRATOR_RULE_SIDE))
-            .mb(px(ORCHESTRATOR_RULE_BOTTOM))
+            .mt(px(FALLBACK_RULE_TOP))
+            .mx(px(FALLBACK_RULE_SIDE))
+            .mb(px(FALLBACK_RULE_BOTTOM))
             .h(px(1.0))
             .flex_none()
             .bg(theme.border)

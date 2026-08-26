@@ -119,7 +119,7 @@ pub struct RunControls {
     /// `COMET_BOARD_CHAT_ID` — the identity `HERDR_PANE_ID` carried in herdr:
     /// a `comet-board dispatch` run by the agent inherits its own chat id
     /// without anyone passing ids by hand (§dispatch-pipeline). Every chat's
-    /// runs get it, not only board-dispatched ones — an orchestrator the board
+    /// runs get it, not only board-dispatched ones — a driving chat the board
     /// never dispatched still names itself. `None` only for chat-less runs
     /// (title generation).
     pub chat_id: Option<String>,
@@ -142,7 +142,7 @@ pub struct RunControls {
     /// checking `dispatchable`, releasing sub-work, and waiting.
     ///
     /// Set on every run, not only board-dispatched ones: the skill is
-    /// installed for the whole box, so an orchestrator the board never
+    /// installed for the whole box, so a driving chat the board never
     /// dispatched reads the same page of verbs. Empty when the engine cannot
     /// find a `comet-board` beside itself, which leaves PATH exactly as it was.
     ///

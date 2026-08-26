@@ -58,8 +58,8 @@ token means the field in `Theme`, never a literal at the call site.
 
 - **C2.1** A 1px `--line` divider sits above the Spaces header, margin 12/8/0.
 - **C2.2** Header: "Spaces" 11px/600 `--subtle`, and a 20px "+" button right.
-- **C2.3** **Spaces is the primary group and Orchestrator lives inside the
-  selected space** — not as a sibling group, and not displaced by Active.
+- **C2.3** **Spaces is the primary group and the board-notices slot lives
+  inside the selected space** — not as a sibling group, and not displaced by Active.
 - **C2.4** A space row is radius 10, padding 6×9, gap 8: a 15px source icon,
   the name 13/18/500, the branch 12px `--subtle`, a spacer, a running count
   ("3 running") led by a 5px dot, then a 16px chevron.
@@ -69,9 +69,9 @@ token means the field in `Theme`, never a literal at the call site.
 - **C2.7** **The children hang off a rail**: the child list is inset
   `padding-left:14` at `margin-left:9` with a 1px `--line` left border. This is
   what makes them read as inside the space rather than under it.
-- **C2.8** Orchestrator is the first child: a 5px `--settled` dot, a `--review`
+- **C2.8** The board-notices slot is the first child: a 5px `--settled` dot, a `--review`
   diamond, the name 13/18/500 `--text`, and an elapsed time 12px `--subtle`.
-- **C2.9** A 1px `--line` divider separates Orchestrator from the chats below
+- **C2.9** A 1px `--line` divider separates that slot from the chats below
   it, margin 3/9/4 — inside the rail, not across the sidebar.
 - **C2.10** A chat row with an agent shows a subline indented 13px: the Claude
   mark at 10px in `--claude`, then the branch at 11/15.

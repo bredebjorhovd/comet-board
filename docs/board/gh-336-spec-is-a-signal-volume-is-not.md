@@ -79,8 +79,8 @@ so the dispatcher-facing rule now says both halves: pass `--stack` when the
 ticket's own text names several separable, dependent concerns, and never on
 size alone. Updated together so they cannot drift:
 `docs/agent-conventions.md`, the shipped skill
-(`assets/skills/comet-board/SKILL.md`), `docs/orchestrator.md`, and the
-`dispatch --stack` help in `apps/board-cli`.
+(`assets/skills/comet-board/SKILL.md`), and the `dispatch --stack` help in
+`apps/board-cli`.
 
 ### Deliberately not here
 
